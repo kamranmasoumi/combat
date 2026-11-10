@@ -8,4 +8,5 @@ moba_shared = { path = "../moba_shared" }
 bevy = { workspace = true, features = ["default_app", "multi_threaded", "serialize"] }
 bevy_rapier3d = { workspace = true, features = ["dim3", "serde-serialize"] }
 renet = { workspace = true }
+renet_netcode = { workspace = true }
 bincode = { workspace = true }

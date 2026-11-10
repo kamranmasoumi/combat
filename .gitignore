@@ -4,7 +4,7 @@ debug
 target
 .idea
 moba_client/assets
-
+assets/
 # نادیده گرفتن تمامی پوشه‌های pycache در کل پروژه
 **/__pycache__/
 __pycache__/

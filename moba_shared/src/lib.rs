@@ -2,13 +2,22 @@ use bevy::ecs::entity::EntityHashSet;
 use bevy::prelude::*;
 use bevy::transform::TransformPlugin;
 use bevy_rapier3d::prelude::*;
+use renet::{ChannelConfig, ConnectionConfig, RenetClient, RenetServer, SendType};
+use renet_netcode::{
+    ClientAuthentication, ConnectToken, NetcodeClientTransport, NetcodeServerTransport,
+    ServerAuthentication, ServerConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // -----------------------------------------------------------------------------
 // ۱. ساختارهای کانفیگ (بدون هیچ Default یا serde(default))
 // -----------------------------------------------------------------------------
+
+use std::collections::HashSet;
 
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
@@ -22,6 +31,7 @@ pub struct GameConfig {
     pub combat: CombatConfig,
     pub fx: FxConfig,
     pub animations: AnimationConfig,
+    pub map: MapConfig,
     pub obstacles: Vec<ObstacleDef>,
     pub targets: Vec<TargetDef>,
 }
@@ -30,12 +40,14 @@ impl GameConfig {
     pub fn load_from_file(path: &str) -> Self {
         let content = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("خطای بحرانی: فایل کانفیگ '{}' خوانده نشد: {}", path, e));
-        ron::from_str::<GameConfig>(&content).unwrap_or_else(|e| {
+        let cfg = ron::from_str::<GameConfig>(&content).unwrap_or_else(|e| {
             panic!(
                 "خطای بحرانی: ساختار فایل کانفیگ '{}' نامعتبر است: {}",
                 path, e
             )
-        })
+        });
+        cfg.validate_unique_map_ids();
+        cfg
     }
 
     pub fn exact_anim_duration(&self, anim_name: &str) -> f32 {
@@ -50,14 +62,188 @@ impl GameConfig {
                 )
             })
     }
+
+    pub fn validate_unique_map_ids(&self) {
+        let mut seen = HashSet::new();
+        let mut check_id = |id: &str, category: &str| {
+            assert!(
+                !id.trim().is_empty(),
+                "خطای بحرانی کانفیگ: شناسه خالی در بخش '{}' مجاز نیست!",
+                category
+            );
+            assert!(
+                seen.insert(id.to_string()),
+                "خطای بحرانی کانفیگ: شناسه تکراری '{}' در بخش '{}' پیدا شد! تمام آبجکت‌های نقشه باید شناسه منحصر‌به‌فرد داشته باشند.",
+                id,
+                category
+            );
+        };
+
+        for item in &self.map.terrains {
+            check_id(&item.id, "map.terrains");
+        }
+        for item in &self.map.ramps {
+            check_id(&item.id, "map.ramps");
+        }
+        for item in &self.map.river_segments {
+            check_id(&item.id, "map.river_segments");
+        }
+        for item in &self.map.waterfalls {
+            check_id(&item.id, "map.waterfalls");
+        }
+        check_id(&self.map.center_bridge.id, "map.center_bridge");
+        for item in &self.map.fountains {
+            check_id(&item.id, "map.fountains");
+        }
+        for item in &self.map.ancients {
+            check_id(&item.id, "map.ancients");
+        }
+        for item in &self.map.turrets {
+            check_id(&item.id, "map.turrets");
+        }
+        for item in &self.map.mountains {
+            check_id(&item.id, "map.mountains");
+        }
+        for item in &self.map.trees {
+            check_id(&item.id, "map.trees");
+        }
+        for item in &self.map.lanes {
+            check_id(&item.id, "map.lanes");
+        }
+        for item in &self.obstacles {
+            check_id(&item.id, "obstacles");
+        }
+        for item in &self.targets {
+            check_id(&item.id, "targets");
+        }
+    }
 }
+
+pub const CHANNEL_UNRELIABLE_STATE: u8 = 0;
+pub const CHANNEL_RELIABLE_FX: u8 = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NetworkConfig {
     pub server_bind_addr: String,
     pub client_bind_addr: String,
     pub server_tick_rate_hz: f64,
-    pub socket_recv_buffer_bytes: usize,
+    pub protocol_id: u64,
+    pub max_clients: usize,
+    pub client_id: u64,
+    pub connect_token_expire_secs: u64,
+    pub connect_token_timeout_secs: i32,
+    pub available_bytes_per_tick: u64,
+    pub channel_max_memory_bytes: usize,
+    pub reliable_resend_time_ms: u64,
+    pub private_key: [u8; 32],
+}
+
+pub fn build_shared_renet_connection_config(net: &NetworkConfig) -> ConnectionConfig {
+    let channels = vec![
+        ChannelConfig {
+            channel_id: CHANNEL_UNRELIABLE_STATE,
+            max_memory_usage_bytes: net.channel_max_memory_bytes,
+            send_type: SendType::Unreliable,
+        },
+        ChannelConfig {
+            channel_id: CHANNEL_RELIABLE_FX,
+            max_memory_usage_bytes: net.channel_max_memory_bytes,
+            send_type: SendType::ReliableOrdered {
+                resend_time: Duration::from_millis(net.reliable_resend_time_ms),
+            },
+        },
+    ];
+
+    ConnectionConfig {
+        available_bytes_per_tick: net.available_bytes_per_tick,
+        client_channels_config: channels.clone(),
+        server_channels_config: channels,
+    }
+}
+
+pub fn create_shared_renet_server(net: &NetworkConfig) -> (RenetServer, NetcodeServerTransport) {
+    let server_addr: SocketAddr = net.server_bind_addr.parse().unwrap_or_else(|e| {
+        panic!(
+            "خطای بحرانی سرور: آدرس '{}' معتبر نیست: {}",
+            net.server_bind_addr, e
+        )
+    });
+    let socket = UdpSocket::bind(server_addr).unwrap_or_else(|e| {
+        panic!(
+            "خطای بحرانی سرور: امکان بایند روی '{}' نیست: {}",
+            net.server_bind_addr, e
+        )
+    });
+    socket
+        .set_nonblocking(true)
+        .expect("خطای بحرانی: تنظیم حالت non-blocking سوکت سرور شکست خورد");
+
+    let current_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("خطای بحرانی: ساعت سیستم نامعتبر است");
+
+    let server_config = ServerConfig {
+        current_time,
+        max_clients: net.max_clients,
+        protocol_id: net.protocol_id,
+        public_addresses: vec![server_addr],
+        authentication: ServerAuthentication::Secure {
+            private_key: net.private_key,
+        },
+    };
+
+    let transport = NetcodeServerTransport::new(server_config, socket)
+        .expect("خطای بحرانی سرور: ساخت NetcodeServerTransport شکست خورد");
+    let server = RenetServer::new(build_shared_renet_connection_config(net));
+
+    (server, transport)
+}
+
+pub fn create_shared_renet_client(net: &NetworkConfig) -> (RenetClient, NetcodeClientTransport) {
+    let server_addr: SocketAddr = net.server_bind_addr.parse().unwrap_or_else(|e| {
+        panic!(
+            "خطای بحرانی کلاینت: آدرس سرور '{}' معتبر نیست: {}",
+            net.server_bind_addr, e
+        )
+    });
+    let client_addr: SocketAddr = net.client_bind_addr.parse().unwrap_or_else(|e| {
+        panic!(
+            "خطای بحرانی کلاینت: آدرس کلاینت '{}' معتبر نیست: {}",
+            net.client_bind_addr, e
+        )
+    });
+    let socket = UdpSocket::bind(client_addr).unwrap_or_else(|e| {
+        panic!(
+            "خطای بحرانی کلاینت: امکان بایند روی '{}' نیست: {}",
+            net.client_bind_addr, e
+        )
+    });
+    socket
+        .set_nonblocking(true)
+        .expect("خطای بحرانی کلاینت: تنظیم حالت non-blocking سوکت شکست خورد");
+
+    let current_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("خطای بحرانی: ساعت سیستم نامعتبر است");
+
+    let connect_token = ConnectToken::generate(
+        current_time,
+        net.protocol_id,
+        net.connect_token_expire_secs,
+        net.client_id,
+        net.connect_token_timeout_secs,
+        vec![server_addr],
+        None,
+        &net.private_key,
+    )
+        .expect("خطای بحرانی کلاینت: تولید ConnectToken شکست خورد");
+
+    let auth = ClientAuthentication::Secure { connect_token };
+    let transport = NetcodeClientTransport::new(current_time, auth, socket)
+        .expect("خطای بحرانی کلاینت: ساخت NetcodeClientTransport شکست خورد");
+    let client = RenetClient::new(build_shared_renet_connection_config(net));
+
+    (client, transport)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -116,6 +302,7 @@ pub struct PhysicsConfig {
     pub target_restitution: f32,
     pub soldier_capsule_half_segment: f32,
     pub soldier_capsule_center_y: f32,
+    pub character_gravity_step_y: f32,
     pub character_skin_offset: f32,
     pub character_max_slope_climb_deg: f32,
     pub character_min_slope_slide_deg: f32,
@@ -230,15 +417,209 @@ pub struct AnimationConfig {
     pub clip_durations: HashMap<String, f32>,
 }
 
+// -----------------------------------------------------------------------------
+// ۱-ب. ساختارهای کامل نقشه MOBA + Tactical Shooter (بدون هیچ مقدار پیش‌فرض)
+// -----------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TeamId {
+    Neutral,
+    Dawn,
+    Dusk,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LaneId {
+    Top,
+    Mid,
+    Bot,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TreeSize {
+    Small,
+    Large,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CoverKind {
+    LowWall,
+    TallWall,
+    Sandbag,
+    ConcreteBarrier,
+    CrateCluster,
+    RockOutcrop,
+    RuinedPillar,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ObstacleDef {
+pub struct MapConfig {
+    pub map_dimensions: (f32, f32),
+    pub base_vision_range: f32,
+    pub high_ground_vision_bonus: f32,
+    pub high_ground_occlusion_min_diff: f32,
+    pub terrains: Vec<TerrainPlatformDef>,
+    pub ramps: Vec<RampDef>,
+    pub river_segments: Vec<RiverSegmentDef>,
+    pub waterfalls: Vec<WaterfallDef>,
+    pub center_bridge: CenterBridgeDef,
+    pub fountains: Vec<FountainDef>,
+    pub ancients: Vec<AncientDef>,
+    pub turrets: Vec<TurretDef>,
+    pub mountains: Vec<MountainDef>,
+    pub trees: Vec<TreeDef>,
+    pub lanes: Vec<LanePathDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TerrainPlatformDef {
+    pub id: String,
+    pub team: TeamId,
+    pub elevation_tier: i32,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
+    pub color_rgb: (f32, f32, f32),
+    pub roughness: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RampDef {
+    pub id: String,
+    pub pos: (f32, f32, f32),
+    pub size: (f32, f32, f32),
+    pub rotation_euler_deg: (f32, f32, f32),
+    pub color_rgb: (f32, f32, f32),
+    pub roughness: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RiverSegmentDef {
+    pub id: String,
+    pub pos: (f32, f32, f32),
+    pub size: (f32, f32, f32),
+    pub yaw_deg: f32,
+    pub color_rgb: (f32, f32, f32),
+    pub emissive_rgb: (f32, f32, f32),
+    pub roughness: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WaterfallDef {
+    pub id: String,
+    pub pos: (f32, f32, f32),
+    pub size: (f32, f32, f32),
+    pub yaw_deg: f32,
+    pub water_color_rgb: (f32, f32, f32),
+    pub foam_emissive_rgb: (f32, f32, f32),
+    pub mist_particle_interval_secs: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CenterBridgeDef {
+    pub id: String,
+    pub center_pos: (f32, f32, f32),
+    pub outer_radius: f32,
+    pub deck_thickness: f32,
+    pub pillar_radius: f32,
+    pub pillar_height: f32,
+    pub elevation_tier: i32,
+    pub color_rgb: (f32, f32, f32),
+    pub accent_color_rgb: (f32, f32, f32),
+    pub roughness: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FountainDef {
+    pub id: String,
+    pub team: TeamId,
+    pub pos: (f32, f32, f32),
+    pub outer_radius: f32,
+    pub inner_radius: f32,
+    pub rim_height: f32,
+    pub heal_radius: f32,
+    pub heal_per_sec: f32,
+    pub stone_color_rgb: (f32, f32, f32),
+    pub water_emissive_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AncientDef {
+    pub id: String,
+    pub team: TeamId,
+    pub pos: (f32, f32, f32),
+    pub base_size: (f32, f32, f32),
+    pub core_radius: f32,
+    pub core_height: f32,
+    pub max_hp: f32,
+    pub color_rgb: (f32, f32, f32),
+    pub core_emissive_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TurretDef {
+    pub id: String,
+    pub team: TeamId,
+    pub lane: LaneId,
+    pub tier: u8,
+    pub pos: (f32, f32, f32),
+    pub base_radius: f32,
+    pub height: f32,
+    pub head_radius: f32,
+    pub max_hp: f32,
+    pub attack_range: f32,
+    pub color_rgb: (f32, f32, f32),
+    pub crystal_emissive_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MountainDef {
+    pub id: String,
+    pub pos: (f32, f32, f32),
+    pub size: (f32, f32, f32),
+    pub yaw_deg: f32,
+    pub color_rgb: (f32, f32, f32),
+    pub roughness: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TreeDef {
+    pub id: String,
+    pub tree_size: TreeSize,
+    pub pos: (f32, f32, f32),
+    pub trunk_radius: f32,
+    pub trunk_height: f32,
+    pub canopy_radius: f32,
+    pub canopy_height: f32,
+    pub trunk_color_rgb: (f32, f32, f32),
+    pub canopy_color_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LanePathDef {
+    pub id: String,
+    pub lane: LaneId,
+    pub width: f32,
+    pub thickness: f32,
+    pub color_rgb: (f32, f32, f32),
+    pub roughness: f32,
+    pub waypoints: Vec<(f32, f32, f32)>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ObstacleDef {
+    pub id: String,
+    pub kind: CoverKind,
+    pub pos: (f32, f32, f32),
+    pub size: (f32, f32, f32),
+    pub yaw_deg: f32,
     pub can_vault: bool,
+    pub color_rgb: (f32, f32, f32),
+    pub roughness: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TargetDef {
+    pub id: String,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub color_rgb: (f32, f32, f32),
@@ -404,10 +785,7 @@ pub const GROUP_GRENADE: Group = Group::GROUP_3;
 pub const GROUP_FX: Group = Group::GROUP_4;
 
 pub fn world_collision_groups() -> CollisionGroups {
-    CollisionGroups::new(
-        GROUP_WORLD,
-        GROUP_SOLDIER | GROUP_GRENADE | GROUP_FX | GROUP_WORLD,
-    )
+    CollisionGroups::new(GROUP_WORLD, GROUP_SOLDIER | GROUP_GRENADE | GROUP_FX)
 }
 
 pub fn soldier_collision_groups() -> CollisionGroups {
@@ -501,16 +879,57 @@ impl Plugin for MobaSharedPhysicsPlugin {
 }
 
 #[derive(Component)]
+pub struct MapObjectId(pub String);
+
+#[derive(Component)]
+pub struct ElevationSurface {
+    pub elevation_tier: i32,
+    pub top_y: f32,
+}
+
+#[derive(Component)]
 pub struct PhysicsGround;
 
 #[derive(Component)]
 pub struct PhysicsObstacle {
+    pub id: String,
     pub can_vault: bool,
 }
 
 #[derive(Component)]
 pub struct PhysicsTarget {
+    pub id: String,
     pub index: usize,
+}
+
+#[derive(Component)]
+pub struct PhysicsMountain {
+    pub id: String,
+}
+
+#[derive(Component)]
+pub struct PhysicsTree {
+    pub id: String,
+}
+
+#[derive(Component)]
+pub struct PhysicsTurret {
+    pub id: String,
+    pub team: TeamId,
+    pub lane: LaneId,
+    pub tier: u8,
+}
+
+#[derive(Component)]
+pub struct PhysicsAncient {
+    pub id: String,
+    pub team: TeamId,
+}
+
+#[derive(Component)]
+pub struct PhysicsFountain {
+    pub id: String,
+    pub team: TeamId,
 }
 
 #[derive(Component)]
@@ -541,13 +960,14 @@ pub struct PhysicsParticle {
 }
 
 // -----------------------------------------------------------------------------
-// ۴. باندل‌های ساخت کولایدر و اجسام فیزیکی مشترک (استفاده در سرور و کلاینت)
+// ۴. باندل‌های ساخت کولایدر و اجسام فیزیکی مشترک نقشه (استفاده در سرور و کلاینت)
 // -----------------------------------------------------------------------------
 
 pub fn ground_physics_bundle(
     config: &GameConfig,
 ) -> (
     PhysicsGround,
+    ElevationSurface,
     RigidBody,
     Collider,
     Friction,
@@ -555,11 +975,16 @@ pub fn ground_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let hx = config.lighting.ground_size.0 * 0.5;
+    let hx = config.map.map_dimensions.0 * 0.5;
     let hy = config.physics.ground_half_thickness;
-    let hz = config.lighting.ground_size.1 * 0.5;
+    let hz = config.map.map_dimensions.1 * 0.5;
+    let river_floor_y = -1.6;
     (
         PhysicsGround,
+        ElevationSurface {
+            elevation_tier: -1,
+            top_y: river_floor_y,
+        },
         RigidBody::Fixed,
         Collider::cuboid(hx, hy, hz),
         Friction {
@@ -571,15 +996,16 @@ pub fn ground_physics_bundle(
             combine_rule: CoefficientCombineRule::Average,
         },
         world_collision_groups(),
-        Transform::from_xyz(0.0, -hy, 0.0),
+        Transform::from_xyz(0.0, river_floor_y - hy, 0.0),
     )
 }
 
-pub fn obstacle_physics_bundle(
+pub fn terrain_platform_physics_bundle(
     config: &GameConfig,
-    obs: &ObstacleDef,
+    plat: &TerrainPlatformDef,
 ) -> (
-    PhysicsObstacle,
+    MapObjectId,
+    ElevationSurface,
     RigidBody,
     Collider,
     Friction,
@@ -587,11 +1013,289 @@ pub fn obstacle_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let pos = Vec3::new(obs.pos.0, obs.pos.1, obs.pos.2);
-    let half = Vec3::new(obs.size.0 * 0.5, obs.size.1 * 0.5, obs.size.2 * 0.5);
+    let pos = Vec3::new(plat.pos.0, plat.pos.1, plat.pos.2);
+    let half = Vec3::new(plat.size.0 * 0.5, plat.size.1 * 0.5, plat.size.2 * 0.5);
     (
-        PhysicsObstacle {
-            can_vault: obs.can_vault,
+        MapObjectId(plat.id.clone()),
+        ElevationSurface {
+            elevation_tier: plat.elevation_tier,
+            top_y: pos.y + half.y,
+        },
+        RigidBody::Fixed,
+        Collider::cuboid(half.x, half.y, half.z),
+        Friction {
+            coefficient: config.physics.ground_friction,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        Restitution {
+            coefficient: config.physics.ground_restitution,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        world_collision_groups(),
+        Transform::from_translation(pos),
+    )
+}
+
+pub fn ramp_physics_bundle(
+    config: &GameConfig,
+    ramp: &RampDef,
+) -> (
+    MapObjectId,
+    RigidBody,
+    Collider,
+    Friction,
+    Restitution,
+    CollisionGroups,
+    Transform,
+) {
+    let pos = Vec3::new(ramp.pos.0, ramp.pos.1, ramp.pos.2);
+    let half = Vec3::new(ramp.size.0 * 0.5, ramp.size.1 * 0.5, ramp.size.2 * 0.5);
+    let rot = Quat::from_euler(
+        EulerRot::YXZ,
+        ramp.rotation_euler_deg.1.to_radians(),
+        ramp.rotation_euler_deg.0.to_radians(),
+        ramp.rotation_euler_deg.2.to_radians(),
+    );
+    (
+        MapObjectId(ramp.id.clone()),
+        RigidBody::Fixed,
+        Collider::cuboid(half.x, half.y, half.z),
+        Friction {
+            coefficient: config.physics.ground_friction,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        Restitution {
+            coefficient: config.physics.ground_restitution,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        world_collision_groups(),
+        Transform {
+            translation: pos,
+            rotation: rot,
+            scale: Vec3::ONE,
+        },
+    )
+}
+
+pub fn center_bridge_physics_bundle(
+    config: &GameConfig,
+    bridge: &CenterBridgeDef,
+) -> (
+    MapObjectId,
+    ElevationSurface,
+    RigidBody,
+    Collider,
+    Friction,
+    Restitution,
+    CollisionGroups,
+    Transform,
+) {
+    let pos = Vec3::new(
+        bridge.center_pos.0,
+        bridge.center_pos.1,
+        bridge.center_pos.2,
+    );
+    let half_h = bridge.deck_thickness * 0.5;
+    (
+        MapObjectId(bridge.id.clone()),
+        ElevationSurface {
+            elevation_tier: bridge.elevation_tier,
+            top_y: pos.y + half_h,
+        },
+        RigidBody::Fixed,
+        Collider::cylinder(half_h, bridge.outer_radius),
+        Friction {
+            coefficient: config.physics.ground_friction,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        Restitution {
+            coefficient: config.physics.ground_restitution,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        world_collision_groups(),
+        Transform::from_translation(pos),
+    )
+}
+
+pub fn lane_segment_physics_bundle(
+    config: &GameConfig,
+    seg_id: String,
+    start: Vec3,
+    end: Vec3,
+    width: f32,
+    thickness: f32,
+) -> (
+    MapObjectId,
+    RigidBody,
+    Collider,
+    Friction,
+    Restitution,
+    CollisionGroups,
+    Transform,
+) {
+    let diff = end - start;
+    let len_3d = diff.length();
+    let mid = (start + end) * 0.5;
+    let dir = diff.normalize_or_zero();
+    let rot = Transform::IDENTITY.looking_to(dir, Vec3::Y).rotation;
+    (
+        MapObjectId(seg_id),
+        RigidBody::Fixed,
+        Collider::cuboid(width * 0.5, thickness * 0.5, len_3d * 0.5),
+        Friction {
+            coefficient: config.physics.ground_friction,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        Restitution {
+            coefficient: config.physics.ground_restitution,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        world_collision_groups(),
+        Transform {
+            translation: mid,
+            rotation: rot,
+            scale: Vec3::ONE,
+        },
+    )
+}
+
+pub fn mountain_physics_bundle(
+    config: &GameConfig,
+    mtn: &MountainDef,
+) -> (
+    MapObjectId,
+    PhysicsMountain,
+    RigidBody,
+    Collider,
+    Friction,
+    Restitution,
+    CollisionGroups,
+    Transform,
+) {
+    let pos = Vec3::new(mtn.pos.0, mtn.pos.1, mtn.pos.2);
+    let half = Vec3::new(mtn.size.0 * 0.5, mtn.size.1 * 0.5, mtn.size.2 * 0.5);
+    let rot = Quat::from_rotation_y(mtn.yaw_deg.to_radians());
+    (
+        MapObjectId(mtn.id.clone()),
+        PhysicsMountain {
+            id: mtn.id.clone(),
+        },
+        RigidBody::Fixed,
+        Collider::cuboid(half.x, half.y, half.z),
+        Friction {
+            coefficient: config.physics.obstacle_friction,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        Restitution {
+            coefficient: config.physics.obstacle_restitution,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        world_collision_groups(),
+        Transform {
+            translation: pos,
+            rotation: rot,
+            scale: Vec3::ONE,
+        },
+    )
+}
+
+pub fn tree_physics_bundle(
+    config: &GameConfig,
+    tree: &TreeDef,
+) -> (
+    MapObjectId,
+    PhysicsTree,
+    RigidBody,
+    Collider,
+    Friction,
+    Restitution,
+    CollisionGroups,
+    Transform,
+) {
+    let half_h = tree.trunk_height * 0.5;
+    let pos = Vec3::new(tree.pos.0, tree.pos.1 + half_h, tree.pos.2);
+    (
+        MapObjectId(tree.id.clone()),
+        PhysicsTree {
+            id: tree.id.clone(),
+        },
+        RigidBody::Fixed,
+        Collider::cylinder(half_h, tree.trunk_radius),
+        Friction {
+            coefficient: config.physics.obstacle_friction,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        Restitution {
+            coefficient: config.physics.obstacle_restitution,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        world_collision_groups(),
+        Transform::from_translation(pos),
+    )
+}
+
+pub fn turret_physics_bundle(
+    config: &GameConfig,
+    turret: &TurretDef,
+) -> (
+    MapObjectId,
+    PhysicsTurret,
+    RigidBody,
+    Collider,
+    Friction,
+    Restitution,
+    CollisionGroups,
+    Transform,
+) {
+    let half_h = turret.height * 0.5;
+    let pos = Vec3::new(turret.pos.0, turret.pos.1 + half_h, turret.pos.2);
+    (
+        MapObjectId(turret.id.clone()),
+        PhysicsTurret {
+            id: turret.id.clone(),
+            team: turret.team,
+            lane: turret.lane,
+            tier: turret.tier,
+        },
+        RigidBody::Fixed,
+        Collider::cylinder(half_h, turret.base_radius),
+        Friction {
+            coefficient: config.physics.obstacle_friction,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        Restitution {
+            coefficient: config.physics.obstacle_restitution,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        world_collision_groups(),
+        Transform::from_translation(pos),
+    )
+}
+
+pub fn ancient_physics_bundle(
+    config: &GameConfig,
+    ancient: &AncientDef,
+) -> (
+    MapObjectId,
+    PhysicsAncient,
+    RigidBody,
+    Collider,
+    Friction,
+    Restitution,
+    CollisionGroups,
+    Transform,
+) {
+    let half = Vec3::new(
+        ancient.base_size.0 * 0.5,
+        ancient.base_size.1 * 0.5,
+        ancient.base_size.2 * 0.5,
+    );
+    let pos = Vec3::new(ancient.pos.0, ancient.pos.1 + half.y, ancient.pos.2);
+    (
+        MapObjectId(ancient.id.clone()),
+        PhysicsAncient {
+            id: ancient.id.clone(),
+            team: ancient.team,
         },
         RigidBody::Fixed,
         Collider::cuboid(half.x, half.y, half.z),
@@ -608,11 +1312,53 @@ pub fn obstacle_physics_bundle(
     )
 }
 
+pub fn obstacle_physics_bundle(
+    config: &GameConfig,
+    obs: &ObstacleDef,
+) -> (
+    MapObjectId,
+    PhysicsObstacle,
+    RigidBody,
+    Collider,
+    Friction,
+    Restitution,
+    CollisionGroups,
+    Transform,
+) {
+    let pos = Vec3::new(obs.pos.0, obs.pos.1, obs.pos.2);
+    let half = Vec3::new(obs.size.0 * 0.5, obs.size.1 * 0.5, obs.size.2 * 0.5);
+    let rot = Quat::from_rotation_y(obs.yaw_deg.to_radians());
+    (
+        MapObjectId(obs.id.clone()),
+        PhysicsObstacle {
+            id: obs.id.clone(),
+            can_vault: obs.can_vault,
+        },
+        RigidBody::Fixed,
+        Collider::cuboid(half.x, half.y, half.z),
+        Friction {
+            coefficient: config.physics.obstacle_friction,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        Restitution {
+            coefficient: config.physics.obstacle_restitution,
+            combine_rule: CoefficientCombineRule::Average,
+        },
+        world_collision_groups(),
+        Transform {
+            translation: pos,
+            rotation: rot,
+            scale: Vec3::ONE,
+        },
+    )
+}
+
 pub fn target_physics_bundle(
     config: &GameConfig,
     index: usize,
     target: &TargetDef,
 ) -> (
+    MapObjectId,
     PhysicsTarget,
     RigidBody,
     Collider,
@@ -628,7 +1374,11 @@ pub fn target_physics_bundle(
         target.size.2 * 0.5,
     );
     (
-        PhysicsTarget { index },
+        MapObjectId(target.id.clone()),
+        PhysicsTarget {
+            id: target.id.clone(),
+            index,
+        },
         RigidBody::Fixed,
         Collider::cuboid(half.x, half.y, half.z),
         Friction {
@@ -845,6 +1595,47 @@ pub fn particle_physics_bundle(
     )
 }
 
+/// قانون برتری دید ارتفاعی (Dota 2 High-Ground Vision Rule):
+/// اگر ناظر در ارتفاع پایین‌تر از هدف باشد (اختلاف بیش از `high_ground_occlusion_min_diff`)،
+/// دید مستقیم به سطح بالاتر مسدود است؛ اما اگر ناظر روی High-Ground باشد، شعاع دید او به اندازه
+/// `high_ground_vision_bonus` افزایش می‌یابد.
+pub fn can_observer_see_point(
+    rapier_context: &RapierContext,
+    config: &GameConfig,
+    observer_feet_pos: Vec3,
+    target_feet_pos: Vec3,
+    eye_height: f32,
+) -> bool {
+    let height_diff = target_feet_pos.y - observer_feet_pos.y;
+    if height_diff >= config.map.high_ground_occlusion_min_diff {
+        return false;
+    }
+
+    let effective_range = if observer_feet_pos.y - target_feet_pos.y
+        >= config.map.high_ground_occlusion_min_diff
+    {
+        config.map.base_vision_range + config.map.high_ground_vision_bonus
+    } else {
+        config.map.base_vision_range
+    };
+
+    let eye_origin = observer_feet_pos + Vec3::Y * eye_height;
+    let target_point = target_feet_pos + Vec3::Y * eye_height;
+    let to_target = target_point - eye_origin;
+    let dist = to_target.length();
+    if dist > effective_range {
+        return false;
+    }
+    if dist <= f32::EPSILON {
+        return true;
+    }
+
+    let filter = QueryFilter::new().groups(CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD));
+    rapier_context
+        .cast_ray(eye_origin, to_target / dist, dist, true, filter)
+        .is_none()
+}
+
 // -----------------------------------------------------------------------------
 // ۵. وضعیت کامل شبیه‌سازی (درون moba_shared برای جلوگیری از بازنویسی)
 // -----------------------------------------------------------------------------
@@ -1042,13 +1833,17 @@ impl AuthoritativeWorldState {
                     is_dead: t.is_dead,
                 })
                 .collect(),
-            fx_events: std::mem::take(&mut self.pending_fx),
+            fx_events: Vec::new(),
         }
+    }
+
+    pub fn take_fx_events(&mut self) -> Vec<GameplayFxEvent> {
+        std::mem::take(&mut self.pending_fx)
     }
 }
 
 // -----------------------------------------------------------------------------
-// ۶. توابع کمکی جهت‌گیری، لیزر و پرتوهای Rapier (مشترک بین سرور و کلاینت)
+// ۶. توابع کمکی جهت‌گیری، لیزر و راه‌اندازی Rapier (مشترک بین سرور و کلاینت)
 // -----------------------------------------------------------------------------
 
 pub fn orient_soldier_towards(soldier_tf: &mut Transform, dir: Vec3, min_dir_sq: f32) {
@@ -1158,10 +1953,6 @@ fn resolve_muzzle_pos(
     }
 }
 
-// -----------------------------------------------------------------------------
-// ۷. سیستم‌های راه‌اندازی و گام‌های شبیه‌سازی Rapier (Drive و React)
-// -----------------------------------------------------------------------------
-
 fn configure_rapier_context_system(
     config: Res<GameConfig>,
     mut rapier_configs: Query<&mut RapierConfiguration, With<DefaultRapierContext>>,
@@ -1170,7 +1961,7 @@ fn configure_rapier_context_system(
         .single_mut()
         .expect("خطای بحرانی: DefaultRapierContext در صحنه یافت نشد");
     rapier_cfg.gravity = Vec3::new(0.0, config.physics.gravity_y, 0.0);
-    rapier_cfg.force_update_from_transform_changes = true;
+    rapier_cfg.force_update_from_transform_changes = false;
 }
 
 fn spawn_shared_physics_actors_system(mut commands: Commands, config: Res<GameConfig>) {
@@ -1179,6 +1970,54 @@ fn spawn_shared_physics_actors_system(mut commands: Commands, config: Res<GameCo
 
 fn spawn_server_environment_colliders_system(mut commands: Commands, config: Res<GameConfig>) {
     commands.spawn(ground_physics_bundle(&config));
+
+    for plat in &config.map.terrains {
+        commands.spawn(terrain_platform_physics_bundle(&config, plat));
+    }
+
+    for ramp in &config.map.ramps {
+        commands.spawn(ramp_physics_bundle(&config, ramp));
+    }
+
+    commands.spawn(center_bridge_physics_bundle(
+        &config,
+        &config.map.center_bridge,
+    ));
+
+    for lane in &config.map.lanes {
+        for seg_idx in 0..lane.waypoints.len().saturating_sub(1) {
+            let a = lane.waypoints[seg_idx];
+            let b = lane.waypoints[seg_idx + 1];
+            let start = Vec3::new(a.0, a.1, a.2);
+            let end = Vec3::new(b.0, b.1, b.2);
+            if start.distance(end) > 0.1 {
+                commands.spawn(lane_segment_physics_bundle(
+                    &config,
+                    format!("{}_seg_{}", lane.id, seg_idx),
+                    start,
+                    end,
+                    lane.width,
+                    lane.thickness,
+                ));
+            }
+        }
+    }
+
+    for mtn in &config.map.mountains {
+        commands.spawn(mountain_physics_bundle(&config, mtn));
+    }
+
+    for tree in &config.map.trees {
+        commands.spawn(tree_physics_bundle(&config, tree));
+    }
+
+    for turret in &config.map.turrets {
+        commands.spawn(turret_physics_bundle(&config, turret));
+    }
+
+    for ancient in &config.map.ancients {
+        commands.spawn(ancient_physics_bundle(&config, ancient));
+    }
 
     for obs in &config.obstacles {
         commands.spawn(obstacle_physics_bundle(&config, obs));
@@ -1214,7 +2053,7 @@ fn shared_authoritative_drive_system(
         .single_mut()
         .expect("خطای بحرانی: موجودیت PhysicsSoldier یافت نشد");
 
-    // ۱. بررسی کلید X (تست مرگ) و تایمر زنده شدن مجدد
+    // ۱. بررسی کلید X (تست مرگ) و تایمر زنده شدن مجدد در چشمه پایگاه
     if input.kill_toggle_just_pressed {
         if world.is_dead {
             world.is_dead = false;
@@ -1231,6 +2070,14 @@ fn shared_authoritative_drive_system(
         if world.respawn_remaining <= 0.0 {
             world.is_dead = false;
             world.base_stance = Stance::Run;
+            let spawn_pos = Vec3::new(
+                config.soldier.spawn_pos.0,
+                config.soldier.spawn_pos.1,
+                config.soldier.spawn_pos.2,
+            );
+            world.soldier_pos = spawn_pos;
+            soldier_tf.translation =
+                spawn_pos + Vec3::Y * config.physics.soldier_capsule_center_y;
         }
     } else {
         // ۲. آپدیت تایمرهای بالاتنه
@@ -1292,7 +2139,7 @@ fn shared_authoritative_drive_system(
             world.base_stance
         };
 
-        // ۵. محاسبه جهت هدف‌گیری با ماوس (Aim Ray)
+        // ۵. محاسبه جهت هدف‌گیری با ماوس (Aim Ray) با در نظر گرفتن ارتفاع فعلی کاراکتر
         if !world.traversal.is_active
             && input.has_aim_ray
             && input.aim_ray_dir.y.abs() > config.physics.aim_ray_min_dir_y_epsilon
@@ -1353,8 +2200,9 @@ fn shared_authoritative_drive_system(
             dt,
         );
 
-        // ۸. جابجایی فیزیکی کاراکتر با KinematicCharacterController در Rapier
+        // ۸. جابجایی فیزیکی ۳بعدی کاراکتر روی رمپ‌ها، پل مرکزی و سطوح ارتفاعی با KinematicCharacterController
         if !world.traversal.is_active {
+            let grav_y = config.physics.character_gravity_step_y * dt;
             if world.is_moving {
                 let speed = match world.effective_stance {
                     Stance::Run => config.soldier.run_speed,
@@ -1362,9 +2210,9 @@ fn shared_authoritative_drive_system(
                     Stance::Crouch => config.soldier.crouch_speed,
                 };
                 let desired_delta = world.move_input.normalize() * speed * dt;
-                controller.translation = Some(Vec3::new(desired_delta.x, 0.0, desired_delta.z));
+                controller.translation = Some(Vec3::new(desired_delta.x, grav_y, desired_delta.z));
             } else {
-                controller.translation = None;
+                controller.translation = Some(Vec3::new(0.0, grav_y, 0.0));
             }
         }
     }
@@ -1388,15 +2236,13 @@ fn step_traversal_with_rapier(
     if world.traversal.is_active {
         world.traversal.elapsed += dt;
         let frac = (world.traversal.elapsed / world.traversal.duration).clamp(0.0, 1.0);
-        let mut current_pos = world
+        let current_pos = world
             .traversal
             .start_pos
             .lerp(world.traversal.target_pos, frac);
-        current_pos.y = config.soldier.spawn_pos.1;
         world.soldier_facing_dir = world.traversal.travel_dir;
 
         if world.traversal.kind == TraversalKind::ObstacleVault {
-            // در حالت پرش از روی مانع کوتاه، کپسول مستقیماً از روی مانع عبور می‌کند
             controller.translation = None;
             soldier_tf.translation = Vec3::new(
                 current_pos.x,
@@ -1405,9 +2251,9 @@ fn step_traversal_with_rapier(
             );
             world.soldier_pos = current_pos;
         } else {
-            // در حالت سر خوردن یا غلتیدن، حرکت از طریق KinematicCharacterController اعمال می‌شود
             let step_delta = current_pos - world.soldier_pos;
-            controller.translation = Some(Vec3::new(step_delta.x, 0.0, step_delta.z));
+            let grav_y = config.physics.character_gravity_step_y * dt;
+            controller.translation = Some(Vec3::new(step_delta.x, grav_y, step_delta.z));
         }
 
         if world.traversal.kind == TraversalKind::RunningJump {
@@ -1439,7 +2285,6 @@ fn step_traversal_with_rapier(
         world.aim_world_dir
     };
 
-    // بررسی وجود مانع قابل پرش (Vault) با Raycast در Rapier
     let ray_origin = world.soldier_pos + Vec3::Y * config.soldier.vault_ray_height;
     let vault_pred = |entity: Entity, _collider: &bevy_rapier3d::rapier::geometry::Collider| {
         obstacle_query
@@ -1476,7 +2321,7 @@ fn step_traversal_with_rapier(
         world.traversal.start_pos = world.soldier_pos;
         world.traversal.target_pos = Vec3::new(
             world.soldier_pos.x + travel_dir.x * config.soldier.vault_travel_distance,
-            config.soldier.spawn_pos.1,
+            world.soldier_pos.y,
             world.soldier_pos.z + travel_dir.z * config.soldier.vault_travel_distance,
         );
         world.traversal.travel_dir = travel_dir;
@@ -1505,7 +2350,6 @@ fn step_traversal_with_rapier(
     let exact_duration = config.exact_anim_duration(anim_name);
     let distance = speed * exact_duration;
 
-    // بررسی مسیر غلت/سر خوردن با ShapeCast کپسول در Rapier
     let capsule_shape = Collider::capsule_y(
         config.physics.soldier_capsule_half_segment,
         config.soldier.player_radius,
@@ -1552,7 +2396,7 @@ fn step_traversal_with_rapier(
     world.traversal.start_pos = world.soldier_pos;
     world.traversal.target_pos = Vec3::new(
         world.soldier_pos.x + travel_dir.x * safe_dist,
-        config.soldier.spawn_pos.1,
+        world.soldier_pos.y,
         world.soldier_pos.z + travel_dir.z * safe_dist,
     );
     world.traversal.travel_dir = travel_dir;
@@ -1682,14 +2526,14 @@ fn shared_authoritative_react_system(
         .single()
         .expect("خطای بحرانی: RapierContext در گام React یافت نشد");
 
-    // ۱. خواندن موقعیت نهایی کپسول سرباز پس از حل برخوردهای Rapier
+    // ۱. خواندن موقعیت ۳بعدی نهایی کپسول سرباز (شامل ارتفاع دقیق روی رمپ، پل یا High-Ground)
     let soldier_tf = soldier_query
         .single()
         .expect("خطای بحرانی: موجودیت PhysicsSoldier یافت نشد");
     if world.traversal.kind != TraversalKind::ObstacleVault || !world.traversal.is_active {
         world.soldier_pos = Vec3::new(
             soldier_tf.translation.x,
-            config.soldier.spawn_pos.1,
+            soldier_tf.translation.y - config.physics.soldier_capsule_center_y,
             soldier_tf.translation.z,
         );
     }
@@ -1841,7 +2685,7 @@ fn shared_authoritative_react_system(
         }
     }
 
-    // ۵. محاسبه نقطه برخورد لیزر با Raycast در Rapier
+    // ۵. محاسبه نقطه برخورد لیزر با Raycast در Rapier (پرتو افقی از ارتفاع لوله سلاح؛ اگر به دیوار/صخره High-Ground بخورد مسدود می‌شود)
     let muzzle_pos = resolve_muzzle_pos(&world, &input, &config);
     let raw_target = Vec3::new(world.aim_hit_pos.x, muzzle_pos.y, world.aim_hit_pos.z);
     let dead_flags: Vec<bool> = world.targets.iter().map(|t| t.is_dead).collect();
@@ -1850,7 +2694,7 @@ fn shared_authoritative_react_system(
         &rapier_context,
         muzzle_pos,
         raw_target,
-        &|hit_ent| {
+        |hit_ent| {
             if let Some(&t_idx) = target_idx_by_entity.get(&hit_ent) {
                 !dead_flags[t_idx]
             } else {
@@ -1863,10 +2707,6 @@ fn shared_authoritative_react_system(
         active_input.consume_just_pressed();
     }
 }
-
-// -----------------------------------------------------------------------------
-// ۸. سیستم‌های پیش‌بینی و اجرای فیزیک Rapier در سمت کلاینت (درون moba_shared)
-// -----------------------------------------------------------------------------
 
 fn shared_client_drive_system(
     time: Res<Time<Fixed>>,
@@ -1884,8 +2724,11 @@ fn shared_client_drive_system(
         return;
     }
 
+    let dt = time.delta_secs();
+    let grav_y = config.physics.character_gravity_step_y * dt;
+
     let Some(ref input) = prediction.latest_input else {
-        controller.translation = None;
+        controller.translation = Some(Vec3::new(0.0, grav_y, 0.0));
         return;
     };
 
@@ -1896,10 +2739,10 @@ fn shared_client_drive_system(
             Stance::Walk => config.soldier.walk_speed,
             Stance::Crouch => config.soldier.crouch_speed,
         };
-        let delta = flat_input.normalize() * speed * time.delta_secs();
-        controller.translation = Some(Vec3::new(delta.x, 0.0, delta.z));
+        let delta = flat_input.normalize() * speed * dt;
+        controller.translation = Some(Vec3::new(delta.x, grav_y, delta.z));
     } else {
-        controller.translation = None;
+        controller.translation = Some(Vec3::new(0.0, grav_y, 0.0));
     }
 }
 

@@ -6,15 +6,20 @@ use bevy::transform::TransformSystems;
 use bevy::window::{PresentMode, PrimaryWindow, WindowResolution};
 use bevy_rapier3d::prelude::{ColliderDisabled, Velocity};
 use moba_shared::{
-    grenade_physics_bundle, ground_physics_bundle, obstacle_physics_bundle,
-    orient_soldier_towards, particle_physics_bundle, reconcile_soldier_physics_pos,
-    shell_casing_physics_bundle, target_physics_bundle, ClientInputCommand,
-    ClientPhysicsPredictionState, GameConfig, GameplayFxEvent, MobaSharedPhysicsPlugin,
-    PhysicsRole, PhysicsSoldier, ServerWorldSnapshot, UpperBodyAction,
+    ancient_physics_bundle, center_bridge_physics_bundle, create_shared_renet_client,
+    grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
+    mountain_physics_bundle, obstacle_physics_bundle, orient_soldier_towards,
+    particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
+    shell_casing_physics_bundle, target_physics_bundle, terrain_platform_physics_bundle,
+    tree_physics_bundle, turret_physics_bundle, ClientInputCommand, ClientPhysicsPredictionState,
+    GameConfig, GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole,
+    PhysicsSoldier, ServerWorldSnapshot, UpperBodyAction, CHANNEL_RELIABLE_FX,
+    CHANNEL_UNRELIABLE_STATE,
 };
+use renet::RenetClient;
+use renet_netcode::NetcodeClientTransport;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
-use std::net::UdpSocket;
 use std::time::Duration;
 
 fn main() {
@@ -22,23 +27,7 @@ fn main() {
     let tick_hz = config.network.server_tick_rate_hz;
     let substeps = config.physics.substeps;
 
-    let socket = UdpSocket::bind(&config.network.client_bind_addr).unwrap_or_else(|e| {
-        panic!(
-            "خطای بحرانی کلاینت: امکان بایند سوکت روی '{}' نیست: {}",
-            config.network.client_bind_addr, e
-        )
-    });
-    socket
-        .connect(&config.network.server_bind_addr)
-        .unwrap_or_else(|e| {
-            panic!(
-                "خطای بحرانی کلاینت: اتصال به سرور '{}' شکست خورد: {}",
-                config.network.server_bind_addr, e
-            )
-        });
-    socket
-        .set_nonblocking(true)
-        .expect("خطای بحرانی کلاینت: تنظیم حالت non-blocking شکست خورد");
+    let (client, transport) = create_shared_renet_client(&config.network);
 
     let tuner = WeaponTuner {
         offset: Vec3::new(
@@ -55,23 +44,19 @@ fn main() {
     };
 
     let render_state = ClientRenderState::new_from_config(&config);
-    let recv_buf_len = config.network.socket_recv_buffer_bytes;
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: config.window.title.clone(),
                 resolution: WindowResolution::new(config.window.width, config.window.height),
-                present_mode: PresentMode::AutoNoVsync,
+                present_mode: PresentMode::AutoVsync,
                 ..default()
             }),
             ..default()
         }))
         .insert_resource(config)
-        .insert_resource(ClientNetwork {
-            socket,
-            recv_buf: vec![0u8; recv_buf_len],
-        })
+        .insert_resource(ClientNetwork { client, transport })
         .insert_resource(render_state)
         .insert_resource(ClientPhysicsPredictionState::new())
         .insert_resource(WeaponAttachmentStatus {
@@ -87,13 +72,17 @@ fn main() {
         })
         .add_systems(Startup, setup_scene)
         .add_systems(
+            FixedUpdate,
+            client_flush_input_to_server_system,
+        )
+        .add_systems(
             Update,
             (
                 load_gltf_and_build_graph,
                 attach_split_body_animation_graphs,
                 attach_weapon_to_left_hand,
                 weapon_live_calibration_system,
-                client_send_input_system,
+                client_sample_input_system,
                 client_receive_snapshot_and_sync_system,
                 target_visual_reaction_system,
                 camera_follow_system,
@@ -112,8 +101,8 @@ fn main() {
 
 #[derive(Resource)]
 struct ClientNetwork {
-    socket: UdpSocket,
-    recv_buf: Vec<u8>,
+    client: RenetClient,
+    transport: NetcodeClientTransport,
 }
 
 #[derive(Resource)]
@@ -284,6 +273,11 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let spawn_pos = Vec3::new(
+        config.soldier.spawn_pos.0,
+        config.soldier.spawn_pos.1,
+        config.soldier.spawn_pos.2,
+    );
     let cam_offset = Vec3::new(
         config.camera.offset.0,
         config.camera.offset.1,
@@ -292,7 +286,7 @@ fn setup_scene(
     commands.spawn((
         Camera3d::default(),
         MobaCamera,
-        Transform::from_translation(cam_offset).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_translation(spawn_pos + cam_offset).looking_at(spawn_pos, Vec3::Y),
     ));
 
     let light_pos = Vec3::new(
@@ -304,7 +298,7 @@ fn setup_scene(
         DirectionalLight {
             color: Color::WHITE,
             illuminance: config.lighting.directional_illuminance,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: false,
             contact_shadows_enabled: false,
             affects_lightmapped_mesh_diffuse: true,
             shadow_depth_bias: config.lighting.directional_shadow_depth_bias,
@@ -320,13 +314,14 @@ fn setup_scene(
         affects_lightmapped_meshes: true,
     });
 
+    // ۱. بستر زیرین کل نقشه و کولایدر کف
     let g_c = config.lighting.ground_color_rgb;
     commands.spawn((
         Mesh3d(
             meshes.add(
                 Plane3d::default()
                     .mesh()
-                    .size(config.lighting.ground_size.0, config.lighting.ground_size.1),
+                    .size(config.map.map_dimensions.0, config.map.map_dimensions.1),
             ),
         ),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -334,39 +329,317 @@ fn setup_scene(
             perceptual_roughness: config.lighting.ground_roughness,
             ..default()
         })),
-        Transform::from_xyz(0.0, 0.0, 0.0),
+        Transform::from_xyz(0.0, -1.6, 0.0),
     ));
-    // کولایدر فیزیکی زمین در Rapier از طریق moba_shared
     commands.spawn(ground_physics_bundle(&config));
 
-    let lw_c = config.lighting.low_wall_color_rgb;
-    let low_wall_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(lw_c.0, lw_c.1, lw_c.2),
-        perceptual_roughness: config.lighting.low_wall_roughness,
-        ..default()
-    });
-
-    let tw_c = config.lighting.tall_wall_color_rgb;
-    let tall_wall_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(tw_c.0, tw_c.1, tw_c.2),
-        perceptual_roughness: config.lighting.tall_wall_roughness,
-        ..default()
-    });
-
-    for obs in &config.obstacles {
-        let size = Vec3::new(obs.size.0, obs.size.1, obs.size.2);
-        let mat = if obs.can_vault {
-            low_wall_mat.clone()
-        } else {
-            tall_wall_mat.clone()
-        };
+    // ۲. سطوح ارتفاعی زمین و پایگاه‌های High-Ground هر دو تیم
+    for plat in &config.map.terrains {
+        let size = Vec3::new(plat.size.0, plat.size.1, plat.size.2);
+        let c = plat.color_rgb;
         commands.spawn((
             Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
-            MeshMaterial3d(mat),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(c.0, c.1, c.2),
+                perceptual_roughness: plat.roughness,
+                ..default()
+            })),
+            terrain_platform_physics_bundle(&config, plat),
+        ));
+    }
+
+    // ۳. رمپ‌های شیب‌دار ارتباطی بین سطوح مختلف (ورودی‌های پایگاه، پل مرکزی و رودخانه)
+    for ramp in &config.map.ramps {
+        let size = Vec3::new(ramp.size.0, ramp.size.1, ramp.size.2);
+        let c = ramp.color_rgb;
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(c.0, c.1, c.2),
+                perceptual_roughness: ramp.roughness,
+                ..default()
+            })),
+            ramp_physics_bundle(&config, ramp),
+        ));
+    }
+
+    // ۴. رودخانه مرکزی و آبشارهای درخشان
+    for seg in &config.map.river_segments {
+        let pos = Vec3::new(seg.pos.0, seg.pos.1, seg.pos.2);
+        let size = Vec3::new(seg.size.0, seg.size.1, seg.size.2);
+        let c = seg.color_rgb;
+        let em = seg.emissive_rgb;
+        commands.spawn((
+            MapObjectId(seg.id.clone()),
+            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(c.0, c.1, c.2),
+                emissive: LinearRgba::new(em.0, em.1, em.2, 1.0),
+                perceptual_roughness: seg.roughness,
+                metallic: 0.2,
+                ..default()
+            })),
+            Transform {
+                translation: pos,
+                rotation: Quat::from_rotation_y(seg.yaw_deg.to_radians()),
+                scale: Vec3::ONE,
+            },
+        ));
+    }
+
+    for wf in &config.map.waterfalls {
+        let pos = Vec3::new(wf.pos.0, wf.pos.1, wf.pos.2);
+        let size = Vec3::new(wf.size.0, wf.size.1, wf.size.2);
+        let c = wf.water_color_rgb;
+        let em = wf.foam_emissive_rgb;
+        commands
+            .spawn((
+                MapObjectId(wf.id.clone()),
+                Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(c.0, c.1, c.2),
+                    emissive: LinearRgba::new(em.0, em.1, em.2, 1.0),
+                    perceptual_roughness: 0.15,
+                    ..default()
+                })),
+                Transform {
+                    translation: pos,
+                    rotation: Quat::from_rotation_y(wf.yaw_deg.to_radians()),
+                    scale: Vec3::ONE,
+                },
+                Visibility::Visible,
+            ))
+            .with_children(|parent| {
+                // حوضچه کف آبشار در پایین ریزش آب
+                parent.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(size.x * 0.65, 0.35))),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::srgb(0.88, 0.96, 1.0),
+                        emissive: LinearRgba::new(em.0 * 1.4, em.1 * 1.4, em.2 * 1.4, 1.0),
+                        unlit: true,
+                        ..default()
+                    })),
+                    Transform::from_xyz(0.0, -size.y * 0.48, 0.8),
+                ));
+            });
+    }
+
+    // ۵. پل مرکزی دایره‌ای بالای رودخانه
+    let bridge = &config.map.center_bridge;
+    let bc = bridge.color_rgb;
+    let ac = bridge.accent_color_rgb;
+    commands
+        .spawn((
+            Mesh3d(meshes.add(Cylinder::new(bridge.outer_radius, bridge.deck_thickness))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(bc.0, bc.1, bc.2),
+                perceptual_roughness: bridge.roughness,
+                ..default()
+            })),
+            center_bridge_physics_bundle(&config, bridge),
+            Visibility::Visible,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Mesh3d(meshes.add(Cylinder::new(bridge.pillar_radius, bridge.pillar_height))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(ac.0, ac.1, ac.2),
+                    perceptual_roughness: bridge.roughness,
+                    ..default()
+                })),
+                Transform::from_xyz(0.0, -bridge.pillar_height * 0.5, 0.0),
+            ));
+        });
+
+    // ۶. مسیرهای ۳ لاین اصلی (Top, Mid, Bot) همراه با کولایدر فیزیکی ۳بعدی
+    for lane in &config.map.lanes {
+        let lc = lane.color_rgb;
+        let lane_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(lc.0, lc.1, lc.2),
+            perceptual_roughness: lane.roughness,
+            ..default()
+        });
+        for seg_idx in 0..lane.waypoints.len().saturating_sub(1) {
+            let a = lane.waypoints[seg_idx];
+            let b = lane.waypoints[seg_idx + 1];
+            let start = Vec3::new(a.0, a.1, a.2);
+            let end = Vec3::new(b.0, b.1, b.2);
+            let len_3d = start.distance(end);
+            if len_3d > 0.1 {
+                commands.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(lane.width, lane.thickness, len_3d))),
+                    MeshMaterial3d(lane_mat.clone()),
+                    lane_segment_physics_bundle(
+                        &config,
+                        format!("{}_seg_{}", lane.id, seg_idx),
+                        start,
+                        end,
+                        lane.width,
+                        lane.thickness,
+                    ),
+                ));
+            }
+        }
+    }
+
+    // ۷. چشمه‌های پایگاه (Fountains) در آخرین نقطه هر پایگاه
+    for ftn in &config.map.fountains {
+        let pos = Vec3::new(ftn.pos.0, ftn.pos.1, ftn.pos.2);
+        let sc = ftn.stone_color_rgb;
+        let we = ftn.water_emissive_rgb;
+        commands
+            .spawn((
+                MapObjectId(ftn.id.clone()),
+                Mesh3d(meshes.add(Cylinder::new(ftn.outer_radius, ftn.rim_height))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(sc.0, sc.1, sc.2),
+                    perceptual_roughness: 0.6,
+                    ..default()
+                })),
+                Transform::from_translation(pos + Vec3::Y * (ftn.rim_height * 0.5)),
+                Visibility::Visible,
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(ftn.inner_radius, ftn.rim_height * 1.15))),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::srgb(0.2, 0.75, 1.0),
+                        emissive: LinearRgba::new(we.0, we.1, we.2, 1.0),
+                        unlit: true,
+                        ..default()
+                    })),
+                    Transform::from_xyz(0.0, 0.05, 0.0),
+                ));
+            });
+    }
+
+    // ۸. ساختمان‌های مرکزی هر تیم (Ancients)
+    for anc in &config.map.ancients {
+        let bs = Vec3::new(anc.base_size.0, anc.base_size.1, anc.base_size.2);
+        let c = anc.color_rgb;
+        let ce = anc.core_emissive_rgb;
+        commands
+            .spawn((
+                Mesh3d(meshes.add(Cuboid::new(bs.x, bs.y, bs.z))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(c.0, c.1, c.2),
+                    metallic: 0.45,
+                    perceptual_roughness: 0.4,
+                    ..default()
+                })),
+                ancient_physics_bundle(&config, anc),
+                Visibility::Visible,
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(anc.core_radius, anc.core_height))),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::WHITE,
+                        emissive: LinearRgba::new(ce.0, ce.1, ce.2, 1.0),
+                        unlit: true,
+                        ..default()
+                    })),
+                    Transform::from_xyz(0.0, bs.y * 0.5 + anc.core_height * 0.5, 0.0),
+                ));
+            });
+    }
+
+    // ۹. برج‌های دفاعی در هر ۳ لاین برای هر دو تیم (۱۸ عدد Turret)
+    for tur in &config.map.turrets {
+        let tc = tur.color_rgb;
+        let ce = tur.crystal_emissive_rgb;
+        commands
+            .spawn((
+                Mesh3d(meshes.add(Cylinder::new(tur.base_radius, tur.height))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(tc.0, tc.1, tc.2),
+                    metallic: 0.55,
+                    perceptual_roughness: 0.45,
+                    ..default()
+                })),
+                turret_physics_bundle(&config, tur),
+                Visibility::Visible,
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(meshes.add(Sphere::new(tur.head_radius))),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::WHITE,
+                        emissive: LinearRgba::new(ce.0, ce.1, ce.2, 1.0),
+                        unlit: true,
+                        ..default()
+                    })),
+                    Transform::from_xyz(0.0, tur.height * 0.5 + tur.head_radius * 0.8, 0.0),
+                ));
+            });
+    }
+
+    // ۱۰. کوه‌های محصورکننده پایگاه‌ها و مرزهای نقشه
+    for mtn in &config.map.mountains {
+        let size = Vec3::new(mtn.size.0, mtn.size.1, mtn.size.2);
+        let mc = mtn.color_rgb;
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(mc.0, mc.1, mc.2),
+                perceptual_roughness: mtn.roughness,
+                ..default()
+            })),
+            mountain_physics_bundle(&config, mtn),
+        ));
+    }
+
+    // ۱۱. درختان کوچک و بزرگ در سراسر نقشه
+    for tree in &config.map.trees {
+        let tc = tree.trunk_color_rgb;
+        let cc = tree.canopy_color_rgb;
+        commands
+            .spawn((
+                Mesh3d(meshes.add(Cylinder::new(tree.trunk_radius, tree.trunk_height))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(tc.0, tc.1, tc.2),
+                    perceptual_roughness: 0.9,
+                    ..default()
+                })),
+                tree_physics_bundle(&config, tree),
+                Visibility::Visible,
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(meshes.add(Cone {
+                        radius: tree.canopy_radius,
+                        height: tree.canopy_height,
+                    })),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::srgb(cc.0, cc.1, cc.2),
+                        perceptual_roughness: 0.85,
+                        ..default()
+                    })),
+                    Transform::from_xyz(
+                        0.0,
+                        tree.trunk_height * 0.5 + tree.canopy_height * 0.35,
+                        0.0,
+                    ),
+                ));
+            });
+    }
+
+    // ۱۲. سنگرهای متنوع و آبجکت‌های تاکتیکی
+    for obs in &config.obstacles {
+        let size = Vec3::new(obs.size.0, obs.size.1, obs.size.2);
+        let oc = obs.color_rgb;
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgb(oc.0, oc.1, oc.2),
+                perceptual_roughness: obs.roughness,
+                ..default()
+            })),
             obstacle_physics_bundle(&config, obs),
         ));
     }
 
+    // ۱۳. اهداف تیراندازی
     for (index, t) in config.targets.iter().enumerate() {
         let pos = Vec3::new(t.pos.0, t.pos.1, t.pos.2);
         let size = Vec3::new(t.size.0, t.size.1, t.size.2);
@@ -752,13 +1025,12 @@ fn weapon_live_calibration_system(
 // ارسال ورودی به سرور و دریافت وضعیت Authoritative از سرور
 // -----------------------------------------------------------------------------
 
-fn client_send_input_system(
+fn client_sample_input_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
     muzzle_query: Query<&GlobalTransform, With<MuzzlePoint>>,
-    net: Res<ClientNetwork>,
     mut prediction: ResMut<ClientPhysicsPredictionState>,
 ) {
     let mut move_vec = Vec3::ZERO;
@@ -808,16 +1080,33 @@ fn client_send_input_system(
         client_muzzle_world_pos,
     };
 
-    prediction.latest_input = Some(cmd.clone());
+    if let Some(ref mut existing) = prediction.latest_input {
+        existing.accumulate_from(cmd);
+    } else {
+        prediction.latest_input = Some(cmd);
+    }
+}
 
-    let bytes =
-        bincode::serialize(&cmd).expect("خطای بحرانی کلاینت: سریالایز کردن ورودی شکست خورد");
-    let _ = net.socket.send(&bytes);
+fn client_flush_input_to_server_system(
+    mut net: ResMut<ClientNetwork>,
+    mut prediction: ResMut<ClientPhysicsPredictionState>,
+) {
+    let net = &mut *net;
+    if net.client.is_connected() {
+        if let Some(ref mut cmd) = prediction.latest_input {
+            let bytes = bincode::serialize(cmd)
+                .expect("خطای بحرانی کلاینت: سریالایز کردن ورودی شکست خورد");
+            net.client.send_message(CHANNEL_UNRELIABLE_STATE, bytes);
+            cmd.consume_just_pressed();
+        }
+    }
+    let _ = net.transport.send_packets(&mut net.client);
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn client_receive_snapshot_and_sync_system(
     mut commands: Commands,
+    time: Res<Time>,
     config: Res<GameConfig>,
     mut net: ResMut<ClientNetwork>,
     mut render_state: ResMut<ClientRenderState>,
@@ -861,21 +1150,28 @@ fn client_receive_snapshot_and_sync_system(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let delta = time.delta();
+    let net = &mut *net;
+
+    net.client.update(delta);
+    if let Err(e) = net.transport.update(delta, &mut net.client) {
+        panic!("خطای بحرانی ترنسپورت Renet در کلاینت: {}", e);
+    }
+
     let mut latest_snapshot: Option<ServerWorldSnapshot> = None;
     let mut all_fx_events: Vec<GameplayFxEvent> = Vec::new();
 
-    let net = &mut *net;
-    loop {
-        match net.socket.recv(&mut net.recv_buf) {
-            Ok(len) => {
-                let mut snap: ServerWorldSnapshot = bincode::deserialize(&net.recv_buf[..len])
-                    .expect("خطای بحرانی کلاینت: پکت Snapshot دریافتی از سرور نامعتبر است");
-                all_fx_events.append(&mut snap.fx_events);
-                latest_snapshot = Some(snap);
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
-            Err(e) => panic!("خطای بحرانی شبکه در کلاینت: {}", e),
+    if net.client.is_connected() {
+        while let Some(message) = net.client.receive_message(CHANNEL_RELIABLE_FX) {
+            let mut batch: Vec<GameplayFxEvent> = bincode::deserialize(&message)
+                .expect("خطای بحرانی کلاینت: پکت رویدادهای FX نامعتبر است");
+            all_fx_events.append(&mut batch);
+        }
+
+        while let Some(message) = net.client.receive_message(CHANNEL_UNRELIABLE_STATE) {
+            let snap: ServerWorldSnapshot = bincode::deserialize(&message)
+                .expect("خطای بحرانی کلاینت: پکت Snapshot دریافتی از سرور نامعتبر است");
+            latest_snapshot = Some(snap);
         }
     }
 
@@ -998,32 +1294,38 @@ fn client_receive_snapshot_and_sync_system(
             }
         }
 
-        // اجرای رویدادهای جلوه‌های ویژه ارسالی از سرور
-        for fx in all_fx_events {
-            spawn_fx_from_server_event(
-                &mut commands,
-                &config,
-                &mut render_state,
-                &mut shake,
-                &mut meshes,
-                &mut materials,
-                fx,
-            );
-        }
     }
 
-    // همگام‌سازی موقعیت بصری سرباز با کپسول فیزیکی Rapier
+    // اجرای رویدادهای جلوه‌های ویژه ارسالی از سرور (از کانال ReliableOrdered)
+    for fx in all_fx_events {
+        spawn_fx_from_server_event(
+            &mut commands,
+            &config,
+            &mut render_state,
+            &mut shake,
+            &mut meshes,
+            &mut materials,
+            fx,
+        );
+    }
+
+    // همگام‌سازی نرم و بدون پرش موقعیت بصری ۳بعدی سرباز با کپسول فیزیکی Rapier
     if let (Ok(soldier_phys_tf), Ok(mut soldier_vis_tf)) = (
         soldier_physics_query.single(),
         soldier_visual_query.single_mut(),
     ) {
-        let feet_pos = Vec3::new(
+        let target_feet_pos = Vec3::new(
             soldier_phys_tf.translation.x,
-            config.soldier.spawn_pos.1,
+            soldier_phys_tf.translation.y - config.physics.soldier_capsule_center_y,
             soldier_phys_tf.translation.z,
         );
-        render_state.soldier_pos = feet_pos;
-        soldier_vis_tf.translation = feet_pos;
+        let smooth_y = soldier_vis_tf
+            .translation
+            .y
+            .lerp(target_feet_pos.y, config.physics.position_reconcile_lerp_factor);
+        let smoothed_pos = Vec3::new(target_feet_pos.x, smooth_y, target_feet_pos.z);
+        render_state.soldier_pos = smoothed_pos;
+        soldier_vis_tf.translation = smoothed_pos;
         orient_soldier_towards(
             &mut soldier_vis_tf,
             render_state.soldier_facing_dir,

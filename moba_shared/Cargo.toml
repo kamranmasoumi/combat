@@ -1,0 +1,12 @@
+[package]
+name = "moba_shared"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = { workspace = true, features = ["default_app", "multi_threaded", "serialize"] }
+bevy_rapier3d = { workspace = true, features = ["dim3", "serde-serialize"] }
+renet = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }
+bincode = { workspace = true }

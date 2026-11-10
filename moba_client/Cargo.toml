@@ -1,0 +1,11 @@
+[package]
+name = "moba_client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+moba_shared = { path = "../moba_shared" }
+bevy = { workspace = true, features = ["3d", "ui", "audio", "serialize"] }
+bevy_rapier3d = { workspace = true, features = ["dim3", "serde-serialize"] }
+renet = { workspace = true }
+bincode = { workspace = true }

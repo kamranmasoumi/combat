@@ -1,4 +1,6 @@
 use bevy::animation::AnimatedBy;
+use bevy::asset::RenderAssetUsages;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::gltf::Gltf;
 use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight};
 use bevy::pbr::ContactShadows;
@@ -68,6 +70,11 @@ fn main() {
         })
         .insert_resource(tuner)
         .insert_resource(CameraShake { trauma: 0.0 })
+        .insert_resource(CameraControlState {
+            free_look_target: None,
+            is_pointer_over_minimap: false,
+            is_dragging_minimap: false,
+        })
         .add_plugins(MobaSharedPhysicsPlugin {
             role: PhysicsRole::Client,
             tick_rate_hz: tick_hz,
@@ -91,6 +98,8 @@ fn main() {
                 laser_sight_gizmo_system,
                 gameplay_fx_system,
                 update_map_object_labels_system,
+                minimap_interaction_system,
+                minimap_overlay_update_system,
             )
                 .chain(),
         )
@@ -232,6 +241,30 @@ struct CameraShake {
     trauma: f32,
 }
 
+const MINIMAP_MARGIN_PX: f32 = 16.0;
+const MINIMAP_WIDTH_PX: f32 = 272.0;
+const MINIMAP_HEIGHT_PX: f32 = 192.0;
+const MINIMAP_TEX_W: u32 = 544;
+const MINIMAP_TEX_H: u32 = 384;
+
+#[derive(Resource)]
+struct CameraControlState {
+    free_look_target: Option<Vec3>,
+    is_pointer_over_minimap: bool,
+    is_dragging_minimap: bool,
+}
+
+#[derive(Component)]
+struct MinimapSoldierDot;
+
+#[derive(Component)]
+struct MinimapTargetDot {
+    index: usize,
+}
+
+#[derive(Component)]
+struct MinimapCameraBox;
+
 #[derive(Resource)]
 struct SoldierGltfHandle(Handle<Gltf>);
 
@@ -343,12 +376,12 @@ fn model_transform_to_bevy(t: &ModelTransformConfig) -> Transform {
 fn glb_model_bundle(
     asset_server: &AssetServer,
     model_path: &str,
-    model_transform: &ModelTransformConfig,
+    _model_transform: &ModelTransformConfig,
 ) -> (WorldAssetRoot, Transform, Visibility) {
     let scene_handle = asset_server.load(format!("{}#Scene0", model_path));
     (
         WorldAssetRoot(scene_handle),
-        model_transform_to_bevy(model_transform),
+        Transform::IDENTITY,
         Visibility::Visible,
     )
 }
@@ -399,6 +432,7 @@ fn setup_scene(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let spawn_pos = Vec3::new(
         config.soldier.spawn_pos.0,
@@ -638,19 +672,19 @@ fn setup_scene(
     });
 
     for (seg_idx, seg) in config.map.river_segments.iter().enumerate() {
-        let pos = Vec3::new(seg.pos.0, seg.pos.1, seg.pos.2);
-        let size = Vec3::new(seg.size.0, seg.size.1, seg.size.2);
+        let tf = seg.model_transform.to_transform();
+        let pos = tf.translation;
+        let size = Vec3::new(
+            seg.size.0 * tf.scale.x,
+            seg.size.1 * tf.scale.y,
+            seg.size.2 * tf.scale.z,
+        );
         let c = seg.color_rgb;
         let em = seg.emissive_rgb;
-        let rot = Quat::from_rotation_y(seg.yaw_deg.to_radians());
 
         let mut ent_cmds = commands.spawn((
             MapObjectId(seg.id.clone()),
-            Transform {
-                translation: pos,
-                rotation: rot,
-                scale: Vec3::ONE,
-            },
+            tf,
             Visibility::Visible,
         ));
 
@@ -754,19 +788,14 @@ fn setup_scene(
     });
 
     for wf in &config.map.waterfalls {
-        let pos = Vec3::new(wf.pos.0, wf.pos.1, wf.pos.2);
+        let tf = wf.model_transform.to_transform();
         let size = Vec3::new(wf.size.0, wf.size.1, wf.size.2);
         let c = wf.water_color_rgb;
         let em = wf.foam_emissive_rgb;
-        let rot = Quat::from_rotation_y(wf.yaw_deg.to_radians());
 
         let mut ent_cmds = commands.spawn((
             MapObjectId(wf.id.clone()),
-            Transform {
-                translation: pos,
-                rotation: rot,
-                scale: Vec3::ONE,
-            },
+            tf,
             Visibility::Visible,
         ));
 
@@ -936,12 +965,13 @@ fn setup_scene(
 
     // ۸. چشمه‌های مقدس پایگاه‌ها (Fountains)
     for ftn in &config.map.fountains {
-        let pos = Vec3::new(ftn.pos.0, ftn.pos.1, ftn.pos.2);
+        let mut tf = ftn.model_transform.to_transform();
+        tf.translation.y += ftn.rim_height * 0.5 * tf.scale.y;
         let sc = ftn.stone_color_rgb;
         let we = ftn.water_emissive_rgb;
         let mut ftn_cmds = commands.spawn((
             MapObjectId(ftn.id.clone()),
-            Transform::from_translation(pos + Vec3::Y * (ftn.rim_height * 0.5)),
+            tf,
             Visibility::Visible,
         ));
         let ftn_ent = ftn_cmds.id();
@@ -1353,7 +1383,7 @@ fn setup_scene(
 
     // ۱۴. اهداف تیراندازی
     for (index, t) in config.targets.iter().enumerate() {
-        let pos = Vec3::new(t.pos.0, t.pos.1, t.pos.2);
+        let pos = t.model_transform.location_vec();
         let size = Vec3::new(t.size.0, t.size.1, t.size.2);
         let color = Color::srgb(t.color_rgb.0, t.color_rgb.1, t.color_rgb.2);
         let mut target_cmds = commands.spawn((
@@ -1364,7 +1394,7 @@ fn setup_scene(
                 hp: t.max_hp,
                 hit_flash_timer: 0.0,
                 base_pos: pos,
-                base_scale: Vec3::ONE,
+                base_scale: t.model_transform.scale_vec(),
                 base_color: color,
                 is_dead: false,
             },
@@ -1433,6 +1463,11 @@ fn setup_scene(
             },
         ));
     }
+
+    // ۱۶. ساخت تکسچر دقیق مینی‌مپ از تمام مسیرها و آبجکت‌های نقشه و نمایش آن در پایین سمت راست
+    let minimap_image = bake_minimap_image(&config);
+    let minimap_handle = images.add(minimap_image);
+    spawn_minimap_ui(&mut commands, &config, minimap_handle);
 
     let gltf_handle = asset_server.load(&config.animations.model_path);
     commands.insert_resource(SoldierGltfHandle(gltf_handle));
@@ -1986,6 +2021,7 @@ fn weapon_live_calibration_system(
 fn client_sample_input_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
+    camera_control: Res<CameraControlState>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
     muzzle_query: Query<&GlobalTransform, With<MuzzlePoint>>,
@@ -2030,8 +2066,12 @@ fn client_sample_input_system(
         grenade_just_pressed: keyboard.just_pressed(KeyCode::KeyF),
         space_just_pressed: keyboard.just_pressed(KeyCode::Space),
         kill_toggle_just_pressed: keyboard.just_pressed(KeyCode::KeyX),
-        fire_just_pressed: mouse_button.just_pressed(MouseButton::Left),
-        fire_held: mouse_button.pressed(MouseButton::Left),
+        fire_just_pressed: !camera_control.is_pointer_over_minimap
+            && !camera_control.is_dragging_minimap
+            && mouse_button.just_pressed(MouseButton::Left),
+        fire_held: !camera_control.is_pointer_over_minimap
+            && !camera_control.is_dragging_minimap
+            && mouse_button.pressed(MouseButton::Left),
         aim_ray_origin,
         aim_ray_dir,
         has_aim_ray,
@@ -2644,6 +2684,7 @@ fn camera_follow_system(
     config: Res<GameConfig>,
     mut shake: ResMut<CameraShake>,
     mut render_state: ResMut<ClientRenderState>,
+    camera_control: Res<CameraControlState>,
     soldier_query: Query<&Transform, (With<SoldierMarker>, Without<MobaCamera>)>,
     mut camera_query: Query<&mut Transform, With<MobaCamera>>,
 ) {
@@ -2669,13 +2710,16 @@ fn camera_follow_system(
         config.camera.offset.1,
         config.camera.offset.2,
     );
-    let target_pos = soldier_tf.translation + camera_offset + shake_offset;
+    let focus_pos = camera_control
+        .free_look_target
+        .unwrap_or(soldier_tf.translation);
+    let target_pos = focus_pos + camera_offset + shake_offset;
 
     camera_tf.translation = camera_tf
         .translation
         .lerp(target_pos, config.camera.follow_lerp_speed * dt);
     camera_tf.look_at(
-        soldier_tf.translation + shake_offset * config.camera.look_at_shake_factor,
+        focus_pos + shake_offset * config.camera.look_at_shake_factor,
         Vec3::Y,
     );
 }
@@ -2838,4 +2882,597 @@ fn update_map_object_labels_system(
             *vis = Visibility::Hidden;
         }
     }
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم مینی‌مپ دقیق (پایین سمت راست) + کلیک و درگ برای انتقال دوربین
+// -----------------------------------------------------------------------------
+
+fn world_to_minimap_uv(config: &GameConfig, world_x: f32, world_z: f32) -> Vec2 {
+    let map_w = config.map.map_dimensions.0.max(1.0);
+    let map_h = config.map.map_dimensions.1.max(1.0);
+    Vec2::new(
+        (world_x / map_w + 0.5).clamp(0.0, 1.0),
+        (world_z / map_h + 0.5).clamp(0.0, 1.0),
+    )
+}
+
+fn spawn_minimap_ui(commands: &mut Commands, config: &GameConfig, minimap_handle: Handle<Image>) {
+    let mut target_dots = Vec::new();
+    for index in 0..config.targets.len() {
+        target_dots.push(index);
+    }
+
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                right: px(MINIMAP_MARGIN_PX),
+                bottom: px(MINIMAP_MARGIN_PX),
+                width: px(MINIMAP_WIDTH_PX),
+                height: px(MINIMAP_HEIGHT_PX),
+                border: UiRect::all(px(2.0)),
+                border_radius: BorderRadius::all(px(6.0)),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.65, 0.72, 0.80, 0.85)),
+            BackgroundColor(Color::srgba(0.06, 0.08, 0.11, 0.94)),
+        ))
+        .with_children(|parent| {
+            // تصویر پس‌زمینه رندر شده از تمام مسیرها، رودها، کوه‌ها، درخت‌ها و سازه‌های نقشه
+            parent.spawn((
+                ImageNode::new(minimap_handle),
+                Node {
+                    width: percent(100),
+                    height: percent(100),
+                    position_type: PositionType::Absolute,
+                    left: px(0.0),
+                    top: px(0.0),
+                    ..default()
+                },
+            ));
+
+            // کادر محدوده دید فعلی دوربین
+            parent.spawn((
+                MinimapCameraBox,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0.0),
+                    top: px(0.0),
+                    width: px(28.0),
+                    height: px(20.0),
+                    border: UiRect::all(px(1.5)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.80)),
+                BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.05)),
+            ));
+
+            // نشانگر زنده اهداف تیراندازی
+            for idx in target_dots {
+                parent.spawn((
+                    MinimapTargetDot { index: idx },
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        width: px(6.0),
+                        height: px(6.0),
+                        border: UiRect::all(px(1.0)),
+                        border_radius: BorderRadius::MAX,
+                        ..default()
+                    },
+                    BorderColor::all(Color::BLACK),
+                    BackgroundColor(Color::srgb(1.0, 0.65, 0.15)),
+                    Visibility::Visible,
+                ));
+            }
+
+            // نشانگر زنده بازیکن (سرباز)
+            parent.spawn((
+                MinimapSoldierDot,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0.0),
+                    top: px(0.0),
+                    width: px(9.0),
+                    height: px(9.0),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BorderColor::all(Color::BLACK),
+                BackgroundColor(Color::srgb(1.0, 0.96, 0.35)),
+            ));
+
+            // راهنمای بازگشت دوربین به بازیکن
+            parent.spawn((
+                Text::new("Y: Center Cam"),
+                TextFont {
+                    font_size: FontSize::Px(10.0),
+                    ..default()
+                },
+                TextColor(Color::srgba(0.92, 0.95, 1.0, 0.78)),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(6.0),
+                    top: px(4.0),
+                    ..default()
+                },
+            ));
+        });
+}
+
+fn minimap_interaction_system(
+    config: Res<GameConfig>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    render_state: Res<ClientRenderState>,
+    mut camera_control: ResMut<CameraControlState>,
+) {
+    let wasd_pressed = keyboard.pressed(KeyCode::KeyW)
+        || keyboard.pressed(KeyCode::KeyA)
+        || keyboard.pressed(KeyCode::KeyS)
+        || keyboard.pressed(KeyCode::KeyD);
+
+    if keyboard.just_pressed(KeyCode::KeyY)
+        || keyboard.just_pressed(KeyCode::Home)
+        || (wasd_pressed && !camera_control.is_dragging_minimap)
+    {
+        camera_control.free_look_target = None;
+    }
+
+    let Ok(window) = window_query.single() else {
+        camera_control.is_pointer_over_minimap = false;
+        camera_control.is_dragging_minimap = false;
+        return;
+    };
+
+    let Some(cursor) = window.cursor_position() else {
+        camera_control.is_pointer_over_minimap = false;
+        if !mouse_button.pressed(MouseButton::Left) {
+            camera_control.is_dragging_minimap = false;
+        }
+        return;
+    };
+
+    let min_x = window.width() - MINIMAP_MARGIN_PX - MINIMAP_WIDTH_PX;
+    let max_x = window.width() - MINIMAP_MARGIN_PX;
+    let min_y = window.height() - MINIMAP_MARGIN_PX - MINIMAP_HEIGHT_PX;
+    let max_y = window.height() - MINIMAP_MARGIN_PX;
+
+    let inside = cursor.x >= min_x && cursor.x <= max_x && cursor.y >= min_y && cursor.y <= max_y;
+    camera_control.is_pointer_over_minimap = inside;
+
+    if inside && mouse_button.just_pressed(MouseButton::Left) {
+        camera_control.is_dragging_minimap = true;
+    }
+    if !mouse_button.pressed(MouseButton::Left) {
+        camera_control.is_dragging_minimap = false;
+    }
+
+    if camera_control.is_dragging_minimap {
+        let u = ((cursor.x - min_x) / MINIMAP_WIDTH_PX).clamp(0.0, 1.0);
+        let v = ((cursor.y - min_y) / MINIMAP_HEIGHT_PX).clamp(0.0, 1.0);
+        let world_x = (u - 0.5) * config.map.map_dimensions.0;
+        let world_z = (v - 0.5) * config.map.map_dimensions.1;
+        camera_control.free_look_target = Some(Vec3::new(world_x, render_state.soldier_pos.y, world_z));
+    }
+}
+
+fn minimap_overlay_update_system(
+    config: Res<GameConfig>,
+    render_state: Res<ClientRenderState>,
+    camera_control: Res<CameraControlState>,
+    soldier_query: Query<&Transform, With<SoldierMarker>>,
+    target_query: Query<&VisualTarget>,
+    mut soldier_dot_query: Query<
+        &mut Node,
+        (
+            With<MinimapSoldierDot>,
+            Without<MinimapTargetDot>,
+            Without<MinimapCameraBox>,
+        ),
+    >,
+    mut target_dot_query: Query<
+        (&MinimapTargetDot, &mut Node, &mut Visibility),
+        (Without<MinimapSoldierDot>, Without<MinimapCameraBox>),
+    >,
+    mut cam_box_query: Query<
+        &mut Node,
+        (
+            With<MinimapCameraBox>,
+            Without<MinimapSoldierDot>,
+            Without<MinimapTargetDot>,
+        ),
+    >,
+) {
+    let soldier_pos = soldier_query
+        .single()
+        .map(|tf| tf.translation)
+        .unwrap_or(render_state.soldier_pos);
+
+    if let Ok(mut dot_node) = soldier_dot_query.single_mut() {
+        let uv = world_to_minimap_uv(&config, soldier_pos.x, soldier_pos.z);
+        dot_node.left = px(uv.x * MINIMAP_WIDTH_PX - 4.5);
+        dot_node.top = px(uv.y * MINIMAP_HEIGHT_PX - 4.5);
+    }
+
+    let focus = camera_control.free_look_target.unwrap_or(soldier_pos);
+    if let Ok(mut cam_node) = cam_box_query.single_mut() {
+        let uv = world_to_minimap_uv(&config, focus.x, focus.z);
+        let box_w = 28.0;
+        let box_h = 20.0;
+        cam_node.left = px((uv.x * MINIMAP_WIDTH_PX - box_w * 0.5).clamp(0.0, MINIMAP_WIDTH_PX - box_w));
+        cam_node.top = px((uv.y * MINIMAP_HEIGHT_PX - box_h * 0.5).clamp(0.0, MINIMAP_HEIGHT_PX - box_h));
+    }
+
+    for (dot, mut node, mut vis) in &mut target_dot_query {
+        if let Some(vt) = target_query.iter().find(|t| t.index == dot.index) {
+            if vt.is_dead {
+                *vis = Visibility::Hidden;
+            } else {
+                *vis = Visibility::Visible;
+                let uv = world_to_minimap_uv(&config, vt.base_pos.x, vt.base_pos.z);
+                node.left = px(uv.x * MINIMAP_WIDTH_PX - 3.0);
+                node.top = px(uv.y * MINIMAP_HEIGHT_PX - 3.0);
+            }
+        }
+    }
+}
+
+fn bake_minimap_image(config: &GameConfig) -> Image {
+    let w = MINIMAP_TEX_W as usize;
+    let h = MINIMAP_TEX_H as usize;
+    let mut pixels = vec![0u8; w * h * 4];
+
+    let map_w = config.map.map_dimensions.0.max(1.0);
+    let map_h = config.map.map_dimensions.1.max(1.0);
+    let px_per_unit_x = (w as f32) / map_w;
+    let px_per_unit_z = (h as f32) / map_h;
+
+    let to_px = |wx: f32, wz: f32| -> (f32, f32) {
+        (
+            (wx / map_w + 0.5) * (w as f32),
+            (wz / map_h + 0.5) * (h as f32),
+        )
+    };
+
+    let put_pixel = |buf: &mut [u8], x: i32, y: i32, rgba: [u8; 4]| {
+        if x >= 0 && x < w as i32 && y >= 0 && y < h as i32 {
+            let idx = ((y as usize) * w + (x as usize)) * 4;
+            let a = rgba[3] as f32 / 255.0;
+            let inv_a = 1.0 - a;
+            buf[idx] = (buf[idx] as f32 * inv_a + rgba[0] as f32 * a).round() as u8;
+            buf[idx + 1] = (buf[idx + 1] as f32 * inv_a + rgba[1] as f32 * a).round() as u8;
+            buf[idx + 2] = (buf[idx + 2] as f32 * inv_a + rgba[2] as f32 * a).round() as u8;
+            buf[idx + 3] = 255;
+        }
+    };
+
+    // پس‌زمینه دره و ابرهای حاشیه نقشه
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) * 4;
+            pixels[idx] = 20;
+            pixels[idx + 1] = 24;
+            pixels[idx + 2] = 30;
+            pixels[idx + 3] = 255;
+        }
+    }
+
+    let rgb_to_u8 = |c: (f32, f32, f32), boost: f32, alpha: u8| -> [u8; 4] {
+        [
+            ((c.0 * boost).clamp(0.0, 1.0) * 255.0) as u8,
+            ((c.1 * boost).clamp(0.0, 1.0) * 255.0) as u8,
+            ((c.2 * boost).clamp(0.0, 1.0) * 255.0) as u8,
+            alpha,
+        ]
+    };
+
+    let draw_rotated_rect = |buf: &mut [u8], cx: f32, cz: f32, sx: f32, sz: f32, yaw_deg: f32, rgba: [u8; 4]| {
+        let (pcx, pcz) = to_px(cx, cz);
+        let hx = (sx * 0.5) * px_per_unit_x;
+        let hz = (sz * 0.5) * px_per_unit_z;
+        let bound = (hx * hx + hz * hz).sqrt().ceil() as i32 + 1;
+        let rad = yaw_deg.to_radians();
+        let cos_a = rad.cos();
+        let sin_a = rad.sin();
+
+        let min_x = (pcx as i32 - bound).max(0);
+        let max_x = (pcx as i32 + bound).min(w as i32 - 1);
+        let min_y = (pcz as i32 - bound).max(0);
+        let max_y = (pcz as i32 + bound).min(h as i32 - 1);
+
+        for py in min_y..=max_y {
+            for px_i in min_x..=max_x {
+                let dx = (px_i as f32 + 0.5) - pcx;
+                let dy = (py as f32 + 0.5) - pcz;
+                let lx = dx * cos_a - dy * sin_a;
+                let ly = dx * sin_a + dy * cos_a;
+                if lx.abs() <= hx && ly.abs() <= hz {
+                    put_pixel(buf, px_i, py, rgba);
+                }
+            }
+        }
+    };
+
+    let draw_rotated_ellipse = |buf: &mut [u8], cx: f32, cz: f32, sx: f32, sz: f32, yaw_deg: f32, rgba: [u8; 4]| {
+        let (pcx, pcz) = to_px(cx, cz);
+        let hx = (sx * 0.5 * px_per_unit_x).max(1.0);
+        let hz = (sz * 0.5 * px_per_unit_z).max(1.0);
+        let bound = hx.max(hz).ceil() as i32 + 1;
+        let rad = yaw_deg.to_radians();
+        let cos_a = rad.cos();
+        let sin_a = rad.sin();
+
+        let min_x = (pcx as i32 - bound).max(0);
+        let max_x = (pcx as i32 + bound).min(w as i32 - 1);
+        let min_y = (pcz as i32 - bound).max(0);
+        let max_y = (pcz as i32 + bound).min(h as i32 - 1);
+
+        for py in min_y..=max_y {
+            for px_i in min_x..=max_x {
+                let dx = (px_i as f32 + 0.5) - pcx;
+                let dy = (py as f32 + 0.5) - pcz;
+                let lx = (dx * cos_a - dy * sin_a) / hx;
+                let ly = (dx * sin_a + dy * cos_a) / hz;
+                if lx * lx + ly * ly <= 1.0 {
+                    put_pixel(buf, px_i, py, rgba);
+                }
+            }
+        }
+    };
+
+    let draw_circle = |buf: &mut [u8], cx: f32, cz: f32, radius_px: f32, rgba: [u8; 4]| {
+        let (pcx, pcz) = to_px(cx, cz);
+        let r = radius_px.max(1.0);
+        let ri = r.ceil() as i32 + 1;
+        for py in (pcz as i32 - ri)..=(pcz as i32 + ri) {
+            for px_i in (pcx as i32 - ri)..=(pcx as i32 + ri) {
+                let dx = (px_i as f32 + 0.5) - pcx;
+                let dy = (py as f32 + 0.5) - pcz;
+                if dx * dx + dy * dy <= r * r {
+                    put_pixel(buf, px_i, py, rgba);
+                }
+            }
+        }
+    };
+
+    let draw_segment = |buf: &mut [u8], ax: f32, az: f32, bx: f32, bz: f32, half_width_px: f32, rgba: [u8; 4]| {
+        let (pax, paz) = to_px(ax, az);
+        let (pbx, pbz) = to_px(bx, bz);
+        let hw = half_width_px.max(1.0);
+        let pad = hw.ceil() as i32 + 1;
+        let min_x = (pax.min(pbx) as i32 - pad).max(0);
+        let max_x = (pax.max(pbx) as i32 + pad).min(w as i32 - 1);
+        let min_y = (paz.min(pbz) as i32 - pad).max(0);
+        let max_y = (paz.max(pbz) as i32 + pad).min(h as i32 - 1);
+
+        let abx = pbx - pax;
+        let aby = pbz - paz;
+        let ab_len_sq = abx * abx + aby * aby;
+
+        for py in min_y..=max_y {
+            for px_i in min_x..=max_x {
+                let ppx = px_i as f32 + 0.5;
+                let ppy = py as f32 + 0.5;
+                let t = if ab_len_sq > 1e-4 {
+                    (((ppx - pax) * abx + (ppy - paz) * aby) / ab_len_sq).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let cx = pax + abx * t;
+                let cy = paz + aby * t;
+                let dx = ppx - cx;
+                let dy = ppy - cy;
+                if dx * dx + dy * dy <= hw * hw {
+                    put_pixel(buf, px_i, py, rgba);
+                }
+            }
+        }
+    };
+
+    // ۱. پلتفرم‌های زمین و پایگاه‌ها
+    for plat in &config.map.terrains {
+        let boost = if plat.elevation_tier >= 2 { 1.35 } else { 1.15 };
+        let col = rgb_to_u8(plat.color_rgb, boost, 255);
+        let loc = plat.model_transform.location;
+        let scl = plat.model_transform.scale;
+        draw_rotated_rect(&mut pixels, loc.0, loc.2, plat.size.0 * scl.0, plat.size.2 * scl.2, plat.model_transform.rotation.1, col);
+    }
+
+    // ۲. برکه‌ها و جویبارها
+    for seg in &config.map.river_segments {
+        let col = rgb_to_u8(seg.color_rgb, 1.45, 235);
+        let loc = seg.model_transform.location;
+        let scl = seg.model_transform.scale;
+        draw_rotated_ellipse(&mut pixels, loc.0, loc.2, seg.size.0 * scl.0, seg.size.2 * scl.2, seg.model_transform.rotation.1, col);
+    }
+
+    // ۳. مسیرهای ۳ لاین اصلی (Top, Mid, Bot)
+    for lane in &config.map.lanes {
+        let border_col = rgb_to_u8(lane.color_rgb, 0.72, 255);
+        let road_col = rgb_to_u8(lane.color_rgb, 1.28, 255);
+        let hw = lane.width * 0.5 * px_per_unit_x;
+        for seg_idx in 0..lane.waypoints.len().saturating_sub(1) {
+            let a = lane.waypoints[seg_idx];
+            let b = lane.waypoints[seg_idx + 1];
+            draw_segment(&mut pixels, a.0, a.2, b.0, b.2, hw + 1.2, border_col);
+        }
+        for seg_idx in 0..lane.waypoints.len().saturating_sub(1) {
+            let a = lane.waypoints[seg_idx];
+            let b = lane.waypoints[seg_idx + 1];
+            draw_segment(&mut pixels, a.0, a.2, b.0, b.2, hw, road_col);
+        }
+    }
+
+    // ۴. رمپ‌ها و پلکان‌های سنگی
+    for ramp in &config.map.ramps {
+        let col = rgb_to_u8(ramp.color_rgb, 1.35, 255);
+        let loc = ramp.model_transform.location;
+        let scl = ramp.model_transform.scale;
+        draw_rotated_rect(
+            &mut pixels,
+            loc.0,
+            loc.2,
+            ramp.size.0 * scl.0,
+            ramp.size.2 * scl.2,
+            ramp.model_transform.rotation.1,
+            col,
+        );
+    }
+
+    // ۵. میدان باستانی مرکز نقشه
+    let bridge = &config.map.center_bridge;
+    let bridge_loc = bridge.model_transform.location;
+    let bridge_s = bridge.model_transform.scale.0.max(bridge.model_transform.scale.2);
+    let bridge_r = bridge.outer_radius * bridge_s * px_per_unit_x;
+    draw_circle(
+        &mut pixels,
+        bridge_loc.0,
+        bridge_loc.2,
+        bridge_r + 1.5,
+        [60, 58, 52, 255],
+    );
+    draw_circle(
+        &mut pixels,
+        bridge_loc.0,
+        bridge_loc.2,
+        bridge_r,
+        rgb_to_u8(bridge.color_rgb, 1.25, 255),
+    );
+    draw_circle(
+        &mut pixels,
+        bridge_loc.0,
+        bridge_loc.2,
+        4.6 * px_per_unit_x,
+        [55, 215, 235, 255],
+    );
+
+    // ۶. آبشارها
+    for wf in &config.map.waterfalls {
+        let loc = wf.model_transform.location;
+        let scl = wf.model_transform.scale;
+        draw_rotated_rect(
+            &mut pixels,
+            loc.0,
+            loc.2,
+            wf.size.0 * scl.0,
+            (wf.size.2 * scl.2).max(2.0),
+            wf.model_transform.rotation.1,
+            [140, 240, 255, 245],
+        );
+    }
+
+    // ۷. کوه‌ها و دیوارهای سنگی
+    for mtn in &config.map.mountains {
+        let loc = mtn.model_transform.location;
+        let scl = mtn.model_transform.scale;
+        let sx = mtn.size.0 * scl.0;
+        let sz = mtn.size.2 * scl.2;
+        draw_rotated_rect(
+            &mut pixels,
+            loc.0,
+            loc.2,
+            sx + 1.5,
+            sz + 1.5,
+            mtn.model_transform.rotation.1,
+            [32, 34, 38, 255],
+        );
+        draw_rotated_rect(
+            &mut pixels,
+            loc.0,
+            loc.2,
+            sx,
+            sz,
+            mtn.model_transform.rotation.1,
+            rgb_to_u8(mtn.color_rgb, 1.25, 255),
+        );
+    }
+
+    // ۸. موانع تاکتیکی و خرابه‌ها (Obstacles)
+    for obs in &config.obstacles {
+        let loc = obs.model_transform.location;
+        let scl = obs.model_transform.scale;
+        draw_rotated_rect(
+            &mut pixels,
+            loc.0,
+            loc.2,
+            (obs.size.0 * scl.0).max(2.0),
+            (obs.size.2 * scl.2).max(2.0),
+            obs.model_transform.rotation.1,
+            rgb_to_u8(obs.color_rgb, 1.4, 255),
+        );
+    }
+
+    // ۹. درختان جنگل
+    for tree in &config.map.trees {
+        let loc = tree.model_transform.location;
+        let ts = tree.model_transform.scale.0.max(tree.model_transform.scale.2);
+        let tr = (tree.canopy_radius * ts * px_per_unit_x).max(2.2);
+        draw_circle(&mut pixels, loc.0, loc.2, tr + 0.9, [18, 32, 18, 240]);
+        draw_circle(
+            &mut pixels,
+            loc.0,
+            loc.2,
+            tr,
+            rgb_to_u8(tree.canopy_color_rgb, 1.35, 255),
+        );
+    }
+
+    // ۱۰. چشمه‌های پایگاه (Fountains)
+    for ftn in &config.map.fountains {
+        let loc = ftn.model_transform.location;
+        let fs = ftn.model_transform.scale.0.max(ftn.model_transform.scale.2);
+        let fr = (ftn.outer_radius * fs * px_per_unit_x).max(4.0);
+        let col = if ftn.team == TeamId::Dawn {
+            [50, 235, 195, 255]
+        } else {
+            [245, 85, 70, 255]
+        };
+        draw_circle(&mut pixels, loc.0, loc.2, fr + 1.2, [255, 255, 255, 210]);
+        draw_circle(&mut pixels, loc.0, loc.2, fr, col);
+    }
+
+    // ۱۱. برج‌های دفاعی (Turrets)
+    for tur in &config.map.turrets {
+        let loc = tur.model_transform.location;
+        let col = if tur.team == TeamId::Dawn {
+            [45, 235, 175, 255]
+        } else {
+            [245, 75, 65, 255]
+        };
+        draw_circle(&mut pixels, loc.0, loc.2, 4.5, [15, 18, 22, 255]);
+        draw_circle(&mut pixels, loc.0, loc.2, 3.3, col);
+        draw_circle(&mut pixels, loc.0, loc.2, 1.3, [255, 255, 255, 255]);
+    }
+
+    // ۱۲. ساختمان‌های باستانی (Ancients)
+    for anc in &config.map.ancients {
+        let loc = anc.model_transform.location;
+        let col = if anc.team == TeamId::Dawn {
+            [40, 255, 185, 255]
+        } else {
+            [255, 65, 55, 255]
+        };
+        draw_circle(&mut pixels, loc.0, loc.2, 8.2, [15, 18, 22, 255]);
+        draw_circle(&mut pixels, loc.0, loc.2, 6.6, col);
+        draw_circle(&mut pixels, loc.0, loc.2, 2.8, [255, 255, 255, 255]);
+    }
+
+    Image::new(
+        Extent3d {
+            width: MINIMAP_TEX_W,
+            height: MINIMAP_TEX_H,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    )
 }

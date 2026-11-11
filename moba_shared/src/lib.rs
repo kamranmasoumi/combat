@@ -457,6 +457,47 @@ pub struct ModelTransformConfig {
     pub scale: (f32, f32, f32),
 }
 
+impl ModelTransformConfig {
+    #[inline]
+    pub fn location_vec(&self) -> Vec3 {
+        Vec3::new(self.location.0, self.location.1, self.location.2)
+    }
+
+    #[inline]
+    pub fn rotation_quat(&self) -> Quat {
+        Quat::from_euler(
+            EulerRot::YXZ,
+            self.rotation.1.to_radians(),
+            self.rotation.0.to_radians(),
+            self.rotation.2.to_radians(),
+        )
+    }
+
+    #[inline]
+    pub fn scale_vec(&self) -> Vec3 {
+        Vec3::new(self.scale.0.abs().max(0.001), self.scale.1.abs().max(0.001), self.scale.2.abs().max(0.001))
+    }
+
+    #[inline]
+    pub fn apply_to_transform(&self, base_pos: Vec3, base_rot: Quat) -> Transform {
+        let s = self.scale_vec();
+        Transform {
+            translation: base_pos + base_rot * self.location_vec(),
+            rotation: base_rot * self.rotation_quat(),
+            scale: s,
+        }
+    }
+
+    #[inline]
+    pub fn to_transform(&self) -> Transform {
+        Transform {
+            translation: self.location_vec(),
+            rotation: self.rotation_quat(),
+            scale: self.scale_vec(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MapConfig {
     pub map_dimensions: (f32, f32),
@@ -484,7 +525,6 @@ pub struct TerrainPlatformDef {
     pub model_transform: ModelTransformConfig,
     pub team: TeamId,
     pub elevation_tier: i32,
-    pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
@@ -495,9 +535,7 @@ pub struct RampDef {
     pub id: String,
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
-    pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
-    pub rotation_euler_deg: (f32, f32, f32),
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
 }
@@ -507,9 +545,7 @@ pub struct RiverSegmentDef {
     pub id: String,
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
-    pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
-    pub yaw_deg: f32,
     pub flow_dir: (f32, f32),
     pub color_rgb: (f32, f32, f32),
     pub emissive_rgb: (f32, f32, f32),
@@ -521,9 +557,7 @@ pub struct WaterfallDef {
     pub id: String,
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
-    pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
-    pub yaw_deg: f32,
     pub water_color_rgb: (f32, f32, f32),
     pub foam_emissive_rgb: (f32, f32, f32),
     pub mist_particle_interval_secs: f32,
@@ -534,11 +568,8 @@ pub struct CenterBridgeDef {
     pub id: String,
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
-    pub center_pos: (f32, f32, f32),
     pub outer_radius: f32,
     pub deck_thickness: f32,
-    pub pillar_radius: f32,
-    pub pillar_height: f32,
     pub elevation_tier: i32,
     pub color_rgb: (f32, f32, f32),
     pub accent_color_rgb: (f32, f32, f32),
@@ -551,7 +582,6 @@ pub struct FountainDef {
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
     pub team: TeamId,
-    pub pos: (f32, f32, f32),
     pub outer_radius: f32,
     pub inner_radius: f32,
     pub rim_height: f32,
@@ -567,7 +597,6 @@ pub struct AncientDef {
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
     pub team: TeamId,
-    pub pos: (f32, f32, f32),
     pub base_size: (f32, f32, f32),
     pub core_radius: f32,
     pub core_height: f32,
@@ -584,7 +613,6 @@ pub struct TurretDef {
     pub team: TeamId,
     pub lane: LaneId,
     pub tier: u8,
-    pub pos: (f32, f32, f32),
     pub base_radius: f32,
     pub height: f32,
     pub head_radius: f32,
@@ -599,9 +627,7 @@ pub struct MountainDef {
     pub id: String,
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
-    pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
-    pub yaw_deg: f32,
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
 }
@@ -612,7 +638,6 @@ pub struct TreeDef {
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
     pub tree_size: TreeSize,
-    pub pos: (f32, f32, f32),
     pub trunk_radius: f32,
     pub trunk_height: f32,
     pub canopy_radius: f32,
@@ -638,9 +663,7 @@ pub struct ObstacleDef {
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
     pub kind: CoverKind,
-    pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
-    pub yaw_deg: f32,
     pub can_vault: bool,
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
@@ -651,7 +674,6 @@ pub struct TargetDef {
     pub id: String,
     pub model_path: String,
     pub model_transform: ModelTransformConfig,
-    pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub color_rgb: (f32, f32, f32),
     pub max_hp: f32,
@@ -859,15 +881,20 @@ pub fn fx_collision_groups() -> CollisionGroups {
 /// بررسی قرار گرفتن یک نقطه ۳بعدی درون برکه‌ها و رودخانه‌های نقشه و برگرداندن ارتفاع سطح آب و بردار جریان
 pub fn sample_water_surface_at(config: &GameConfig, world_pos: Vec3) -> Option<(f32, Vec2)> {
     for seg in &config.map.river_segments {
-        let seg_pos = Vec3::new(seg.pos.0, seg.pos.1, seg.pos.2);
-        let half = Vec3::new(seg.size.0 * 0.5, seg.size.1 * 0.5, seg.size.2 * 0.5);
+        let seg_tf = seg.model_transform.to_transform();
+        let seg_pos = seg_tf.translation;
+        let half = Vec3::new(
+            seg.size.0 * 0.5 * seg_tf.scale.x,
+            seg.size.1 * 0.5 * seg_tf.scale.y,
+            seg.size.2 * 0.5 * seg_tf.scale.z,
+        );
         let water_top_y = seg_pos.y + half.y;
 
         if world_pos.y < water_top_y - 1.35 || world_pos.y > water_top_y + 0.45 {
             continue;
         }
 
-        let inv_rot = Quat::from_rotation_y(-seg.yaw_deg.to_radians());
+        let inv_rot = seg_tf.rotation.inverse();
         let local = inv_rot * (world_pos - seg_pos);
         // استفاده از شکل بیضوی/نرم در صفحه افقی برای طبیعی‌تر شدن مرز برکه‌ها
         let nx = local.x / half.x.max(0.1);
@@ -1986,13 +2013,18 @@ pub fn terrain_platform_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let pos = Vec3::new(plat.pos.0, plat.pos.1, plat.pos.2);
-    let half = Vec3::new(plat.size.0 * 0.5, plat.size.1 * 0.5, plat.size.2 * 0.5);
+    let tf = plat.model_transform.to_transform();
+    let s = tf.scale;
+    let half = Vec3::new(
+        plat.size.0 * 0.5 * s.x,
+        plat.size.1 * 0.5 * s.y,
+        plat.size.2 * 0.5 * s.z,
+    );
     (
         MapObjectId(plat.id.clone()),
         ElevationSurface {
             elevation_tier: plat.elevation_tier,
-            top_y: pos.y + half.y,
+            top_y: tf.translation.y + half.y,
         },
         CustomRigidBody::Fixed,
         CustomCollider::cuboid(half.x, half.y, half.z),
@@ -2001,7 +2033,7 @@ pub fn terrain_platform_physics_bundle(
             restitution: config.physics.ground_restitution,
         },
         world_collision_groups(),
-        Transform::from_translation(pos),
+        tf,
     )
 }
 
@@ -2016,13 +2048,12 @@ pub fn ramp_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let pos = Vec3::new(ramp.pos.0, ramp.pos.1, ramp.pos.2);
-    let half = Vec3::new(ramp.size.0 * 0.5, ramp.size.1 * 0.5, ramp.size.2 * 0.5);
-    let rot = Quat::from_euler(
-        EulerRot::YXZ,
-        ramp.rotation_euler_deg.1.to_radians(),
-        ramp.rotation_euler_deg.0.to_radians(),
-        ramp.rotation_euler_deg.2.to_radians(),
+    let tf = ramp.model_transform.to_transform();
+    let s = tf.scale;
+    let half = Vec3::new(
+        ramp.size.0 * 0.5 * s.x,
+        ramp.size.1 * 0.5 * s.y,
+        ramp.size.2 * 0.5 * s.z,
     );
     (
         MapObjectId(ramp.id.clone()),
@@ -2033,11 +2064,7 @@ pub fn ramp_physics_bundle(
             restitution: config.physics.ground_restitution,
         },
         world_collision_groups(),
-        Transform {
-            translation: pos,
-            rotation: rot,
-            scale: Vec3::ONE,
-        },
+        tf,
     )
 }
 
@@ -2053,26 +2080,24 @@ pub fn center_bridge_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let pos = Vec3::new(
-        bridge.center_pos.0,
-        bridge.center_pos.1,
-        bridge.center_pos.2,
-    );
-    let half_h = bridge.deck_thickness * 0.5;
+    let tf = bridge.model_transform.to_transform();
+    let s = tf.scale;
+    let half_h = bridge.deck_thickness * 0.5 * s.y;
+    let rad = bridge.outer_radius * s.x.max(s.z);
     (
         MapObjectId(bridge.id.clone()),
         ElevationSurface {
             elevation_tier: bridge.elevation_tier,
-            top_y: pos.y + half_h,
+            top_y: tf.translation.y + half_h,
         },
         CustomRigidBody::Fixed,
-        CustomCollider::cylinder(half_h, bridge.outer_radius),
+        CustomCollider::cylinder(half_h, rad),
         SurfaceMaterial {
             friction: config.physics.ground_friction,
             restitution: config.physics.ground_restitution,
         },
         world_collision_groups(),
-        Transform::from_translation(pos),
+        tf,
     )
 }
 
@@ -2125,9 +2150,13 @@ pub fn mountain_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let pos = Vec3::new(mtn.pos.0, mtn.pos.1, mtn.pos.2);
-    let half = Vec3::new(mtn.size.0 * 0.5, mtn.size.1 * 0.5, mtn.size.2 * 0.5);
-    let rot = Quat::from_rotation_y(mtn.yaw_deg.to_radians());
+    let tf = mtn.model_transform.to_transform();
+    let s = tf.scale;
+    let half = Vec3::new(
+        mtn.size.0 * 0.5 * s.x,
+        mtn.size.1 * 0.5 * s.y,
+        mtn.size.2 * 0.5 * s.z,
+    );
     (
         MapObjectId(mtn.id.clone()),
         PhysicsMountain {
@@ -2140,11 +2169,7 @@ pub fn mountain_physics_bundle(
             restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
-        Transform {
-            translation: pos,
-            rotation: rot,
-            scale: Vec3::ONE,
-        },
+        tf,
     )
 }
 
@@ -2160,21 +2185,24 @@ pub fn tree_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let half_h = tree.trunk_height * 0.5;
-    let pos = Vec3::new(tree.pos.0, tree.pos.1 + half_h, tree.pos.2);
+    let mut tf = tree.model_transform.to_transform();
+    let s = tf.scale;
+    let half_h = tree.trunk_height * 0.5 * s.y;
+    tf.translation.y += half_h;
+    let rad = tree.trunk_radius * s.x.max(s.z);
     (
         MapObjectId(tree.id.clone()),
         PhysicsTree {
             id: tree.id.clone(),
         },
         CustomRigidBody::Fixed,
-        CustomCollider::cylinder(half_h, tree.trunk_radius),
+        CustomCollider::cylinder(half_h, rad),
         SurfaceMaterial {
             friction: config.physics.obstacle_friction,
             restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
-        Transform::from_translation(pos),
+        tf,
     )
 }
 
@@ -2190,8 +2218,11 @@ pub fn turret_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let half_h = turret.height * 0.5;
-    let pos = Vec3::new(turret.pos.0, turret.pos.1 + half_h, turret.pos.2);
+    let mut tf = turret.model_transform.to_transform();
+    let s = tf.scale;
+    let half_h = turret.height * 0.5 * s.y;
+    tf.translation.y += half_h;
+    let rad = turret.base_radius * s.x.max(s.z);
     (
         MapObjectId(turret.id.clone()),
         PhysicsTurret {
@@ -2201,13 +2232,13 @@ pub fn turret_physics_bundle(
             tier: turret.tier,
         },
         CustomRigidBody::Fixed,
-        CustomCollider::cylinder(half_h, turret.base_radius),
+        CustomCollider::cylinder(half_h, rad),
         SurfaceMaterial {
             friction: config.physics.obstacle_friction,
             restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
-        Transform::from_translation(pos),
+        tf,
     )
 }
 
@@ -2223,12 +2254,14 @@ pub fn ancient_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
+    let mut tf = ancient.model_transform.to_transform();
+    let s = tf.scale;
     let half = Vec3::new(
-        ancient.base_size.0 * 0.5,
-        ancient.base_size.1 * 0.5,
-        ancient.base_size.2 * 0.5,
+        ancient.base_size.0 * 0.5 * s.x,
+        ancient.base_size.1 * 0.5 * s.y,
+        ancient.base_size.2 * 0.5 * s.z,
     );
-    let pos = Vec3::new(ancient.pos.0, ancient.pos.1 + half.y, ancient.pos.2);
+    tf.translation.y += half.y;
     (
         MapObjectId(ancient.id.clone()),
         PhysicsAncient {
@@ -2242,7 +2275,7 @@ pub fn ancient_physics_bundle(
             restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
-        Transform::from_translation(pos),
+        tf,
     )
 }
 
@@ -2258,9 +2291,13 @@ pub fn obstacle_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let pos = Vec3::new(obs.pos.0, obs.pos.1, obs.pos.2);
-    let half = Vec3::new(obs.size.0 * 0.5, obs.size.1 * 0.5, obs.size.2 * 0.5);
-    let rot = Quat::from_rotation_y(obs.yaw_deg.to_radians());
+    let tf = obs.model_transform.to_transform();
+    let s = tf.scale;
+    let half = Vec3::new(
+        obs.size.0 * 0.5 * s.x,
+        obs.size.1 * 0.5 * s.y,
+        obs.size.2 * 0.5 * s.z,
+    );
     (
         MapObjectId(obs.id.clone()),
         PhysicsObstacle {
@@ -2274,11 +2311,7 @@ pub fn obstacle_physics_bundle(
             restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
-        Transform {
-            translation: pos,
-            rotation: rot,
-            scale: Vec3::ONE,
-        },
+        tf,
     )
 }
 
@@ -2295,11 +2328,12 @@ pub fn target_physics_bundle(
     CollisionGroups,
     Transform,
 ) {
-    let pos = Vec3::new(target.pos.0, target.pos.1, target.pos.2);
+    let tf = target.model_transform.to_transform();
+    let s = tf.scale;
     let half = Vec3::new(
-        target.size.0 * 0.5,
-        target.size.1 * 0.5,
-        target.size.2 * 0.5,
+        target.size.0 * 0.5 * s.x,
+        target.size.1 * 0.5 * s.y,
+        target.size.2 * 0.5 * s.z,
     );
     (
         MapObjectId(target.id.clone()),
@@ -2314,7 +2348,7 @@ pub fn target_physics_bundle(
             restitution: config.physics.target_restitution,
         },
         world_collision_groups(),
-        Transform::from_translation(pos),
+        tf,
     )
 }
 
@@ -2591,7 +2625,7 @@ impl AuthoritativeWorldState {
     pub fn new_from_config(config: &GameConfig) -> Self {
         let mut targets = Vec::new();
         for t in &config.targets {
-            let pos = Vec3::new(t.pos.0, t.pos.1, t.pos.2);
+            let pos = t.model_transform.location_vec();
             targets.push(SharedTarget {
                 max_hp: t.max_hp,
                 hp: t.max_hp,

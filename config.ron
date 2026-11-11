@@ -102,6 +102,17 @@ GameConfig(
         water_move_speed_multiplier: 0.80,
         water_splash_interval_secs: 0.16,
     ),
+    heroes: [
+        HeroDef(
+            id: "hero_vanguard_rifleman",
+            display_name: "Vanguard Rifleman",
+            team: Dawn,
+            vision_range: 38.0,
+            high_ground_vision_bonus: 14.0,
+            move_speed_multiplier: 1.0,
+            max_hp: 650.0,
+        ),
+    ],
     soldier: SoldierConfig(
         spawn_pos: (-112.0, 2.4, 0.0),
         initial_aim_dir: (1.0, 0.0, 0.0),
@@ -320,7 +331,7 @@ GameConfig(
             MountainDef(id: "mtn_south_border_west", model_path: "models/mtn_south_border_west.glb", model_transform: ModelTransformConfig(location: (-48.0, 5.0, 100.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)), size: (54.0, 10.0, 8.0), color_rgb: (0.37, 0.38, 0.36), roughness: 0.88),
             MountainDef(id: "mtn_south_border_east", model_path: "models/mtn_south_border_east.glb", model_transform: ModelTransformConfig(location: (48.0, 5.0, 100.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)), size: (54.0, 10.0, 8.0), color_rgb: (0.37, 0.38, 0.36), roughness: 0.88),
             MountainDef(id: "mtn_jungle_nw_waterfall_crag", model_path: "models/mtn_jungle_nw_waterfall_crag.glb", model_transform: ModelTransformConfig(location: (-59.0, 3.2, -51.0), rotation: (0.0, 22.0, 0.0), scale: (10.0, 10.0, 10.0)), size: (1.5, 1.0, 1.0), color_rgb: (0.43, 0.42, 0.39), roughness: 0.88),
-            MountainDef(id: "mtn_jungle_nw_west_ridge", model_path: "models/mtn_jungle_nw_west_ridge.glb", model_transform: ModelTransformConfig(location: (-66.0, 2.5, -39.0), rotation: (0.0, -15.0, 0.0), scale: (1.0, 1.0, 1.0)), size: (11.0, 5.0, 10.0), color_rgb: (0.41, 0.40, 0.37), roughness: 0.88),
+            MountainDef(id: "mtn_jungle_nw_west_ridge", model_path: "models/mtn_jungle_nw_west_ridge.glb", model_transform: ModelTransformConfig(location: (-66.0, 2.5, -39.0), rotation: (0.0, 90.0, 0.0), scale: (7.0, 7.0, 7.0)), size: (1.5, 1.0, 1.0), color_rgb: (0.41, 0.40, 0.37), roughness: 0.88),
             MountainDef(id: "mtn_jungle_sw_waterfall_crag", model_path: "models/mtn_jungle_sw_waterfall_crag.glb", model_transform: ModelTransformConfig(location: (-50.0, 2.8, 47.0), rotation: (0.0, -20.0, 0.0), scale: (1.0, 1.0, 1.0)), size: (16.0, 5.6, 12.0), color_rgb: (0.43, 0.42, 0.39), roughness: 0.88),
             MountainDef(id: "mtn_jungle_se_waterfall_crag", model_path: "models/mtn_jungle_se_waterfall_crag.glb", model_transform: ModelTransformConfig(location: (56.0, 3.2, 31.0), rotation: (0.0, -18.0, 0.0), scale: (1.0, 1.0, 1.0)), size: (17.0, 6.4, 11.0), color_rgb: (0.43, 0.42, 0.39), roughness: 0.88),
             MountainDef(id: "mtn_jungle_se_east_ridge", model_path: "models/mtn_jungle_se_east_ridge.glb", model_transform: ModelTransformConfig(location: (66.0, 2.5, 42.0), rotation: (0.0, 15.0, 0.0), scale: (1.0, 1.0, 1.0)), size: (11.0, 5.0, 10.0), color_rgb: (0.41, 0.40, 0.37), roughness: 0.88),

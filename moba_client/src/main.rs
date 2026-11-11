@@ -1,9 +1,9 @@
 use bevy::animation::AnimatedBy;
 use bevy::asset::RenderAssetUsages;
+use bevy::image::ImageSampler;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::gltf::Gltf;
-use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight};
-use bevy::pbr::ContactShadows;
+use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight, NotShadowCaster};
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use bevy::window::{PresentMode, PrimaryWindow, WindowResolution};
@@ -14,7 +14,7 @@ use moba_shared::{
     particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
     sample_water_surface_at, shell_casing_physics_bundle, target_physics_bundle,
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
-    ClientInputCommand, ClientPhysicsPredictionState, ModelTransformConfig, ColliderDisabled, GameConfig,
+    ClientInputCommand, ClientPhysicsPredictionState, ModelTransformConfig, SharedFogOfWar, FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
     CHANNEL_UNRELIABLE_STATE,
@@ -59,7 +59,7 @@ fn main() {
             }),
             ..default()
         }))
-        .insert_resource(DirectionalLightShadowMap { size: 4096 })
+        .insert_resource(DirectionalLightShadowMap { size: 2048 })
         .insert_resource(config)
         .insert_resource(ClientNetwork { client, transport })
         .insert_resource(render_state)
@@ -100,6 +100,9 @@ fn main() {
                 update_map_object_labels_system,
                 minimap_interaction_system,
                 minimap_overlay_update_system,
+                fog_of_war_update_system,
+                occlusion_transparency_system,
+                optimize_tree_shadows_system,
             )
                 .chain(),
         )
@@ -161,6 +164,7 @@ struct VisualTarget {
     base_scale: Vec3,
     base_color: Color,
     is_dead: bool,
+    is_server_visible: bool,
 }
 
 #[derive(Component)]
@@ -264,6 +268,31 @@ struct MinimapTargetDot {
 
 #[derive(Component)]
 struct MinimapCameraBox;
+
+#[derive(Component)]
+struct TreeVisualMarker {
+    shadows_optimized: bool,
+}
+
+#[derive(Component)]
+struct VisionOccludable {
+    half_extents: Vec3,
+    is_faded: bool,
+}
+
+#[derive(Component)]
+struct OccludedMaterialState {
+    original_handle: Handle<StandardMaterial>,
+    original_alpha: f32,
+    current_alpha: f32,
+}
+
+#[derive(Resource)]
+struct FogOfWarState {
+    shared: SharedFogOfWar,
+    alpha_grid: Vec<f32>,
+    fog_image: Handle<Image>,
+}
 
 #[derive(Resource)]
 struct SoldierGltfHandle(Handle<Gltf>);
@@ -447,7 +476,6 @@ fn setup_scene(
     commands.spawn((
         Camera3d::default(),
         MobaCamera,
-        ContactShadows::default(),
         DistanceFog {
             color: Color::srgba(0.68, 0.76, 0.84, 1.0),
             directional_light_color: Color::srgba(1.0, 0.92, 0.78, 0.45),
@@ -471,7 +499,7 @@ fn setup_scene(
             color: Color::srgb(1.0, 0.96, 0.88),
             illuminance: config.lighting.directional_illuminance,
             shadow_maps_enabled: true,
-            contact_shadows_enabled: true,
+            contact_shadows_enabled: false,
             affects_lightmapped_mesh_diffuse: true,
             shadow_depth_bias: config.lighting.directional_shadow_depth_bias,
             shadow_normal_bias: config.lighting.directional_shadow_normal_bias,
@@ -479,11 +507,11 @@ fn setup_scene(
         },
         Transform::from_translation(light_pos).looking_at(Vec3::ZERO, Vec3::Y),
         CascadeShadowConfigBuilder {
-            num_cascades: 4,
+            num_cascades: 3,
             minimum_distance: 0.5,
-            maximum_distance: 230.0,
-            first_cascade_far_bound: 32.0,
-            overlap_proportion: 0.2,
+            maximum_distance: 130.0,
+            first_cascade_far_bound: 26.0,
+            overlap_proportion: 0.15,
         }
         .build(),
     ));
@@ -799,6 +827,7 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        ent_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
         let wf_ent = ent_cmds.id();
         if custom_glb_exists(&wf.model_path) {
             ent_cmds.with_children(|parent| {
@@ -1028,6 +1057,7 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        anc_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(bs.x * 0.5, anc.core_height * 0.6, bs.z * 0.5) });
         let anc_ent = anc_cmds.id();
         if custom_glb_exists(&anc.model_path) {
             anc_cmds.with_children(|parent| {
@@ -1127,6 +1157,7 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        tur_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(tur.base_radius * 1.4, tur.height * 0.55, tur.base_radius * 1.4) });
         let tur_ent = tur_cmds.id();
         if custom_glb_exists(&tur.model_path) {
             tur_cmds.with_children(|parent| {
@@ -1207,6 +1238,7 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        mtn_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
         let mtn_ent = mtn_cmds.id();
         if custom_glb_exists(&mtn.model_path) {
             mtn_cmds.with_children(|parent| {
@@ -1268,6 +1300,8 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        tree_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(tree.canopy_radius, (tree.trunk_height + tree.canopy_height) * 0.5, tree.canopy_radius) });
+        tree_cmds.insert(TreeVisualMarker { shadows_optimized: false });
         let tree_ent = tree_cmds.id();
         if custom_glb_exists(&tree.model_path) {
             tree_cmds.with_children(|parent| {
@@ -1359,6 +1393,7 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        obs_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
         let obs_ent = obs_cmds.id();
         if custom_glb_exists(&obs.model_path) {
             obs_cmds.with_children(|parent| {
@@ -1397,6 +1432,7 @@ fn setup_scene(
                 base_scale: t.model_transform.scale_vec(),
                 base_color: color,
                 is_dead: false,
+                is_server_visible: true,
             },
             target_physics_bundle(&config, index, t),
         ));
@@ -1464,10 +1500,32 @@ fn setup_scene(
         ));
     }
 
-    // ۱۶. ساخت تکسچر دقیق مینی‌مپ از تمام مسیرها و آبجکت‌های نقشه و نمایش آن در پایین سمت راست
+    // ۱۶. ساخت سیستم Fog of War (مه جنگ Dota 2 با برتری ارتفاع و موانع دید)
+    let fow_state = init_fog_of_war(&config, &mut images);
+    let fog_handle = fow_state.fog_image.clone();
+    commands.spawn((
+        Mesh3d(
+            meshes.add(
+                Plane3d::default()
+                    .mesh()
+                    .size(config.map.map_dimensions.0, config.map.map_dimensions.1),
+            ),
+        ),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            base_color_texture: Some(fog_handle.clone()),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        })),
+        Transform::from_xyz(0.0, 2.75, 0.0),
+    ));
+    commands.insert_resource(fow_state);
+
+    // ۱۷. ساخت تکسچر دقیق مینی‌مپ از تمام مسیرها و آبجکت‌های نقشه و نمایش آن در پایین سمت راست
     let minimap_image = bake_minimap_image(&config);
     let minimap_handle = images.add(minimap_image);
-    spawn_minimap_ui(&mut commands, &config, minimap_handle);
+    spawn_minimap_ui(&mut commands, &config, minimap_handle, fog_handle);
 
     let gltf_handle = asset_server.load(&config.animations.model_path);
     commands.insert_resource(SoldierGltfHandle(gltf_handle));
@@ -2110,6 +2168,7 @@ fn client_receive_snapshot_and_sync_system(
     mut render_state: ResMut<ClientRenderState>,
     mut prediction: ResMut<ClientPhysicsPredictionState>,
     mut shake: ResMut<CameraShake>,
+    mut fow: Option<ResMut<FogOfWarState>>,
     mut soldier_visual_query: Query<
         &mut Transform,
         (
@@ -2186,6 +2245,9 @@ fn client_receive_snapshot_and_sync_system(
         render_state.is_dead = snap.is_dead;
         render_state.death_anim_name = snap.death_anim_name;
         render_state.in_water = snap.in_water;
+        if let Some(ref mut fow_state) = fow {
+            fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
+        }
 
         prediction.traversal_active = snap.traversal_active;
         prediction.is_dead = snap.is_dead;
@@ -2201,6 +2263,7 @@ fn client_receive_snapshot_and_sync_system(
             v_target.max_hp = s_target.max_hp;
             v_target.hit_flash_timer = s_target.hit_flash_timer;
             v_target.is_dead = s_target.is_dead;
+            v_target.is_server_visible = s_target.is_visible;
 
             if !was_dead && s_target.is_dead {
                 commands.entity(entity).insert(ColliderDisabled);
@@ -2566,7 +2629,7 @@ fn target_visual_reaction_system(
     let lerp_speed = config.fx.target_recover_lerp_speed;
 
     for (mut tf, mut vis, mat_handle_opt, target) in &mut target_query {
-        if target.is_dead {
+        if target.is_dead || !target.is_server_visible {
             *vis = Visibility::Hidden;
             continue;
         }
@@ -2898,7 +2961,7 @@ fn world_to_minimap_uv(config: &GameConfig, world_x: f32, world_z: f32) -> Vec2 
     )
 }
 
-fn spawn_minimap_ui(commands: &mut Commands, config: &GameConfig, minimap_handle: Handle<Image>) {
+fn spawn_minimap_ui(commands: &mut Commands, config: &GameConfig, minimap_handle: Handle<Image>, fog_handle: Handle<Image>) {
     let mut target_dots = Vec::new();
     for index in 0..config.targets.len() {
         target_dots.push(index);
@@ -2924,6 +2987,19 @@ fn spawn_minimap_ui(commands: &mut Commands, config: &GameConfig, minimap_handle
             // تصویر پس‌زمینه رندر شده از تمام مسیرها، رودها، کوه‌ها، درخت‌ها و سازه‌های نقشه
             parent.spawn((
                 ImageNode::new(minimap_handle),
+                Node {
+                    width: percent(100),
+                    height: percent(100),
+                    position_type: PositionType::Absolute,
+                    left: px(0.0),
+                    top: px(0.0),
+                    ..default()
+                },
+            ));
+
+            // لایه زنده Fog of War روی مینی‌مپ
+            parent.spawn((
+                ImageNode::new(fog_handle),
                 Node {
                     width: percent(100),
                     height: percent(100),
@@ -3065,6 +3141,7 @@ fn minimap_interaction_system(
 
 fn minimap_overlay_update_system(
     config: Res<GameConfig>,
+    fow: Option<Res<FogOfWarState>>,
     render_state: Res<ClientRenderState>,
     camera_control: Res<CameraControlState>,
     soldier_query: Query<&Transform, With<SoldierMarker>>,
@@ -3112,7 +3189,7 @@ fn minimap_overlay_update_system(
 
     for (dot, mut node, mut vis) in &mut target_dot_query {
         if let Some(vt) = target_query.iter().find(|t| t.index == dot.index) {
-            if vt.is_dead {
+            if vt.is_dead || !vt.is_server_visible {
                 *vis = Visibility::Hidden;
             } else {
                 *vis = Visibility::Visible;
@@ -3475,4 +3552,241 @@ fn bake_minimap_image(config: &GameConfig) -> Image {
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     )
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم Fog of War (شبیه Dota 2) و شفاف‌سازی آبجکت‌های مسدودکننده دید دوربین
+// -----------------------------------------------------------------------------
+
+fn init_fog_of_war(config: &GameConfig, images: &mut Assets<Image>) -> FogOfWarState {
+    let hero_team = config
+        .heroes
+        .first()
+        .map(|h| h.team)
+        .unwrap_or(TeamId::Dawn);
+    let shared = SharedFogOfWar::from_config(config, hero_team);
+    let total = FOW_GRID_W * FOW_GRID_H;
+
+    let mut img = Image::new_fill(
+        Extent3d {
+            width: FOW_GRID_W as u32,
+            height: FOW_GRID_H as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[10, 16, 28, 220],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    img.sampler = ImageSampler::linear();
+    let fog_image = images.add(img);
+
+    FogOfWarState {
+        shared,
+        alpha_grid: vec![0.86; total],
+        fog_image,
+    }
+}
+
+fn fog_of_war_update_system(
+    time: Res<Time>,
+    mut fow: ResMut<FogOfWarState>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let dt = time.delta_secs();
+    let t = time.elapsed_secs();
+
+    let lerp_rate = (10.0 * dt).clamp(0.05, 1.0);
+    let fog_handle = fow.fog_image.clone();
+    let Some(mut img) = images.get_mut(&fog_handle) else {
+        return;
+    };
+    let Some(ref mut data) = img.data else {
+        return;
+    };
+
+    for gz in 0..FOW_GRID_H {
+        for gx in 0..FOW_GRID_W {
+            let idx = gz * FOW_GRID_W + gx;
+            let is_vis = fow.shared.visible_now[idx];
+            let is_exp = fow.shared.explored[idx];
+            let target_alpha = if is_vis {
+                0.0
+            } else if is_exp {
+                0.55
+            } else {
+                0.86
+            };
+
+            fow.alpha_grid[idx] =
+                fow.alpha_grid[idx] + (target_alpha - fow.alpha_grid[idx]) * lerp_rate;
+            let shimmer =
+                ((gx as f32 * 0.18 + t * 0.9).sin() * (gz as f32 * 0.18 - t * 0.7).cos()) * 0.025;
+            let a = if target_alpha == 0.0 && fow.alpha_grid[idx] < 0.04 {
+                0.0
+            } else {
+                (fow.alpha_grid[idx] + shimmer).clamp(0.0, 0.92)
+            };
+
+            let p = idx * 4;
+            if is_exp {
+                data[p] = 12;
+                data[p + 1] = 20;
+                data[p + 2] = 36;
+            } else {
+                data[p] = 6;
+                data[p + 1] = 10;
+                data[p + 2] = 18;
+            }
+            data[p + 3] = (a * 255.0) as u8;
+        }
+    }
+}
+
+fn segment_intersects_aabb(seg_a: Vec3, seg_b: Vec3, center: Vec3, half: Vec3, rot: Quat) -> bool {
+    let inv_rot = rot.inverse();
+    let la = inv_rot * (seg_a - center);
+    let lb = inv_rot * (seg_b - center);
+    let dir = lb - la;
+
+    let mut t_min = 0.0_f32;
+    let mut t_max = 1.0_f32;
+
+    for axis in 0..3 {
+        let o = la[axis];
+        let d = dir[axis];
+        let h = half[axis];
+        if d.abs() < 1e-5 {
+            if o < -h || o > h {
+                return false;
+            }
+        } else {
+            let inv_d = 1.0 / d;
+            let mut t1 = (-h - o) * inv_d;
+            let mut t2 = (h - o) * inv_d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            t_min = t_min.max(t1);
+            t_max = t_max.min(t2);
+            if t_min > t_max {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn optimize_tree_shadows_system(
+    mut commands: Commands,
+    mut tree_query: Query<(Entity, &mut TreeVisualMarker)>,
+    children_query: Query<&Children>,
+    mesh_query: Query<(), With<Mesh3d>>,
+) {
+    for (tree_ent, mut marker) in &mut tree_query {
+        if marker.shadows_optimized {
+            continue;
+        }
+        let mut found_mesh = false;
+        if mesh_query.contains(tree_ent) {
+            commands.entity(tree_ent).insert(NotShadowCaster);
+            found_mesh = true;
+        }
+        for desc in children_query.iter_descendants(tree_ent) {
+            if mesh_query.contains(desc) {
+                commands.entity(desc).insert(NotShadowCaster);
+                found_mesh = true;
+            }
+        }
+        if found_mesh {
+            marker.shadows_optimized = true;
+        }
+    }
+}
+
+fn occlusion_transparency_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    render_state: Res<ClientRenderState>,
+    camera_query: Query<&GlobalTransform, With<MobaCamera>>,
+    mut occludable_query: Query<(Entity, &GlobalTransform, &mut VisionOccludable)>,
+    children_query: Query<&Children>,
+    mut mat_mesh_query: Query<(
+        &mut MeshMaterial3d<StandardMaterial>,
+        Option<&mut OccludedMaterialState>,
+    )>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let Ok(cam_gtf) = camera_query.single() else {
+        return;
+    };
+    let cam_pos = cam_gtf.translation();
+    let hero_focus = render_state.soldier_pos + Vec3::Y * 1.1;
+    let dt = time.delta_secs();
+    let fade_speed = (10.0 * dt).clamp(0.05, 1.0);
+
+    for (root_entity, root_gtf, mut occ) in &mut occludable_query {
+        let (scale, rot, center) = root_gtf.to_scale_rotation_translation();
+        let padded_half = Vec3::new(
+            occ.half_extents.x * scale.x.abs() + 1.2,
+            occ.half_extents.y * scale.y.abs() + 0.6,
+            occ.half_extents.z * scale.z.abs() + 1.2,
+        );
+
+        let is_blocking = segment_intersects_aabb(cam_pos, hero_focus, center, padded_half, rot);
+        if !is_blocking && !occ.is_faded {
+            continue;
+        }
+
+        let target_alpha = if is_blocking { 0.22_f32 } else { 1.0_f32 };
+        let mut any_still_faded = false;
+
+        let mut process_entity = |ent: Entity| {
+            let Ok((mut mat_comp, state_opt)) = mat_mesh_query.get_mut(ent) else {
+                return;
+            };
+
+            if let Some(mut state) = state_opt {
+                let goal = if is_blocking { 0.22 } else { state.original_alpha };
+                state.current_alpha = state.current_alpha + (goal - state.current_alpha) * fade_speed;
+
+                if !is_blocking && (state.current_alpha - state.original_alpha).abs() < 0.025 {
+                    // بازگردانی Handle اصلی اشتراکی برای حفظ کامل GPU Instancing
+                    mat_comp.0 = state.original_handle.clone();
+                    commands.entity(ent).remove::<OccludedMaterialState>();
+                } else {
+                    any_still_faded = true;
+                    if let Some(mut mat) = materials.get_mut(&mat_comp.0) {
+                        mat.base_color.set_alpha(state.current_alpha);
+                        mat.alpha_mode = AlphaMode::Blend;
+                    }
+                }
+            } else if is_blocking {
+                if let Some(orig_mat) = materials.get(&mat_comp.0).cloned() {
+                    let orig_handle = mat_comp.0.clone();
+                    let orig_alpha = orig_mat.base_color.alpha();
+                    let mut cloned = orig_mat;
+                    let new_alpha = orig_alpha + (target_alpha - orig_alpha) * fade_speed;
+                    cloned.base_color.set_alpha(new_alpha);
+                    cloned.alpha_mode = AlphaMode::Blend;
+                    let new_handle = materials.add(cloned);
+                    mat_comp.0 = new_handle;
+                    commands.entity(ent).insert(OccludedMaterialState {
+                        original_handle: orig_handle,
+                        original_alpha: orig_alpha,
+                        current_alpha: new_alpha,
+                    });
+                    any_still_faded = true;
+                }
+            }
+        };
+
+        process_entity(root_entity);
+        for desc in children_query.iter_descendants(root_entity) {
+            process_entity(desc);
+        }
+
+        occ.is_faded = is_blocking || any_still_faded;
+    }
 }

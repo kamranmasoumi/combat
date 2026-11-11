@@ -23,6 +23,7 @@ pub struct GameConfig {
     pub lighting: LightingConfig,
     pub weapon_tuner: WeaponTunerConfig,
     pub physics: PhysicsConfig,
+    pub heroes: Vec<HeroDef>,
     pub soldier: SoldierConfig,
     pub combat: CombatConfig,
     pub fx: FxConfig,
@@ -334,6 +335,17 @@ pub struct PhysicsConfig {
     pub orient_min_dir_sq: f32,
     pub water_move_speed_multiplier: f32,
     pub water_splash_interval_secs: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroDef {
+    pub id: String,
+    pub display_name: String,
+    pub team: TeamId,
+    pub vision_range: f32,
+    pub high_ground_vision_bonus: f32,
+    pub move_speed_multiplier: f32,
+    pub max_hp: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -810,6 +822,7 @@ pub struct TargetSnapshot {
     pub max_hp: f32,
     pub hit_flash_timer: f32,
     pub is_dead: bool,
+    pub is_visible: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -827,6 +840,7 @@ pub struct ServerWorldSnapshot {
     pub is_dead: bool,
     pub death_anim_name: String,
     pub in_water: bool,
+    pub fog_visible_mask: Vec<u8>,
     pub bullets: Vec<BulletSnapshot>,
     pub grenades: Vec<GrenadeSnapshot>,
     pub targets: Vec<TargetSnapshot>,
@@ -2544,6 +2558,270 @@ pub fn can_observer_see_point(
         .is_none()
 }
 
+pub const FOW_GRID_W: usize = 170;
+pub const FOW_GRID_H: usize = 120;
+
+/// سیستم Fog of War مشترک (Server-Authoritative در moba_shared)
+/// سرور هر تیک دید هیرو و سازه‌های تیم را محاسبه می‌کند، آبجکت‌های خارج از دید را فیلتر می‌کند
+/// و ماسک فشرده دید (`fog_visible_mask`) را برای نمایش به کلاینت می‌فرستد.
+#[derive(Clone, Debug)]
+pub struct SharedFogOfWar {
+    pub terrain_y: Vec<f32>,
+    pub blocker: Vec<bool>,
+    pub explored: Vec<bool>,
+    pub visible_now: Vec<bool>,
+    pub allied_sources: Vec<(Vec3, f32)>,
+}
+
+impl SharedFogOfWar {
+    pub fn from_config(config: &GameConfig, hero_team: TeamId) -> Self {
+        let total = FOW_GRID_W * FOW_GRID_H;
+        let mut terrain_y = vec![0.0_f32; total];
+        let mut blocker = vec![false; total];
+
+        for gz in 0..FOW_GRID_H {
+            for gx in 0..FOW_GRID_W {
+                let (wx, wz) = Self::cell_to_world(config, gx, gz);
+                let idx = gz * FOW_GRID_W + gx;
+
+                let mut best_y = -1.6_f32;
+                for plat in &config.map.terrains {
+                    let loc = plat.model_transform.location;
+                    let scl = plat.model_transform.scale;
+                    let hx = plat.size.0 * 0.5 * scl.0.abs();
+                    let hz = plat.size.2 * 0.5 * scl.2.abs();
+                    if (wx - loc.0).abs() <= hx && (wz - loc.2).abs() <= hz {
+                        let top_y = loc.1 + plat.size.1 * 0.5 * scl.1.abs();
+                        best_y = best_y.max(top_y);
+                    }
+                }
+
+                let bridge = &config.map.center_bridge;
+                let b_loc = bridge.model_transform.location;
+                let b_s = bridge
+                    .model_transform
+                    .scale
+                    .0
+                    .abs()
+                    .max(bridge.model_transform.scale.2.abs());
+                let b_rad = bridge.outer_radius * b_s;
+                let dx = wx - b_loc.0;
+                let dz = wz - b_loc.2;
+                if dx * dx + dz * dz <= b_rad * b_rad {
+                    best_y = best_y.max(
+                        b_loc.1 + bridge.deck_thickness * 0.5 * bridge.model_transform.scale.1.abs(),
+                    );
+                }
+
+                terrain_y[idx] = best_y;
+
+                let mut blocked = false;
+                for mtn in &config.map.mountains {
+                    let loc = mtn.model_transform.location;
+                    let scl = mtn.model_transform.scale;
+                    let hx = mtn.size.0 * 0.5 * scl.0.abs();
+                    let hz = mtn.size.2 * 0.5 * scl.2.abs();
+                    let inv_rot =
+                        Quat::from_rotation_y(-mtn.model_transform.rotation.1.to_radians());
+                    let local = inv_rot * Vec3::new(wx - loc.0, 0.0, wz - loc.2);
+                    if local.x.abs() <= hx && local.z.abs() <= hz {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if !blocked {
+                    for obs in &config.obstacles {
+                        if obs.can_vault {
+                            continue;
+                        }
+                        let loc = obs.model_transform.location;
+                        let scl = obs.model_transform.scale;
+                        let hx = obs.size.0 * 0.5 * scl.0.abs();
+                        let hz = obs.size.2 * 0.5 * scl.2.abs();
+                        let inv_rot =
+                            Quat::from_rotation_y(-obs.model_transform.rotation.1.to_radians());
+                        let local = inv_rot * Vec3::new(wx - loc.0, 0.0, wz - loc.2);
+                        if local.x.abs() <= hx && local.z.abs() <= hz {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                }
+                if !blocked {
+                    for tree in &config.map.trees {
+                        let loc = tree.model_transform.location;
+                        let ts = tree
+                            .model_transform
+                            .scale
+                            .0
+                            .abs()
+                            .max(tree.model_transform.scale.2.abs());
+                        let r = (tree.trunk_radius * 1.45 * ts).max(0.85);
+                        let tdx = wx - loc.0;
+                        let tdz = wz - loc.2;
+                        if tdx * tdx + tdz * tdz <= r * r {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                }
+                blocker[idx] = blocked;
+            }
+        }
+
+        let mut allied_sources = Vec::new();
+        for ftn in &config.map.fountains {
+            if ftn.team == hero_team {
+                let loc = ftn.model_transform.location;
+                allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), 24.0));
+            }
+        }
+        for anc in &config.map.ancients {
+            if anc.team == hero_team {
+                let loc = anc.model_transform.location;
+                allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), 26.0));
+            }
+        }
+        for tur in &config.map.turrets {
+            if tur.team == hero_team {
+                let loc = tur.model_transform.location;
+                allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), tur.attack_range + 4.0));
+            }
+        }
+
+        Self {
+            terrain_y,
+            blocker,
+            explored: vec![false; total],
+            visible_now: vec![false; total],
+            allied_sources,
+        }
+    }
+
+    #[inline]
+    pub fn world_to_cell(config: &GameConfig, wx: f32, wz: f32) -> Option<(usize, usize)> {
+        let map_w = config.map.map_dimensions.0.max(1.0);
+        let map_h = config.map.map_dimensions.1.max(1.0);
+        let u = wx / map_w + 0.5;
+        let v = wz / map_h + 0.5;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return None;
+        }
+        let gx = ((u * FOW_GRID_W as f32) as usize).min(FOW_GRID_W - 1);
+        let gz = ((v * FOW_GRID_H as f32) as usize).min(FOW_GRID_H - 1);
+        Some((gx, gz))
+    }
+
+    #[inline]
+    pub fn cell_to_world(config: &GameConfig, gx: usize, gz: usize) -> (f32, f32) {
+        let map_w = config.map.map_dimensions.0;
+        let map_h = config.map.map_dimensions.1;
+        let u = (gx as f32 + 0.5) / FOW_GRID_W as f32;
+        let v = (gz as f32 + 0.5) / FOW_GRID_H as f32;
+        ((u - 0.5) * map_w, (v - 0.5) * map_h)
+    }
+
+    #[inline]
+    pub fn is_world_point_visible(&self, config: &GameConfig, wx: f32, wz: f32) -> bool {
+        if let Some((gx, gz)) = Self::world_to_cell(config, wx, wz) {
+            self.visible_now[gz * FOW_GRID_W + gx]
+        } else {
+            false
+        }
+    }
+
+    fn reveal_from_source(
+        &mut self,
+        config: &GameConfig,
+        origin: Vec3,
+        vision_range: f32,
+        ray_count: usize,
+    ) {
+        let origin_y = Self::world_to_cell(config, origin.x, origin.z)
+            .map(|(gx, gz)| self.terrain_y[gz * FOW_GRID_W + gx])
+            .unwrap_or(origin.y);
+
+        let step_size = 1.5_f32;
+        let steps = (vision_range / step_size).ceil() as usize;
+
+        for r_i in 0..ray_count {
+            let angle = (r_i as f32) * (std::f32::consts::PI * 2.0 / ray_count as f32);
+            let dx = angle.cos();
+            let dz = angle.sin();
+
+            for s_i in 0..=steps {
+                let dist = s_i as f32 * step_size;
+                if dist > vision_range {
+                    break;
+                }
+                let wx = origin.x + dx * dist;
+                let wz = origin.z + dz * dist;
+                let Some((gx, gz)) = Self::world_to_cell(config, wx, wz) else {
+                    break;
+                };
+                let idx = gz * FOW_GRID_W + gx;
+
+                let cell_y = self.terrain_y[idx];
+                if cell_y - origin_y >= config.map.high_ground_occlusion_min_diff {
+                    break;
+                }
+
+                self.visible_now[idx] = true;
+                self.explored[idx] = true;
+
+                if self.blocker[idx] && dist > 1.8 {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef) {
+        self.visible_now.fill(false);
+
+        let hero_ground_y = Self::world_to_cell(config, hero_pos.x, hero_pos.z)
+            .map(|(gx, gz)| self.terrain_y[gz * FOW_GRID_W + gx])
+            .unwrap_or(hero_pos.y);
+
+        let hero_range = hero.vision_range
+            + if hero_ground_y >= config.map.high_ground_occlusion_min_diff {
+                hero.high_ground_vision_bonus
+            } else {
+                0.0
+            };
+
+        self.reveal_from_source(config, hero_pos, hero_range, 240);
+
+        let allied = self.allied_sources.clone();
+        for (src_pos, src_range) in allied {
+            self.reveal_from_source(config, src_pos, src_range, 72);
+        }
+    }
+
+    pub fn pack_visible_mask(&self) -> Vec<u8> {
+        let byte_len = self.visible_now.len().div_ceil(8);
+        let mut mask = vec![0u8; byte_len];
+        for (i, &vis) in self.visible_now.iter().enumerate() {
+            if vis {
+                mask[i / 8] |= 1 << (i % 8);
+            }
+        }
+        mask
+    }
+
+    pub fn apply_visible_mask(&mut self, mask: &[u8]) {
+        for (i, vis) in self.visible_now.iter_mut().enumerate() {
+            let b = mask.get(i / 8).copied().unwrap_or(0);
+            let is_vis = ((b >> (i % 8)) & 1) != 0;
+            *vis = is_vis;
+            if is_vis {
+                self.explored[i] = true;
+            }
+        }
+    }
+}
+
+
 // -----------------------------------------------------------------------------
 // ۵. وضعیت کامل شبیه‌سازی (درون moba_shared برای جلوگیری از بازنویسی)
 // -----------------------------------------------------------------------------
@@ -2612,10 +2890,13 @@ pub struct AuthoritativeWorldState {
     pub is_dead: bool,
     pub death_anim_name: String,
     pub respawn_remaining: f32,
+    pub hero_index: usize,
+    pub fog_of_war: SharedFogOfWar,
     pub in_water: bool,
     pub water_splash_cooldown: f32,
     pub traversal: SharedTraversalState,
     pub targets: Vec<SharedTarget>,
+    pub targets_visible: Vec<bool>,
     pub bullets_snapshot: Vec<BulletSnapshot>,
     pub grenades_snapshot: Vec<GrenadeSnapshot>,
     pub pending_fx: Vec<GameplayFxEvent>,
@@ -2648,6 +2929,12 @@ impl AuthoritativeWorldState {
             config.soldier.initial_aim_dir.2,
         )
         .normalize();
+        let hero_team = config
+            .heroes
+            .first()
+            .map(|h| h.team)
+            .unwrap_or(TeamId::Dawn);
+        let fog_of_war = SharedFogOfWar::from_config(config, hero_team);
         let initial_aim_hit = Vec3::new(
             config.soldier.initial_aim_hit_pos.0,
             config.soldier.initial_aim_hit_pos.1,
@@ -2677,6 +2964,8 @@ impl AuthoritativeWorldState {
             is_dead: false,
             death_anim_name: String::new(),
             respawn_remaining: 0.0,
+            hero_index: 0,
+            fog_of_war,
             in_water: false,
             water_splash_cooldown: 0.0,
             traversal: SharedTraversalState {
@@ -2689,6 +2978,7 @@ impl AuthoritativeWorldState {
                 target_pos: spawn_pos,
                 travel_dir: initial_aim_dir,
             },
+            targets_visible: vec![true; targets.len()],
             targets,
             bullets_snapshot: Vec::new(),
             grenades_snapshot: Vec::new(),
@@ -2732,18 +3022,27 @@ impl AuthoritativeWorldState {
             is_dead: self.is_dead,
             death_anim_name: self.death_anim_name.clone(),
             in_water: self.in_water,
+            fog_visible_mask: self.fog_of_war.pack_visible_mask(),
             bullets: self.bullets_snapshot.clone(),
             grenades: self.grenades_snapshot.clone(),
             targets: self
                 .targets
                 .iter()
                 .enumerate()
-                .map(|(index, t)| TargetSnapshot {
-                    index,
-                    hp: t.hp,
-                    max_hp: t.max_hp,
-                    hit_flash_timer: t.hit_flash_timer,
-                    is_dead: t.is_dead,
+                .map(|(index, t)| {
+                    let is_visible = self
+                        .targets_visible
+                        .get(index)
+                        .copied()
+                        .unwrap_or(true);
+                    TargetSnapshot {
+                        index,
+                        hp: if is_visible { t.hp } else { t.max_hp },
+                        max_hp: t.max_hp,
+                        hit_flash_timer: if is_visible { t.hit_flash_timer } else { 0.0 },
+                        is_dead: t.is_dead,
+                        is_visible,
+                    }
                 })
                 .collect(),
             fx_events: Vec::new(),
@@ -3806,6 +4105,27 @@ fn shared_authoritative_react_system(
             }
         },
     );
+
+    // محاسبه Authoritative مه جنگ (Fog of War) در سرور بر اساس ویژگی vision هیرو
+    if let Some(hero) = config.heroes.get(world.hero_index) {
+        let hero_pos = world.soldier_pos;
+        world.fog_of_war.update_for_hero(&config, hero_pos, hero);
+
+        for idx in 0..world.targets.len() {
+            let t_pos = world.targets[idx].base_pos;
+            world.targets_visible[idx] =
+                world.fog_of_war.is_world_point_visible(&config, t_pos.x, t_pos.z);
+        }
+
+        let world_inner = &mut *world;
+        let fow_ref = &world_inner.fog_of_war;
+        world_inner
+            .bullets_snapshot
+            .retain(|b| fow_ref.is_world_point_visible(&config, b.translation.x, b.translation.z));
+        world_inner
+            .grenades_snapshot
+            .retain(|g| fow_ref.is_world_point_visible(&config, g.translation.x, g.translation.z));
+    }
 
     if let Some(ref mut active_input) = world.active_input {
         active_input.consume_just_pressed();

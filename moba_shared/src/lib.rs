@@ -332,6 +332,8 @@ pub struct PhysicsConfig {
     pub aim_target_min_dist_sq: f32,
     pub muzzle_aim_min_dist_sq: f32,
     pub orient_min_dir_sq: f32,
+    pub water_move_speed_multiplier: f32,
+    pub water_splash_interval_secs: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -414,7 +416,7 @@ pub struct AnimationConfig {
 }
 
 // -----------------------------------------------------------------------------
-// ۱-ب. ساختارهای کامل نقشه MOBA + Tactical Shooter
+// ۱-ب. ساختارهای کامل نقشه MOBA + Tactical Shooter (همراه با model_path برای جایگزینی GLB)
 // -----------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -470,6 +472,7 @@ pub struct MapConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TerrainPlatformDef {
     pub id: String,
+    pub model_path: String,
     pub team: TeamId,
     pub elevation_tier: i32,
     pub pos: (f32, f32, f32),
@@ -481,6 +484,7 @@ pub struct TerrainPlatformDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RampDef {
     pub id: String,
+    pub model_path: String,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub rotation_euler_deg: (f32, f32, f32),
@@ -491,9 +495,11 @@ pub struct RampDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RiverSegmentDef {
     pub id: String,
+    pub model_path: String,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub yaw_deg: f32,
+    pub flow_dir: (f32, f32),
     pub color_rgb: (f32, f32, f32),
     pub emissive_rgb: (f32, f32, f32),
     pub roughness: f32,
@@ -502,6 +508,7 @@ pub struct RiverSegmentDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WaterfallDef {
     pub id: String,
+    pub model_path: String,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub yaw_deg: f32,
@@ -513,6 +520,7 @@ pub struct WaterfallDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CenterBridgeDef {
     pub id: String,
+    pub model_path: String,
     pub center_pos: (f32, f32, f32),
     pub outer_radius: f32,
     pub deck_thickness: f32,
@@ -527,6 +535,7 @@ pub struct CenterBridgeDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FountainDef {
     pub id: String,
+    pub model_path: String,
     pub team: TeamId,
     pub pos: (f32, f32, f32),
     pub outer_radius: f32,
@@ -541,6 +550,7 @@ pub struct FountainDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AncientDef {
     pub id: String,
+    pub model_path: String,
     pub team: TeamId,
     pub pos: (f32, f32, f32),
     pub base_size: (f32, f32, f32),
@@ -554,6 +564,7 @@ pub struct AncientDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TurretDef {
     pub id: String,
+    pub model_path: String,
     pub team: TeamId,
     pub lane: LaneId,
     pub tier: u8,
@@ -570,6 +581,7 @@ pub struct TurretDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MountainDef {
     pub id: String,
+    pub model_path: String,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub yaw_deg: f32,
@@ -580,6 +592,7 @@ pub struct MountainDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TreeDef {
     pub id: String,
+    pub model_path: String,
     pub tree_size: TreeSize,
     pub pos: (f32, f32, f32),
     pub trunk_radius: f32,
@@ -604,6 +617,7 @@ pub struct LanePathDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ObstacleDef {
     pub id: String,
+    pub model_path: String,
     pub kind: CoverKind,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
@@ -616,6 +630,7 @@ pub struct ObstacleDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TargetDef {
     pub id: String,
+    pub model_path: String,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub color_rgb: (f32, f32, f32),
@@ -724,6 +739,10 @@ pub enum GameplayFxEvent {
     SlideDust {
         pos: Vec3,
     },
+    WaterSplash {
+        pos: Vec3,
+        intensity: f32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -765,6 +784,7 @@ pub struct ServerWorldSnapshot {
     pub traversal_anim_name: String,
     pub is_dead: bool,
     pub death_anim_name: String,
+    pub in_water: bool,
     pub bullets: Vec<BulletSnapshot>,
     pub grenades: Vec<GrenadeSnapshot>,
     pub targets: Vec<TargetSnapshot>,
@@ -772,7 +792,7 @@ pub struct ServerWorldSnapshot {
 }
 
 // -----------------------------------------------------------------------------
-// ۳. موتور فیزیک ۳بعدی اختصاصی (جایگزین کامل و بدون وابستگی bevy_rapier3d)
+// ۳. موتور فیزیک ۳بعدی اختصاصی + تشخیص تعاملی جریان آب و برکه‌ها
 // -----------------------------------------------------------------------------
 
 pub const GROUP_WORLD: u32 = 1 << 0;
@@ -814,6 +834,30 @@ pub fn grenade_collision_groups() -> CollisionGroups {
 
 pub fn fx_collision_groups() -> CollisionGroups {
     CollisionGroups::new(GROUP_FX, GROUP_WORLD)
+}
+
+/// بررسی قرار گرفتن یک نقطه ۳بعدی درون برکه‌ها و رودخانه‌های نقشه و برگرداندن ارتفاع سطح آب و بردار جریان
+pub fn sample_water_surface_at(config: &GameConfig, world_pos: Vec3) -> Option<(f32, Vec2)> {
+    for seg in &config.map.river_segments {
+        let seg_pos = Vec3::new(seg.pos.0, seg.pos.1, seg.pos.2);
+        let half = Vec3::new(seg.size.0 * 0.5, seg.size.1 * 0.5, seg.size.2 * 0.5);
+        let water_top_y = seg_pos.y + half.y;
+
+        if world_pos.y < water_top_y - 1.35 || world_pos.y > water_top_y + 0.45 {
+            continue;
+        }
+
+        let inv_rot = Quat::from_rotation_y(-seg.yaw_deg.to_radians());
+        let local = inv_rot * (world_pos - seg_pos);
+        // استفاده از شکل بیضوی/نرم در صفحه افقی برای طبیعی‌تر شدن مرز برکه‌ها
+        let nx = local.x / half.x.max(0.1);
+        let nz = local.z / half.z.max(0.1);
+        if nx * nx + nz * nz <= 1.05 {
+            let flow = Vec2::new(seg.flow_dir.0, seg.flow_dir.1).normalize_or_zero();
+            return Some((water_top_y, flow));
+        }
+    }
+    None
 }
 
 /// کامپوننت غیرفعال‌سازی کولایدر (برای اهداف منهدم‌شده)
@@ -923,7 +967,7 @@ pub struct DynamicBodyProps {
     pub ccd_enabled: bool,
 }
 
-/// کنترلر اختصاصی حرکت کاراکتر (جایگزین بدون باگ KinematicCharacterController)
+/// کنترلر اختصاصی حرکت کاراکتر
 #[derive(Component, Clone, Debug, Default)]
 pub struct CustomCharacterController {
     pub translation: Option<Vec3>,
@@ -988,7 +1032,6 @@ impl CustomPhysicsWorld {
             if entry.disabled || !query_groups.interacts_with(entry.groups) {
                 continue;
             }
-            // فیلتر اولیه با کره محیطی برای سرعت بالا
             let to_center = entry.translation - origin;
             let proj = to_center.dot(unit_dir);
             if proj < -entry.bounding_radius || proj > closest_toi + entry.bounding_radius {
@@ -1065,7 +1108,6 @@ impl CustomPhysicsWorld {
                     if let Some(contact) =
                         sphere_vs_static_collider(sphere_center, expanded_r, entry)
                     {
-                        // فقط برخورد با دیوارها و موانع عمودی مانع غلتیدن می‌شود (نه کف زمین)
                         if contact.normal.y < 0.65 {
                             return ((step_idx - 1) as f32 * dt_dist - contact.penetration).max(0.0);
                         }
@@ -1086,7 +1128,6 @@ impl CustomPhysicsWorld {
         config: &GameConfig,
     ) -> (Vec3, bool) {
         if self.static_colliders.is_empty() {
-            // اگر هنوز کولایدرهای محیطی اسپاون نشده‌اند، از سقوط کاراکتر جلوگیری شود
             return (
                 Vec3::new(
                     current_center.x + desired_delta.x,
@@ -1142,7 +1183,6 @@ impl CustomPhysicsWorld {
                         continue;
                     }
 
-                    // بررسی برخورد سه کره تشکیل‌دهنده کپسول عمودی با مانع
                     let mut deepest_wall_contact: Option<SphereContact> = None;
                     for &oy in &sample_offsets_y {
                         let sphere_pos = center + Vec3::Y * oy;
@@ -1150,7 +1190,6 @@ impl CustomPhysicsWorld {
                             sphere_vs_static_collider(sphere_pos, eff_radius, entry)
                         {
                             if contact.normal.y >= max_slope_cos {
-                                // سطح شیب‌دار قابل راه رفتن (رمپ یا زمین): در گام عمودی تنظیم می‌شود
                                 continue;
                             }
                             if deepest_wall_contact
@@ -1163,7 +1202,6 @@ impl CustomPhysicsWorld {
                     }
 
                     if let Some(wall_hit) = deepest_wall_contact {
-                        // بررسی امکان بالا رفتن خودکار (Autostep) اگر ارتفاع مانع کم باشد
                         let step_origin = Vec3::new(
                             center.x,
                             feet_y + autostep_max_h + 0.15,
@@ -1203,7 +1241,7 @@ impl CustomPhysicsWorld {
             }
         }
 
-        // ۲. یافتن ارتفاع دقیق سطح زمین/رمپ/پل زیر پای کاراکتر (۵ پرتو در مقطع کپسول)
+        // ۲. یافتن ارتفاع دقیق سطح زمین/رمپ/حوضچه زیر پای کاراکتر (۵ پرتو در مقطع کپسول)
         let feet_y = center.y - center_y_offset;
         let probe_r = radius * 0.62;
         let footprint_offsets = [
@@ -1247,7 +1285,7 @@ impl CustomPhysicsWorld {
             }
         }
 
-        // ۳. اعمال گرانش و چسبیدن نرم به سطح رمپ یا زمین (Snap-to-Ground)
+        // ۳. اعمال گرانش و چسبیدن نرم به سطح رمپ، زمین یا کف برکه‌ها
         let mut grounded = false;
         let new_feet_y = if let Some(ground_y) = highest_walkable_y {
             let free_fall_feet_y = feet_y + desired_delta.y;
@@ -1258,7 +1296,6 @@ impl CustomPhysicsWorld {
                 free_fall_feet_y
             }
         } else {
-            // کف اضطراری بستر رودخانه در صورتی که کاراکتر خارج از محدوده کولایدرها باشد
             (feet_y + desired_delta.y).max(-1.6)
         };
 
@@ -1375,7 +1412,6 @@ fn ray_intersect_obb(
             }
         } else {
             let inv_d = 1.0 / d;
-            // صفحه -h دارای نرمال بیرونی -1.0 و صفحه +h دارای نرمال بیرونی +1.0 است
             let t_neg_face = (-h - o) * inv_d;
             let t_pos_face = (h - o) * inv_d;
 
@@ -1404,7 +1440,6 @@ fn ray_intersect_obb(
     let (toi, hit_normal_local) = if t_enter >= 0.0 {
         (t_enter, enter_normal_local)
     } else {
-        // مبدا پرتو درون مکعب قرار دارد: نرمال نزدیک‌ترین وجه بیرونی
         let dx = (half.x - local_origin.x.abs()).abs();
         let dy = (half.y - local_origin.y.abs()).abs();
         let dz = (half.z - local_origin.z.abs()).abs();
@@ -1439,7 +1474,6 @@ fn ray_intersect_cylinder(
     let lo = inv_cyl_rot * (origin - cyl_pos);
     let ld = inv_cyl_rot * unit_dir;
 
-    // بررسی اینکه آیا مبدا پرتو درون استوانه قرار دارد
     if lo.x * lo.x + lo.z * lo.z <= radius * radius && lo.y.abs() <= half_height {
         let radial = Vec3::new(lo.x, 0.0, lo.z).normalize_or_zero();
         let n_local = if (half_height - lo.y.abs()) < (radius - (lo.x * lo.x + lo.z * lo.z).sqrt())
@@ -1458,7 +1492,6 @@ fn ray_intersect_cylinder(
     let mut best_t = max_toi + 1.0;
     let mut best_normal_local = Vec3::Y;
 
-    // ۱. برخورد با کلاهک بالا و پایین (y = ±half_height)
     if ld.y.abs() > 1e-6 {
         for &cap_sign in &[-1.0_f32, 1.0_f32] {
             let cap_y = cap_sign * half_height;
@@ -1474,7 +1507,6 @@ fn ray_intersect_cylinder(
         }
     }
 
-    // ۲. برخورد با بدنه جانبی استوانه (x^2 + z^2 = r^2)
     let a = ld.x * ld.x + ld.z * ld.z;
     if a > 1e-6 {
         let b = 2.0 * (lo.x * ld.x + lo.z * ld.z);
@@ -1547,7 +1579,6 @@ fn ray_intersect_sphere(
     }
 }
 
-/// تشخیص برخورد دقیق کره با کولایدر ثابت (OBB یا استوانه)
 pub fn sphere_vs_static_collider(
     sphere_center: Vec3,
     sphere_radius: f32,
@@ -1632,7 +1663,6 @@ fn sphere_vs_obb(
             contact_point: world_contact,
         })
     } else {
-        // مرکز کره داخل جعبه است: خروج از نزدیک‌ترین وجه
         let dx = half.x - local_p.x.abs();
         let dy = half.y - local_p.y.abs();
         let dz = half.z - local_p.z.abs();
@@ -1701,7 +1731,6 @@ fn sphere_vs_cylinder(
             contact_point: cyl_pos + cyl_rot * closest,
         })
     } else {
-        // مرکز کره داخل استوانه قرار گرفته است
         let radial_pen = cyl_radius - radial_dist;
         let cap_pen = half_height - local_p.y.abs();
         let (local_normal, face_dist) = if cap_pen < radial_pen {
@@ -1890,7 +1919,7 @@ pub struct PhysicsParticle {
 }
 
 // -----------------------------------------------------------------------------
-// ۴. باندل‌های ساخت کولایدر و اجسام فیزیکی مشترک نقشه (بدون Rapier)
+// ۴. باندل‌های ساخت کولایدر و اجسام فیزیکی مشترک نقشه
 // -----------------------------------------------------------------------------
 
 pub fn ground_physics_bundle(
@@ -2529,6 +2558,8 @@ pub struct AuthoritativeWorldState {
     pub is_dead: bool,
     pub death_anim_name: String,
     pub respawn_remaining: f32,
+    pub in_water: bool,
+    pub water_splash_cooldown: f32,
     pub traversal: SharedTraversalState,
     pub targets: Vec<SharedTarget>,
     pub bullets_snapshot: Vec<BulletSnapshot>,
@@ -2592,6 +2623,8 @@ impl AuthoritativeWorldState {
             is_dead: false,
             death_anim_name: String::new(),
             respawn_remaining: 0.0,
+            in_water: false,
+            water_splash_cooldown: 0.0,
             traversal: SharedTraversalState {
                 is_active: false,
                 kind: TraversalKind::RunningJump,
@@ -2644,6 +2677,7 @@ impl AuthoritativeWorldState {
             traversal_anim_name: self.traversal.anim_name.clone(),
             is_dead: self.is_dead,
             death_anim_name: self.death_anim_name.clone(),
+            in_water: self.in_water,
             bullets: self.bullets_snapshot.clone(),
             grenades: self.grenades_snapshot.clone(),
             targets: self
@@ -2917,14 +2951,12 @@ fn step_custom_physics_simulation_system(
         let mut grenade_positions: Vec<(Entity, Vec3, f32)> = Vec::new();
 
         for (entity, mut tf, mut vel, collider, props, groups) in &mut dynamic_query {
-            // اعمال شتاب گرانش و میرایی (Damping)
             vel.linear += gravity * props.gravity_scale * sub_dt;
             let lin_damp = (1.0 - props.linear_damping * sub_dt).clamp(0.0, 1.0);
             let ang_damp = (1.0 - props.angular_damping * sub_dt).clamp(0.0, 1.0);
             vel.linear *= lin_damp;
             vel.angular *= ang_damp;
 
-            // انتگرال‌گیری چرخش زاویه‌ای
             let ang_speed = vel.angular.length();
             if ang_speed > 1e-5 {
                 let axis = vel.angular / ang_speed;
@@ -2936,7 +2968,6 @@ fn step_custom_physics_simulation_system(
             let step_vec = vel.linear * sub_dt;
             let step_len = step_vec.length();
 
-            // تشخیص برخورد پیوسته (CCD) برای اجسام سریع مثل نارنجک
             if props.ccd_enabled && step_len > radius * 0.65 {
                 if let Some((_hit_ent, hit)) = physics_world.cast_ray(
                     tf.translation,
@@ -2963,7 +2994,6 @@ fn step_custom_physics_simulation_system(
 
             tf.translation += step_vec;
 
-            // حل برخورد کره با کولایدرهای ثابت نقشه
             for entry in &physics_world.static_colliders {
                 if entry.disabled || !groups.interacts_with(entry.groups) {
                     continue;
@@ -2985,7 +3015,6 @@ fn step_custom_physics_simulation_system(
                         vel.linear = tangent_vel * (1.0 - combined_friction * 0.35).clamp(0.0, 1.0)
                             - normal_vel * combined_restitution;
 
-                        // جلوگیری از لرزش‌های ریز وقتی جسم روی زمین آرام گرفته است
                         if contact.normal.y > 0.7 && vel.linear.y.abs() < 0.25 {
                             vel.linear.y = 0.0;
                         }
@@ -2998,7 +3027,6 @@ fn step_custom_physics_simulation_system(
             }
         }
 
-        // برخورد متقابل نارنجک‌ها با یکدیگر
         if grenade_positions.len() > 1 {
             for i in 0..grenade_positions.len() {
                 for j in (i + 1)..grenade_positions.len() {
@@ -3196,8 +3224,49 @@ fn shared_authoritative_drive_system(
             dt,
         );
 
-        // ۸. جابجایی فیزیکی ۳بعدی کاراکتر روی رمپ‌ها، پل مرکزی و سطوح ارتفاعی
-        if !world.traversal.is_active {
+        // ۸. جابجایی فیزیکی ۳بعدی کاراکتر همراه با مقاومت طبیعی آب و رانش جریان برکه‌ها
+        let water_sample = sample_water_surface_at(&config, world.soldier_pos);
+        let was_in_water = world.in_water;
+        world.in_water = water_sample.is_some();
+        world.water_splash_cooldown = (world.water_splash_cooldown - dt).max(0.0);
+
+        if let Some((water_y, flow_dir)) = water_sample {
+            // استخراج نقطه پاشش قبل از push کردن برای رفع خطای Borrow Checker
+            let splash_pos = Vec3::new(world.soldier_pos.x, water_y, world.soldier_pos.z);
+
+            if !was_in_water {
+                world.pending_fx.push(GameplayFxEvent::WaterSplash {
+                    pos: splash_pos,
+                    intensity: 1.35,
+                });
+                world.water_splash_cooldown = config.physics.water_splash_interval_secs;
+            } else if world.is_moving && world.water_splash_cooldown <= 0.0 {
+                world.pending_fx.push(GameplayFxEvent::WaterSplash {
+                    pos: splash_pos,
+                    intensity: 0.85,
+                });
+                world.water_splash_cooldown = config.physics.water_splash_interval_secs;
+            }
+
+            if !world.traversal.is_active {
+                let grav_y = config.physics.character_gravity_step_y * dt;
+                let flow_drift = Vec3::new(flow_dir.x, 0.0, flow_dir.y) * 0.35 * dt;
+                if world.is_moving {
+                    let base_speed = match world.effective_stance {
+                        Stance::Run => config.soldier.run_speed,
+                        Stance::Walk => config.soldier.walk_speed,
+                        Stance::Crouch => config.soldier.crouch_speed,
+                    };
+                    let water_speed = base_speed * config.physics.water_move_speed_multiplier;
+                    let desired_delta =
+                        world.move_input.normalize() * water_speed * dt + flow_drift;
+                    controller.translation =
+                        Some(Vec3::new(desired_delta.x, grav_y, desired_delta.z));
+                } else {
+                    controller.translation = Some(Vec3::new(flow_drift.x, grav_y, flow_drift.z));
+                }
+            }
+        } else if !world.traversal.is_active {
             let grav_y = config.physics.character_gravity_step_y * dt;
             if world.is_moving {
                 let speed = match world.effective_stance {
@@ -3253,11 +3322,20 @@ fn step_traversal_custom(
         }
 
         if world.traversal.kind == TraversalKind::RunningJump {
-            let dust_pos =
-                world.soldier_pos - world.traversal.travel_dir * 0.4 + Vec3::new(0.0, 0.08, 0.0);
-            world
-                .pending_fx
-                .push(GameplayFxEvent::SlideDust { pos: dust_pos });
+            let current_soldier_pos = world.soldier_pos;
+            if let Some((water_y, _)) = sample_water_surface_at(config, current_soldier_pos) {
+                let splash_pos = Vec3::new(current_soldier_pos.x, water_y, current_soldier_pos.z);
+                world.pending_fx.push(GameplayFxEvent::WaterSplash {
+                    pos: splash_pos,
+                    intensity: 1.15,
+                });
+            } else {
+                let dust_pos = current_soldier_pos - world.traversal.travel_dir * 0.4
+                    + Vec3::new(0.0, 0.08, 0.0);
+                world
+                    .pending_fx
+                    .push(GameplayFxEvent::SlideDust { pos: dust_pos });
+            }
         }
 
         if world.traversal.elapsed >= world.traversal.duration {
@@ -3501,7 +3579,6 @@ fn shared_authoritative_react_system(
     };
     let dt = time.delta_secs();
 
-    // ۱. خواندن موقعیت ۳بعدی نهایی کپسول سرباز
     let soldier_tf = soldier_query
         .single()
         .expect("خطای بحرانی: موجودیت PhysicsSoldier یافت نشد");
@@ -3520,7 +3597,6 @@ fn shared_authoritative_react_system(
         target_idx_by_entity.insert(entity, p_target.index);
     }
 
-    // ۲. بروزرسانی نارنجک‌های دینامیک و بررسی انفجار
     let mut exploded_positions = Vec::new();
     world.grenades_snapshot.clear();
 
@@ -3560,6 +3636,13 @@ fn shared_authoritative_react_system(
             trigger_random_death(&mut world, &config);
         }
 
+        if let Some((water_y, _)) = sample_water_surface_at(&config, pos) {
+            world.pending_fx.push(GameplayFxEvent::WaterSplash {
+                pos: Vec3::new(pos.x, water_y, pos.z),
+                intensity: 2.2,
+            });
+        }
+
         world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
             pos,
             trauma_add: config.combat.grenade_explosion_trauma_add,
@@ -3567,7 +3650,6 @@ fn shared_authoritative_react_system(
         });
     }
 
-    // ۳. حرکت گلوله‌ها و تشخیص برخورد پیوسته با Raycast اختصاصی
     world.bullets_snapshot.clear();
     let bullet_query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
 
@@ -3638,7 +3720,6 @@ fn shared_authoritative_react_system(
         }
     }
 
-    // ۴. ریکاوری و فعال‌سازی مجدد کولایدر اهداف تیراندازی
     for (idx, target) in world.targets.iter_mut().enumerate() {
         if target.is_dead {
             target.respawn_remaining -= dt;
@@ -3655,7 +3736,6 @@ fn shared_authoritative_react_system(
         }
     }
 
-    // ۵. محاسبه نقطه برخورد لیزر با Raycast اختصاصی
     let muzzle_pos = resolve_muzzle_pos(&world, &input, &config);
     let raw_target = Vec3::new(world.aim_hit_pos.x, muzzle_pos.y, world.aim_hit_pos.z);
     let dead_flags: Vec<bool> = world.targets.iter().map(|t| t.is_dead).collect();
@@ -3682,10 +3762,10 @@ fn shared_client_drive_system(
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
     prediction: Option<Res<ClientPhysicsPredictionState>>,
-    mut soldier_query: Query<&mut CustomCharacterController, With<PhysicsSoldier>>,
+    mut soldier_query: Query<(&Transform, &mut CustomCharacterController), With<PhysicsSoldier>>,
 ) {
     let Some(prediction) = prediction else { return };
-    let Ok(mut controller) = soldier_query.single_mut() else {
+    let Ok((soldier_tf, mut controller)) = soldier_query.single_mut() else {
         return;
     };
 
@@ -3697,8 +3777,23 @@ fn shared_client_drive_system(
     let dt = time.delta_secs();
     let grav_y = config.physics.character_gravity_step_y * dt;
 
+    let feet_pos = Vec3::new(
+        soldier_tf.translation.x,
+        soldier_tf.translation.y - config.physics.soldier_capsule_center_y,
+        soldier_tf.translation.z,
+    );
+    let water_sample = sample_water_surface_at(&config, feet_pos);
+    let speed_mult = if water_sample.is_some() {
+        config.physics.water_move_speed_multiplier
+    } else {
+        1.0
+    };
+    let flow_drift = water_sample
+        .map(|(_, flow)| Vec3::new(flow.x, 0.0, flow.y) * 0.35 * dt)
+        .unwrap_or(Vec3::ZERO);
+
     let Some(ref input) = prediction.latest_input else {
-        controller.translation = Some(Vec3::new(0.0, grav_y, 0.0));
+        controller.translation = Some(Vec3::new(flow_drift.x, grav_y, flow_drift.z));
         return;
     };
 
@@ -3708,11 +3803,11 @@ fn shared_client_drive_system(
             Stance::Run => config.soldier.run_speed,
             Stance::Walk => config.soldier.walk_speed,
             Stance::Crouch => config.soldier.crouch_speed,
-        };
-        let delta = flat_input.normalize() * speed * dt;
+        } * speed_mult;
+        let delta = flat_input.normalize() * speed * dt + flow_drift;
         controller.translation = Some(Vec3::new(delta.x, grav_y, delta.z));
     } else {
-        controller.translation = Some(Vec3::new(0.0, grav_y, 0.0));
+        controller.translation = Some(Vec3::new(flow_drift.x, grav_y, flow_drift.z));
     }
 }
 

@@ -12,7 +12,7 @@ use moba_shared::{
     particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
     sample_water_surface_at, shell_casing_physics_bundle, target_physics_bundle,
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
-    ClientInputCommand, ClientPhysicsPredictionState, ColliderDisabled, GameConfig,
+    ClientInputCommand, ClientPhysicsPredictionState, ModelTransformConfig, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
     CHANNEL_UNRELIABLE_STATE,
@@ -90,6 +90,7 @@ fn main() {
                 soldier_animation_player_system,
                 laser_sight_gizmo_system,
                 gameplay_fx_system,
+                update_map_object_labels_system,
             )
                 .chain(),
         )
@@ -134,6 +135,12 @@ struct WeaponRoot;
 
 #[derive(Component)]
 struct MuzzlePoint;
+
+#[derive(Component)]
+struct MapObjectLabel {
+    target_entity: Entity,
+    world_offset: Vec3,
+}
 
 #[derive(Component)]
 struct VisualTarget {
@@ -320,6 +327,68 @@ fn custom_glb_exists(model_path: &str) -> bool {
     Path::new("assets").join(model_path).is_file() || Path::new(model_path).is_file()
 }
 
+fn model_transform_to_bevy(t: &ModelTransformConfig) -> Transform {
+    Transform {
+        translation: Vec3::new(t.location.0, t.location.1, t.location.2),
+        rotation: Quat::from_euler(
+            EulerRot::YXZ,
+            t.rotation.1.to_radians(),
+            t.rotation.0.to_radians(),
+            t.rotation.2.to_radians(),
+        ),
+        scale: Vec3::new(t.scale.0, t.scale.1, t.scale.2),
+    }
+}
+
+fn glb_model_bundle(
+    asset_server: &AssetServer,
+    model_path: &str,
+    model_transform: &ModelTransformConfig,
+) -> (WorldAssetRoot, Transform, Visibility) {
+    let scene_handle = asset_server.load(format!("{}#Scene0", model_path));
+    (
+        WorldAssetRoot(scene_handle),
+        model_transform_to_bevy(model_transform),
+        Visibility::Visible,
+    )
+}
+
+fn spawn_map_object_label(
+    commands: &mut Commands,
+    show_labels: bool,
+    target_entity: Entity,
+    label_text: &str,
+    y_offset: f32,
+) {
+    if !show_labels {
+        return;
+    }
+    commands.spawn((
+        MapObjectLabel {
+            target_entity,
+            world_offset: Vec3::new(0.0, y_offset, 0.0),
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0.0),
+            top: px(0.0),
+            padding: UiRect::axes(px(5.0), px(2.0)),
+            border_radius: BorderRadius::all(px(4.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.05, 0.07, 0.10, 0.75)),
+        Visibility::Hidden,
+        children![(
+            Text::new(label_text),
+            TextFont {
+                font_size: FontSize::Px(11.0),
+                ..default()
+            },
+            TextColor(Color::srgb(0.95, 0.97, 1.0)),
+        )],
+    ));
+}
+
 // -----------------------------------------------------------------------------
 // راه‌اندازی صحنه، نورپردازی سایه‌دار، برکه‌های طبیعی، آبشارها و جنگل انبوه
 // -----------------------------------------------------------------------------
@@ -452,11 +521,15 @@ fn setup_scene(
             terrain_platform_physics_bundle(&config, plat),
             Visibility::Visible,
         ));
+        let ent = ent_cmds.id();
 
         if custom_glb_exists(&plat.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", plat.model_path));
             ent_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &plat.model_path,
+                    &plat.model_transform,
+                ));
             });
         } else {
             ent_cmds.insert((
@@ -516,6 +589,7 @@ fn setup_scene(
                 });
             }
         }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, ent, &plat.id, size.y * 0.5 + 0.8);
     }
 
     // ۳. رمپ‌ها و پلکان‌های سنگی
@@ -526,10 +600,14 @@ fn setup_scene(
             ramp_physics_bundle(&config, ramp),
             Visibility::Visible,
         ));
+        let ent = ent_cmds.id();
         if custom_glb_exists(&ramp.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", ramp.model_path));
             ent_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &ramp.model_path,
+                    &ramp.model_transform,
+                ));
             });
         } else {
             ent_cmds.insert((
@@ -541,6 +619,7 @@ fn setup_scene(
                 })),
             ));
         }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, ent, &ramp.id, size.y * 0.5 + 0.8);
     }
 
     // ۴. برکه‌های فیروزه‌ای طبیعی، جویبارهای جنگلی و جریان پویا (River Segments & Lagoons)
@@ -575,10 +654,14 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        let seg_ent = ent_cmds.id();
         if custom_glb_exists(&seg.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", seg.model_path));
             ent_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &seg.model_path,
+                    &seg.model_transform,
+                ));
             });
         } else {
             // استفاده از استوانه بیضوی برای برکه‌های طبیعی و شفافیت آب
@@ -611,6 +694,8 @@ fn setup_scene(
                 }
             });
         }
+
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, seg_ent, &seg.id, size.y * 0.5 + 0.8);
 
         // نور ملایم فیروزه‌ای روی برکه‌های اصلی و حوضچه مرکزی
         commands.spawn((
@@ -685,10 +770,14 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        let wf_ent = ent_cmds.id();
         if custom_glb_exists(&wf.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", wf.model_path));
             ent_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &wf.model_path,
+                    &wf.model_transform,
+                ));
             });
         } else {
             ent_cmds.insert((
@@ -736,6 +825,7 @@ fn setup_scene(
                 }
             }
         });
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, wf_ent, &wf.id, size.y * 0.5 + 0.8);
     }
 
     // ۶. میدان باستانی دایره‌ای مرکز نقشه (Center Ruined Colosseum Nexus)
@@ -747,10 +837,14 @@ fn setup_scene(
         Visibility::Visible,
     ));
 
+    let bridge_ent = bridge_cmds.id();
     if custom_glb_exists(&bridge.model_path) {
-        let scene_handle = asset_server.load(format!("{}#Scene0", bridge.model_path));
         bridge_cmds.with_children(|parent| {
-            parent.spawn(WorldAssetRoot(scene_handle));
+            parent.spawn(glb_model_bundle(
+                &asset_server,
+                &bridge.model_path,
+                &bridge.model_transform,
+            ));
         });
     } else {
         bridge_cmds
@@ -785,6 +879,8 @@ fn setup_scene(
                 ));
             });
     }
+
+    spawn_map_object_label(&mut commands, config.map.show_object_labels, bridge_ent, &bridge.id, bridge.deck_thickness * 0.5 + 1.2);
 
     // ۷. مسیرهای سنگ‌فرش ۳ لاین اصلی (Top, Mid, Bot)
     for lane in &config.map.lanes {
@@ -848,10 +944,14 @@ fn setup_scene(
             Transform::from_translation(pos + Vec3::Y * (ftn.rim_height * 0.5)),
             Visibility::Visible,
         ));
+        let ftn_ent = ftn_cmds.id();
         if custom_glb_exists(&ftn.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", ftn.model_path));
             ftn_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &ftn.model_path,
+                    &ftn.model_transform,
+                ));
             });
         } else {
             ftn_cmds
@@ -879,6 +979,7 @@ fn setup_scene(
                     ));
                 });
         }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, ftn_ent, &ftn.id, ftn.rim_height * 0.5 + 1.0);
     }
 
     // ۹. کریستال‌های باستانی هر دو تیم (Ancients: زمردی در غرب، یاقوتی در شرق)
@@ -897,10 +998,14 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        let anc_ent = anc_cmds.id();
         if custom_glb_exists(&anc.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", anc.model_path));
             anc_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &anc.model_path,
+                    &anc.model_transform,
+                ));
             });
         } else {
             anc_cmds
@@ -980,6 +1085,7 @@ fn setup_scene(
                     ));
                 });
         }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, anc_ent, &anc.id, anc.base_size.1 * 0.5 + anc.core_height + 1.0);
     }
 
     // ۱۰. ۱۸ برج دفاعی (Turrets) در هر ۳ لاین مطابق تصویر مرجع
@@ -991,10 +1097,14 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        let tur_ent = tur_cmds.id();
         if custom_glb_exists(&tur.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", tur.model_path));
             tur_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &tur.model_path,
+                    &tur.model_transform,
+                ));
             });
         } else {
             tur_cmds
@@ -1055,6 +1165,7 @@ fn setup_scene(
                     ));
                 });
         }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, tur_ent, &tur.id, tur.height * 0.5 + tur.head_radius * 2.0 + 1.0);
     }
 
     // ۱۱. کوه‌ها، صخره‌های چندلایه خزه‌دار و باروهای سنگی دور نقشه
@@ -1066,10 +1177,14 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        let mtn_ent = mtn_cmds.id();
         if custom_glb_exists(&mtn.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", mtn.model_path));
             mtn_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &mtn.model_path,
+                    &mtn.model_transform,
+                ));
             });
         } else {
             mtn_cmds
@@ -1111,6 +1226,7 @@ fn setup_scene(
                     ));
                 });
         }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, mtn_ent, &mtn.id, size.y * 0.5 + 1.5);
     }
 
     // ۱۲. جنگل انبوه درختان کاج چندطبقه (۸۸ درخت در سراسر برکه‌ها و مسیرهای جنگلی)
@@ -1122,10 +1238,14 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        let tree_ent = tree_cmds.id();
         if custom_glb_exists(&tree.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", tree.model_path));
             tree_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &tree.model_path,
+                    &tree.model_transform,
+                ));
             });
         } else {
             let tier1_mat = materials.add(StandardMaterial {
@@ -1197,6 +1317,7 @@ fn setup_scene(
                     ));
                 });
         }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, tree_ent, &tree.id, tree.trunk_height * 0.5 + tree.canopy_height + 0.8);
     }
 
     // ۱۳. خرابه‌های باستانی، دیوارهای شکسته و سنگرهای تاکتیکی (Obstacles)
@@ -1208,10 +1329,14 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
+        let obs_ent = obs_cmds.id();
         if custom_glb_exists(&obs.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", obs.model_path));
             obs_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &obs.model_path,
+                    &obs.model_transform,
+                ));
             });
         } else {
             obs_cmds.insert((
@@ -1223,6 +1348,7 @@ fn setup_scene(
                 })),
             ));
         }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, obs_ent, &obs.id, size.y * 0.5 + 0.8);
     }
 
     // ۱۴. اهداف تیراندازی
@@ -1245,10 +1371,14 @@ fn setup_scene(
             target_physics_bundle(&config, index, t),
         ));
 
+        let target_ent = target_cmds.id();
         if custom_glb_exists(&t.model_path) {
-            let scene_handle = asset_server.load(format!("{}#Scene0", t.model_path));
             target_cmds.with_children(|parent| {
-                parent.spawn(WorldAssetRoot(scene_handle));
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &t.model_path,
+                    &t.model_transform,
+                ));
             });
         } else {
             target_cmds.insert((
@@ -1261,6 +1391,7 @@ fn setup_scene(
                 })),
             ));
         }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, target_ent, &t.id, size.y * 0.5 + 0.8);
     }
 
     // ۱۵. ذرات معلق جادویی و شب‌تاب‌های درخشان بالای برکه‌ها و جنگل (Ambient VFX Motes)
@@ -2655,6 +2786,56 @@ fn soldier_animation_player_system(
                 active.seek_to(lower_seek);
                 render_state.previous_upper_anim = render_state.current_locomotion.clone();
             }
+        }
+    }
+}
+
+
+fn update_map_object_labels_system(
+    config: Res<GameConfig>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    target_transforms: Query<&GlobalTransform>,
+    mut label_query: Query<(&MapObjectLabel, &mut Node, &mut Visibility)>,
+) {
+    if !config.map.show_object_labels {
+        for (_, _, mut vis) in &mut label_query {
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
+
+    let Ok(window) = window_query.single() else {
+        return;
+    };
+    let Ok((camera, camera_gtf)) = camera_query.single() else {
+        return;
+    };
+
+    let win_w = window.width();
+    let win_h = window.height();
+
+    for (label, mut node, mut vis) in &mut label_query {
+        let Ok(target_gtf) = target_transforms.get(label.target_entity) else {
+            *vis = Visibility::Hidden;
+            continue;
+        };
+
+        let world_pos = target_gtf.translation() + label.world_offset;
+        if let Ok(viewport_pos) = camera.world_to_viewport(camera_gtf, world_pos) {
+            if viewport_pos.x >= -80.0
+                && viewport_pos.x <= win_w + 80.0
+                && viewport_pos.y >= -40.0
+                && viewport_pos.y <= win_h + 40.0
+            {
+                node.left = px(viewport_pos.x);
+                node.top = px(viewport_pos.y);
+                *vis = Visibility::Visible;
+            } else {
+                *vis = Visibility::Hidden;
+            }
+        } else {
+            *vis = Visibility::Hidden;
         }
     }
 }

@@ -451,8 +451,16 @@ pub enum CoverKind {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ModelTransformConfig {
+    pub location: (f32, f32, f32),
+    pub rotation: (f32, f32, f32),
+    pub scale: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MapConfig {
     pub map_dimensions: (f32, f32),
+    pub show_object_labels: bool,
     pub base_vision_range: f32,
     pub high_ground_vision_bonus: f32,
     pub high_ground_occlusion_min_diff: f32,
@@ -473,6 +481,7 @@ pub struct MapConfig {
 pub struct TerrainPlatformDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub team: TeamId,
     pub elevation_tier: i32,
     pub pos: (f32, f32, f32),
@@ -485,6 +494,7 @@ pub struct TerrainPlatformDef {
 pub struct RampDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub rotation_euler_deg: (f32, f32, f32),
@@ -496,6 +506,7 @@ pub struct RampDef {
 pub struct RiverSegmentDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub yaw_deg: f32,
@@ -509,6 +520,7 @@ pub struct RiverSegmentDef {
 pub struct WaterfallDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub yaw_deg: f32,
@@ -521,6 +533,7 @@ pub struct WaterfallDef {
 pub struct CenterBridgeDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub center_pos: (f32, f32, f32),
     pub outer_radius: f32,
     pub deck_thickness: f32,
@@ -536,6 +549,7 @@ pub struct CenterBridgeDef {
 pub struct FountainDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub team: TeamId,
     pub pos: (f32, f32, f32),
     pub outer_radius: f32,
@@ -551,6 +565,7 @@ pub struct FountainDef {
 pub struct AncientDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub team: TeamId,
     pub pos: (f32, f32, f32),
     pub base_size: (f32, f32, f32),
@@ -565,6 +580,7 @@ pub struct AncientDef {
 pub struct TurretDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub team: TeamId,
     pub lane: LaneId,
     pub tier: u8,
@@ -582,6 +598,7 @@ pub struct TurretDef {
 pub struct MountainDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub yaw_deg: f32,
@@ -593,6 +610,7 @@ pub struct MountainDef {
 pub struct TreeDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub tree_size: TreeSize,
     pub pos: (f32, f32, f32),
     pub trunk_radius: f32,
@@ -618,6 +636,7 @@ pub struct LanePathDef {
 pub struct ObstacleDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub kind: CoverKind,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
@@ -631,6 +650,7 @@ pub struct ObstacleDef {
 pub struct TargetDef {
     pub id: String,
     pub model_path: String,
+    pub model_transform: ModelTransformConfig,
     pub pos: (f32, f32, f32),
     pub size: (f32, f32, f32),
     pub color_rgb: (f32, f32, f32),

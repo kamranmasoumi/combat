@@ -1,14 +1,12 @@
-use bevy::ecs::entity::EntityHashSet;
 use bevy::prelude::*;
 use bevy::transform::TransformPlugin;
-use bevy_rapier3d::prelude::*;
 use renet::{ChannelConfig, ConnectionConfig, RenetClient, RenetServer, SendType};
 use renet_netcode::{
     ClientAuthentication, ConnectToken, NetcodeClientTransport, NetcodeServerTransport,
     ServerAuthentication, ServerConfig,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,8 +14,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // -----------------------------------------------------------------------------
 // ۱. ساختارهای کانفیگ (بدون هیچ Default یا serde(default))
 // -----------------------------------------------------------------------------
-
-use std::collections::HashSet;
 
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
@@ -236,7 +232,7 @@ pub fn create_shared_renet_client(net: &NetworkConfig) -> (RenetClient, NetcodeC
         None,
         &net.private_key,
     )
-        .expect("خطای بحرانی کلاینت: تولید ConnectToken شکست خورد");
+    .expect("خطای بحرانی کلاینت: تولید ConnectToken شکست خورد");
 
     let auth = ClientAuthentication::Secure { connect_token };
     let transport = NetcodeClientTransport::new(current_time, auth, socket)
@@ -418,7 +414,7 @@ pub struct AnimationConfig {
 }
 
 // -----------------------------------------------------------------------------
-// ۱-ب. ساختارهای کامل نقشه MOBA + Tactical Shooter (بدون هیچ مقدار پیش‌فرض)
+// ۱-ب. ساختارهای کامل نقشه MOBA + Tactical Shooter
 // -----------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -776,13 +772,33 @@ pub struct ServerWorldSnapshot {
 }
 
 // -----------------------------------------------------------------------------
-// ۳. گروه‌های برخورد، کامپوننت‌ها و پلاگین مشترک Rapier 0.37
+// ۳. موتور فیزیک ۳بعدی اختصاصی (جایگزین کامل و بدون وابستگی bevy_rapier3d)
 // -----------------------------------------------------------------------------
 
-pub const GROUP_WORLD: Group = Group::GROUP_1;
-pub const GROUP_SOLDIER: Group = Group::GROUP_2;
-pub const GROUP_GRENADE: Group = Group::GROUP_3;
-pub const GROUP_FX: Group = Group::GROUP_4;
+pub const GROUP_WORLD: u32 = 1 << 0;
+pub const GROUP_SOLDIER: u32 = 1 << 1;
+pub const GROUP_GRENADE: u32 = 1 << 2;
+pub const GROUP_FX: u32 = 1 << 3;
+
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollisionGroups {
+    pub memberships: u32,
+    pub filters: u32,
+}
+
+impl CollisionGroups {
+    pub const fn new(memberships: u32, filters: u32) -> Self {
+        Self {
+            memberships,
+            filters,
+        }
+    }
+
+    #[inline]
+    pub const fn interacts_with(self, other: Self) -> bool {
+        (self.memberships & other.filters) != 0 && (other.memberships & self.filters) != 0
+    }
+}
 
 pub fn world_collision_groups() -> CollisionGroups {
     CollisionGroups::new(GROUP_WORLD, GROUP_SOLDIER | GROUP_GRENADE | GROUP_FX)
@@ -800,10 +816,921 @@ pub fn fx_collision_groups() -> CollisionGroups {
     CollisionGroups::new(GROUP_FX, GROUP_WORLD)
 }
 
+/// کامپوننت غیرفعال‌سازی کولایدر (برای اهداف منهدم‌شده)
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ColliderDisabled;
+
+/// سرعت خطی و زاویه‌ای اجسام دینامیک
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Velocity {
+    pub linear: Vec3,
+    pub angular: Vec3,
+}
+
+/// نوع جسم فیزیکی در موتور اختصاصی
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomRigidBody {
+    Fixed,
+    KinematicPositionBased,
+    Dynamic,
+}
+
+/// اشکال هندسی برخورد در موتور اختصاصی
+#[derive(Component, Clone, Copy, Debug)]
+pub enum CustomCollider {
+    Cuboid { half_extents: Vec3 },
+    Cylinder { half_height: f32, radius: f32 },
+    Ball { radius: f32 },
+    CapsuleY { half_segment: f32, radius: f32 },
+}
+
+impl CustomCollider {
+    #[inline]
+    pub fn cuboid(hx: f32, hy: f32, hz: f32) -> Self {
+        Self::Cuboid {
+            half_extents: Vec3::new(hx, hy, hz),
+        }
+    }
+
+    #[inline]
+    pub fn cylinder(half_height: f32, radius: f32) -> Self {
+        Self::Cylinder {
+            half_height,
+            radius,
+        }
+    }
+
+    #[inline]
+    pub fn ball(radius: f32) -> Self {
+        Self::Ball { radius }
+    }
+
+    #[inline]
+    pub fn capsule_y(half_segment: f32, radius: f32) -> Self {
+        Self::CapsuleY {
+            half_segment,
+            radius,
+        }
+    }
+
+    #[inline]
+    pub fn bounding_sphere_radius(&self) -> f32 {
+        match *self {
+            Self::Cuboid { half_extents } => half_extents.length(),
+            Self::Cylinder {
+                half_height,
+                radius,
+            } => (half_height * half_height + radius * radius).sqrt(),
+            Self::Ball { radius } => radius,
+            Self::CapsuleY {
+                half_segment,
+                radius,
+            } => half_segment + radius,
+        }
+    }
+
+    #[inline]
+    pub fn effective_ball_radius(&self) -> f32 {
+        match *self {
+            Self::Ball { radius } => radius,
+            Self::Cylinder {
+                half_height,
+                radius,
+            } => radius.max(half_height),
+            Self::Cuboid { half_extents } => {
+                half_extents.x.max(half_extents.y).max(half_extents.z)
+            }
+            Self::CapsuleY { radius, .. } => radius,
+        }
+    }
+}
+
+/// خواص فیزیکی سطح برای کولایدرهای ثابت نقشه
+#[derive(Component, Clone, Copy, Debug)]
+pub struct SurfaceMaterial {
+    pub friction: f32,
+    pub restitution: f32,
+}
+
+/// خواص فیزیکی اجسام دینامیک (نارنجک، پوکه و ذرات)
+#[derive(Component, Clone, Copy, Debug)]
+pub struct DynamicBodyProps {
+    pub restitution: f32,
+    pub friction: f32,
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub gravity_scale: f32,
+    pub ccd_enabled: bool,
+}
+
+/// کنترلر اختصاصی حرکت کاراکتر (جایگزین بدون باگ KinematicCharacterController)
+#[derive(Component, Clone, Debug, Default)]
+pub struct CustomCharacterController {
+    pub translation: Option<Vec3>,
+    pub grounded: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RayHit {
+    pub toi: f32,
+    pub point: Vec3,
+    pub normal: Vec3,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SphereContact {
+    pub normal: Vec3,
+    pub penetration: f32,
+    pub contact_point: Vec3,
+}
+
+#[derive(Clone, Debug)]
+pub struct StaticColliderEntry {
+    pub entity: Entity,
+    pub translation: Vec3,
+    pub rotation: Quat,
+    pub inv_rotation: Quat,
+    pub collider: CustomCollider,
+    pub bounding_radius: f32,
+    pub material: SurfaceMaterial,
+    pub groups: CollisionGroups,
+    pub disabled: bool,
+}
+
+/// دنیای فیزیک اختصاصی که لیست کولایدرهای ثابت فعال را برای پرتوافکنی و برخوردها نگه می‌دارد
+#[derive(Resource, Default, Clone, Debug)]
+pub struct CustomPhysicsWorld {
+    pub static_colliders: Vec<StaticColliderEntry>,
+}
+
+impl CustomPhysicsWorld {
+    /// پرتوافکنی ۳بعدی دقیق به سمت جعبه‌های چرخیده (OBB) و استوانه‌ها
+    pub fn cast_ray<F>(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_toi: f32,
+        query_groups: CollisionGroups,
+        predicate: F,
+    ) -> Option<(Entity, RayHit)>
+    where
+        F: Fn(Entity) -> bool,
+    {
+        let dir_len = dir.length();
+        if dir_len <= f32::EPSILON || max_toi <= 0.0 {
+            return None;
+        }
+        let unit_dir = dir / dir_len;
+        let mut closest_toi = max_toi;
+        let mut best_hit: Option<(Entity, RayHit)> = None;
+
+        for entry in &self.static_colliders {
+            if entry.disabled || !query_groups.interacts_with(entry.groups) {
+                continue;
+            }
+            // فیلتر اولیه با کره محیطی برای سرعت بالا
+            let to_center = entry.translation - origin;
+            let proj = to_center.dot(unit_dir);
+            if proj < -entry.bounding_radius || proj > closest_toi + entry.bounding_radius {
+                continue;
+            }
+            let perp_dist_sq = (to_center.length_squared() - proj * proj).max(0.0);
+            if perp_dist_sq > (entry.bounding_radius + 0.05).powi(2) {
+                continue;
+            }
+
+            if !predicate(entry.entity) {
+                continue;
+            }
+
+            let hit_opt = ray_intersect_single_entry(origin, unit_dir, closest_toi, entry);
+
+            if let Some(hit) = hit_opt {
+                if hit.toi < closest_toi {
+                    closest_toi = hit.toi;
+                    best_hit = Some((entry.entity, hit));
+                }
+            }
+        }
+
+        best_hit
+    }
+
+    /// بررسی حرکت افقی کپسول (Sweep) برای غلتیدن، شیرجه و سر خوردن تا برخورد به موانع
+    pub fn sweep_capsule_horizontal<F>(
+        &self,
+        start_center: Vec3,
+        half_segment: f32,
+        radius: f32,
+        travel_dir: Vec3,
+        max_distance: f32,
+        padding: f32,
+        query_groups: CollisionGroups,
+        predicate: F,
+    ) -> f32
+    where
+        F: Fn(Entity) -> bool,
+    {
+        let flat_dir = Vec3::new(travel_dir.x, 0.0, travel_dir.z).normalize_or_zero();
+        if flat_dir == Vec3::ZERO || max_distance <= 0.0 {
+            return 0.0;
+        }
+
+        let expanded_r = radius + padding;
+        let step_size = (radius * 0.35).max(0.08);
+        let steps = ((max_distance / step_size).ceil() as usize).max(1);
+        let dt_dist = max_distance / (steps as f32);
+
+        let sample_offsets_y = [-half_segment * 0.75, 0.0, half_segment * 0.75];
+
+        for step_idx in 1..=steps {
+            let dist = (step_idx as f32) * dt_dist;
+            let candidate_center = start_center + flat_dir * dist;
+
+            for entry in &self.static_colliders {
+                if entry.disabled || !query_groups.interacts_with(entry.groups) {
+                    continue;
+                }
+                let center_dist_sq = candidate_center.distance_squared(entry.translation);
+                let max_r = entry.bounding_radius + half_segment + expanded_r;
+                if center_dist_sq > max_r * max_r {
+                    continue;
+                }
+                if !predicate(entry.entity) {
+                    continue;
+                }
+
+                for &oy in &sample_offsets_y {
+                    let sphere_center = candidate_center + Vec3::Y * oy;
+                    if let Some(contact) =
+                        sphere_vs_static_collider(sphere_center, expanded_r, entry)
+                    {
+                        // فقط برخورد با دیوارها و موانع عمودی مانع غلتیدن می‌شود (نه کف زمین)
+                        if contact.normal.y < 0.65 {
+                            return ((step_idx - 1) as f32 * dt_dist - contact.penetration).max(0.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        max_distance
+    }
+
+    /// حل کامل حرکت ۳بعدی کپسول سرباز شامل شیب رمپ‌ها، بالا رفتن خودکار از پله (Autostep)،
+    /// چسبیدن به زمین (Snap-to-Ground) و سر خوردن نرم کنار دیوارها بدون لرزش
+    pub fn move_character_capsule(
+        &self,
+        current_center: Vec3,
+        desired_delta: Vec3,
+        config: &GameConfig,
+    ) -> (Vec3, bool) {
+        if self.static_colliders.is_empty() {
+            // اگر هنوز کولایدرهای محیطی اسپاون نشده‌اند، از سقوط کاراکتر جلوگیری شود
+            return (
+                Vec3::new(
+                    current_center.x + desired_delta.x,
+                    current_center.y,
+                    current_center.z + desired_delta.z,
+                ),
+                true,
+            );
+        }
+
+        let half_seg = config.physics.soldier_capsule_half_segment;
+        let radius = config.soldier.player_radius;
+        let skin = config.physics.character_skin_offset;
+        let eff_radius = radius + skin;
+        let center_y_offset = config.physics.soldier_capsule_center_y;
+        let max_slope_cos = config
+            .physics
+            .character_max_slope_climb_deg
+            .to_radians()
+            .cos();
+        let autostep_max_h = config.physics.character_autostep_max_height;
+        let snap_dist = config.physics.character_snap_to_ground;
+        let nudge = config.physics.character_normal_nudge_factor;
+
+        let mut center = current_center;
+        let horiz_delta = Vec3::new(desired_delta.x, 0.0, desired_delta.z);
+        let horiz_len = horiz_delta.length();
+        let num_horiz_steps = if horiz_len > radius * 0.45 {
+            ((horiz_len / (radius * 0.45)).ceil() as usize).clamp(1, 6)
+        } else {
+            1
+        };
+        let step_xz = horiz_delta / (num_horiz_steps as f32);
+
+        let soldier_groups = soldier_collision_groups();
+        let sample_offsets_y = [-half_seg, 0.0, half_seg];
+
+        // ۱. جابجایی افقی و حل برخورد با دیوارها + Autostep روی لبه‌ها
+        for _ in 0..num_horiz_steps {
+            center.x += step_xz.x;
+            center.z += step_xz.z;
+
+            for _iter in 0..3 {
+                let mut any_wall_push = false;
+                let feet_y = center.y - center_y_offset;
+
+                for entry in &self.static_colliders {
+                    if entry.disabled || !soldier_groups.interacts_with(entry.groups) {
+                        continue;
+                    }
+                    let max_r = entry.bounding_radius + half_seg + eff_radius;
+                    if center.distance_squared(entry.translation) > max_r * max_r {
+                        continue;
+                    }
+
+                    // بررسی برخورد سه کره تشکیل‌دهنده کپسول عمودی با مانع
+                    let mut deepest_wall_contact: Option<SphereContact> = None;
+                    for &oy in &sample_offsets_y {
+                        let sphere_pos = center + Vec3::Y * oy;
+                        if let Some(contact) =
+                            sphere_vs_static_collider(sphere_pos, eff_radius, entry)
+                        {
+                            if contact.normal.y >= max_slope_cos {
+                                // سطح شیب‌دار قابل راه رفتن (رمپ یا زمین): در گام عمودی تنظیم می‌شود
+                                continue;
+                            }
+                            if deepest_wall_contact
+                                .as_ref()
+                                .map_or(true, |prev| contact.penetration > prev.penetration)
+                            {
+                                deepest_wall_contact = Some(contact);
+                            }
+                        }
+                    }
+
+                    if let Some(wall_hit) = deepest_wall_contact {
+                        // بررسی امکان بالا رفتن خودکار (Autostep) اگر ارتفاع مانع کم باشد
+                        let step_origin = Vec3::new(
+                            center.x,
+                            feet_y + autostep_max_h + 0.15,
+                            center.z,
+                        );
+                        let mut stepped_up = false;
+                        if let Some(top_hit) = ray_intersect_single_entry(
+                            step_origin,
+                            Vec3::NEG_Y,
+                            autostep_max_h + 0.20,
+                            entry,
+                        ) {
+                            if top_hit.normal.y >= max_slope_cos
+                                && top_hit.point.y >= feet_y - 0.02
+                                && top_hit.point.y <= feet_y + autostep_max_h
+                            {
+                                center.y = top_hit.point.y + center_y_offset;
+                                stepped_up = true;
+                            }
+                        }
+
+                        if !stepped_up {
+                            let horiz_normal =
+                                Vec3::new(wall_hit.normal.x, 0.0, wall_hit.normal.z)
+                                    .normalize_or_zero();
+                            if horiz_normal != Vec3::ZERO {
+                                center += horiz_normal * (wall_hit.penetration + nudge);
+                                any_wall_push = true;
+                            }
+                        }
+                    }
+                }
+
+                if !any_wall_push {
+                    break;
+                }
+            }
+        }
+
+        // ۲. یافتن ارتفاع دقیق سطح زمین/رمپ/پل زیر پای کاراکتر (۵ پرتو در مقطع کپسول)
+        let feet_y = center.y - center_y_offset;
+        let probe_r = radius * 0.62;
+        let footprint_offsets = [
+            Vec2::ZERO,
+            Vec2::new(probe_r, 0.0),
+            Vec2::new(-probe_r, 0.0),
+            Vec2::new(0.0, probe_r),
+            Vec2::new(0.0, -probe_r),
+        ];
+
+        let ray_start_offset = autostep_max_h + 0.35;
+        let max_down_dist = 100.0_f32;
+        let mut highest_walkable_y: Option<f32> = None;
+
+        for offset in &footprint_offsets {
+            let ray_origin = Vec3::new(
+                center.x + offset.x,
+                feet_y + ray_start_offset,
+                center.z + offset.y,
+            );
+            for entry in &self.static_colliders {
+                if entry.disabled || !soldier_groups.interacts_with(entry.groups) {
+                    continue;
+                }
+                let dx = ray_origin.x - entry.translation.x;
+                let dz = ray_origin.z - entry.translation.z;
+                if dx * dx + dz * dz > (entry.bounding_radius + 0.2).powi(2) {
+                    continue;
+                }
+
+                if let Some(hit) =
+                    ray_intersect_single_entry(ray_origin, Vec3::NEG_Y, max_down_dist, entry)
+                {
+                    if hit.normal.y >= max_slope_cos && hit.point.y <= feet_y + autostep_max_h + 0.06
+                    {
+                        highest_walkable_y = Some(
+                            highest_walkable_y.map_or(hit.point.y, |prev| prev.max(hit.point.y)),
+                        );
+                    }
+                }
+            }
+        }
+
+        // ۳. اعمال گرانش و چسبیدن نرم به سطح رمپ یا زمین (Snap-to-Ground)
+        let mut grounded = false;
+        let new_feet_y = if let Some(ground_y) = highest_walkable_y {
+            let free_fall_feet_y = feet_y + desired_delta.y;
+            if free_fall_feet_y <= ground_y + snap_dist {
+                grounded = true;
+                ground_y
+            } else {
+                free_fall_feet_y
+            }
+        } else {
+            // کف اضطراری بستر رودخانه در صورتی که کاراکتر خارج از محدوده کولایدرها باشد
+            (feet_y + desired_delta.y).max(-1.6)
+        };
+
+        center.y = new_feet_y + center_y_offset;
+
+        // ۴. اصلاح نهایی نفوذ افقی و عمودی در ارتفاع جدید
+        for entry in &self.static_colliders {
+            if entry.disabled || !soldier_groups.interacts_with(entry.groups) {
+                continue;
+            }
+            let max_r = entry.bounding_radius + half_seg + eff_radius;
+            if center.distance_squared(entry.translation) > max_r * max_r {
+                continue;
+            }
+            for &oy in &sample_offsets_y {
+                let sphere_pos = center + Vec3::Y * oy;
+                if let Some(contact) = sphere_vs_static_collider(sphere_pos, eff_radius, entry) {
+                    if contact.normal.y >= max_slope_cos {
+                        if oy <= -half_seg * 0.5 && contact.penetration > 0.0 {
+                            center.y += contact.normal.y * contact.penetration;
+                            grounded = true;
+                        }
+                    } else {
+                        let horiz_normal = Vec3::new(contact.normal.x, 0.0, contact.normal.z)
+                            .normalize_or_zero();
+                        if horiz_normal != Vec3::ZERO {
+                            center += horiz_normal * (contact.penetration + nudge);
+                        }
+                    }
+                }
+            }
+        }
+
+        (center, grounded)
+    }
+}
+
+fn ray_intersect_single_entry(
+    origin: Vec3,
+    unit_dir: Vec3,
+    max_toi: f32,
+    entry: &StaticColliderEntry,
+) -> Option<RayHit> {
+    match entry.collider {
+        CustomCollider::Cuboid { half_extents } => ray_intersect_obb(
+            origin,
+            unit_dir,
+            max_toi,
+            entry.translation,
+            entry.rotation,
+            entry.inv_rotation,
+            half_extents,
+        ),
+        CustomCollider::Cylinder {
+            half_height,
+            radius,
+        } => ray_intersect_cylinder(
+            origin,
+            unit_dir,
+            max_toi,
+            entry.translation,
+            entry.rotation,
+            entry.inv_rotation,
+            half_height,
+            radius,
+        ),
+        CustomCollider::Ball { radius } => {
+            ray_intersect_sphere(origin, unit_dir, max_toi, entry.translation, radius)
+        }
+        CustomCollider::CapsuleY {
+            half_segment,
+            radius,
+        } => ray_intersect_cylinder(
+            origin,
+            unit_dir,
+            max_toi,
+            entry.translation,
+            entry.rotation,
+            entry.inv_rotation,
+            half_segment + radius,
+            radius,
+        ),
+    }
+}
+
+fn ray_intersect_obb(
+    origin: Vec3,
+    unit_dir: Vec3,
+    max_toi: f32,
+    box_pos: Vec3,
+    box_rot: Quat,
+    inv_box_rot: Quat,
+    half: Vec3,
+) -> Option<RayHit> {
+    let local_origin = inv_box_rot * (origin - box_pos);
+    let local_dir = inv_box_rot * unit_dir;
+
+    let mut t_enter = -f32::INFINITY;
+    let mut t_exit = max_toi;
+    let mut enter_normal_local = Vec3::Y;
+
+    let orig_arr = [local_origin.x, local_origin.y, local_origin.z];
+    let dir_arr = [local_dir.x, local_dir.y, local_dir.z];
+    let half_arr = [half.x, half.y, half.z];
+
+    for axis in 0..3 {
+        let o = orig_arr[axis];
+        let d = dir_arr[axis];
+        let h = half_arr[axis];
+
+        if d.abs() < 1e-6 {
+            if o < -h || o > h {
+                return None;
+            }
+        } else {
+            let inv_d = 1.0 / d;
+            // صفحه -h دارای نرمال بیرونی -1.0 و صفحه +h دارای نرمال بیرونی +1.0 است
+            let t_neg_face = (-h - o) * inv_d;
+            let t_pos_face = (h - o) * inv_d;
+
+            let (t_near, t_far, near_normal_sign) = if t_neg_face <= t_pos_face {
+                (t_neg_face, t_pos_face, -1.0_f32)
+            } else {
+                (t_pos_face, t_neg_face, 1.0_f32)
+            };
+
+            if t_near > t_enter {
+                t_enter = t_near;
+                enter_normal_local = Vec3::ZERO;
+                enter_normal_local[axis] = near_normal_sign;
+            }
+            t_exit = t_exit.min(t_far);
+            if t_enter > t_exit || t_exit < 0.0 {
+                return None;
+            }
+        }
+    }
+
+    if t_enter > max_toi {
+        return None;
+    }
+
+    let (toi, hit_normal_local) = if t_enter >= 0.0 {
+        (t_enter, enter_normal_local)
+    } else {
+        // مبدا پرتو درون مکعب قرار دارد: نرمال نزدیک‌ترین وجه بیرونی
+        let dx = (half.x - local_origin.x.abs()).abs();
+        let dy = (half.y - local_origin.y.abs()).abs();
+        let dz = (half.z - local_origin.z.abs()).abs();
+        let inside_normal = if dy <= dx && dy <= dz {
+            Vec3::new(0.0, if local_origin.y >= 0.0 { 1.0 } else { -1.0 }, 0.0)
+        } else if dx <= dz {
+            Vec3::new(if local_origin.x >= 0.0 { 1.0 } else { -1.0 }, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 0.0, if local_origin.z >= 0.0 { 1.0 } else { -1.0 })
+        };
+        (0.0, inside_normal)
+    };
+
+    let world_normal = (box_rot * hit_normal_local).normalize_or_zero();
+    Some(RayHit {
+        toi,
+        point: origin + unit_dir * toi,
+        normal: world_normal,
+    })
+}
+
+fn ray_intersect_cylinder(
+    origin: Vec3,
+    unit_dir: Vec3,
+    max_toi: f32,
+    cyl_pos: Vec3,
+    cyl_rot: Quat,
+    inv_cyl_rot: Quat,
+    half_height: f32,
+    radius: f32,
+) -> Option<RayHit> {
+    let lo = inv_cyl_rot * (origin - cyl_pos);
+    let ld = inv_cyl_rot * unit_dir;
+
+    // بررسی اینکه آیا مبدا پرتو درون استوانه قرار دارد
+    if lo.x * lo.x + lo.z * lo.z <= radius * radius && lo.y.abs() <= half_height {
+        let radial = Vec3::new(lo.x, 0.0, lo.z).normalize_or_zero();
+        let n_local = if (half_height - lo.y.abs()) < (radius - (lo.x * lo.x + lo.z * lo.z).sqrt())
+        {
+            Vec3::new(0.0, if lo.y >= 0.0 { 1.0 } else { -1.0 }, 0.0)
+        } else {
+            radial
+        };
+        return Some(RayHit {
+            toi: 0.0,
+            point: origin,
+            normal: (cyl_rot * n_local).normalize_or_zero(),
+        });
+    }
+
+    let mut best_t = max_toi + 1.0;
+    let mut best_normal_local = Vec3::Y;
+
+    // ۱. برخورد با کلاهک بالا و پایین (y = ±half_height)
+    if ld.y.abs() > 1e-6 {
+        for &cap_sign in &[-1.0_f32, 1.0_f32] {
+            let cap_y = cap_sign * half_height;
+            let t = (cap_y - lo.y) / ld.y;
+            if (0.0..=max_toi).contains(&t) && t < best_t {
+                let px = lo.x + ld.x * t;
+                let pz = lo.z + ld.z * t;
+                if px * px + pz * pz <= radius * radius {
+                    best_t = t;
+                    best_normal_local = Vec3::new(0.0, cap_sign, 0.0);
+                }
+            }
+        }
+    }
+
+    // ۲. برخورد با بدنه جانبی استوانه (x^2 + z^2 = r^2)
+    let a = ld.x * ld.x + ld.z * ld.z;
+    if a > 1e-6 {
+        let b = 2.0 * (lo.x * ld.x + lo.z * ld.z);
+        let c = lo.x * lo.x + lo.z * lo.z - radius * radius;
+        let disc = b * b - 4.0 * a * c;
+        if disc >= 0.0 {
+            let sqrt_d = disc.sqrt();
+            let t1 = (-b - sqrt_d) / (2.0 * a);
+            let t2 = (-b + sqrt_d) / (2.0 * a);
+            for &t in &[t1, t2] {
+                if (0.0..=max_toi).contains(&t) && t < best_t {
+                    let py = lo.y + ld.y * t;
+                    if py.abs() <= half_height {
+                        best_t = t;
+                        let px = lo.x + ld.x * t;
+                        let pz = lo.z + ld.z * t;
+                        best_normal_local = Vec3::new(px, 0.0, pz).normalize_or_zero();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if best_t <= max_toi {
+        Some(RayHit {
+            toi: best_t,
+            point: origin + unit_dir * best_t,
+            normal: (cyl_rot * best_normal_local).normalize_or_zero(),
+        })
+    } else {
+        None
+    }
+}
+
+fn ray_intersect_sphere(
+    origin: Vec3,
+    unit_dir: Vec3,
+    max_toi: f32,
+    sphere_pos: Vec3,
+    radius: f32,
+) -> Option<RayHit> {
+    let m = origin - sphere_pos;
+    let b = m.dot(unit_dir);
+    let c = m.length_squared() - radius * radius;
+    if c <= 0.0 {
+        return Some(RayHit {
+            toi: 0.0,
+            point: origin,
+            normal: m.normalize_or_zero(),
+        });
+    }
+    if b > 0.0 {
+        return None;
+    }
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = -b - disc.sqrt();
+    if (0.0..=max_toi).contains(&t) {
+        let point = origin + unit_dir * t;
+        Some(RayHit {
+            toi: t,
+            point,
+            normal: ((point - sphere_pos) / radius).normalize_or_zero(),
+        })
+    } else {
+        None
+    }
+}
+
+/// تشخیص برخورد دقیق کره با کولایدر ثابت (OBB یا استوانه)
+pub fn sphere_vs_static_collider(
+    sphere_center: Vec3,
+    sphere_radius: f32,
+    entry: &StaticColliderEntry,
+) -> Option<SphereContact> {
+    match entry.collider {
+        CustomCollider::Cuboid { half_extents } => sphere_vs_obb(
+            sphere_center,
+            sphere_radius,
+            entry.translation,
+            entry.rotation,
+            entry.inv_rotation,
+            half_extents,
+        ),
+        CustomCollider::Cylinder {
+            half_height,
+            radius,
+        } => sphere_vs_cylinder(
+            sphere_center,
+            sphere_radius,
+            entry.translation,
+            entry.rotation,
+            entry.inv_rotation,
+            half_height,
+            radius,
+        ),
+        CustomCollider::Ball { radius } => {
+            let diff = sphere_center - entry.translation;
+            let dist = diff.length();
+            let min_d = sphere_radius + radius;
+            if dist < min_d {
+                let n = if dist > 1e-5 { diff / dist } else { Vec3::Y };
+                Some(SphereContact {
+                    normal: n,
+                    penetration: min_d - dist,
+                    contact_point: entry.translation + n * radius,
+                })
+            } else {
+                None
+            }
+        }
+        CustomCollider::CapsuleY {
+            half_segment,
+            radius,
+        } => sphere_vs_cylinder(
+            sphere_center,
+            sphere_radius,
+            entry.translation,
+            entry.rotation,
+            entry.inv_rotation,
+            half_segment + radius,
+            radius,
+        ),
+    }
+}
+
+fn sphere_vs_obb(
+    sphere_center: Vec3,
+    sphere_radius: f32,
+    box_pos: Vec3,
+    box_rot: Quat,
+    inv_box_rot: Quat,
+    half: Vec3,
+) -> Option<SphereContact> {
+    let local_p = inv_box_rot * (sphere_center - box_pos);
+    let closest = local_p.clamp(-half, half);
+    let diff = local_p - closest;
+    let dist_sq = diff.length_squared();
+
+    if dist_sq > sphere_radius * sphere_radius {
+        return None;
+    }
+
+    if dist_sq > 1e-8 {
+        let dist = dist_sq.sqrt();
+        let local_normal = diff / dist;
+        let world_normal = (box_rot * local_normal).normalize_or_zero();
+        let world_contact = box_pos + box_rot * closest;
+        Some(SphereContact {
+            normal: world_normal,
+            penetration: sphere_radius - dist,
+            contact_point: world_contact,
+        })
+    } else {
+        // مرکز کره داخل جعبه است: خروج از نزدیک‌ترین وجه
+        let dx = half.x - local_p.x.abs();
+        let dy = half.y - local_p.y.abs();
+        let dz = half.z - local_p.z.abs();
+
+        let (local_normal, face_dist) = if dy <= dx && dy <= dz {
+            (
+                Vec3::new(0.0, if local_p.y >= 0.0 { 1.0 } else { -1.0 }, 0.0),
+                dy,
+            )
+        } else if dx <= dz {
+            (
+                Vec3::new(if local_p.x >= 0.0 { 1.0 } else { -1.0 }, 0.0, 0.0),
+                dx,
+            )
+        } else {
+            (
+                Vec3::new(0.0, 0.0, if local_p.z >= 0.0 { 1.0 } else { -1.0 }),
+                dz,
+            )
+        };
+
+        let world_normal = (box_rot * local_normal).normalize_or_zero();
+        Some(SphereContact {
+            normal: world_normal,
+            penetration: sphere_radius + face_dist.max(0.0),
+            contact_point: sphere_center - world_normal * face_dist.max(0.0),
+        })
+    }
+}
+
+fn sphere_vs_cylinder(
+    sphere_center: Vec3,
+    sphere_radius: f32,
+    cyl_pos: Vec3,
+    cyl_rot: Quat,
+    inv_cyl_rot: Quat,
+    half_height: f32,
+    cyl_radius: f32,
+) -> Option<SphereContact> {
+    let local_p = inv_cyl_rot * (sphere_center - cyl_pos);
+    let radial_dist = (local_p.x * local_p.x + local_p.z * local_p.z).sqrt();
+    let clamped_y = local_p.y.clamp(-half_height, half_height);
+
+    let (clamped_x, clamped_z) = if radial_dist > cyl_radius && radial_dist > 1e-6 {
+        let scale = cyl_radius / radial_dist;
+        (local_p.x * scale, local_p.z * scale)
+    } else {
+        (local_p.x, local_p.z)
+    };
+
+    let closest = Vec3::new(clamped_x, clamped_y, clamped_z);
+    let diff = local_p - closest;
+    let dist_sq = diff.length_squared();
+
+    if dist_sq > sphere_radius * sphere_radius {
+        return None;
+    }
+
+    if dist_sq > 1e-8 {
+        let dist = dist_sq.sqrt();
+        let local_normal = diff / dist;
+        let world_normal = (cyl_rot * local_normal).normalize_or_zero();
+        Some(SphereContact {
+            normal: world_normal,
+            penetration: sphere_radius - dist,
+            contact_point: cyl_pos + cyl_rot * closest,
+        })
+    } else {
+        // مرکز کره داخل استوانه قرار گرفته است
+        let radial_pen = cyl_radius - radial_dist;
+        let cap_pen = half_height - local_p.y.abs();
+        let (local_normal, face_dist) = if cap_pen < radial_pen {
+            (
+                Vec3::new(0.0, if local_p.y >= 0.0 { 1.0 } else { -1.0 }, 0.0),
+                cap_pen,
+            )
+        } else if radial_dist > 1e-5 {
+            (
+                Vec3::new(local_p.x / radial_dist, 0.0, local_p.z / radial_dist),
+                radial_pen,
+            )
+        } else {
+            (Vec3::X, radial_pen)
+        };
+        let world_normal = (cyl_rot * local_normal).normalize_or_zero();
+        Some(SphereContact {
+            normal: world_normal,
+            penetration: sphere_radius + face_dist.max(0.0),
+            contact_point: sphere_center - world_normal * face_dist.max(0.0),
+        })
+    }
+}
+
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MobaPhysicsSet {
     InputIngress,
     Drive,
+    Simulate,
     React,
     NetworkEgress,
 }
@@ -826,30 +1753,23 @@ impl Plugin for MobaSharedPhysicsPlugin {
             app.add_plugins(TransformPlugin);
         }
 
-        let fixed_dt = (1.0 / self.tick_rate_hz) as f32;
-
         app.insert_resource(Time::<Fixed>::from_hz(self.tick_rate_hz))
-            .insert_resource(TimestepMode::Fixed {
-                dt: fixed_dt,
-                substeps: self.substeps,
-            })
-            .add_plugins(RapierPhysicsPlugin::<NoUserData>::default().in_fixed_schedule())
+            .init_resource::<CustomPhysicsWorld>()
             .configure_sets(
                 FixedUpdate,
                 (
-                    MobaPhysicsSet::InputIngress.before(MobaPhysicsSet::Drive),
-                    MobaPhysicsSet::Drive.before(PhysicsSet::SyncBackend),
-                    MobaPhysicsSet::React.after(PhysicsSet::Writeback),
-                    MobaPhysicsSet::NetworkEgress.after(MobaPhysicsSet::React),
-                ),
-            )
-            .add_systems(
-                Startup,
-                (
-                    configure_rapier_context_system,
-                    spawn_shared_physics_actors_system,
+                    MobaPhysicsSet::InputIngress,
+                    MobaPhysicsSet::Drive,
+                    MobaPhysicsSet::Simulate,
+                    MobaPhysicsSet::React,
+                    MobaPhysicsSet::NetworkEgress,
                 )
                     .chain(),
+            )
+            .add_systems(Startup, spawn_shared_physics_actors_system)
+            .add_systems(
+                FixedUpdate,
+                step_custom_physics_simulation_system.in_set(MobaPhysicsSet::Simulate),
             );
 
         match self.role {
@@ -857,7 +1777,12 @@ impl Plugin for MobaSharedPhysicsPlugin {
                 app.add_systems(Startup, spawn_server_environment_colliders_system)
                     .add_systems(
                         FixedUpdate,
-                        shared_authoritative_drive_system.in_set(MobaPhysicsSet::Drive),
+                        (
+                            sync_static_colliders_to_world_system,
+                            shared_authoritative_drive_system,
+                        )
+                            .chain()
+                            .in_set(MobaPhysicsSet::Drive),
                     )
                     .add_systems(
                         FixedUpdate,
@@ -867,12 +1792,17 @@ impl Plugin for MobaSharedPhysicsPlugin {
             PhysicsRole::Client => {
                 app.add_systems(
                     FixedUpdate,
-                    shared_client_drive_system.in_set(MobaPhysicsSet::Drive),
+                    (
+                        sync_static_colliders_to_world_system,
+                        shared_client_drive_system,
+                    )
+                        .chain()
+                        .in_set(MobaPhysicsSet::Drive),
                 )
-                    .add_systems(
-                        FixedUpdate,
-                        shared_client_react_system.in_set(MobaPhysicsSet::React),
-                    );
+                .add_systems(
+                    FixedUpdate,
+                    shared_client_react_system.in_set(MobaPhysicsSet::React),
+                );
             }
         }
     }
@@ -960,7 +1890,7 @@ pub struct PhysicsParticle {
 }
 
 // -----------------------------------------------------------------------------
-// ۴. باندل‌های ساخت کولایدر و اجسام فیزیکی مشترک نقشه (استفاده در سرور و کلاینت)
+// ۴. باندل‌های ساخت کولایدر و اجسام فیزیکی مشترک نقشه (بدون Rapier)
 // -----------------------------------------------------------------------------
 
 pub fn ground_physics_bundle(
@@ -968,10 +1898,9 @@ pub fn ground_physics_bundle(
 ) -> (
     PhysicsGround,
     ElevationSurface,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -985,15 +1914,11 @@ pub fn ground_physics_bundle(
             elevation_tier: -1,
             top_y: river_floor_y,
         },
-        RigidBody::Fixed,
-        Collider::cuboid(hx, hy, hz),
-        Friction {
-            coefficient: config.physics.ground_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.ground_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cuboid(hx, hy, hz),
+        SurfaceMaterial {
+            friction: config.physics.ground_friction,
+            restitution: config.physics.ground_restitution,
         },
         world_collision_groups(),
         Transform::from_xyz(0.0, river_floor_y - hy, 0.0),
@@ -1006,10 +1931,9 @@ pub fn terrain_platform_physics_bundle(
 ) -> (
     MapObjectId,
     ElevationSurface,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1021,15 +1945,11 @@ pub fn terrain_platform_physics_bundle(
             elevation_tier: plat.elevation_tier,
             top_y: pos.y + half.y,
         },
-        RigidBody::Fixed,
-        Collider::cuboid(half.x, half.y, half.z),
-        Friction {
-            coefficient: config.physics.ground_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.ground_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cuboid(half.x, half.y, half.z),
+        SurfaceMaterial {
+            friction: config.physics.ground_friction,
+            restitution: config.physics.ground_restitution,
         },
         world_collision_groups(),
         Transform::from_translation(pos),
@@ -1041,10 +1961,9 @@ pub fn ramp_physics_bundle(
     ramp: &RampDef,
 ) -> (
     MapObjectId,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1058,15 +1977,11 @@ pub fn ramp_physics_bundle(
     );
     (
         MapObjectId(ramp.id.clone()),
-        RigidBody::Fixed,
-        Collider::cuboid(half.x, half.y, half.z),
-        Friction {
-            coefficient: config.physics.ground_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.ground_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cuboid(half.x, half.y, half.z),
+        SurfaceMaterial {
+            friction: config.physics.ground_friction,
+            restitution: config.physics.ground_restitution,
         },
         world_collision_groups(),
         Transform {
@@ -1083,10 +1998,9 @@ pub fn center_bridge_physics_bundle(
 ) -> (
     MapObjectId,
     ElevationSurface,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1102,15 +2016,11 @@ pub fn center_bridge_physics_bundle(
             elevation_tier: bridge.elevation_tier,
             top_y: pos.y + half_h,
         },
-        RigidBody::Fixed,
-        Collider::cylinder(half_h, bridge.outer_radius),
-        Friction {
-            coefficient: config.physics.ground_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.ground_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cylinder(half_h, bridge.outer_radius),
+        SurfaceMaterial {
+            friction: config.physics.ground_friction,
+            restitution: config.physics.ground_restitution,
         },
         world_collision_groups(),
         Transform::from_translation(pos),
@@ -1126,10 +2036,9 @@ pub fn lane_segment_physics_bundle(
     thickness: f32,
 ) -> (
     MapObjectId,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1140,15 +2049,11 @@ pub fn lane_segment_physics_bundle(
     let rot = Transform::IDENTITY.looking_to(dir, Vec3::Y).rotation;
     (
         MapObjectId(seg_id),
-        RigidBody::Fixed,
-        Collider::cuboid(width * 0.5, thickness * 0.5, len_3d * 0.5),
-        Friction {
-            coefficient: config.physics.ground_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.ground_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cuboid(width * 0.5, thickness * 0.5, len_3d * 0.5),
+        SurfaceMaterial {
+            friction: config.physics.ground_friction,
+            restitution: config.physics.ground_restitution,
         },
         world_collision_groups(),
         Transform {
@@ -1165,10 +2070,9 @@ pub fn mountain_physics_bundle(
 ) -> (
     MapObjectId,
     PhysicsMountain,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1180,15 +2084,11 @@ pub fn mountain_physics_bundle(
         PhysicsMountain {
             id: mtn.id.clone(),
         },
-        RigidBody::Fixed,
-        Collider::cuboid(half.x, half.y, half.z),
-        Friction {
-            coefficient: config.physics.obstacle_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.obstacle_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cuboid(half.x, half.y, half.z),
+        SurfaceMaterial {
+            friction: config.physics.obstacle_friction,
+            restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
         Transform {
@@ -1205,10 +2105,9 @@ pub fn tree_physics_bundle(
 ) -> (
     MapObjectId,
     PhysicsTree,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1219,15 +2118,11 @@ pub fn tree_physics_bundle(
         PhysicsTree {
             id: tree.id.clone(),
         },
-        RigidBody::Fixed,
-        Collider::cylinder(half_h, tree.trunk_radius),
-        Friction {
-            coefficient: config.physics.obstacle_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.obstacle_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cylinder(half_h, tree.trunk_radius),
+        SurfaceMaterial {
+            friction: config.physics.obstacle_friction,
+            restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
         Transform::from_translation(pos),
@@ -1240,10 +2135,9 @@ pub fn turret_physics_bundle(
 ) -> (
     MapObjectId,
     PhysicsTurret,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1257,15 +2151,11 @@ pub fn turret_physics_bundle(
             lane: turret.lane,
             tier: turret.tier,
         },
-        RigidBody::Fixed,
-        Collider::cylinder(half_h, turret.base_radius),
-        Friction {
-            coefficient: config.physics.obstacle_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.obstacle_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cylinder(half_h, turret.base_radius),
+        SurfaceMaterial {
+            friction: config.physics.obstacle_friction,
+            restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
         Transform::from_translation(pos),
@@ -1278,10 +2168,9 @@ pub fn ancient_physics_bundle(
 ) -> (
     MapObjectId,
     PhysicsAncient,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1297,15 +2186,11 @@ pub fn ancient_physics_bundle(
             id: ancient.id.clone(),
             team: ancient.team,
         },
-        RigidBody::Fixed,
-        Collider::cuboid(half.x, half.y, half.z),
-        Friction {
-            coefficient: config.physics.obstacle_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.obstacle_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cuboid(half.x, half.y, half.z),
+        SurfaceMaterial {
+            friction: config.physics.obstacle_friction,
+            restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
         Transform::from_translation(pos),
@@ -1318,10 +2203,9 @@ pub fn obstacle_physics_bundle(
 ) -> (
     MapObjectId,
     PhysicsObstacle,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1334,15 +2218,11 @@ pub fn obstacle_physics_bundle(
             id: obs.id.clone(),
             can_vault: obs.can_vault,
         },
-        RigidBody::Fixed,
-        Collider::cuboid(half.x, half.y, half.z),
-        Friction {
-            coefficient: config.physics.obstacle_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.obstacle_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cuboid(half.x, half.y, half.z),
+        SurfaceMaterial {
+            friction: config.physics.obstacle_friction,
+            restitution: config.physics.obstacle_restitution,
         },
         world_collision_groups(),
         Transform {
@@ -1360,10 +2240,9 @@ pub fn target_physics_bundle(
 ) -> (
     MapObjectId,
     PhysicsTarget,
-    RigidBody,
-    Collider,
-    Friction,
-    Restitution,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
     CollisionGroups,
     Transform,
 ) {
@@ -1379,15 +2258,11 @@ pub fn target_physics_bundle(
             id: target.id.clone(),
             index,
         },
-        RigidBody::Fixed,
-        Collider::cuboid(half.x, half.y, half.z),
-        Friction {
-            coefficient: config.physics.target_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Restitution {
-            coefficient: config.physics.target_restitution,
-            combine_rule: CoefficientCombineRule::Average,
+        CustomRigidBody::Fixed,
+        CustomCollider::cuboid(half.x, half.y, half.z),
+        SurfaceMaterial {
+            friction: config.physics.target_friction,
+            restitution: config.physics.target_restitution,
         },
         world_collision_groups(),
         Transform::from_translation(pos),
@@ -1398,10 +2273,10 @@ pub fn soldier_physics_bundle(
     config: &GameConfig,
 ) -> (
     PhysicsSoldier,
-    RigidBody,
-    Collider,
+    CustomRigidBody,
+    CustomCollider,
     CollisionGroups,
-    KinematicCharacterController,
+    CustomCharacterController,
     Transform,
 ) {
     let spawn_pos = Vec3::new(
@@ -1411,36 +2286,15 @@ pub fn soldier_physics_bundle(
     );
     (
         PhysicsSoldier,
-        RigidBody::KinematicPositionBased,
-        Collider::capsule_y(
+        CustomRigidBody::KinematicPositionBased,
+        CustomCollider::capsule_y(
             config.physics.soldier_capsule_half_segment,
             config.soldier.player_radius,
         ),
         soldier_collision_groups(),
-        KinematicCharacterController {
-            up: Vec3::Y,
-            offset: CharacterLength::Absolute(config.physics.character_skin_offset),
-            slide: true,
-            autostep: Some(CharacterAutostep {
-                max_height: CharacterLength::Absolute(config.physics.character_autostep_max_height),
-                min_width: CharacterLength::Absolute(config.physics.character_autostep_min_width),
-                include_dynamic_bodies: false,
-            }),
-            max_slope_climb_angle: config.physics.character_max_slope_climb_deg.to_radians(),
-            min_slope_slide_angle: config.physics.character_min_slope_slide_deg.to_radians(),
-            apply_impulse_to_dynamic_bodies: true,
-            snap_to_ground: Some(CharacterLength::Absolute(
-                config.physics.character_snap_to_ground,
-            )),
-            normal_nudge_factor: config.physics.character_normal_nudge_factor,
-            filter_flags: QueryFilterFlags::empty(),
-            filter_groups: Some(soldier_collision_groups()),
-            exclude_colliders: EntityHashSet::new(),
-            exclude_rigid_bodies: EntityHashSet::new(),
-            filter_predicate: None,
-            custom_shape: None,
-            custom_mass: None,
+        CustomCharacterController {
             translation: None,
+            grounded: true,
         },
         Transform::from_translation(spawn_pos),
     )
@@ -1455,14 +2309,10 @@ pub fn grenade_physics_bundle(
     angular_velocity: Vec3,
 ) -> (
     PhysicsGrenade,
-    RigidBody,
-    Collider,
-    Restitution,
-    Friction,
-    Damping,
-    GravityScale,
+    CustomRigidBody,
+    CustomCollider,
+    DynamicBodyProps,
     Velocity,
-    Ccd,
     CollisionGroups,
     Transform,
 ) {
@@ -1471,26 +2321,20 @@ pub fn grenade_physics_bundle(
             id,
             remaining_fuse: config.combat.grenade_fuse_secs,
         },
-        RigidBody::Dynamic,
-        Collider::ball(config.physics.grenade_collider_radius),
-        Restitution {
-            coefficient: config.physics.grenade_restitution,
-            combine_rule: CoefficientCombineRule::Max,
-        },
-        Friction {
-            coefficient: config.physics.grenade_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Damping {
+        CustomRigidBody::Dynamic,
+        CustomCollider::ball(config.physics.grenade_collider_radius),
+        DynamicBodyProps {
+            restitution: config.physics.grenade_restitution,
+            friction: config.physics.grenade_friction,
             linear_damping: config.physics.grenade_linear_damping,
             angular_damping: config.physics.grenade_angular_damping,
+            gravity_scale: config.physics.grenade_gravity_scale,
+            ccd_enabled: true,
         },
-        GravityScale(config.physics.grenade_gravity_scale),
         Velocity {
             linear: linear_velocity,
             angular: angular_velocity,
         },
-        Ccd::enabled(),
         grenade_collision_groups(),
         Transform {
             translation,
@@ -1507,12 +2351,9 @@ pub fn shell_casing_physics_bundle(
     angular_velocity: Vec3,
 ) -> (
     PhysicsShellCasing,
-    RigidBody,
-    Collider,
-    Restitution,
-    Friction,
-    Damping,
-    GravityScale,
+    CustomRigidBody,
+    CustomCollider,
+    DynamicBodyProps,
     Velocity,
     CollisionGroups,
     Transform,
@@ -1521,24 +2362,19 @@ pub fn shell_casing_physics_bundle(
         PhysicsShellCasing {
             lifetime: Timer::from_seconds(config.fx.shell_lifetime_secs, TimerMode::Once),
         },
-        RigidBody::Dynamic,
-        Collider::cylinder(
+        CustomRigidBody::Dynamic,
+        CustomCollider::cylinder(
             config.physics.shell_collider_half_height,
             config.physics.shell_collider_radius,
         ),
-        Restitution {
-            coefficient: config.physics.shell_restitution,
-            combine_rule: CoefficientCombineRule::Max,
-        },
-        Friction {
-            coefficient: config.physics.shell_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Damping {
+        DynamicBodyProps {
+            restitution: config.physics.shell_restitution,
+            friction: config.physics.shell_friction,
             linear_damping: config.physics.shell_linear_damping,
             angular_damping: config.physics.shell_angular_damping,
+            gravity_scale: config.physics.shell_gravity_scale,
+            ccd_enabled: false,
         },
-        GravityScale(config.physics.shell_gravity_scale),
         Velocity {
             linear: linear_velocity,
             angular: angular_velocity,
@@ -1556,12 +2392,9 @@ pub fn particle_physics_bundle(
     scale_decay: bool,
 ) -> (
     PhysicsParticle,
-    RigidBody,
-    Collider,
-    Restitution,
-    Friction,
-    Damping,
-    GravityScale,
+    CustomRigidBody,
+    CustomCollider,
+    DynamicBodyProps,
     Velocity,
     CollisionGroups,
     Transform,
@@ -1571,21 +2404,16 @@ pub fn particle_physics_bundle(
             lifetime: Timer::from_seconds(lifetime_secs, TimerMode::Once),
             scale_decay,
         },
-        RigidBody::Dynamic,
-        Collider::ball(config.physics.particle_collider_radius),
-        Restitution {
-            coefficient: config.physics.particle_restitution,
-            combine_rule: CoefficientCombineRule::Max,
-        },
-        Friction {
-            coefficient: config.physics.particle_friction,
-            combine_rule: CoefficientCombineRule::Average,
-        },
-        Damping {
+        CustomRigidBody::Dynamic,
+        CustomCollider::ball(config.physics.particle_collider_radius),
+        DynamicBodyProps {
+            restitution: config.physics.particle_restitution,
+            friction: config.physics.particle_friction,
             linear_damping: config.physics.particle_linear_damping,
             angular_damping: config.physics.particle_angular_damping,
+            gravity_scale: config.physics.particle_gravity_scale,
+            ccd_enabled: false,
         },
-        GravityScale(config.physics.particle_gravity_scale),
         Velocity {
             linear: linear_velocity,
             angular: Vec3::ZERO,
@@ -1595,12 +2423,9 @@ pub fn particle_physics_bundle(
     )
 }
 
-/// قانون برتری دید ارتفاعی (Dota 2 High-Ground Vision Rule):
-/// اگر ناظر در ارتفاع پایین‌تر از هدف باشد (اختلاف بیش از `high_ground_occlusion_min_diff`)،
-/// دید مستقیم به سطح بالاتر مسدود است؛ اما اگر ناظر روی High-Ground باشد، شعاع دید او به اندازه
-/// `high_ground_vision_bonus` افزایش می‌یابد.
+/// قانون برتری دید ارتفاعی (Dota 2 High-Ground Vision Rule) با استفاده از موتور فیزیک اختصاصی
 pub fn can_observer_see_point(
-    rapier_context: &RapierContext,
+    physics_world: &CustomPhysicsWorld,
     config: &GameConfig,
     observer_feet_pos: Vec3,
     target_feet_pos: Vec3,
@@ -1630,9 +2455,9 @@ pub fn can_observer_see_point(
         return true;
     }
 
-    let filter = QueryFilter::new().groups(CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD));
-    rapier_context
-        .cast_ray(eye_origin, to_target / dist, dist, true, filter)
+    let query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
+    physics_world
+        .cast_ray(eye_origin, to_target / dist, dist, query_groups, |_| true)
         .is_none()
 }
 
@@ -1737,7 +2562,7 @@ impl AuthoritativeWorldState {
             config.soldier.initial_aim_dir.1,
             config.soldier.initial_aim_dir.2,
         )
-            .normalize();
+        .normalize();
         let initial_aim_hit = Vec3::new(
             config.soldier.initial_aim_hit_pos.0,
             config.soldier.initial_aim_hit_pos.1,
@@ -1843,7 +2668,7 @@ impl AuthoritativeWorldState {
 }
 
 // -----------------------------------------------------------------------------
-// ۶. توابع کمکی جهت‌گیری، لیزر و راه‌اندازی Rapier (مشترک بین سرور و کلاینت)
+// ۶. توابع کمکی جهت‌گیری، لیزر و سیستم‌های اجرای موتور فیزیک اختصاصی
 // -----------------------------------------------------------------------------
 
 pub fn orient_soldier_towards(soldier_tf: &mut Transform, dir: Vec3, min_dir_sq: f32) {
@@ -1875,11 +2700,11 @@ pub fn angle_to_direction_8(degrees: f32) -> &'static str {
     }
 }
 
-pub fn compute_laser_hit_with_rapier<F>(
-    rapier_context: &RapierContext,
+pub fn compute_laser_hit<F>(
+    physics_world: &CustomPhysicsWorld,
     muzzle_pos: Vec3,
     raw_target: Vec3,
-    dead_target_predicate: F,
+    active_target_predicate: F,
 ) -> Vec3
 where
     F: Fn(Entity) -> bool,
@@ -1890,15 +2715,12 @@ where
         return raw_target;
     }
     let dir = to_target / max_dist;
-    let pred = |entity: Entity, _collider: &bevy_rapier3d::rapier::geometry::Collider| {
-        dead_target_predicate(entity)
-    };
-    let filter = QueryFilter::new()
-        .groups(CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD))
-        .predicate(&pred);
+    let query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
 
-    if let Some((_entity, toi)) = rapier_context.cast_ray(muzzle_pos, dir, max_dist, true, filter) {
-        muzzle_pos + dir * toi
+    if let Some((_entity, hit)) =
+        physics_world.cast_ray(muzzle_pos, dir, max_dist, query_groups, active_target_predicate)
+    {
+        hit.point
     } else {
         raw_target
     }
@@ -1951,17 +2773,6 @@ fn resolve_muzzle_pos(
             + Vec3::new(0.0, config.combat.fallback_muzzle_offset_y, 0.0)
             + world.aim_world_dir * config.combat.fallback_muzzle_forward
     }
-}
-
-fn configure_rapier_context_system(
-    config: Res<GameConfig>,
-    mut rapier_configs: Query<&mut RapierConfiguration, With<DefaultRapierContext>>,
-) {
-    let mut rapier_cfg = rapier_configs
-        .single_mut()
-        .expect("خطای بحرانی: DefaultRapierContext در صحنه یافت نشد");
-    rapier_cfg.gravity = Vec3::new(0.0, config.physics.gravity_y, 0.0);
-    rapier_cfg.force_update_from_transform_changes = false;
 }
 
 fn spawn_shared_physics_actors_system(mut commands: Commands, config: Res<GameConfig>) {
@@ -2028,14 +2839,202 @@ fn spawn_server_environment_colliders_system(mut commands: Commands, config: Res
     }
 }
 
+/// همگام‌سازی لیست کولایدرهای ثابت نقشه با CustomPhysicsWorld در ابتدای هر تیک فیزیک
+fn sync_static_colliders_to_world_system(
+    mut physics_world: ResMut<CustomPhysicsWorld>,
+    static_query: Query<(
+        Entity,
+        &Transform,
+        &CustomRigidBody,
+        &CustomCollider,
+        &SurfaceMaterial,
+        &CollisionGroups,
+        Has<ColliderDisabled>,
+    )>,
+) {
+    physics_world.static_colliders.clear();
+    for (entity, tf, body, collider, mat, groups, disabled) in &static_query {
+        if *body != CustomRigidBody::Fixed {
+            continue;
+        }
+        let rot = tf.rotation.normalize();
+        physics_world.static_colliders.push(StaticColliderEntry {
+            entity,
+            translation: tf.translation,
+            rotation: rot,
+            inv_rotation: rot.inverse(),
+            collider: *collider,
+            bounding_radius: collider.bounding_sphere_radius(),
+            material: *mat,
+            groups: *groups,
+            disabled,
+        });
+    }
+}
+
+/// گام شبیه‌سازی موتور فیزیک اختصاصی (حرکت کپسول کاراکتر + اجسام دینامیک نارنجک/پوکه/ذرات)
+fn step_custom_physics_simulation_system(
+    time: Res<Time<Fixed>>,
+    config: Res<GameConfig>,
+    physics_world: Res<CustomPhysicsWorld>,
+    mut soldier_query: Query<
+        (&mut Transform, &mut CustomCharacterController),
+        (With<PhysicsSoldier>, Without<DynamicBodyProps>),
+    >,
+    mut dynamic_query: Query<
+        (
+            Entity,
+            &mut Transform,
+            &mut Velocity,
+            &CustomCollider,
+            &DynamicBodyProps,
+            &CollisionGroups,
+        ),
+        Without<PhysicsSoldier>,
+    >,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+
+    // ۱. اجرای کنترلر حرکتی کاراکتر
+    for (mut soldier_tf, mut controller) in &mut soldier_query {
+        if let Some(desired_delta) = controller.translation.take() {
+            let (new_center, grounded) =
+                physics_world.move_character_capsule(soldier_tf.translation, desired_delta, &config);
+            soldier_tf.translation = new_center;
+            controller.grounded = grounded;
+        }
+    }
+
+    // ۲. اجرای شبیه‌سازی اجسام دینامیک (نارنجک‌ها، پوکه‌ها و ذرات) با Substeps
+    let substeps = config.physics.substeps.max(1);
+    let sub_dt = dt / (substeps as f32);
+    let gravity = Vec3::new(0.0, config.physics.gravity_y, 0.0);
+
+    for _ in 0..substeps {
+        let mut grenade_positions: Vec<(Entity, Vec3, f32)> = Vec::new();
+
+        for (entity, mut tf, mut vel, collider, props, groups) in &mut dynamic_query {
+            // اعمال شتاب گرانش و میرایی (Damping)
+            vel.linear += gravity * props.gravity_scale * sub_dt;
+            let lin_damp = (1.0 - props.linear_damping * sub_dt).clamp(0.0, 1.0);
+            let ang_damp = (1.0 - props.angular_damping * sub_dt).clamp(0.0, 1.0);
+            vel.linear *= lin_damp;
+            vel.angular *= ang_damp;
+
+            // انتگرال‌گیری چرخش زاویه‌ای
+            let ang_speed = vel.angular.length();
+            if ang_speed > 1e-5 {
+                let axis = vel.angular / ang_speed;
+                let dq = Quat::from_axis_angle(axis, ang_speed * sub_dt);
+                tf.rotation = (dq * tf.rotation).normalize();
+            }
+
+            let radius = collider.effective_ball_radius();
+            let step_vec = vel.linear * sub_dt;
+            let step_len = step_vec.length();
+
+            // تشخیص برخورد پیوسته (CCD) برای اجسام سریع مثل نارنجک
+            if props.ccd_enabled && step_len > radius * 0.65 {
+                if let Some((_hit_ent, hit)) = physics_world.cast_ray(
+                    tf.translation,
+                    step_vec / step_len,
+                    step_len + radius,
+                    *groups,
+                    |_| true,
+                ) {
+                    tf.translation = hit.point + hit.normal * radius;
+                    let vn = vel.linear.dot(hit.normal);
+                    if vn < 0.0 {
+                        let normal_vel = hit.normal * vn;
+                        let tangent_vel = vel.linear - normal_vel;
+                        vel.linear = tangent_vel * (1.0 - props.friction).clamp(0.0, 1.0)
+                            - normal_vel * props.restitution;
+                        vel.angular *= 0.85;
+                    }
+                    if (groups.memberships & GROUP_GRENADE) != 0 {
+                        grenade_positions.push((entity, tf.translation, radius));
+                    }
+                    continue;
+                }
+            }
+
+            tf.translation += step_vec;
+
+            // حل برخورد کره با کولایدرهای ثابت نقشه
+            for entry in &physics_world.static_colliders {
+                if entry.disabled || !groups.interacts_with(entry.groups) {
+                    continue;
+                }
+                let max_r = entry.bounding_radius + radius;
+                if tf.translation.distance_squared(entry.translation) > max_r * max_r {
+                    continue;
+                }
+
+                if let Some(contact) = sphere_vs_static_collider(tf.translation, radius, entry) {
+                    tf.translation += contact.normal * contact.penetration;
+                    let vn = vel.linear.dot(contact.normal);
+                    if vn < 0.0 {
+                        let combined_restitution = props.restitution.max(entry.material.restitution);
+                        let combined_friction =
+                            0.5 * (props.friction + entry.material.friction);
+                        let normal_vel = contact.normal * vn;
+                        let tangent_vel = vel.linear - normal_vel;
+                        vel.linear = tangent_vel * (1.0 - combined_friction * 0.35).clamp(0.0, 1.0)
+                            - normal_vel * combined_restitution;
+
+                        // جلوگیری از لرزش‌های ریز وقتی جسم روی زمین آرام گرفته است
+                        if contact.normal.y > 0.7 && vel.linear.y.abs() < 0.25 {
+                            vel.linear.y = 0.0;
+                        }
+                    }
+                }
+            }
+
+            if (groups.memberships & GROUP_GRENADE) != 0 {
+                grenade_positions.push((entity, tf.translation, radius));
+            }
+        }
+
+        // برخورد متقابل نارنجک‌ها با یکدیگر
+        if grenade_positions.len() > 1 {
+            for i in 0..grenade_positions.len() {
+                for j in (i + 1)..grenade_positions.len() {
+                    let (e1, p1, r1) = grenade_positions[i];
+                    let (e2, p2, r2) = grenade_positions[j];
+                    let diff = p1 - p2;
+                    let dist = diff.length();
+                    let min_d = r1 + r2;
+                    if dist < min_d && dist > 1e-5 {
+                        let n = diff / dist;
+                        let push = (min_d - dist) * 0.5;
+                        if let Ok([mut g1, mut g2]) = dynamic_query.get_many_mut([e1, e2]) {
+                            g1.1.translation += n * push;
+                            g2.1.translation -= n * push;
+                            let rel_v = (g1.2.linear - g2.2.linear).dot(n);
+                            if rel_v < 0.0 {
+                                let impulse = n * (rel_v * 0.75);
+                                g1.2.linear -= impulse;
+                                g2.2.linear += impulse;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn shared_authoritative_drive_system(
     mut commands: Commands,
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
-    rapier_contexts: ReadRapierContext,
+    physics_world: Res<CustomPhysicsWorld>,
     mut world: ResMut<AuthoritativeWorldState>,
     mut soldier_query: Query<
-        (&mut Transform, &mut KinematicCharacterController),
+        (&mut Transform, &mut CustomCharacterController),
         With<PhysicsSoldier>,
     >,
     obstacle_query: Query<&PhysicsObstacle>,
@@ -2046,9 +3045,6 @@ fn shared_authoritative_drive_system(
     };
 
     let dt = time.delta_secs();
-    let rapier_context = rapier_contexts
-        .single()
-        .expect("خطای بحرانی: RapierContext معتبر یافت نشد");
     let (mut soldier_tf, mut controller) = soldier_query
         .single_mut()
         .expect("خطای بحرانی: موجودیت PhysicsSoldier یافت نشد");
@@ -2187,12 +3183,12 @@ fn shared_authoritative_drive_system(
             };
         }
 
-        // ۷. سیستم پرش، غلت و عبور از مانع با پرتو و کپسول Rapier
-        step_traversal_with_rapier(
+        // ۷. سیستم پرش، غلت و عبور از مانع با پرتو و کپسول فیزیک اختصاصی
+        step_traversal_custom(
             &mut world,
             &input,
             &config,
-            &rapier_context,
+            &physics_world,
             &obstacle_query,
             &target_query,
             &mut soldier_tf,
@@ -2200,7 +3196,7 @@ fn shared_authoritative_drive_system(
             dt,
         );
 
-        // ۸. جابجایی فیزیکی ۳بعدی کاراکتر روی رمپ‌ها، پل مرکزی و سطوح ارتفاعی با KinematicCharacterController
+        // ۸. جابجایی فیزیکی ۳بعدی کاراکتر روی رمپ‌ها، پل مرکزی و سطوح ارتفاعی
         if !world.traversal.is_active {
             let grav_y = config.physics.character_gravity_step_y * dt;
             if world.is_moving {
@@ -2217,20 +3213,20 @@ fn shared_authoritative_drive_system(
         }
     }
 
-    // ۹. شلیک گلوله و پرتاب نارنجک در دنیای Rapier
+    // ۹. شلیک گلوله و پرتاب نارنجک
     step_shooting_and_grenade_spawn(&mut commands, &mut world, &input, &config, dt);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn step_traversal_with_rapier(
+fn step_traversal_custom(
     world: &mut AuthoritativeWorldState,
     input: &ClientInputCommand,
     config: &GameConfig,
-    rapier_context: &RapierContext,
+    physics_world: &CustomPhysicsWorld,
     obstacle_query: &Query<&PhysicsObstacle>,
     target_query: &Query<&PhysicsTarget>,
     soldier_tf: &mut Transform,
-    controller: &mut KinematicCharacterController,
+    controller: &mut CustomCharacterController,
     dt: f32,
 ) {
     if world.traversal.is_active {
@@ -2286,23 +3282,20 @@ fn step_traversal_with_rapier(
     };
 
     let ray_origin = world.soldier_pos + Vec3::Y * config.soldier.vault_ray_height;
-    let vault_pred = |entity: Entity, _collider: &bevy_rapier3d::rapier::geometry::Collider| {
-        obstacle_query
-            .get(entity)
-            .map(|obs| obs.can_vault)
-            .unwrap_or(false)
-    };
-    let vault_filter = QueryFilter::new()
-        .groups(CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD))
-        .predicate(&vault_pred);
+    let query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
 
-    let crossing_obstacle = rapier_context
+    let crossing_obstacle = physics_world
         .cast_ray(
             ray_origin,
             travel_dir,
             config.soldier.vault_check_distance,
-            true,
-            vault_filter,
+            query_groups,
+            |entity| {
+                obstacle_query
+                    .get(entity)
+                    .map(|obs| obs.can_vault)
+                    .unwrap_or(false)
+            },
         )
         .is_some();
 
@@ -2350,43 +3343,28 @@ fn step_traversal_with_rapier(
     let exact_duration = config.exact_anim_duration(anim_name);
     let distance = speed * exact_duration;
 
-    let capsule_shape = Collider::capsule_y(
-        config.physics.soldier_capsule_half_segment,
-        config.soldier.player_radius,
-    );
     let shape_pos = Vec3::new(
         world.soldier_pos.x,
         world.soldier_pos.y + config.physics.soldier_capsule_center_y,
         world.soldier_pos.z,
     );
-    let cast_pred = |entity: Entity, _collider: &bevy_rapier3d::rapier::geometry::Collider| {
-        if let Ok(t) = target_query.get(entity) {
-            !world.targets[t.index].is_dead
-        } else {
-            obstacle_query.contains(entity)
-        }
-    };
-    let cast_filter = QueryFilter::new()
-        .groups(CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD))
-        .predicate(&cast_pred);
 
-    let safe_dist = if let Some((_entity, hit)) = rapier_context.cast_shape(
+    let safe_dist = physics_world.sweep_capsule_horizontal(
         shape_pos,
-        Quat::IDENTITY,
+        config.physics.soldier_capsule_half_segment,
+        config.soldier.player_radius,
         travel_dir,
-        &capsule_shape,
-        ShapeCastOptions {
-            max_time_of_impact: distance,
-            target_distance: config.soldier.free_traversal_wall_padding,
-            stop_at_penetration: true,
-            compute_impact_geometry_on_penetration: true,
+        distance,
+        config.soldier.free_traversal_wall_padding,
+        query_groups,
+        |entity| {
+            if let Ok(t) = target_query.get(entity) {
+                !world.targets[t.index].is_dead
+            } else {
+                obstacle_query.contains(entity)
+            }
         },
-        cast_filter,
-    ) {
-        hit.time_of_impact.max(0.0)
-    } else {
-        distance
-    };
+    );
 
     world.traversal.is_active = true;
     world.traversal.kind = kind;
@@ -2505,7 +3483,7 @@ fn shared_authoritative_react_system(
     mut commands: Commands,
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
-    rapier_contexts: ReadRapierContext,
+    physics_world: Res<CustomPhysicsWorld>,
     mut world: ResMut<AuthoritativeWorldState>,
     soldier_query: Query<&Transform, With<PhysicsSoldier>>,
     mut bullet_query: Query<
@@ -2522,11 +3500,8 @@ fn shared_authoritative_react_system(
         return;
     };
     let dt = time.delta_secs();
-    let rapier_context = rapier_contexts
-        .single()
-        .expect("خطای بحرانی: RapierContext در گام React یافت نشد");
 
-    // ۱. خواندن موقعیت ۳بعدی نهایی کپسول سرباز (شامل ارتفاع دقیق روی رمپ، پل یا High-Ground)
+    // ۱. خواندن موقعیت ۳بعدی نهایی کپسول سرباز
     let soldier_tf = soldier_query
         .single()
         .expect("خطای بحرانی: موجودیت PhysicsSoldier یافت نشد");
@@ -2545,7 +3520,7 @@ fn shared_authoritative_react_system(
         target_idx_by_entity.insert(entity, p_target.index);
     }
 
-    // ۲. بروزرسانی نارنجک‌های دینامیک Rapier و بررسی انفجار
+    // ۲. بروزرسانی نارنجک‌های دینامیک و بررسی انفجار
     let mut exploded_positions = Vec::new();
     world.grenades_snapshot.clear();
 
@@ -2592,8 +3567,9 @@ fn shared_authoritative_react_system(
         });
     }
 
-    // ۳. حرکت گلوله‌ها و تشخیص برخورد پیوسته با Raycast در Rapier
+    // ۳. حرکت گلوله‌ها و تشخیص برخورد پیوسته با Raycast اختصاصی
     world.bullets_snapshot.clear();
+    let bullet_query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
 
     for (entity, mut bullet, mut tf) in &mut bullet_query {
         let old_pos = tf.translation;
@@ -2603,22 +3579,16 @@ fn shared_authoritative_react_system(
         let new_pos = old_pos + step_vec;
         bullet.remaining_lifetime -= dt;
 
-        let bullet_pred =
-            |hit_ent: Entity, _collider: &bevy_rapier3d::rapier::geometry::Collider| {
-                if let Some(&t_idx) = target_idx_by_entity.get(&hit_ent) {
-                    !world.targets[t_idx].is_dead
-                } else {
-                    true
-                }
-            };
-        let filter = QueryFilter::new()
-            .groups(CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD))
-            .predicate(&bullet_pred);
-
         let ray_hit = if step_dist > f32::EPSILON {
-            rapier_context
-                .cast_ray_and_get_normal(old_pos, step_dir, step_dist, true, filter)
-                .map(|(hit_ent, intersection)| (hit_ent, intersection.point))
+            physics_world
+                .cast_ray(old_pos, step_dir, step_dist, bullet_query_groups, |hit_ent| {
+                    if let Some(&t_idx) = target_idx_by_entity.get(&hit_ent) {
+                        !world.targets[t_idx].is_dead
+                    } else {
+                        true
+                    }
+                })
+                .map(|(hit_ent, hit)| (hit_ent, hit.point))
         } else {
             None
         };
@@ -2668,7 +3638,7 @@ fn shared_authoritative_react_system(
         }
     }
 
-    // ۴. ریکاوری و فعال‌سازی مجدد کولایدر اهداف تیراندازی در Rapier
+    // ۴. ریکاوری و فعال‌سازی مجدد کولایدر اهداف تیراندازی
     for (idx, target) in world.targets.iter_mut().enumerate() {
         if target.is_dead {
             target.respawn_remaining -= dt;
@@ -2685,13 +3655,13 @@ fn shared_authoritative_react_system(
         }
     }
 
-    // ۵. محاسبه نقطه برخورد لیزر با Raycast در Rapier (پرتو افقی از ارتفاع لوله سلاح؛ اگر به دیوار/صخره High-Ground بخورد مسدود می‌شود)
+    // ۵. محاسبه نقطه برخورد لیزر با Raycast اختصاصی
     let muzzle_pos = resolve_muzzle_pos(&world, &input, &config);
     let raw_target = Vec3::new(world.aim_hit_pos.x, muzzle_pos.y, world.aim_hit_pos.z);
     let dead_flags: Vec<bool> = world.targets.iter().map(|t| t.is_dead).collect();
 
-    world.laser_hit_pos = compute_laser_hit_with_rapier(
-        &rapier_context,
+    world.laser_hit_pos = compute_laser_hit(
+        &physics_world,
         muzzle_pos,
         raw_target,
         |hit_ent| {
@@ -2712,7 +3682,7 @@ fn shared_client_drive_system(
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
     prediction: Option<Res<ClientPhysicsPredictionState>>,
-    mut soldier_query: Query<&mut KinematicCharacterController, With<PhysicsSoldier>>,
+    mut soldier_query: Query<&mut CustomCharacterController, With<PhysicsSoldier>>,
 ) {
     let Some(prediction) = prediction else { return };
     let Ok(mut controller) = soldier_query.single_mut() else {

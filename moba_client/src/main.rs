@@ -4,7 +4,6 @@ use bevy::light::GlobalAmbientLight;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use bevy::window::{PresentMode, PrimaryWindow, WindowResolution};
-use bevy_rapier3d::prelude::{ColliderDisabled, Velocity};
 use moba_shared::{
     ancient_physics_bundle, center_bridge_physics_bundle, create_shared_renet_client,
     grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
@@ -12,9 +11,9 @@ use moba_shared::{
     particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
     shell_casing_physics_bundle, target_physics_bundle, terrain_platform_physics_bundle,
     tree_physics_bundle, turret_physics_bundle, ClientInputCommand, ClientPhysicsPredictionState,
-    GameConfig, GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole,
-    PhysicsSoldier, ServerWorldSnapshot, UpperBodyAction, CHANNEL_RELIABLE_FX,
-    CHANNEL_UNRELIABLE_STATE,
+    ColliderDisabled, GameConfig, GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin,
+    PhysicsRole, PhysicsSoldier, ServerWorldSnapshot, UpperBodyAction, Velocity,
+    CHANNEL_RELIABLE_FX, CHANNEL_UNRELIABLE_STATE,
 };
 use renet::RenetClient;
 use renet_netcode::NetcodeClientTransport;
@@ -1195,7 +1194,7 @@ fn client_receive_snapshot_and_sync_system(
             reconcile_soldier_physics_pos(&mut soldier_phys_tf, snap.soldier_pos, &config);
         }
 
-        // همگام‌سازی اهداف و وضعیت کولایدر Rapier آن‌ها (ColliderDisabled)
+        // همگام‌سازی اهداف و وضعیت کولایدر اختصاصی آن‌ها (ColliderDisabled)
         for (entity, mut v_target) in &mut target_query {
             let s_target = &snap.targets[v_target.index];
             let was_dead = v_target.is_dead;
@@ -1253,7 +1252,7 @@ fn client_receive_snapshot_and_sync_system(
             }
         }
 
-        // همگام‌سازی نارنجک‌های دینامیک Rapier در کلاینت
+        // همگام‌سازی نارنجک‌های دینامیک فیزیک اختصاصی در کلاینت
         let grenade_map: HashMap<u64, _> = snap.grenades.iter().map(|g| (g.id, g)).collect();
         let mut seen_grenades = HashSet::new();
 
@@ -1309,7 +1308,7 @@ fn client_receive_snapshot_and_sync_system(
         );
     }
 
-    // همگام‌سازی نرم و بدون پرش موقعیت بصری ۳بعدی سرباز با کپسول فیزیکی Rapier
+    // همگام‌سازی نرم و بدون پرش موقعیت بصری ۳بعدی سرباز با کپسول فیزیک اختصاصی
     if let (Ok(soldier_phys_tf), Ok(mut soldier_vis_tf)) = (
         soldier_physics_query.single(),
         soldier_visual_query.single_mut(),

@@ -21,7 +21,7 @@ fn main() {
     let (server, transport) = create_shared_renet_server(&config.network);
 
     println!(
-        "=== سرور Authoritative (Renet + Rapier 3D) روی {} با نرخ {} هرتز فعال شد ===",
+        "=== سرور Authoritative (Renet + Custom 3D Physics) روی {} با نرخ {} هرتز فعال شد ===",
         config.network.server_bind_addr, tick_hz
     );
 

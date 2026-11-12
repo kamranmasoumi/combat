@@ -71,8 +71,16 @@ impl GameConfig {
             "xp_thresholds_per_level در config.ron باید دقیقاً ۲۵ سطح (۱ تا ۲۵) داشته باشد!"
         );
         assert!(
+            self.combat.respawn_times_per_level.len() == 25,
+            "respawn_times_per_level در config.ron باید دقیقاً ۲۵ سطح (۱ تا ۲۵) داشته باشد!"
+        );
+        assert!(
             self.combat.min_fire_rate_secs > 0.0,
             "min_fire_rate_secs باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            self.combat.min_reload_duration_secs > 0.0,
+            "min_reload_duration_secs باید بزرگ‌تر از صفر باشد"
         );
         assert!(
             !self.heroes.is_empty(),
@@ -81,11 +89,13 @@ impl GameConfig {
         for hero in &self.heroes {
             assert!(!hero.id.trim().is_empty(), "شناسه هیرو نمی‌تواند خالی باشد");
             assert!(!hero.model_path.trim().is_empty(), "model_path هیرو '{}' نمی‌تواند خالی باشد", hero.id);
+            assert!(!hero.portrait_path.trim().is_empty(), "portrait_path هیرو '{}' نمی‌تواند خالی باشد", hero.id);
             assert!(hero.max_hp > 0.0, "max_hp هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.hero_scale > 0.0, "hero_scale هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.xp_gain_radius > 0.0, "xp_gain_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.magazine_size > 0, "magazine_size اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.fire_rate_secs > 0.0, "fire_rate_secs اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.weapon.reload_duration_secs > 0.0, "reload_duration_secs اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.projectile_speed > 0.0, "projectile_speed اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.max_range > 0.0, "max_range اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.pellets_per_shot > 0, "pellets_per_shot اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -464,6 +474,7 @@ pub struct HeroWeaponDef {
     pub weapon_kind: WeaponKind,
     pub magazine_size: u32,
     pub fire_rate_secs: f32,
+    pub reload_duration_secs: f32,
     pub damage: f32,
     pub projectile_speed: f32,
     pub max_range: f32,
@@ -476,6 +487,7 @@ pub struct HeroDef {
     pub id: String,
     pub display_name: String,
     pub model_path: String,
+    pub portrait_path: String,
     pub team: TeamId,
     pub starting_gold: u32,
     pub xp_gain_radius: f32,
@@ -495,6 +507,7 @@ pub struct HeroDef {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HeroLevelGrowth {
     pub fire_rate_reduction_per_level: f32,
+    pub reload_time_reduction_per_level: f32,
     pub damage_per_level: f32,
     pub max_range_per_level: f32,
     pub max_hp_per_level: f32,
@@ -561,6 +574,8 @@ pub struct CombatConfig {
     pub bullet_hit_forgiveness_height_top: f32,
     pub max_vertical_aim_pitch_sin: f32,
     pub min_fire_rate_secs: f32,
+    pub min_reload_duration_secs: f32,
+    pub respawn_times_per_level: Vec<f32>,
     pub xp_thresholds_per_level: Vec<u32>,
 }
 
@@ -650,6 +665,10 @@ pub struct FxConfig {
     pub target_recover_lerp_speed: f32,
     pub level_up_vfx_duration_secs: f32,
     pub level_up_particle_count: u32,
+    pub coin_burst_count: u32,
+    pub coin_lifetime_secs: f32,
+    pub floating_popup_duration_secs: f32,
+    pub floating_popup_rise_px: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1037,6 +1056,13 @@ pub enum GameplayFxEvent {
     HeroLeveledUp {
         pos: Vec3,
         new_level: u32,
+    },
+    LastHitGold {
+        pos: Vec3,
+        gold: u32,
+    },
+    CreepDenied {
+        pos: Vec3,
     },
 }
 
@@ -1440,6 +1466,7 @@ pub struct HeroSnapshot {
     pub ammo_in_mag: u32,
     pub magazine_size: u32,
     pub fire_rate_secs: f32,
+    pub reload_duration_secs: f32,
     pub weapon_damage: f32,
     pub projectile_speed: f32,
     pub weapon_max_range: f32,
@@ -1448,6 +1475,19 @@ pub struct HeroSnapshot {
     pub assists: u32,
     pub kills: u32,
     pub deaths: u32,
+    pub respawn_remaining: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TopBarHeroInfo {
+    pub slot_index: usize,
+    pub team: TeamId,
+    pub hero_id: String,
+    pub display_name: String,
+    pub portrait_path: String,
+    pub is_dead: bool,
+    pub respawn_remaining: f32,
+    pub hp_ratio: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1476,6 +1516,7 @@ pub struct RemotePlayerSnapshot {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerWorldSnapshot {
     pub tick: u64,
+    pub match_elapsed_secs: f32,
     pub soldier_pos: Vec3,
     pub soldier_facing_dir: Vec3,
     pub aim_world_dir: Vec3,
@@ -1492,6 +1533,7 @@ pub struct ServerWorldSnapshot {
     pub in_water: bool,
     pub hero: HeroSnapshot,
     pub other_players: Vec<RemotePlayerSnapshot>,
+    pub top_bar_heroes: Vec<TopBarHeroInfo>,
     pub fog_visible_mask: Vec<u8>,
     pub bullets: Vec<BulletSnapshot>,
     pub grenades: Vec<GrenadeSnapshot>,
@@ -3353,13 +3395,15 @@ pub fn particle_physics_bundle(
     )
 }
 
-/// قانون برتری دید ارتفاعی (Dota 2 High-Ground Vision Rule) با استفاده از موتور فیزیک اختصاصی
-pub fn can_observer_see_point(
+/// قانون برتری دید ارتفاعی و خط دید موانع (Dota 2 High-Ground + Line-of-Sight) با برد دلخواه
+pub fn can_observer_see_point_with_range(
     physics_world: &CustomPhysicsWorld,
     config: &GameConfig,
     observer_feet_pos: Vec3,
     target_feet_pos: Vec3,
     eye_height: f32,
+    base_range: f32,
+    high_ground_bonus: f32,
 ) -> bool {
     let height_diff = target_feet_pos.y - observer_feet_pos.y;
     if height_diff >= config.map.high_ground_occlusion_min_diff {
@@ -3369,9 +3413,9 @@ pub fn can_observer_see_point(
     let effective_range = if observer_feet_pos.y - target_feet_pos.y
         >= config.map.high_ground_occlusion_min_diff
     {
-        config.map.base_vision_range + config.map.high_ground_vision_bonus
+        base_range + high_ground_bonus
     } else {
-        config.map.base_vision_range
+        base_range
     };
 
     let eye_origin = observer_feet_pos + Vec3::Y * eye_height;
@@ -3389,6 +3433,25 @@ pub fn can_observer_see_point(
     physics_world
         .cast_ray(eye_origin, to_target / dist, dist, query_groups, |_| true)
         .is_none()
+}
+
+/// قانون برتری دید ارتفاعی (Dota 2 High-Ground Vision Rule) با استفاده از موتور فیزیک اختصاصی
+pub fn can_observer_see_point(
+    physics_world: &CustomPhysicsWorld,
+    config: &GameConfig,
+    observer_feet_pos: Vec3,
+    target_feet_pos: Vec3,
+    eye_height: f32,
+) -> bool {
+    can_observer_see_point_with_range(
+        physics_world,
+        config,
+        observer_feet_pos,
+        target_feet_pos,
+        eye_height,
+        config.map.base_vision_range,
+        config.map.high_ground_vision_bonus,
+    )
 }
 
 pub const FOW_GRID_W: usize = 170;
@@ -4178,15 +4241,48 @@ impl AuthoritativeWorldState {
         if self.players.is_empty() {
             return self.build_snapshot(config);
         }
+        // قبل از swap_slot_in، لیست کامل کارت‌های نوار بالا را از داده‌های واقعی تمام بازیکنان بساز
+        let viewer_team = self.players[slot_index].hero_team;
+        let top_bar: Vec<TopBarHeroInfo> = self
+            .players
+            .iter()
+            .map(|p| {
+                let portrait = config.active_hero(p.hero_index).portrait_path.clone();
+                TopBarHeroInfo {
+                    slot_index: p.slot_index,
+                    team: p.hero_team,
+                    hero_id: p.hero_id.clone(),
+                    display_name: p.hero_display_name.clone(),
+                    portrait_path: portrait,
+                    is_dead: p.is_dead,
+                    respawn_remaining: if p.is_dead {
+                        p.respawn_remaining.max(0.0)
+                    } else {
+                        0.0
+                    },
+                    hp_ratio: if p.hero_team == viewer_team {
+                        Some((p.hero_hp / p.hero_max_hp.max(1.0)).clamp(0.0, 1.0))
+                    } else {
+                        None
+                    },
+                }
+            })
+            .collect();
+
         self.swap_slot_in(slot_index);
         let mut snap = self.build_snapshot(config);
         let mut others = Vec::with_capacity(self.players.len().saturating_sub(1));
         for p in &self.players {
+
             if p.slot_index == slot_index {
                 continue;
             }
             let is_vis = p.hero_team == self.hero_team
                 || self.fog_of_war.is_world_point_visible(config, p.soldier_pos.x, p.soldier_pos.z);
+            // Server Authority: اگر دشمن در مه جنگ باشد، مختصات و اطلاعات او اصلاً به کلاینت ارسال نمی‌شود!
+            if !is_vis {
+                continue;
+            }
             let trav_anim = if p.traversal.is_active {
                 Some(p.traversal.anim_name.clone())
             } else {
@@ -4216,34 +4312,38 @@ impl AuthoritativeWorldState {
                 upper_anim,
                 death_anim: p.death_anim_name.clone(),
                 is_dead: p.is_dead,
-                hp: if is_vis { p.hero_hp } else { p.hero_max_hp },
+                hp: p.hero_hp,
                 max_hp: p.hero_max_hp,
                 ammo_in_mag: p.ammo_in_mag,
                 magazine_size: p.hero_weapon.magazine_size,
-                is_visible: is_vis,
+                is_visible: true,
             });
         }
         snap.other_players = others;
+        snap.top_bar_heroes = top_bar;
         snap.creeps = self
             .creeps
             .iter()
-            .map(|c| {
+            .filter_map(|c| {
                 let is_vis = c.team == self.hero_team
                     || self.fog_of_war.is_world_point_visible(config, c.pos.x, c.pos.z);
-                CreepSnapshot {
+                if !is_vis {
+                    return None;
+                }
+                Some(CreepSnapshot {
                     id: c.id,
                     team: c.team,
                     pos: c.pos,
                     facing_dir: c.facing_dir,
-                    hp: if is_vis { c.hp } else { c.max_hp },
+                    hp: c.hp,
                     max_hp: c.max_hp,
                     anim_state: c.anim_state,
                     is_dead: c.is_dead,
                     is_deniable: !c.is_dead
                         && c.team == self.hero_team
                         && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio,
-                    is_visible: is_vis,
-                }
+                    is_visible: true,
+                })
             })
             .collect();
         self.swap_slot_in(slot_index);
@@ -4277,6 +4377,7 @@ impl AuthoritativeWorldState {
         self.tick += 1;
         ServerWorldSnapshot {
             tick: self.tick,
+            match_elapsed_secs: self.match_elapsed_secs,
             soldier_pos: self.soldier_pos,
             soldier_facing_dir: self.soldier_facing_dir,
             aim_world_dir: self.aim_world_dir,
@@ -4323,6 +4424,7 @@ impl AuthoritativeWorldState {
                 ammo_in_mag: self.ammo_in_mag,
                 magazine_size: self.hero_weapon.magazine_size,
                 fire_rate_secs: self.hero_weapon.fire_rate_secs,
+                reload_duration_secs: self.hero_weapon.reload_duration_secs,
                 weapon_damage: self.hero_weapon.damage,
                 projectile_speed: self.hero_weapon.projectile_speed,
                 weapon_max_range: self.hero_weapon.max_range,
@@ -4331,8 +4433,10 @@ impl AuthoritativeWorldState {
                 assists: self.assists,
                 kills: self.kills,
                 deaths: self.deaths,
+                respawn_remaining: if self.is_dead { self.respawn_remaining.max(0.0) } else { 0.0 },
             },
             other_players: Vec::new(),
+            top_bar_heroes: Vec::new(),
             fog_visible_mask: self.fog_of_war.pack_visible_mask(),
             bullets: self.bullets_snapshot.clone(),
             grenades: self.grenades_snapshot.clone(),
@@ -4466,6 +4570,9 @@ pub fn grant_xp_to_player_slot(
             p.hero_weapon.fire_rate_secs = (p.hero_weapon.fire_rate_secs
                 - growth.fire_rate_reduction_per_level)
                 .max(config.combat.min_fire_rate_secs);
+            p.hero_weapon.reload_duration_secs = (p.hero_weapon.reload_duration_secs
+                - growth.reload_time_reduction_per_level)
+                .max(config.combat.min_reload_duration_secs);
             p.hero_weapon.damage += growth.damage_per_level;
             p.hero_weapon.max_range += growth.max_range_per_level;
             p.hero_max_hp += growth.max_hp_per_level;
@@ -4488,13 +4595,15 @@ fn trigger_random_death(world: &mut AuthoritativeWorldState, config: &GameConfig
     assert!(count > 0, "لیست death_animations در کانفیگ خالی است!");
     let idx = ((world.next_rand() * count as f32) as usize).min(count - 1);
     let chosen = config.soldier.death_animations[idx].clone();
-    let duration = config.exact_anim_duration(&chosen);
+    let _duration = config.exact_anim_duration(&chosen);
+    let lvl_idx = (world.hero_level as usize).saturating_sub(1).min(24);
+    let dota_respawn_secs = config.combat.respawn_times_per_level[lvl_idx];
 
     world.is_dead = true;
     world.hero_hp = 0.0;
     world.deaths += 1;
     world.death_anim_name = chosen;
-    world.respawn_remaining = duration + config.soldier.death_extra_respawn_delay_secs;
+    world.respawn_remaining = dota_respawn_secs;
     world.reload_remaining = None;
     world.grenade_elapsed_and_duration = None;
     world.firing_anim_remaining = None;
@@ -4973,8 +5082,7 @@ fn shared_drive_single_player(
             && world.grenade_elapsed_and_duration.is_none()
             && !world.traversal.is_active
         {
-            let dur = config.exact_anim_duration("reloading");
-            world.reload_remaining = Some(dur);
+            world.reload_remaining = Some(world.hero_weapon.reload_duration_secs);
             world.firing_anim_remaining = None;
         }
 
@@ -5524,12 +5632,11 @@ fn step_shooting_and_grenade_spawn(
     }
 
     let wants_fire =
-        input.fire_just_pressed || (input.fire_held && world.fire_cooldown_remaining <= 0.0);
+        (input.fire_just_pressed || input.fire_held) && world.fire_cooldown_remaining <= 0.0;
 
     if wants_fire {
         if world.ammo_in_mag == 0 {
-            let dur = config.exact_anim_duration("reloading");
-            world.reload_remaining = Some(dur);
+            world.reload_remaining = Some(world.hero_weapon.reload_duration_secs);
             world.firing_anim_remaining = None;
             return;
         }
@@ -5871,6 +5978,7 @@ fn shared_authoritative_react_system(
                             denier.denies += 1;
                         }
                     }
+                    world.pending_fx.push(GameplayFxEvent::CreepDenied { pos: creep_pos });
                     let total_denied_xp =
                         ((config.creeps.xp_bounty as f32) * config.creeps.deny_enemy_xp_multiplier).round() as u32;
                     let eligible_indices: Vec<usize> = world
@@ -5902,6 +6010,10 @@ fn shared_authoritative_react_system(
                         if let Some(killer) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
                             killer.last_hits += 1;
                             killer.hero_gold += config.creeps.gold_bounty;
+                            world.pending_fx.push(GameplayFxEvent::LastHitGold {
+                                pos: creep_pos,
+                                gold: config.creeps.gold_bounty,
+                            });
                         }
                     }
                     let killer_team = bullet.owner_team;
@@ -6358,14 +6470,25 @@ fn step_lane_creeps_system(
         let my_pos = world.creeps[idx].pos;
         let my_lane = world.creeps[idx].lane;
 
-        // الف) یافتن نزدیک‌ترین دشمن (سرباز یا هیرو) در میدان دید و برد شلیک
+        // الف) یافتن نزدیک‌ترین دشمن (سرباز یا هیرو) با رعایت کامل مه جنگ، برتری ارتفاع و خط دید موانع
         let mut best_target: Option<(Vec3, f32)> = None;
         for &(other_id, other_team, other_pos, other_dead) in &creep_snap {
             if other_id == my_id || other_team == my_team || other_dead {
                 continue;
             }
             let d = my_pos.distance(other_pos);
-            if d <= config.creeps.vision_range && best_target.map_or(true, |(_, bd)| d < bd) {
+            if d <= config.creeps.vision_range
+                && best_target.map_or(true, |(_, bd)| d < bd)
+                && can_observer_see_point_with_range(
+                    physics_world,
+                    config,
+                    my_pos,
+                    other_pos,
+                    config.creeps.aim_chest_height,
+                    config.creeps.vision_range,
+                    0.0,
+                )
+            {
                 best_target = Some((other_pos, d));
             }
         }
@@ -6374,7 +6497,18 @@ fn step_lane_creeps_system(
                 continue;
             }
             let d = my_pos.distance(h_pos);
-            if d <= config.creeps.vision_range && best_target.map_or(true, |(_, bd)| d < bd) {
+            if d <= config.creeps.vision_range
+                && best_target.map_or(true, |(_, bd)| d < bd)
+                && can_observer_see_point_with_range(
+                    physics_world,
+                    config,
+                    my_pos,
+                    h_pos,
+                    config.creeps.aim_chest_height,
+                    config.creeps.vision_range,
+                    0.0,
+                )
+            {
                 best_target = Some((h_pos, d));
             }
         }

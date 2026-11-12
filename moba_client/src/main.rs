@@ -21,7 +21,7 @@ use moba_shared::{
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
-    ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
@@ -80,6 +80,7 @@ fn main() {
             ammo_in_mag: h.weapon.magazine_size,
             magazine_size: h.weapon.magazine_size,
             fire_rate_secs: h.weapon.fire_rate_secs,
+            reload_duration_secs: h.weapon.reload_duration_secs,
             weapon_damage: h.weapon.damage,
             projectile_speed: h.weapon.projectile_speed,
             weapon_max_range: h.weapon.max_range,
@@ -88,6 +89,7 @@ fn main() {
             assists: 0,
             kills: 0,
             deaths: 0,
+            respawn_remaining: 0.0,
         }
     };
 
@@ -115,6 +117,7 @@ fn main() {
         .insert_resource(LatestHeroSnapshot(initial_hero_snapshot))
         .insert_resource(LatestRemotePlayers::default())
         .insert_resource(LatestCreeps::default())
+        .insert_resource(LatestTopBarState::default())
         .insert_resource(ClientMatchFlow {
             your_slot: None,
             snapshot: None,
@@ -153,6 +156,8 @@ fn main() {
                 cursor_reticle_system,
                 gameplay_fx_system,
                 level_up_vfx_system,
+                floating_world_popup_system,
+                death_screen_overlay_system,
             )
                 .chain(),
         )
@@ -179,7 +184,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            (sync_lane_creeps_system, update_overhead_creep_bars_system)
+            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system)
                 .chain()
                 .after(sync_remote_players_system),
         )
@@ -1731,6 +1736,8 @@ fn setup_scene(
     let minimap_handle = images.add(minimap_image);
     spawn_minimap_ui(&mut commands, &config, minimap_handle, fog_handle);
     spawn_hero_hud_ui(&mut commands);
+    spawn_top_match_hud_ui(&mut commands);
+    spawn_death_screen_overlay(&mut commands);
     spawn_match_overlay_ui(&mut commands, &config);
     spawn_laser_and_reticle_visuals(
         &mut commands,
@@ -2570,6 +2577,8 @@ fn client_receive_snapshot_and_sync_system(
         hud_sync.hero_hud.0 = snap.hero.clone();
         hud_sync.remote_players.0 = snap.other_players.clone();
         hud_sync.creeps.0 = snap.creeps.clone();
+        hud_sync.top_bar.match_elapsed_secs = snap.match_elapsed_secs;
+        hud_sync.top_bar.heroes = snap.top_bar_heroes.clone();
         if let Some(ref mut fow_state) = fow {
             fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
         }
@@ -2992,6 +3001,97 @@ fn spawn_fx_from_server_event(
                     particle_physics_bundle(config, sp, vel, dur * 0.85, true),
                 ));
             }
+        }
+        GameplayFxEvent::LastHitGold { pos, gold } => {
+            let coin_mat = materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.84, 0.16),
+                emissive: LinearRgba::new(5.5, 4.0, 0.4, 1.0),
+                metallic: 0.85,
+                perceptual_roughness: 0.25,
+                ..default()
+            });
+            let coin_mesh = meshes.add(Cylinder::new(0.11, 0.03));
+            for i in 0..config.fx.coin_burst_count {
+                let angle = (i as f32) * (std::f32::consts::TAU / config.fx.coin_burst_count.max(1) as f32)
+                    + render_state.next_fx_rand() * 0.4;
+                let spd = 2.2 + render_state.next_fx_rand() * 2.0;
+                let vel = Vec3::new(angle.cos() * spd, 3.6 + render_state.next_fx_rand() * 2.2, angle.sin() * spd);
+                commands.spawn((
+                    Mesh3d(coin_mesh.clone()),
+                    MeshMaterial3d(coin_mat.clone()),
+                    particle_physics_bundle(
+                        config,
+                        pos + Vec3::Y * 1.1,
+                        vel,
+                        config.fx.coin_lifetime_secs,
+                        true,
+                    ),
+                ));
+            }
+
+            commands
+                .spawn((
+                    FloatingWorldPopup {
+                        world_pos: pos + Vec3::Y * 1.75,
+                        timer: Timer::from_seconds(config.fx.floating_popup_duration_secs, TimerMode::Once),
+                    },
+                    Pickable::IGNORE,
+                    GlobalZIndex(180),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        padding: UiRect::axes(px(7.0), px(3.0)),
+                        border_radius: BorderRadius::all(px(5.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.12, 0.09, 0.02, 0.78)),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        Text::new(format!("+{}g", gold)),
+                        TextFont {
+                            font_size: FontSize::Px(17.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(1.0, 0.88, 0.22)),
+                    ));
+                });
+        }
+        GameplayFxEvent::CreepDenied { pos } => {
+            commands
+                .spawn((
+                    FloatingWorldPopup {
+                        world_pos: pos + Vec3::Y * 1.85,
+                        timer: Timer::from_seconds(config.fx.floating_popup_duration_secs, TimerMode::Once),
+                    },
+                    Pickable::IGNORE,
+                    GlobalZIndex(180),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        width: px(28.0),
+                        height: px(28.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(px(1.5)),
+                        border_radius: BorderRadius::MAX,
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgb(0.35, 0.95, 1.0)),
+                    BackgroundColor(Color::srgba(0.04, 0.14, 0.20, 0.88)),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        Text::new("!"),
+                        TextFont {
+                            font_size: FontSize::Px(19.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.45, 0.98, 1.0)),
+                    ));
+                });
         }
     }
 }
@@ -3647,6 +3747,7 @@ fn camera_follow_system(
 
 fn soldier_animation_player_system(
     config: Res<GameConfig>,
+    hero_hud: Res<LatestHeroSnapshot>,
     mut render_state: ResMut<ClientRenderState>,
     anim_assets: Option<Res<SoldierAnimationAssets>>,
     mut lower_query: Query<
@@ -3720,13 +3821,15 @@ fn soldier_animation_player_system(
         UpperBodyAction::Reloading => {
             if render_state.previous_upper_anim != "reloading" {
                 let node = anim_assets.require_node("reloading");
-                upper_trans
-                    .play(
-                        &mut upper_player,
-                        node,
-                        Duration::from_millis(config.animations.reload_blend_ms),
-                    )
-                    .replay();
+                let base_dur = config.exact_anim_duration("reloading");
+                let speed = (base_dur / hero_hud.0.reload_duration_secs.max(0.1)).max(0.5);
+                let active = upper_trans.play(
+                    &mut upper_player,
+                    node,
+                    Duration::from_millis(config.animations.reload_blend_ms),
+                );
+                active.set_speed(speed);
+                active.replay();
                 render_state.previous_upper_anim = "reloading".to_string();
             }
         }
@@ -5250,13 +5353,17 @@ fn update_hero_hud_system(
         };
     }
     if let Ok(mut t) = hp_txt_q.single_mut() {
-        **t = format!("{:.0} / {:.0} (+{:.1}/s)", h.hp, h.max_hp, h.hp_regen_per_sec);
+        if h.respawn_remaining > 0.0 {
+            **t = format!("DEAD - RESPAWN IN {}s", h.respawn_remaining.ceil() as u32);
+        } else {
+            **t = format!("{:.0} / {:.0} (+{:.1}/s)", h.hp, h.max_hp, h.hp_regen_per_sec);
+        }
     }
     if let Ok(mut t) = dmg_q.single_mut() {
         **t = format!("DMG {:.0}", h.weapon_damage);
     }
     if let Ok(mut t) = rate_q.single_mut() {
-        **t = format!("Rate {:.2}s", h.fire_rate_secs);
+        **t = format!("Rate {:.2}s | Rld {:.2}s", h.fire_rate_secs, h.reload_duration_secs);
     }
     if let Ok(mut t) = range_q.single_mut() {
         **t = format!("Rng {:.0}m", h.weapon_max_range);
@@ -5388,11 +5495,18 @@ struct CreepAnimationAssets {
     die_node: AnimationNodeIndex,
 }
 
+#[derive(Resource, Default)]
+struct LatestTopBarState {
+    match_elapsed_secs: f32,
+    heroes: Vec<TopBarHeroInfo>,
+}
+
 #[derive(SystemParam)]
 struct SnapshotHudSyncParams<'w> {
     hero_hud: ResMut<'w, LatestHeroSnapshot>,
     remote_players: ResMut<'w, LatestRemotePlayers>,
     creeps: ResMut<'w, LatestCreeps>,
+    top_bar: ResMut<'w, LatestTopBarState>,
 }
 
 fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
@@ -5830,6 +5944,13 @@ fn sync_remote_players_system(
 
     let dt = time.delta_secs();
 
+    // Server Authority: اگر مختصات بازیکن دشمن در Snapshot نباشد (در مه جنگ است)، مدل آن را حذف کن
+    for (root_ent, vis_comp, _, _) in &existing_query {
+        if !res.remote_players.0.iter().any(|rp| rp.slot_index == vis_comp.slot_index) {
+            commands.entity(root_ent).despawn();
+        }
+    }
+
     for rp in &res.remote_players.0 {
         let mut root_opt: Option<Entity> = None;
 
@@ -6160,6 +6281,12 @@ fn update_overhead_hero_bars_system(
             ammo_rem: rp.ammo_in_mag,
             ammo_total: rp.magazine_size,
         });
+    }
+
+    for (_, root, mut node) in &mut bars.root_q {
+        if !targets.iter().any(|t| t.key_id == root.key_id) {
+            node.display = Display::None;
+        }
     }
 
     for tgt in &targets {
@@ -6544,6 +6671,436 @@ fn update_overhead_creep_bars_system(
             } else {
                 Color::srgb(0.90, 0.20, 0.20).into()
             };
+        }
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// نوار بالای وسط صفحه (مشابه Dota 2): زمان بازی + عکس هیروهای دو تیم Dawn و Dusk
+// -----------------------------------------------------------------------------
+
+#[derive(Component)]
+struct TopMatchHudRoot;
+
+#[derive(Component)]
+struct TopMatchClockText;
+
+#[derive(Component)]
+struct TopDawnPortraitsRow;
+
+#[derive(Component)]
+struct TopDuskPortraitsRow;
+
+#[derive(Resource, Default)]
+struct TopBarPopulatedSignature(Vec<(usize, String, bool)>);
+
+fn spawn_top_match_hud_ui(commands: &mut Commands) {
+    commands.init_resource::<TopBarPopulatedSignature>();
+    commands
+        .spawn((
+            TopMatchHudRoot,
+            Pickable::IGNORE,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(8.0),
+                width: percent(100),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::FlexStart,
+                column_gap: px(10.0),
+                display: Display::None,
+                ..default()
+            },
+        ))
+        .with_children(|root| {
+            // تیم غرب (Dawn - زمردی)
+            root.spawn((
+                TopDawnPortraitsRow,
+                Pickable::IGNORE,
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(6.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+            ));
+
+            // ساعت مرکزی بازی (MM:SS)
+            root.spawn((
+                Pickable::IGNORE,
+                Node {
+                    padding: UiRect::axes(px(16.0), px(7.0)),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(8.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.65, 0.72, 0.80, 0.85)),
+                BackgroundColor(Color::srgba(0.05, 0.07, 0.11, 0.92)),
+            ))
+            .with_children(|clock| {
+                clock.spawn((
+                    TopMatchClockText,
+                    Text::new("00:00"),
+                    TextFont {
+                        font_size: FontSize::Px(18.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.98, 0.94, 0.76)),
+                ));
+            });
+
+            // تیم شرق (Dusk - یاقوتی)
+            root.spawn((
+                TopDuskPortraitsRow,
+                Pickable::IGNORE,
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(6.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+            ));
+        });
+}
+
+fn hero_initials(name: &str) -> String {
+    let mut out = String::new();
+    for word in name.split_whitespace().take(2) {
+        if let Some(ch) = word.chars().next() {
+            out.push(ch.to_ascii_uppercase());
+        }
+    }
+    if out.is_empty() {
+        "H".to_string()
+    } else {
+        out
+    }
+}
+
+fn spawn_portrait_card(
+    parent: &mut ChildSpawnerCommands,
+    asset_server: &AssetServer,
+    hero: &TopBarHeroInfo,
+) {
+    let border_col = if hero.is_dead {
+        Color::srgb(0.35, 0.35, 0.38)
+    } else if hero.team == TeamId::Dawn {
+        Color::srgb(0.20, 0.85, 0.56)
+    } else {
+        Color::srgb(0.92, 0.28, 0.24)
+    };
+    let bg_col = if hero.is_dead {
+        Color::srgba(0.10, 0.10, 0.12, 0.85)
+    } else if hero.team == TeamId::Dawn {
+        Color::srgba(0.08, 0.24, 0.18, 0.92)
+    } else {
+        Color::srgba(0.26, 0.09, 0.09, 0.92)
+    };
+
+    parent
+        .spawn((
+            Pickable::IGNORE,
+            Node {
+                width: px(50.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: px(2.0),
+                ..default()
+            },
+        ))
+        .with_children(|card| {
+            card.spawn((
+                Pickable::IGNORE,
+                Node {
+                    width: px(50.0),
+                    height: px(36.0),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(4.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BorderColor::all(border_col),
+                BackgroundColor(bg_col),
+            ))
+            .with_children(|frame| {
+                if custom_glb_exists(&hero.portrait_path) {
+                    frame.spawn((
+                        ImageNode::new(asset_server.load(&hero.portrait_path)),
+                        Node {
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                    ));
+                    if hero.is_dead && hero.respawn_remaining > 0.0 {
+                        frame.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                width: percent(100),
+                                height: percent(100),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.05, 0.05, 0.07, 0.72)),
+                        ))
+                        .with_children(|ov| {
+                            ov.spawn((
+                                Text::new(format!("{}", hero.respawn_remaining.ceil() as u32)),
+                                TextFont {
+                                    font_size: FontSize::Px(16.0),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(1.0, 0.35, 0.32)),
+                            ));
+                        });
+                    }
+                } else {
+                    frame.spawn((
+                        Text::new(if hero.is_dead && hero.respawn_remaining > 0.0 {
+                            format!("{}", hero.respawn_remaining.ceil() as u32)
+                        } else {
+                            hero_initials(&hero.display_name)
+                        }),
+                        TextFont {
+                            font_size: FontSize::Px(if hero.is_dead { 16.0 } else { 14.0 }),
+                            ..default()
+                        },
+                        TextColor(if hero.is_dead {
+                            Color::srgb(1.0, 0.35, 0.32)
+                        } else {
+                            Color::WHITE
+                        }),
+                    ));
+                }
+            });
+
+            // نوار سلامتی کوچک زیر عکس هم‌تیمی‌ها
+            if let Some(hp_r) = hero.hp_ratio {
+                card.spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: px(50.0),
+                        height: px(4.5),
+                        border_radius: BorderRadius::all(px(2.0)),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.10, 0.12, 0.14)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        Node {
+                            width: percent((hp_r * 100.0).clamp(0.0, 100.0)),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.18, 0.84, 0.38)),
+                    ));
+                });
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_top_match_hud_system(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    match_flow: Res<ClientMatchFlow>,
+    top_bar: Res<LatestTopBarState>,
+    mut sig_cache: ResMut<TopBarPopulatedSignature>,
+    mut root_q: Query<&mut Node, With<TopMatchHudRoot>>,
+    mut clock_q: Query<&mut Text, With<TopMatchClockText>>,
+    dawn_row_q: Query<(Entity, Option<&Children>), With<TopDawnPortraitsRow>>,
+    dusk_row_q: Query<(Entity, Option<&Children>), With<TopDuskPortraitsRow>>,
+) {
+    let Ok(mut root_node) = root_q.single_mut() else {
+        return;
+    };
+    if !match_flow.is_in_game() {
+        root_node.display = Display::None;
+        return;
+    }
+    root_node.display = Display::Flex;
+
+    let total_secs = top_bar.match_elapsed_secs.max(0.0) as u32;
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    if let Ok(mut clock_txt) = clock_q.single_mut() {
+        **clock_txt = format!("{:02}:{:02}", mins, secs);
+    }
+
+    let new_sig: Vec<(usize, String, bool)> = top_bar
+        .heroes
+        .iter()
+        .map(|h| {
+            let hp_bucket = h.hp_ratio.map(|r| (r * 20.0).round() as i32).unwrap_or(-1);
+            let resp_sec = if h.is_dead { h.respawn_remaining.ceil() as i32 } else { 0 };
+            (h.slot_index, format!("{}_{}_{}", h.hero_id, hp_bucket, resp_sec), h.is_dead)
+        })
+        .collect();
+
+    if sig_cache.0 == new_sig {
+        return;
+    }
+    sig_cache.0 = new_sig;
+
+    if let Ok((dawn_ent, children_opt)) = dawn_row_q.single() {
+        if let Some(children) = children_opt {
+            for child in children.iter() {
+                commands.entity(child).despawn();
+            }
+        }
+        commands.entity(dawn_ent).with_children(|parent| {
+            for h in top_bar.heroes.iter().filter(|h| h.team == TeamId::Dawn) {
+                spawn_portrait_card(parent, &asset_server, h);
+            }
+        });
+    }
+
+    if let Ok((dusk_ent, children_opt)) = dusk_row_q.single() {
+        if let Some(children) = children_opt {
+            for child in children.iter() {
+                commands.entity(child).despawn();
+            }
+        }
+        commands.entity(dusk_ent).with_children(|parent| {
+            for h in top_bar.heroes.iter().filter(|h| h.team == TeamId::Dusk) {
+                spawn_portrait_card(parent, &asset_server, h);
+            }
+        });
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم پاپ‌آپ سکه گلد / علامت تعجب دیناید + افکت صفحه سیاه‌وسفید هنگام مرگ
+// -----------------------------------------------------------------------------
+
+#[derive(Component)]
+struct FloatingWorldPopup {
+    world_pos: Vec3,
+    timer: Timer,
+}
+
+#[derive(Component)]
+struct DeathScreenOverlay;
+
+#[derive(Component)]
+struct DeathScreenCountdownText;
+
+fn spawn_death_screen_overlay(commands: &mut Commands) {
+    commands
+        .spawn((
+            DeathScreenOverlay,
+            Pickable::IGNORE,
+            GlobalZIndex(140),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: percent(100),
+                height: percent(100),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::FlexStart,
+                padding: UiRect::top(px(88.0)),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.08, 0.09, 0.11, 0.60)),
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Pickable::IGNORE,
+                Node {
+                    padding: UiRect::axes(px(22.0), px(10.0)),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(8.0)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.85, 0.24, 0.22, 0.85)),
+                BackgroundColor(Color::srgba(0.06, 0.06, 0.08, 0.88)),
+            ))
+            .with_children(|badge| {
+                badge.spawn((
+                    DeathScreenCountdownText,
+                    Text::new("YOU ARE DEAD - RESPAWNING IN 12s"),
+                    TextFont {
+                        font_size: FontSize::Px(18.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.35, 0.32)),
+                ));
+            });
+        });
+}
+
+fn floating_world_popup_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    config: Res<GameConfig>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut popup_q: Query<(Entity, &mut FloatingWorldPopup, &mut Node, &mut Visibility)>,
+) {
+    let Ok((camera, cam_gtf)) = camera_query.single() else {
+        return;
+    };
+    let rise_px = config.fx.floating_popup_rise_px;
+
+    for (ent, mut popup, mut node, mut vis) in &mut popup_q {
+        popup.timer.tick(time.delta());
+        if popup.timer.is_finished() {
+            commands.entity(ent).despawn();
+            continue;
+        }
+        let frac = popup.timer.fraction();
+        if let Ok(sp) = camera.world_to_viewport(cam_gtf, popup.world_pos) {
+            *vis = Visibility::Visible;
+            node.left = px(sp.x - 16.0);
+            node.top = px(sp.y - 16.0 - frac * rise_px);
+        } else {
+            *vis = Visibility::Hidden;
+        }
+    }
+}
+
+fn death_screen_overlay_system(
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    mut overlay_q: Query<&mut Node, With<DeathScreenOverlay>>,
+    mut txt_q: Query<&mut Text, With<DeathScreenCountdownText>>,
+    mut fog_q: Query<&mut DistanceFog, With<MobaCamera>>,
+) {
+    let is_dead_in_game = match_flow.is_in_game() && render_state.is_dead;
+
+    if let Ok(mut node) = overlay_q.single_mut() {
+        node.display = if is_dead_in_game {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+
+    if is_dead_in_game {
+        if let Ok(mut txt) = txt_q.single_mut() {
+            let secs = hero_hud.0.respawn_remaining.ceil() as u32;
+            **txt = format!("YOU ARE DEAD  |  RESPAWNING IN {}s", secs);
+        }
+    }
+
+    if let Ok(mut fog) = fog_q.single_mut() {
+        if is_dead_in_game {
+            fog.color = Color::srgba(0.24, 0.25, 0.27, 1.0);
+            fog.directional_light_color = Color::srgba(0.32, 0.33, 0.35, 0.35);
+        } else {
+            fog.color = Color::srgba(0.68, 0.76, 0.84, 1.0);
+            fog.directional_light_color = Color::srgba(1.0, 0.92, 0.78, 0.45);
         }
     }
 }

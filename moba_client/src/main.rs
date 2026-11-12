@@ -11,7 +11,7 @@ use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalA
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
-use bevy::window::{PresentMode, PrimaryWindow, WindowResolution};
+use bevy::window::{CursorOptions, PresentMode, PrimaryWindow, WindowResolution};
 use moba_shared::{
     ancient_physics_bundle, center_bridge_physics_bundle, create_shared_renet_client,
     grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
@@ -19,7 +19,7 @@ use moba_shared::{
     particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
     shell_casing_physics_bundle, target_physics_bundle,
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
-    apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage,
+    apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
     ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
@@ -64,7 +64,10 @@ fn main() {
             display_name: h.display_name.clone(),
             team: h.team,
             gold: h.starting_gold,
+            level: 1,
             xp: 0,
+            xp_into_level: 0,
+            xp_for_next_level: config.combat.xp_thresholds_per_level[1],
             xp_gain_radius: h.xp_gain_radius,
             hp: h.max_hp,
             max_hp: h.max_hp,
@@ -111,6 +114,7 @@ fn main() {
         .insert_resource(CameraShake { trauma: 0.0 })
         .insert_resource(LatestHeroSnapshot(initial_hero_snapshot))
         .insert_resource(LatestRemotePlayers::default())
+        .insert_resource(LatestCreeps::default())
         .insert_resource(ClientMatchFlow {
             your_slot: None,
             snapshot: None,
@@ -146,7 +150,9 @@ fn main() {
                 camera_follow_system,
                 soldier_animation_player_system,
                 laser_sight_gizmo_system,
+                cursor_reticle_system,
                 gameplay_fx_system,
+                level_up_vfx_system,
             )
                 .chain(),
         )
@@ -170,6 +176,12 @@ fn main() {
                 update_overhead_hero_bars_system,
             )
                 .chain(),
+        )
+        .add_systems(
+            Update,
+            (sync_lane_creeps_system, update_overhead_creep_bars_system)
+                .chain()
+                .after(sync_remote_players_system),
         )
         .add_systems(
             PostUpdate,
@@ -212,6 +224,45 @@ struct WeaponRoot;
 
 #[derive(Component)]
 struct MuzzlePoint;
+
+#[derive(Component)]
+struct LaserBeamCore;
+
+#[derive(Component)]
+struct LaserBeamGlow;
+
+#[derive(Component)]
+struct LaserPulseBead {
+    phase: f32,
+}
+
+#[derive(Component)]
+struct LaserImpactDot;
+
+#[derive(Component)]
+struct LaserImpactRing;
+
+#[derive(Component)]
+struct ReticleRoot {
+    current_spread_px: f32,
+}
+
+#[derive(Component)]
+struct ReticleOuterRing;
+
+#[derive(Component)]
+struct ReticleInnerRing;
+
+#[derive(Component)]
+struct ReticleCenterDot;
+
+#[derive(Component)]
+enum ReticleTickDir {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
 
 #[derive(Component)]
 struct MapObjectLabel {
@@ -396,10 +447,57 @@ struct MinimapCameraBox;
 struct LatestHeroSnapshot(HeroSnapshot);
 
 #[derive(Component)]
-struct HeroHudMainText;
+struct LevelUpVfx {
+    timer: Timer,
+    is_ring: bool,
+}
+
+#[derive(Component)]
+struct HeroHudHeaderText;
+
+#[derive(Component)]
+struct HeroHudGoldText;
+
+#[derive(Component)]
+struct HeroHudKdaText;
+
+#[derive(Component)]
+struct HeroHudLevelText;
+
+#[derive(Component)]
+struct HeroHudXpLabelText;
+
+#[derive(Component)]
+struct HeroHudXpSegment {
+    index: usize,
+}
 
 #[derive(Component)]
 struct HeroHpBarFill;
+
+#[derive(Component)]
+struct HeroHpBarText;
+
+#[derive(Component)]
+struct HeroStatDmgText;
+
+#[derive(Component)]
+struct HeroStatRateText;
+
+#[derive(Component)]
+struct HeroStatRangeText;
+
+#[derive(Component)]
+struct HeroStatArmorText;
+
+#[derive(Component)]
+struct HeroStatSpeedText;
+
+#[derive(Component)]
+struct HeroStatVisionText;
+
+#[derive(Component)]
+struct HeroStatAmmoText;
 
 #[derive(Component)]
 struct TreeVisualMarker {
@@ -461,6 +559,8 @@ struct ClientRenderState {
     aim_world_dir: Vec3,
     aim_hit_pos: Vec3,
     laser_hit_pos: Vec3,
+    aim_locked_on_enemy: bool,
+    hovered_creep_id: Option<u64>,
     current_locomotion: String,
     previous_lower_anim: String,
     previous_upper_anim: String,
@@ -498,6 +598,8 @@ impl ClientRenderState {
             aim_world_dir: aim_dir,
             aim_hit_pos: aim_hit,
             laser_hit_pos: aim_hit,
+            aim_locked_on_enemy: false,
+            hovered_creep_id: None,
             current_locomotion: "idle".to_string(),
             previous_lower_anim: String::new(),
             previous_upper_anim: String::new(),
@@ -1630,9 +1732,17 @@ fn setup_scene(
     spawn_minimap_ui(&mut commands, &config, minimap_handle, fog_handle);
     spawn_hero_hud_ui(&mut commands);
     spawn_match_overlay_ui(&mut commands, &config);
+    spawn_laser_and_reticle_visuals(
+        &mut commands,
+        &config,
+        &mut meshes,
+        &mut materials,
+    );
 
     let gltf_handle = asset_server.load(&config.animations.model_path);
     commands.insert_resource(SoldierGltfHandle(gltf_handle));
+    let creep_gltf_handle = asset_server.load(&config.creeps.model_path);
+    commands.insert_resource(CreepGltfHandle(creep_gltf_handle));
 }
 
 // -----------------------------------------------------------------------------
@@ -2448,6 +2558,8 @@ fn client_receive_snapshot_and_sync_system(
         render_state.aim_world_dir = snap.aim_world_dir;
         render_state.aim_hit_pos = snap.aim_hit_pos;
         render_state.laser_hit_pos = snap.laser_hit_pos;
+        render_state.aim_locked_on_enemy = snap.aim_locked_on_enemy;
+        render_state.hovered_creep_id = snap.hovered_creep_id;
         render_state.current_locomotion = snap.current_locomotion;
         render_state.upper_action = snap.upper_action;
         render_state.traversal_active = snap.traversal_active;
@@ -2457,6 +2569,7 @@ fn client_receive_snapshot_and_sync_system(
         render_state.in_water = snap.in_water;
         hud_sync.hero_hud.0 = snap.hero.clone();
         hud_sync.remote_players.0 = snap.other_players.clone();
+        hud_sync.creeps.0 = snap.creeps.clone();
         if let Some(ref mut fow_state) = fow {
             fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
         }
@@ -2465,7 +2578,12 @@ fn client_receive_snapshot_and_sync_system(
         prediction.is_dead = snap.is_dead;
 
         if let Ok(mut soldier_phys_tf) = soldier_physics_query.single_mut() {
-            reconcile_soldier_physics_pos(&mut soldier_phys_tf, snap.soldier_pos, &config);
+            reconcile_soldier_physics_pos(
+                &mut soldier_phys_tf,
+                snap.soldier_pos,
+                snap.hero.hero_scale,
+                &config,
+            );
         }
 
         for (entity, mut v_target) in &mut target_query {
@@ -2582,9 +2700,10 @@ fn client_receive_snapshot_and_sync_system(
         soldier_physics_query.single(),
         soldier_visual_query.single_mut(),
     ) {
+        let hero_scale = hud_sync.hero_hud.0.hero_scale;
         let target_feet_pos = Vec3::new(
             soldier_phys_tf.translation.x,
-            soldier_phys_tf.translation.y - config.physics.soldier_capsule_center_y,
+            soldier_phys_tf.translation.y - config.physics.soldier_capsule_center_y * hero_scale,
             soldier_phys_tf.translation.z,
         );
         let smooth_y = soldier_vis_tf
@@ -2818,6 +2937,62 @@ fn spawn_fx_from_server_event(
                 intensity,
             );
         }
+        GameplayFxEvent::HeroLeveledUp { pos, new_level: _ } => {
+            let dur = config.fx.level_up_vfx_duration_secs;
+            let pillar_mat = materials.add(StandardMaterial {
+                base_color: Color::srgba(1.0, 0.86, 0.25, 0.42),
+                emissive: LinearRgba::new(6.5, 4.8, 0.8, 0.42),
+                alpha_mode: AlphaMode::Add,
+                unlit: true,
+                ..default()
+            });
+            commands.spawn((
+                LevelUpVfx {
+                    timer: Timer::from_seconds(dur, TimerMode::Once),
+                    is_ring: false,
+                },
+                Mesh3d(meshes.add(Cylinder::new(0.85, 6.8))),
+                MeshMaterial3d(pillar_mat.clone()),
+                Transform::from_translation(pos + Vec3::Y * 3.4),
+                PointLight {
+                    color: Color::srgb(1.0, 0.85, 0.28),
+                    intensity: 420_000.0,
+                    range: 12.0,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                NotShadowCaster,
+            ));
+            commands.spawn((
+                LevelUpVfx {
+                    timer: Timer::from_seconds(dur, TimerMode::Once),
+                    is_ring: true,
+                },
+                Mesh3d(meshes.add(Torus::new(0.95, 1.15))),
+                MeshMaterial3d(pillar_mat),
+                Transform::from_translation(pos + Vec3::Y * 0.15),
+                NotShadowCaster,
+            ));
+
+            let spark_mat = materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.90, 0.35),
+                emissive: LinearRgba::new(10.0, 7.2, 1.2, 1.0),
+                unlit: true,
+                ..default()
+            });
+            let spark_mesh = meshes.add(Sphere::new(0.06));
+            for i in 0..config.fx.level_up_particle_count {
+                let angle = (i as f32) * (std::f32::consts::TAU / config.fx.level_up_particle_count as f32);
+                let r = 0.55 + render_state.next_fx_rand() * 0.55;
+                let sp = pos + Vec3::new(angle.cos() * r, 0.25, angle.sin() * r);
+                let vel = Vec3::new(angle.cos() * 1.4, 3.8 + render_state.next_fx_rand() * 2.5, angle.sin() * 1.4);
+                commands.spawn((
+                    Mesh3d(spark_mesh.clone()),
+                    MeshMaterial3d(spark_mat.clone()),
+                    particle_physics_bundle(config, sp, vel, dur * 0.85, true),
+                ));
+            }
+        }
     }
 }
 
@@ -2876,19 +3051,300 @@ fn target_visual_reaction_system(
     }
 }
 
+fn spawn_laser_and_reticle_visuals(
+    commands: &mut Commands,
+    config: &GameConfig,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let lc = &config.laser;
+    let cyl_mesh = meshes.add(Cylinder::new(1.0, 1.0));
+
+    let core_a = lc.core_color_rgba.3;
+    let core_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(
+            lc.core_color_rgba.0,
+            lc.core_color_rgba.1,
+            lc.core_color_rgba.2,
+            core_a,
+        ),
+        emissive: LinearRgba::new(
+            lc.core_color_rgba.0 * lc.emissive_strength * core_a,
+            lc.core_color_rgba.1 * lc.emissive_strength * core_a * 0.5,
+            lc.core_color_rgba.2 * lc.emissive_strength * core_a * 0.5,
+            core_a,
+        ),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+
+    let glow_a = lc.glow_color_rgba.3;
+    let glow_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(
+            lc.glow_color_rgba.0,
+            lc.glow_color_rgba.1,
+            lc.glow_color_rgba.2,
+            glow_a,
+        ),
+        emissive: LinearRgba::new(
+            lc.glow_color_rgba.0 * lc.emissive_strength * glow_a,
+            lc.glow_color_rgba.1 * lc.emissive_strength * glow_a,
+            lc.glow_color_rgba.2 * lc.emissive_strength * glow_a,
+            glow_a,
+        ),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+
+    let bead_a = lc.bead_alpha;
+    let bead_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(
+            lc.core_color_rgba.0,
+            lc.core_color_rgba.1,
+            lc.core_color_rgba.2,
+            bead_a,
+        ),
+        emissive: LinearRgba::new(
+            lc.core_color_rgba.0 * lc.emissive_strength * bead_a,
+            lc.core_color_rgba.1 * lc.emissive_strength * bead_a * 0.5,
+            lc.core_color_rgba.2 * lc.emissive_strength * bead_a * 0.5,
+            bead_a,
+        ),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+
+    commands.spawn((
+        LaserBeamCore,
+        Mesh3d(cyl_mesh.clone()),
+        MeshMaterial3d(core_mat.clone()),
+        Transform::default(),
+        Visibility::Hidden,
+        NotShadowCaster,
+    ));
+
+    commands.spawn((
+        LaserBeamGlow,
+        Mesh3d(cyl_mesh.clone()),
+        MeshMaterial3d(glow_mat),
+        Transform::default(),
+        Visibility::Hidden,
+        NotShadowCaster,
+    ));
+
+    for i in 0..3 {
+        commands.spawn((
+            LaserPulseBead {
+                phase: (i as f32) / 3.0,
+            },
+            Mesh3d(cyl_mesh.clone()),
+            MeshMaterial3d(bead_mat.clone()),
+            Transform::default(),
+            Visibility::Hidden,
+            NotShadowCaster,
+        ));
+    }
+
+    let dot_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(
+            lc.core_color_rgba.0,
+            lc.core_color_rgba.1,
+            lc.core_color_rgba.2,
+            1.0,
+        ),
+        emissive: LinearRgba::new(
+            lc.glow_color_rgba.0 * lc.emissive_strength,
+            lc.glow_color_rgba.1 * lc.emissive_strength,
+            lc.glow_color_rgba.2 * lc.emissive_strength,
+            1.0,
+        ),
+        unlit: true,
+        ..default()
+    });
+    commands.spawn((
+        LaserImpactDot,
+        Mesh3d(meshes.add(Sphere::new(lc.impact_dot_radius))),
+        MeshMaterial3d(dot_mat.clone()),
+        Transform::default(),
+        Visibility::Hidden,
+        NotShadowCaster,
+    ));
+
+    commands.spawn((
+        LaserImpactRing,
+        Mesh3d(meshes.add(Torus::new(
+            lc.impact_ring_inner_radius,
+            lc.impact_ring_outer_radius,
+        ))),
+        MeshMaterial3d(dot_mat),
+        Transform::default(),
+        Visibility::Hidden,
+        NotShadowCaster,
+    ));
+
+    // نشانه گر دایره ای زیبا و تاکتیکی موس
+    let rc = &config.cursor_reticle;
+    let norm_col = Color::srgba(
+        rc.normal_color_rgba.0,
+        rc.normal_color_rgba.1,
+        rc.normal_color_rgba.2,
+        rc.normal_color_rgba.3,
+    );
+    let container_size = rc.outer_diameter_px + rc.fire_expand_px + rc.tick_length_px * 2.0 + 16.0;
+
+    commands
+        .spawn((
+            ReticleRoot {
+                current_spread_px: 0.0,
+            },
+            Pickable::IGNORE,
+            GlobalZIndex(200),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: px(container_size),
+                height: px(container_size),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            Visibility::Hidden,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                ReticleOuterRing,
+                Pickable::IGNORE,
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: px(rc.outer_diameter_px),
+                    height: px(rc.outer_diameter_px),
+                    border: UiRect::all(px(rc.outer_border_px)),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BorderColor::all(norm_col),
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.10)),
+            ));
+
+            root.spawn((
+                ReticleInnerRing,
+                Pickable::IGNORE,
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: px(rc.inner_diameter_px),
+                    height: px(rc.inner_diameter_px),
+                    border: UiRect::all(px(rc.inner_border_px)),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BorderColor::all(norm_col),
+                BackgroundColor(Color::NONE),
+            ));
+
+            root.spawn((
+                ReticleCenterDot,
+                Pickable::IGNORE,
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: px(rc.center_dot_px),
+                    height: px(rc.center_dot_px),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BackgroundColor(norm_col),
+            ));
+
+            for (dir, w, h) in [
+                (ReticleTickDir::Top, rc.tick_thickness_px, rc.tick_length_px),
+                (ReticleTickDir::Bottom, rc.tick_thickness_px, rc.tick_length_px),
+                (ReticleTickDir::Left, rc.tick_length_px, rc.tick_thickness_px),
+                (ReticleTickDir::Right, rc.tick_length_px, rc.tick_thickness_px),
+            ] {
+                root.spawn((
+                    dir,
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: px(w),
+                        height: px(h),
+                        border_radius: BorderRadius::all(px(1.0)),
+                        ..default()
+                    },
+                    BackgroundColor(norm_col),
+                ));
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn laser_sight_gizmo_system(
     mut gizmos: Gizmos,
+    time: Res<Time>,
     config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
     muzzle_query: Query<&GlobalTransform, With<MuzzlePoint>>,
     trail_query: Query<&BulletTrail>,
     render_state: Res<ClientRenderState>,
+    mut core_query: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<LaserBeamCore>,
+            Without<LaserBeamGlow>,
+            Without<LaserPulseBead>,
+            Without<LaserImpactDot>,
+            Without<LaserImpactRing>,
+        ),
+    >,
+    mut glow_query: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<LaserBeamGlow>,
+            Without<LaserBeamCore>,
+            Without<LaserPulseBead>,
+            Without<LaserImpactDot>,
+            Without<LaserImpactRing>,
+        ),
+    >,
+    mut bead_query: Query<
+        (&LaserPulseBead, &mut Transform, &mut Visibility),
+        (
+            Without<LaserBeamCore>,
+            Without<LaserBeamGlow>,
+            Without<LaserImpactDot>,
+            Without<LaserImpactRing>,
+        ),
+    >,
+    mut dot_query: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<LaserImpactDot>,
+            Without<LaserBeamCore>,
+            Without<LaserBeamGlow>,
+            Without<LaserPulseBead>,
+            Without<LaserImpactRing>,
+        ),
+    >,
+    mut ring_query: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<LaserImpactRing>,
+            Without<LaserBeamCore>,
+            Without<LaserBeamGlow>,
+            Without<LaserPulseBead>,
+            Without<LaserImpactDot>,
+        ),
+    >,
 ) {
     for trail in &trail_query {
         let alpha = 1.0 - trail.timer.fraction();
         let dir = (trail.end - trail.start).normalize_or_zero();
-        let right = dir.cross(Vec3::Y).normalize_or_zero() * 0.012;
+        let right = dir.cross(Vec3::Y).normalize_or_zero() * 0.014;
 
-        let core_color = Color::srgba(1.0, 0.92, 0.45, alpha);
+        let core_color = Color::srgba(1.0, 0.94, 0.55, alpha);
         let glow_color = Color::srgba(1.0, 0.55, 0.1, alpha * 0.65);
 
         gizmos.line(trail.start, trail.end, core_color);
@@ -2896,10 +3352,27 @@ fn laser_sight_gizmo_system(
         gizmos.line(trail.start - right, trail.end - right, glow_color);
     }
 
-    if render_state.is_dead
+    let hide_laser = !match_flow.is_in_game()
+        || render_state.is_dead
         || render_state.traversal_active
-        || render_state.current_locomotion == "swimming"
-    {
+        || render_state.current_locomotion == "swimming";
+
+    if hide_laser {
+        for (_, mut vis) in &mut core_query {
+            *vis = Visibility::Hidden;
+        }
+        for (_, mut vis) in &mut glow_query {
+            *vis = Visibility::Hidden;
+        }
+        for (_, _, mut vis) in &mut bead_query {
+            *vis = Visibility::Hidden;
+        }
+        for (_, mut vis) in &mut dot_query {
+            *vis = Visibility::Hidden;
+        }
+        for (_, mut vis) in &mut ring_query {
+            *vis = Visibility::Hidden;
+        }
         return;
     }
 
@@ -2912,28 +3385,194 @@ fn laser_sight_gizmo_system(
     };
 
     let laser_end = render_state.laser_hit_pos;
-    let laser_red = Color::srgb(1.0, 0.05, 0.05);
-    let laser_core = Color::srgb(1.0, 0.35, 0.35);
+    let delta = laser_end - muzzle_pos;
+    let beam_len = delta.length();
+    if beam_len <= 0.05 {
+        return;
+    }
+    let beam_dir = delta / beam_len;
+    let beam_rot = Quat::from_rotation_arc(Vec3::Y, beam_dir);
+    let mid_pos = (muzzle_pos + laser_end) * 0.5;
+    let t = time.elapsed_secs();
 
-    gizmos.line(muzzle_pos, laser_end, laser_red);
-    gizmos.line(
-        muzzle_pos + Vec3::Y * 0.004,
-        laser_end + Vec3::Y * 0.004,
-        laser_core,
-    );
+    let base_r = config.laser.beam_radius;
+    let shimmer = 0.85 + 0.15 * (t * config.laser.pulse_speed).sin();
+    let core_r = base_r * config.laser.beam_core_ratio * shimmer;
+    let glow_r = base_r * (0.90 + 0.18 * (t * config.laser.pulse_speed * 0.7).cos());
 
-    gizmos.sphere(
-        Isometry3d::from_translation(laser_end),
-        0.045,
-        Color::srgb(1.0, 0.1, 0.1),
-    );
+    if let Ok((mut core_tf, mut core_vis)) = core_query.single_mut() {
+        core_tf.translation = mid_pos;
+        core_tf.rotation = beam_rot;
+        core_tf.scale = Vec3::new(core_r, beam_len, core_r);
+        *core_vis = Visibility::Visible;
+    }
 
-    let r = 0.28;
-    let gap = 0.10;
-    gizmos.line(laser_end + Vec3::X * gap, laser_end + Vec3::X * r, laser_red);
-    gizmos.line(laser_end - Vec3::X * gap, laser_end - Vec3::X * r, laser_red);
-    gizmos.line(laser_end + Vec3::Z * gap, laser_end + Vec3::Z * r, laser_red);
-    gizmos.line(laser_end - Vec3::Z * gap, laser_end - Vec3::Z * r, laser_red);
+    if let Ok((mut glow_tf, mut glow_vis)) = glow_query.single_mut() {
+        glow_tf.translation = mid_pos;
+        glow_tf.rotation = beam_rot;
+        glow_tf.scale = Vec3::new(glow_r, beam_len, glow_r);
+        *glow_vis = Visibility::Visible;
+    }
+
+    let bead_len = (beam_len * 0.08).clamp(0.25, 0.85);
+    let bead_r = base_r * 0.52;
+    let speed_norm = config.laser.pulse_speed / beam_len.max(1.0);
+    for (bead, mut b_tf, mut b_vis) in &mut bead_query {
+        let u = (t * speed_norm + bead.phase).fract();
+        b_tf.translation = muzzle_pos.lerp(laser_end, u);
+        b_tf.rotation = beam_rot;
+        b_tf.scale = Vec3::new(bead_r, bead_len, bead_r);
+        *b_vis = Visibility::Visible;
+    }
+
+    let pulse = 0.85 + 0.25 * (t * config.laser.impact_pulse_speed).sin();
+    if let Ok((mut dot_tf, mut dot_vis)) = dot_query.single_mut() {
+        dot_tf.translation = laser_end;
+        dot_tf.scale = Vec3::splat(pulse);
+        *dot_vis = Visibility::Visible;
+    }
+
+    if let Ok((mut ring_tf, mut ring_vis)) = ring_query.single_mut() {
+        ring_tf.translation = laser_end;
+        ring_tf.rotation = Quat::from_rotation_y(t * 2.5);
+        ring_tf.scale = Vec3::splat(0.85 + 0.30 * (t * config.laser.impact_pulse_speed).cos());
+        *ring_vis = Visibility::Visible;
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn cursor_reticle_system(
+    time: Res<Time>,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    shake: Res<CameraShake>,
+    mut window_query: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
+    mut root_query: Query<(&mut ReticleRoot, &mut Node, &mut Visibility)>,
+    mut outer_query: Query<
+        (&mut Node, &mut BorderColor),
+        (
+            With<ReticleOuterRing>,
+            Without<ReticleRoot>,
+            Without<ReticleInnerRing>,
+            Without<ReticleCenterDot>,
+            Without<ReticleTickDir>,
+        ),
+    >,
+    mut inner_query: Query<
+        &mut BorderColor,
+        (
+            With<ReticleInnerRing>,
+            Without<ReticleOuterRing>,
+            Without<ReticleCenterDot>,
+            Without<ReticleTickDir>,
+        ),
+    >,
+    mut dot_query: Query<
+        &mut BackgroundColor,
+        (
+            With<ReticleCenterDot>,
+            Without<ReticleOuterRing>,
+            Without<ReticleInnerRing>,
+            Without<ReticleTickDir>,
+        ),
+    >,
+    mut tick_query: Query<
+        (&ReticleTickDir, &mut Node, &mut BackgroundColor),
+        (
+            Without<ReticleRoot>,
+            Without<ReticleOuterRing>,
+            Without<ReticleInnerRing>,
+            Without<ReticleCenterDot>,
+        ),
+    >,
+) {
+    let Ok((window, mut cursor_options)) = window_query.single_mut() else {
+        return;
+    };
+    let in_game = match_flow.is_in_game();
+
+    if config.cursor_reticle.hide_os_cursor_in_game {
+        cursor_options.visible = !in_game;
+    }
+
+    let Ok((mut reticle, mut root_node, mut root_vis)) = root_query.single_mut() else {
+        return;
+    };
+
+    if !in_game {
+        *root_vis = Visibility::Hidden;
+        return;
+    }
+
+    let Some(cursor_pos) = window.cursor_position() else {
+        *root_vis = Visibility::Hidden;
+        return;
+    };
+
+    *root_vis = Visibility::Visible;
+    let rc = &config.cursor_reticle;
+    let container_size = rc.outer_diameter_px + rc.fire_expand_px + rc.tick_length_px * 2.0 + 16.0;
+    root_node.left = px(cursor_pos.x - container_size * 0.5);
+    root_node.top = px(cursor_pos.y - container_size * 0.5);
+
+    let dt = time.delta_secs();
+    let target_spread = if render_state.upper_action == UpperBodyAction::FiringRifle {
+        rc.fire_expand_px
+    } else {
+        (shake.trauma * rc.fire_expand_px * 1.4).clamp(0.0, rc.fire_expand_px)
+    };
+    reticle.current_spread_px = reticle
+        .current_spread_px
+        + (target_spread - reticle.current_spread_px) * (rc.expand_recover_speed * dt).clamp(0.0, 1.0);
+
+    let active_rgba = if render_state.upper_action == UpperBodyAction::Reloading {
+        rc.reload_color_rgba
+    } else if render_state.aim_locked_on_enemy {
+        rc.locked_color_rgba
+    } else {
+        rc.normal_color_rgba
+    };
+    let active_col = Color::srgba(active_rgba.0, active_rgba.1, active_rgba.2, active_rgba.3);
+
+    let outer_d = rc.outer_diameter_px + reticle.current_spread_px;
+    if let Ok((mut outer_node, mut outer_border)) = outer_query.single_mut() {
+        outer_node.width = px(outer_d);
+        outer_node.height = px(outer_d);
+        *outer_border = BorderColor::all(active_col);
+    }
+
+    if let Ok(mut inner_border) = inner_query.single_mut() {
+        *inner_border = BorderColor::all(active_col);
+    }
+
+    if let Ok(mut dot_bg) = dot_query.single_mut() {
+        *dot_bg = BackgroundColor(active_col);
+    }
+
+    let center = container_size * 0.5;
+    let outer_r = outer_d * 0.5;
+    for (dir, mut tick_node, mut tick_bg) in &mut tick_query {
+        *tick_bg = BackgroundColor(active_col);
+        match dir {
+            ReticleTickDir::Top => {
+                tick_node.left = px(center - rc.tick_thickness_px * 0.5);
+                tick_node.top = px(center - outer_r - rc.tick_length_px * 0.65);
+            }
+            ReticleTickDir::Bottom => {
+                tick_node.left = px(center - rc.tick_thickness_px * 0.5);
+                tick_node.top = px(center + outer_r - rc.tick_length_px * 0.35);
+            }
+            ReticleTickDir::Left => {
+                tick_node.left = px(center - outer_r - rc.tick_length_px * 0.65);
+                tick_node.top = px(center - rc.tick_thickness_px * 0.5);
+            }
+            ReticleTickDir::Right => {
+                tick_node.left = px(center + outer_r - rc.tick_length_px * 0.35);
+                tick_node.top = px(center - rc.tick_thickness_px * 0.5);
+            }
+        }
+    }
 }
 
 fn gameplay_fx_system(
@@ -4244,6 +4883,61 @@ fn animate_glb_waterfall_materials_system(
 // رابط کاربری نمایش تمام پارامترهای هیرو و اسلحه (Server-Authoritative HUD)
 // -----------------------------------------------------------------------------
 
+const XP_RING_SEGMENTS: usize = 24;
+
+fn spawn_stat_chip(
+    row: &mut ChildSpawnerCommands,
+    icon_label: &str,
+    icon_color: Color,
+    marker: impl Component,
+) {
+    row.spawn((
+        Node {
+            padding: UiRect::axes(px(7.0), px(4.0)),
+            column_gap: px(5.0),
+            align_items: AlignItems::Center,
+            border: UiRect::all(px(1.0)),
+            border_radius: BorderRadius::all(px(5.0)),
+            ..default()
+        },
+        BorderColor::all(Color::srgba(0.28, 0.34, 0.42, 0.55)),
+        BackgroundColor(Color::srgba(0.08, 0.11, 0.16, 0.85)),
+    ))
+    .with_children(|chip| {
+        chip.spawn((
+            Node {
+                width: px(16.0),
+                height: px(16.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::MAX,
+                ..default()
+            },
+            BackgroundColor(icon_color),
+        ))
+        .with_children(|ic| {
+            ic.spawn((
+                Text::new(icon_label),
+                TextFont {
+                    font_size: FontSize::Px(9.5),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.05, 0.06, 0.08)),
+            ));
+        });
+
+        chip.spawn((
+            marker,
+            Text::new("--"),
+            TextFont {
+                font_size: FontSize::Px(11.5),
+                ..default()
+            },
+            TextColor(Color::srgb(0.92, 0.95, 0.99)),
+        ));
+    });
+}
+
 fn spawn_hero_hud_ui(commands: &mut Commands) {
     commands
         .spawn((
@@ -4251,64 +4945,263 @@ fn spawn_hero_hud_ui(commands: &mut Commands) {
                 position_type: PositionType::Absolute,
                 left: px(16.0),
                 bottom: px(16.0),
-                width: px(390.0),
                 padding: UiRect::all(px(12.0)),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(6.0),
+                flex_direction: FlexDirection::Row,
+                column_gap: px(14.0),
+                align_items: AlignItems::Center,
                 border: UiRect::all(px(1.5)),
-                border_radius: BorderRadius::all(px(8.0)),
+                border_radius: BorderRadius::all(px(10.0)),
                 ..default()
             },
-            BorderColor::all(Color::srgba(0.45, 0.62, 0.72, 0.75)),
-            BackgroundColor(Color::srgba(0.05, 0.07, 0.11, 0.86)),
+            BorderColor::all(Color::srgba(0.42, 0.58, 0.72, 0.78)),
+            BackgroundColor(Color::srgba(0.04, 0.06, 0.10, 0.90)),
         ))
-        .with_children(|parent| {
-            // نوار سلامتی (HP Bar)
-            parent
-                .spawn((
+        .with_children(|root| {
+            // ستون چپ: دایره توخالی نمایش سطح (Level) + حلقه XP دور دایره
+            root.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: px(4.0),
+                    ..default()
+                },
+            ))
+            .with_children(|lvl_col| {
+                let ring_box = 86.0_f32;
+                let center_xy = ring_box * 0.5;
+                let arc_r = 37.0_f32;
+                let seg_size = 6.5_f32;
+
+                lvl_col
+                    .spawn(Node {
+                        width: px(ring_box),
+                        height: px(ring_box),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    })
+                    .with_children(|ring| {
+                        // سگمنت‌های دایره‌ای XP دور دایره سطح
+                        for i in 0..XP_RING_SEGMENTS {
+                            let angle = -std::f32::consts::FRAC_PI_2
+                                + (i as f32) * (std::f32::consts::TAU / XP_RING_SEGMENTS as f32);
+                            let sx = center_xy + angle.cos() * arc_r - seg_size * 0.5;
+                            let sy = center_xy + angle.sin() * arc_r - seg_size * 0.5;
+                            ring.spawn((
+                                HeroHudXpSegment { index: i },
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: px(sx),
+                                    top: px(sy),
+                                    width: px(seg_size),
+                                    height: px(seg_size),
+                                    border_radius: BorderRadius::MAX,
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.20, 0.24, 0.30, 0.65)),
+                            ));
+                        }
+
+                        // دایره توخالی مرکزی با عدد سطح
+                        ring.spawn((
+                            Node {
+                                width: px(56.0),
+                                height: px(56.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(px(2.5)),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BorderColor::all(Color::srgb(0.95, 0.78, 0.24)),
+                            BackgroundColor(Color::srgba(0.06, 0.08, 0.12, 0.92)),
+                        ))
+                        .with_children(|inner| {
+                            inner.spawn((
+                                HeroHudLevelText,
+                                Text::new("1"),
+                                TextFont {
+                                    font_size: FontSize::Px(22.0),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(1.0, 0.88, 0.36)),
+                            ));
+                        });
+                    });
+
+                lvl_col.spawn((
+                    HeroHudXpLabelText,
+                    Text::new("XP 0/240"),
+                    TextFont {
+                        font_size: FontSize::Px(10.5),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.85, 0.78, 0.45)),
+                ));
+            });
+
+            // ستون راست: نام هیرو، گلد، KDA، نوار سلامتی و کارت‌های آمار آیکون‌دار
+            root.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: px(7.0),
+                width: px(375.0),
+                ..default()
+            })
+            .with_children(|info| {
+                // ردیف ۱: نام هیرو + سکه گلد + آمار KDA/LH/DN
+                info.spawn(Node {
+                    width: percent(100),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|top| {
+                    top.spawn((
+                        HeroHudHeaderText,
+                        Text::new("Hero"),
+                        TextFont {
+                            font_size: FontSize::Px(14.5),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.96, 0.98, 1.0)),
+                    ));
+
+                    top.spawn((
+                        Node {
+                            padding: UiRect::axes(px(8.0), px(3.0)),
+                            column_gap: px(5.0),
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(px(5.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.28, 0.22, 0.06, 0.85)),
+                    ))
+                    .with_children(|g| {
+                        g.spawn((
+                            Node {
+                                width: px(11.0),
+                                height: px(11.0),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(1.0, 0.82, 0.16)),
+                        ));
+                        g.spawn((
+                            HeroHudGoldText,
+                            Text::new("600"),
+                            TextFont {
+                                font_size: FontSize::Px(12.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(1.0, 0.88, 0.35)),
+                        ));
+                    });
+                });
+
+                // ردیف ۲: نوار سلامتی (HP) با متن دقیق داخل نوار
+                info.spawn((
                     Node {
                         width: percent(100),
-                        height: px(14.0),
+                        height: px(18.0),
                         border: UiRect::all(px(1.0)),
                         border_radius: BorderRadius::all(px(4.0)),
                         overflow: Overflow::clip(),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
                         ..default()
                     },
-                    BorderColor::all(Color::srgba(0.2, 0.25, 0.3, 0.9)),
-                    BackgroundColor(Color::srgb(0.12, 0.14, 0.16)),
+                    BorderColor::all(Color::srgba(0.22, 0.28, 0.35, 0.9)),
+                    BackgroundColor(Color::srgb(0.10, 0.12, 0.15)),
                 ))
                 .with_children(|bar| {
                     bar.spawn((
                         HeroHpBarFill,
                         Node {
+                            position_type: PositionType::Absolute,
+                            left: px(0.0),
+                            top: px(0.0),
                             width: percent(100),
                             height: percent(100),
                             ..default()
                         },
                         BackgroundColor(Color::srgb(0.16, 0.78, 0.38)),
                     ));
+                    bar.spawn((
+                        HeroHpBarText,
+                        Text::new("650 / 650 (+2.5/s)"),
+                        TextFont {
+                            font_size: FontSize::Px(11.0),
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
                 });
 
-            // متن تمام آمار هیرو و اسلحه
-            parent.spawn((
-                HeroHudMainText,
-                Text::new(""),
-                TextFont {
-                    font_size: FontSize::Px(12.5),
+                // ردیف ۳: آمار KDA و مهمات اسلحه
+                info.spawn(Node {
+                    width: percent(100),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
                     ..default()
-                },
-                TextColor(Color::srgb(0.92, 0.95, 0.98)),
-            ));
+                })
+                .with_children(|mid| {
+                    mid.spawn((
+                        HeroHudKdaText,
+                        Text::new("K 0 / D 0 / A 0  |  LH 0  DN 0"),
+                        TextFont {
+                            font_size: FontSize::Px(11.5),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.76, 0.84, 0.92)),
+                    ));
+
+                    spawn_stat_chip(mid, "A", Color::srgb(0.98, 0.80, 0.22), HeroStatAmmoText);
+                });
+
+                // ردیف ۴: ۶ کارت آمار با آیکون رنگی مفهومی (بدون Scale)
+                info.spawn(Node {
+                    width: percent(100),
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    column_gap: px(6.0),
+                    row_gap: px(6.0),
+                    ..default()
+                })
+                .with_children(|grid| {
+                    spawn_stat_chip(grid, "D", Color::srgb(0.95, 0.30, 0.28), HeroStatDmgText);
+                    spawn_stat_chip(grid, "F", Color::srgb(0.98, 0.58, 0.18), HeroStatRateText);
+                    spawn_stat_chip(grid, "R", Color::srgb(0.24, 0.86, 0.94), HeroStatRangeText);
+                    spawn_stat_chip(grid, "S", Color::srgb(0.36, 0.64, 0.98), HeroStatArmorText);
+                    spawn_stat_chip(grid, "M", Color::srgb(0.26, 0.88, 0.52), HeroStatSpeedText);
+                    spawn_stat_chip(grid, "V", Color::srgb(0.76, 0.48, 0.98), HeroStatVisionText);
+                });
+            });
         });
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_hero_hud_system(
     hero_state: Res<LatestHeroSnapshot>,
-    mut text_query: Query<&mut Text, With<HeroHudMainText>>,
     mut hp_bar_query: Query<(&mut Node, &mut BackgroundColor), With<HeroHpBarFill>>,
+    mut xp_seg_query: Query<(&HeroHudXpSegment, &mut BackgroundColor), Without<HeroHpBarFill>>,
+    mut header_q: Query<&mut Text, With<HeroHudHeaderText>>,
+    mut gold_q: Query<&mut Text, (With<HeroHudGoldText>, Without<HeroHudHeaderText>)>,
+    mut kda_q: Query<&mut Text, (With<HeroHudKdaText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>)>,
+    mut lvl_q: Query<&mut Text, (With<HeroHudLevelText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>)>,
+    mut xp_lbl_q: Query<&mut Text, (With<HeroHudXpLabelText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>)>,
+    mut hp_txt_q: Query<&mut Text, (With<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    mut dmg_q: Query<&mut Text, (With<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    mut rate_q: Query<&mut Text, (With<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    mut range_q: Query<&mut Text, (With<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    mut armor_q: Query<&mut Text, (With<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    mut speed_q: Query<&mut Text, (With<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    mut vision_q: Query<&mut Text, (With<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    mut ammo_q: Query<&mut Text, (With<HeroStatAmmoText>, Without<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
 ) {
     let h = &hero_state.0;
-    let hp_pct = ((h.hp / h.max_hp) * 100.0).clamp(0.0, 100.0);
+    let hp_pct = ((h.hp / h.max_hp.max(1.0)) * 100.0).clamp(0.0, 100.0);
 
     if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
         bar_node.width = percent(hp_pct);
@@ -4321,39 +5214,85 @@ fn update_hero_hud_system(
         };
     }
 
-    if let Ok(mut txt) = text_query.single_mut() {
-        **txt = format!(
-            "{} [{:?}]  |  Scale: {:.2}  |  Speed: {:.2}
-             HP: {:.0} / {:.0} (+{:.1}/s)  |  Armor: {:.1}  |  Vision: {:.0}m
-             Gold: {}  |  XP: {} (Radius: {:.0}m)
-             K: {}   D: {}   A: {}   |   LH: {}   DN: {}
-             Weapon: {:?}  |  Ammo: {}/{}
-             DMG: {:.0}  |  Rate: {:.2}s  |  Speed: {:.0}  |  Range: {:.0}m",
-            h.display_name,
-            h.team,
-            h.hero_scale,
-            h.move_speed,
-            h.hp,
-            h.max_hp,
-            h.hp_regen_per_sec,
-            h.armor,
-            h.vision_range,
-            h.gold,
-            h.xp,
-            h.xp_gain_radius,
-            h.kills,
-            h.deaths,
-            h.assists,
-            h.last_hits,
-            h.denies,
-            h.weapon_kind,
-            h.ammo_in_mag,
-            h.magazine_size,
-            h.weapon_damage,
-            h.fire_rate_secs,
-            h.projectile_speed,
-            h.weapon_max_range,
-        );
+    let xp_frac = if h.level >= 25 || h.xp_for_next_level == 0 {
+        1.0
+    } else {
+        (h.xp_into_level as f32 / h.xp_for_next_level as f32).clamp(0.0, 1.0)
+    };
+    let lit_count = (xp_frac * XP_RING_SEGMENTS as f32).round() as usize;
+    let lit_col = Color::srgb(1.0, 0.84, 0.24);
+    let dim_col = Color::srgba(0.20, 0.24, 0.30, 0.65);
+    for (seg, mut bg) in &mut xp_seg_query {
+        *bg = if seg.index < lit_count {
+            lit_col.into()
+        } else {
+            dim_col.into()
+        };
+    }
+
+    if let Ok(mut t) = header_q.single_mut() {
+        **t = format!("{} [{:?}]", h.display_name, h.team);
+    }
+    if let Ok(mut t) = gold_q.single_mut() {
+        **t = format!("{}", h.gold);
+    }
+    if let Ok(mut t) = kda_q.single_mut() {
+        **t = format!("K {} / D {} / A {}   |   LH {}  DN {}", h.kills, h.deaths, h.assists, h.last_hits, h.denies);
+    }
+    if let Ok(mut t) = lvl_q.single_mut() {
+        **t = format!("{}", h.level);
+    }
+    if let Ok(mut t) = xp_lbl_q.single_mut() {
+        **t = if h.level >= 25 {
+            "MAX LVL".to_string()
+        } else {
+            format!("XP {}/{}", h.xp_into_level, h.xp_for_next_level)
+        };
+    }
+    if let Ok(mut t) = hp_txt_q.single_mut() {
+        **t = format!("{:.0} / {:.0} (+{:.1}/s)", h.hp, h.max_hp, h.hp_regen_per_sec);
+    }
+    if let Ok(mut t) = dmg_q.single_mut() {
+        **t = format!("DMG {:.0}", h.weapon_damage);
+    }
+    if let Ok(mut t) = rate_q.single_mut() {
+        **t = format!("Rate {:.2}s", h.fire_rate_secs);
+    }
+    if let Ok(mut t) = range_q.single_mut() {
+        **t = format!("Rng {:.0}m", h.weapon_max_range);
+    }
+    if let Ok(mut t) = armor_q.single_mut() {
+        **t = format!("Arm {:.1}", h.armor);
+    }
+    if let Ok(mut t) = speed_q.single_mut() {
+        **t = format!("Spd {:.1}", h.move_speed);
+    }
+    if let Ok(mut t) = vision_q.single_mut() {
+        **t = format!("Vis {:.0}m", h.vision_range);
+    }
+    if let Ok(mut t) = ammo_q.single_mut() {
+        **t = format!("{}/{}", h.ammo_in_mag, h.magazine_size);
+    }
+}
+
+fn level_up_vfx_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut Transform, &mut LevelUpVfx)>,
+) {
+    for (ent, mut tf, mut vfx) in &mut q {
+        vfx.timer.tick(time.delta());
+        let frac = vfx.timer.fraction();
+        if vfx.is_ring {
+            let s = 1.0 + frac * 2.2;
+            tf.scale = Vec3::new(s, (1.0 - frac).max(0.05), s);
+        } else {
+            let s = (1.0 - frac).max(0.05);
+            tf.scale = Vec3::new(s, 1.0 + frac * 0.4, s);
+        }
+        if vfx.timer.is_finished() {
+            commands.entity(ent).despawn();
+        }
     }
 }
 
@@ -4434,10 +5373,26 @@ struct RemoteWeaponAttached;
 #[derive(Resource, Default)]
 struct LatestRemotePlayers(Vec<RemotePlayerSnapshot>);
 
+#[derive(Resource, Default)]
+struct LatestCreeps(Vec<CreepSnapshot>);
+
+#[derive(Resource)]
+struct CreepGltfHandle(Handle<Gltf>);
+
+#[derive(Resource)]
+struct CreepAnimationAssets {
+    graph_handle: Handle<AnimationGraph>,
+    run_node: AnimationNodeIndex,
+    idle_node: AnimationNodeIndex,
+    fire_node: AnimationNodeIndex,
+    die_node: AnimationNodeIndex,
+}
+
 #[derive(SystemParam)]
 struct SnapshotHudSyncParams<'w> {
     hero_hud: ResMut<'w, LatestHeroSnapshot>,
     remote_players: ResMut<'w, LatestRemotePlayers>,
+    creeps: ResMut<'w, LatestCreeps>,
 }
 
 fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
@@ -5269,6 +6224,326 @@ fn update_overhead_hero_bars_system(
                     used_black.into()
                 };
             }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// همگام‌سازی بصری سربازان لاین (GLB + انیمیشن‌های run/idle/fire/die + هایلایت قرمز + نوار سلامتی)
+// -----------------------------------------------------------------------------
+
+#[derive(Component)]
+struct CreepVisual {
+    creep_id: u64,
+    last_anim: Option<CreepAnimState>,
+    is_highlighted: bool,
+}
+
+#[derive(Component)]
+struct CreepAnimPlayer {
+    creep_id: u64,
+}
+
+#[derive(Component)]
+struct CreepSavedMaterial(Handle<StandardMaterial>);
+
+#[derive(Component)]
+struct OverheadCreepBarRoot {
+    creep_id: u64,
+}
+
+#[derive(Component)]
+struct OverheadCreepHpFill {
+    creep_id: u64,
+}
+
+#[derive(SystemParam)]
+struct CreepAssetParams<'w> {
+    config: Res<'w, GameConfig>,
+    asset_server: Res<'w, AssetServer>,
+    match_flow: Res<'w, ClientMatchFlow>,
+    render_state: Res<'w, ClientRenderState>,
+    latest_creeps: Res<'w, LatestCreeps>,
+    creep_gltf_handle: Option<Res<'w, CreepGltfHandle>>,
+    gltf_assets: Res<'w, Assets<Gltf>>,
+    animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
+    creep_anim_assets: Option<Res<'w, CreepAnimationAssets>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_lane_creeps_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut res: CreepAssetParams,
+    children_query: Query<&Children>,
+    unbound_player_query: Query<Entity, (With<AnimationPlayer>, Without<AnimationGraphHandle>)>,
+    mut anim_player_query: Query<(&CreepAnimPlayer, &mut AnimationPlayer, &mut AnimationTransitions)>,
+    mut existing_query: Query<(Entity, &mut CreepVisual, &mut Transform, &mut Visibility)>,
+    mut mat_mesh_query: Query<(
+        &mut MeshMaterial3d<StandardMaterial>,
+        Option<&CreepSavedMaterial>,
+    )>,
+) {
+    // ۱. ساخت گراف انیمیشن سربازان لاین به محض لود شدن GLB
+    if res.creep_anim_assets.is_none() {
+        if let Some(ref c_handle) = res.creep_gltf_handle {
+            if let Some(gltf) = res.gltf_assets.get(&c_handle.0) {
+                let mut graph = AnimationGraph::new();
+                let mut nodes = HashMap::new();
+                for (name, clip_h) in &gltf.named_animations {
+                    let node_idx = graph.add_clip(clip_h.clone(), 1.0, graph.root);
+                    nodes.insert(name.to_string(), node_idx);
+                }
+                let find_node = |target: &str, fallbacks: &[&str]| -> AnimationNodeIndex {
+                    if let Some(&idx) = nodes.get(target) {
+                        return idx;
+                    }
+                    for &fb in fallbacks {
+                        if let Some(&idx) = nodes.get(fb) {
+                            return idx;
+                        }
+                    }
+                    *nodes.values().next().unwrap_or_else(|| {
+                        panic!("فایل GLB سرباز لاین '{}' هیچ انیمیشنی ندارد!", res.config.creeps.model_path)
+                    })
+                };
+                let run_node = find_node(&res.config.creeps.anim_run, &["run_forward", "walk_forward"]);
+                let idle_node = find_node(&res.config.creeps.anim_idle, &["idle"]);
+                let fire_node = find_node(&res.config.creeps.anim_fire, &["firing_rifle"]);
+                let die_node = find_node(&res.config.creeps.anim_die, &["die_1", "die_2"]);
+                let graph_handle = res.animation_graphs.add(graph);
+                commands.insert_resource(CreepAnimationAssets {
+                    graph_handle,
+                    run_node,
+                    idle_node,
+                    fire_node,
+                    die_node,
+                });
+            }
+        }
+    }
+
+    if !res.match_flow.is_in_game() {
+        return;
+    }
+
+    let dt = time.delta_secs();
+    let creep_map: HashMap<u64, &CreepSnapshot> =
+        res.latest_creeps.0.iter().map(|c| (c.id, c)).collect();
+    let mut seen_ids = HashSet::new();
+
+    for (root_ent, mut vis_comp, mut tf, mut vis) in &mut existing_query {
+        let Some(&cs) = creep_map.get(&vis_comp.creep_id) else {
+            commands.entity(root_ent).despawn();
+            continue;
+        };
+        seen_ids.insert(cs.id);
+
+        tf.translation = tf.translation.lerp(cs.pos, (16.0 * dt).clamp(0.0, 1.0));
+        tf.scale = Vec3::splat(res.config.creeps.scale);
+
+        let flat_dir = Vec3::new(cs.facing_dir.x, 0.0, cs.facing_dir.z);
+        if flat_dir.length_squared() > 0.0001 {
+            let target_rot = Transform::IDENTITY
+                .looking_to(-flat_dir.normalize(), Vec3::Y)
+                .rotation;
+            tf.rotation = tf.rotation.slerp(target_rot, (14.0 * dt).clamp(0.0, 1.0));
+        }
+
+        *vis = if cs.is_visible {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+
+        // اتصال گراف انیمیشن به سرباز جدید
+        if let Some(ref assets) = res.creep_anim_assets {
+            for desc in children_query.iter_descendants(root_ent) {
+                if unbound_player_query.contains(desc) {
+                    commands.entity(desc).insert((
+                        AnimationGraphHandle(assets.graph_handle.clone()),
+                        AnimationTransitions::new(),
+                        CreepAnimPlayer { creep_id: cs.id },
+                    ));
+                }
+            }
+
+            if vis_comp.last_anim != Some(cs.anim_state) {
+                let target_node = match cs.anim_state {
+                    CreepAnimState::Run => assets.run_node,
+                    CreepAnimState::Idle => assets.idle_node,
+                    CreepAnimState::Fire => assets.fire_node,
+                    CreepAnimState::Die => assets.die_node,
+                };
+                for (cp, mut player, mut trans) in &mut anim_player_query {
+                    if cp.creep_id == cs.id {
+                        let active = trans.play(&mut player, target_node, Duration::from_millis(100));
+                        if cs.anim_state == CreepAnimState::Run || cs.anim_state == CreepAnimState::Idle {
+                            active.repeat();
+                        }
+                    }
+                }
+                vis_comp.last_anim = Some(cs.anim_state);
+            }
+        }
+
+        // هایلایت قرمز ملایم روی سرباز هدف هنگام قرار گرفتن نشانه‌گر موس روی آن
+        let should_highlight = !cs.is_dead && res.render_state.hovered_creep_id == Some(cs.id);
+        if vis_comp.is_highlighted != should_highlight {
+            let tint = res.config.creeps.hovered_tint_emissive_rgb;
+            let mut apply_tint = |ent: Entity| {
+                let Ok((mut mat_comp, saved_opt)) = mat_mesh_query.get_mut(ent) else {
+                    return;
+                };
+                if should_highlight {
+                    if saved_opt.is_none() {
+                        let orig_h = mat_comp.0.clone();
+                        if let Some(mut cloned) = res.materials.get(&orig_h).cloned() {
+                            cloned.emissive = LinearRgba::new(tint.0, tint.1, tint.2, 1.0);
+                            cloned.base_color = cloned.base_color.mix(&Color::srgb(1.0, 0.35, 0.30), 0.35);
+                            mat_comp.0 = res.materials.add(cloned);
+                            commands.entity(ent).insert(CreepSavedMaterial(orig_h));
+                        }
+                    }
+                } else if let Some(saved) = saved_opt {
+                    mat_comp.0 = saved.0.clone();
+                    commands.entity(ent).remove::<CreepSavedMaterial>();
+                }
+            };
+            apply_tint(root_ent);
+            for desc in children_query.iter_descendants(root_ent) {
+                apply_tint(desc);
+            }
+            vis_comp.is_highlighted = should_highlight;
+        }
+    }
+
+    // اسپاون مدل GLB سربازان جدید
+    for cs in &res.latest_creeps.0 {
+        if seen_ids.contains(&cs.id) {
+            continue;
+        }
+        let scene_h = res.asset_server.load(format!("{}#Scene0", res.config.creeps.model_path));
+        commands.spawn((
+            CreepVisual {
+                creep_id: cs.id,
+                last_anim: None,
+                is_highlighted: false,
+            },
+            WorldAssetRoot(scene_h),
+            Transform::from_translation(cs.pos).with_scale(Vec3::splat(res.config.creeps.scale)),
+            if cs.is_visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            },
+        ));
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn update_overhead_creep_bars_system(
+    mut commands: Commands,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    latest_creeps: Res<LatestCreeps>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut bar_root_q: Query<(Entity, &OverheadCreepBarRoot, &mut Node)>,
+    mut bar_fill_q: Query<
+        (&OverheadCreepHpFill, &mut Node, &mut BackgroundColor),
+        Without<OverheadCreepBarRoot>,
+    >,
+) {
+    if !match_flow.is_in_game() {
+        for (_, _, mut node) in &mut bar_root_q {
+            node.display = Display::None;
+        }
+        return;
+    }
+
+    let Ok((camera, cam_gtf)) = camera_query.single() else {
+        return;
+    };
+
+    let my_team = hero_hud.0.team;
+    let creep_map: HashMap<u64, &CreepSnapshot> =
+        latest_creeps.0.iter().map(|c| (c.id, c)).collect();
+    let mut existing_bars: HashMap<u64, Entity> = HashMap::new();
+
+    for (ent, root, mut node) in &mut bar_root_q {
+        let Some(&cs) = creep_map.get(&root.creep_id) else {
+            commands.entity(ent).despawn();
+            continue;
+        };
+        existing_bars.insert(root.creep_id, ent);
+
+        if cs.is_dead || !cs.is_visible {
+            node.display = Display::None;
+            continue;
+        }
+
+        let world_head = cs.pos + Vec3::Y * (config.creeps.hitbox_height + 0.45);
+        if let Ok(sp) = camera.world_to_viewport(cam_gtf, world_head) {
+            node.display = Display::Flex;
+            node.left = px(sp.x - 28.0);
+            node.top = px(sp.y - 12.0);
+        } else {
+            node.display = Display::None;
+        }
+    }
+
+    for cs in &latest_creeps.0 {
+        if !existing_bars.contains_key(&cs.id) && !cs.is_dead {
+            let cid = cs.id;
+            commands
+                .spawn((
+                    OverheadCreepBarRoot { creep_id: cid },
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        width: px(56.0),
+                        height: px(6.5),
+                        border: UiRect::all(px(1.0)),
+                        border_radius: BorderRadius::all(px(2.0)),
+                        overflow: Overflow::clip(),
+                        display: Display::None,
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.04, 0.05, 0.07, 0.9)),
+                    BackgroundColor(Color::srgba(0.08, 0.09, 0.12, 0.80)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        OverheadCreepHpFill { creep_id: cid },
+                        Pickable::IGNORE,
+                        Node {
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.18, 0.84, 0.38)),
+                    ));
+                });
+        }
+    }
+
+    for (fill, mut fnode, mut fbg) in &mut bar_fill_q {
+        if let Some(&cs) = creep_map.get(&fill.creep_id) {
+            let pct = ((cs.hp / cs.max_hp.max(1.0)) * 100.0).clamp(0.0, 100.0);
+            fnode.width = percent(pct);
+            *fbg = if cs.team == my_team {
+                if cs.is_deniable {
+                    Color::srgb(0.95, 0.78, 0.18).into()
+                } else {
+                    Color::srgb(0.18, 0.84, 0.38).into()
+                }
+            } else {
+                Color::srgb(0.90, 0.20, 0.20).into()
+            };
         }
     }
 }

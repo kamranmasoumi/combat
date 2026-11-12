@@ -27,6 +27,9 @@ pub struct GameConfig {
     pub soldier: SoldierConfig,
     pub combat: CombatConfig,
     pub fx: FxConfig,
+    pub cursor_reticle: CursorReticleConfig,
+    pub laser: LaserConfig,
+    pub creeps: CreepConfig,
     pub animations: AnimationConfig,
     pub map: MapConfig,
     pub obstacles: Vec<ObstacleDef>,
@@ -45,6 +48,7 @@ impl GameConfig {
         });
         cfg.validate_unique_map_ids();
         cfg.validate_heroes();
+        cfg.validate_creeps();
         cfg
     }
 
@@ -63,6 +67,14 @@ impl GameConfig {
 
     pub fn validate_heroes(&self) {
         assert!(
+            self.combat.xp_thresholds_per_level.len() == 25,
+            "xp_thresholds_per_level در config.ron باید دقیقاً ۲۵ سطح (۱ تا ۲۵) داشته باشد!"
+        );
+        assert!(
+            self.combat.min_fire_rate_secs > 0.0,
+            "min_fire_rate_secs باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
             !self.heroes.is_empty(),
             "خطای بحرانی کانفیگ: لیست heroes خالی است! حداقل یک هیرو باید در config.ron تعریف شود."
         );
@@ -78,6 +90,24 @@ impl GameConfig {
             assert!(hero.weapon.max_range > 0.0, "max_range اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.pellets_per_shot > 0, "pellets_per_shot اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
         }
+    }
+
+    pub fn validate_creeps(&self) {
+        let c = &self.creeps;
+        assert!(!c.model_path.trim().is_empty(), "model_path سربازان لاین نمی‌تواند خالی باشد");
+        assert!(c.scale > 0.0, "scale سربازان لاین باید بزرگ‌تر از صفر باشد");
+        assert!(c.collider_radius > 0.0, "collider_radius سربازان لاین باید بزرگ‌تر از صفر باشد");
+        assert!(c.hitbox_height > 0.0, "hitbox_height سربازان لاین باید بزرگ‌تر از صفر باشد");
+        assert!(c.wave_interval_secs > 0.0, "wave_interval_secs باید بزرگ‌تر از صفر باشد");
+        assert!(c.creeps_per_wave > 0, "creeps_per_wave باید حداقل ۱ باشد");
+        assert!(c.max_hp > 0.0, "max_hp سربازان لاین باید بزرگ‌تر از صفر باشد");
+        assert!(c.fire_rate_secs > 0.0, "fire_rate_secs سربازان لاین باید بزرگ‌تر از صفر باشد");
+        assert!(c.projectile_speed > 0.0, "projectile_speed سربازان لاین باید بزرگ‌تر از صفر باشد");
+        assert!(c.bullet_max_range > 0.0, "bullet_max_range سربازان لاین باید بزرگ‌تر از صفر باشد");
+        assert!(
+            (0.0..=1.0).contains(&c.deny_hp_threshold_ratio),
+            "deny_hp_threshold_ratio باید بین 0 و 1 باشد"
+        );
     }
 
     pub fn active_hero(&self, index: usize) -> &HeroDef {
@@ -459,6 +489,17 @@ pub struct HeroDef {
     pub vision_range: f32,
     pub high_ground_vision_bonus: f32,
     pub weapon: HeroWeaponDef,
+    pub level_growth: HeroLevelGrowth,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroLevelGrowth {
+    pub fire_rate_reduction_per_level: f32,
+    pub damage_per_level: f32,
+    pub max_range_per_level: f32,
+    pub max_hp_per_level: f32,
+    pub hp_regen_per_level: f32,
+    pub armor_per_level: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -508,6 +549,87 @@ pub struct CombatConfig {
     pub grenade_soldier_kill_radius: f32,
     pub grenade_explosion_trauma_add: f32,
     pub grenade_explosion_trauma_max: f32,
+    pub hero_stand_hitbox_height: f32,
+    pub hero_crouch_hitbox_height: f32,
+    pub hero_stand_aim_chest_height: f32,
+    pub hero_crouch_aim_chest_height: f32,
+    pub hero_hitbox_radius_multiplier: f32,
+    pub aim_lock_radius_multiplier: f32,
+    pub aim_lock_ray_max_distance: f32,
+    pub bullet_hit_forgiveness_radius: f32,
+    pub bullet_hit_forgiveness_height_bottom: f32,
+    pub bullet_hit_forgiveness_height_top: f32,
+    pub max_vertical_aim_pitch_sin: f32,
+    pub min_fire_rate_secs: f32,
+    pub xp_thresholds_per_level: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CursorReticleConfig {
+    pub outer_diameter_px: f32,
+    pub inner_diameter_px: f32,
+    pub center_dot_px: f32,
+    pub outer_border_px: f32,
+    pub inner_border_px: f32,
+    pub tick_length_px: f32,
+    pub tick_thickness_px: f32,
+    pub fire_expand_px: f32,
+    pub expand_recover_speed: f32,
+    pub normal_color_rgba: (f32, f32, f32, f32),
+    pub locked_color_rgba: (f32, f32, f32, f32),
+    pub reload_color_rgba: (f32, f32, f32, f32),
+    pub hide_os_cursor_in_game: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LaserConfig {
+    pub beam_radius: f32,
+    pub beam_core_ratio: f32,
+    pub core_color_rgba: (f32, f32, f32, f32),
+    pub glow_color_rgba: (f32, f32, f32, f32),
+    pub bead_alpha: f32,
+    pub emissive_strength: f32,
+    pub pulse_speed: f32,
+    pub pulse_frequency: f32,
+    pub impact_dot_radius: f32,
+    pub impact_ring_inner_radius: f32,
+    pub impact_ring_outer_radius: f32,
+    pub impact_pulse_speed: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CreepConfig {
+    pub model_path: String,
+    pub scale: f32,
+    pub collider_radius: f32,
+    pub hitbox_height: f32,
+    pub aim_chest_height: f32,
+    pub muzzle_offset_y: f32,
+    pub muzzle_forward: f32,
+    pub first_wave_delay_secs: f32,
+    pub wave_interval_secs: f32,
+    pub creeps_per_wave: usize,
+    pub wave_spawn_spacing: f32,
+    pub move_speed: f32,
+    pub fire_rate_secs: f32,
+    pub vision_range: f32,
+    pub attack_range: f32,
+    pub bullet_damage: f32,
+    pub projectile_speed: f32,
+    pub bullet_max_range: f32,
+    pub armor: f32,
+    pub max_hp: f32,
+    pub gold_bounty: u32,
+    pub xp_bounty: u32,
+    pub deny_hp_threshold_ratio: f32,
+    pub deny_enemy_xp_multiplier: f32,
+    pub anim_run: String,
+    pub anim_idle: String,
+    pub anim_fire: String,
+    pub anim_die: String,
+    pub die_despawn_delay_secs: f32,
+    pub waypoint_reach_dist: f32,
+    pub hovered_tint_emissive_rgb: (f32, f32, f32),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -526,6 +648,8 @@ pub struct FxConfig {
     pub explosion_flash_lifetime_secs: f32,
     pub target_hit_flash_secs: f32,
     pub target_recover_lerp_speed: f32,
+    pub level_up_vfx_duration_secs: f32,
+    pub level_up_particle_count: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -910,6 +1034,10 @@ pub enum GameplayFxEvent {
         pos: Vec3,
         intensity: f32,
     },
+    HeroLeveledUp {
+        pos: Vec3,
+        new_level: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -926,6 +1054,28 @@ pub struct GrenadeSnapshot {
     pub rotation: Quat,
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CreepAnimState {
+    Idle,
+    Run,
+    Fire,
+    Die,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CreepSnapshot {
+    pub id: u64,
+    pub team: TeamId,
+    pub pos: Vec3,
+    pub facing_dir: Vec3,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub anim_state: CreepAnimState,
+    pub is_dead: bool,
+    pub is_deniable: bool,
+    pub is_visible: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1274,7 +1424,10 @@ pub struct HeroSnapshot {
     pub display_name: String,
     pub team: TeamId,
     pub gold: u32,
+    pub level: u32,
     pub xp: u32,
+    pub xp_into_level: u32,
+    pub xp_for_next_level: u32,
     pub xp_gain_radius: f32,
     pub hp: f32,
     pub max_hp: f32,
@@ -1328,6 +1481,8 @@ pub struct ServerWorldSnapshot {
     pub aim_world_dir: Vec3,
     pub aim_hit_pos: Vec3,
     pub laser_hit_pos: Vec3,
+    pub aim_locked_on_enemy: bool,
+    pub hovered_creep_id: Option<u64>,
     pub current_locomotion: String,
     pub upper_action: UpperBodyAction,
     pub traversal_active: bool,
@@ -1341,6 +1496,7 @@ pub struct ServerWorldSnapshot {
     pub bullets: Vec<BulletSnapshot>,
     pub grenades: Vec<GrenadeSnapshot>,
     pub targets: Vec<TargetSnapshot>,
+    pub creeps: Vec<CreepSnapshot>,
     pub fx_events: Vec<GameplayFxEvent>,
 }
 
@@ -1396,7 +1552,7 @@ pub fn dota2_armor_multiplier(armor: f32) -> f32 {
     1.0 - (0.06 * armor) / (1.0 + 0.06 * armor.abs())
 }
 
-/// بررسی برخورد پاره‌خط حرکت تیر با کپسول عمودی هیرو
+/// بررسی تحلیلی و پیوسته برخورد پاره‌خط (اشعه ماوس یا مسیر تیر) با استوانه/کپسول عمودی هیرو
 fn segment_hits_hero_capsule(
     seg_start: Vec3,
     seg_dir: Vec3,
@@ -1404,21 +1560,65 @@ fn segment_hits_hero_capsule(
     hero_feet_pos: Vec3,
     hero_radius: f32,
     hero_height: f32,
+    bottom_forgiveness: f32,
+    top_forgiveness: f32,
 ) -> Option<f32> {
-    let steps = 5_usize;
-    for i in 0..=steps {
-        let t = (i as f32 / steps as f32) * seg_len;
-        let pt = seg_start + seg_dir * t;
-        if pt.y < hero_feet_pos.y - 0.1 || pt.y > hero_feet_pos.y + hero_height {
-            continue;
-        }
-        let dx = pt.x - hero_feet_pos.x;
-        let dz = pt.z - hero_feet_pos.z;
-        if dx * dx + dz * dz <= hero_radius * hero_radius {
-            return Some(t);
-        }
+    if seg_len <= 0.0 || hero_radius <= 0.0 {
+        return None;
     }
-    None
+    let y_min = hero_feet_pos.y - bottom_forgiveness;
+    let y_max = hero_feet_pos.y + hero_height + top_forgiveness;
+
+    let ox = seg_start.x - hero_feet_pos.x;
+    let oz = seg_start.z - hero_feet_pos.z;
+    let dx = seg_dir.x;
+    let dz = seg_dir.z;
+
+    let a = dx * dx + dz * dz;
+    let b = 2.0 * (ox * dx + oz * dz);
+    let c = ox * ox + oz * oz - hero_radius * hero_radius;
+
+    let (t_cyl_enter, t_cyl_exit) = if a < 1e-6 {
+        if c > 0.0 {
+            return None;
+        }
+        (0.0_f32, seg_len)
+    } else {
+        let disc = b * b - 4.0 * a * c;
+        if disc < 0.0 {
+            return None;
+        }
+        let sqrt_d = disc.sqrt();
+        let inv_2a = 0.5 / a;
+        let t1 = (-b - sqrt_d) * inv_2a;
+        let t2 = (-b + sqrt_d) * inv_2a;
+        (t1.max(0.0), t2.min(seg_len))
+    };
+
+    if t_cyl_enter > t_cyl_exit {
+        return None;
+    }
+
+    if seg_dir.y.abs() < 1e-6 {
+        if seg_start.y >= y_min && seg_start.y <= y_max {
+            return Some(t_cyl_enter);
+        }
+        return None;
+    }
+
+    let ty1 = (y_min - seg_start.y) / seg_dir.y;
+    let ty2 = (y_max - seg_start.y) / seg_dir.y;
+    let t_y_enter = ty1.min(ty2);
+    let t_y_exit = ty1.max(ty2);
+
+    let t_enter = t_cyl_enter.max(t_y_enter);
+    let t_exit = t_cyl_exit.min(t_y_exit);
+
+    if t_enter <= t_exit && t_exit >= 0.0 && t_enter <= seg_len {
+        Some(t_enter.max(0.0))
+    } else {
+        None
+    }
 }
 
 pub fn sample_waterfall_depth_offset(config: &GameConfig, wx: f32, wz: f32) -> f32 {
@@ -2539,7 +2739,7 @@ pub struct PhysicsGrenade {
 #[derive(Component)]
 pub struct PhysicsBullet {
     pub id: u64,
-    pub owner_slot: usize,
+    pub owner_slot: Option<usize>,
     pub owner_team: TeamId,
     pub velocity: Vec3,
     pub damage: f32,
@@ -3409,7 +3609,7 @@ impl SharedFogOfWar {
         }
     }
 
-    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef) {
+    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, allied_creeps: &[Vec3]) {
         self.visible_now.fill(false);
 
         let hero_ground_y = Self::world_to_cell(config, hero_pos.x, hero_pos.z)
@@ -3428,6 +3628,9 @@ impl SharedFogOfWar {
         let allied = self.allied_sources.clone();
         for (src_pos, src_range) in allied {
             self.reveal_from_source(config, src_pos, src_range, 72);
+        }
+        for &c_pos in allied_creeps {
+            self.reveal_from_source(config, c_pos, config.creeps.vision_range, 64);
         }
     }
 
@@ -3458,6 +3661,23 @@ impl SharedFogOfWar {
 // -----------------------------------------------------------------------------
 // ۵. وضعیت کامل شبیه‌سازی (درون moba_shared برای جلوگیری از بازنویسی)
 // -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct LaneCreepState {
+    pub id: u64,
+    pub team: TeamId,
+    pub lane: LaneId,
+    pub waypoint_index: usize,
+    pub pos: Vec3,
+    pub facing_dir: Vec3,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub fire_cooldown: f32,
+    pub fire_anim_timer: f32,
+    pub anim_state: CreepAnimState,
+    pub is_dead: bool,
+    pub despawn_timer: f32,
+}
 
 pub struct SharedTarget {
     pub max_hp: f32,
@@ -3514,6 +3734,8 @@ pub struct PlayerSlotState {
     pub aim_world_dir: Vec3,
     pub aim_hit_pos: Vec3,
     pub laser_hit_pos: Vec3,
+    pub aim_locked_on_enemy: bool,
+    pub hovered_creep_id: Option<u64>,
     pub is_moving: bool,
     pub move_input: Vec3,
     pub fire_cooldown_remaining: f32,
@@ -3530,6 +3752,7 @@ pub struct PlayerSlotState {
     pub hero_display_name: String,
     pub hero_team: TeamId,
     pub hero_gold: u32,
+    pub hero_level: u32,
     pub hero_xp: u32,
     pub hero_xp_gain_radius: f32,
     pub hero_hp: f32,
@@ -3573,6 +3796,8 @@ pub struct AuthoritativeWorldState {
     pub aim_world_dir: Vec3,
     pub aim_hit_pos: Vec3,
     pub laser_hit_pos: Vec3,
+    pub aim_locked_on_enemy: bool,
+    pub hovered_creep_id: Option<u64>,
     pub is_moving: bool,
     pub move_input: Vec3,
     pub fire_cooldown_remaining: f32,
@@ -3588,6 +3813,7 @@ pub struct AuthoritativeWorldState {
     pub hero_display_name: String,
     pub hero_team: TeamId,
     pub hero_gold: u32,
+    pub hero_level: u32,
     pub hero_xp: u32,
     pub hero_xp_gain_radius: f32,
     pub hero_hp: f32,
@@ -3613,6 +3839,10 @@ pub struct AuthoritativeWorldState {
     pub traversal: SharedTraversalState,
     pub targets: Vec<SharedTarget>,
     pub targets_visible: Vec<bool>,
+    pub creeps: Vec<LaneCreepState>,
+    pub match_elapsed_secs: f32,
+    pub next_wave_time_secs: f32,
+    pub next_creep_id: u64,
     pub bullets_snapshot: Vec<BulletSnapshot>,
     pub grenades_snapshot: Vec<GrenadeSnapshot>,
     pub pending_fx: Vec<GameplayFxEvent>,
@@ -3666,6 +3896,8 @@ impl AuthoritativeWorldState {
             aim_world_dir: initial_aim_dir,
             aim_hit_pos: initial_aim_hit,
             laser_hit_pos: initial_aim_hit,
+            aim_locked_on_enemy: false,
+            hovered_creep_id: None,
             is_moving: false,
             move_input: Vec3::ZERO,
             fire_cooldown_remaining: 0.0,
@@ -3685,6 +3917,7 @@ impl AuthoritativeWorldState {
             hero_display_name: hero.display_name,
             hero_team: hero.team,
             hero_gold: hero.starting_gold,
+            hero_level: 1,
             hero_xp: 0,
             hero_xp_gain_radius: hero.xp_gain_radius,
             hero_hp: hero.max_hp,
@@ -3719,6 +3952,10 @@ impl AuthoritativeWorldState {
             },
             targets_visible: vec![true; targets.len()],
             targets,
+            creeps: Vec::new(),
+            match_elapsed_secs: 0.0,
+            next_wave_time_secs: config.creeps.first_wave_delay_secs,
+            next_creep_id: 1,
             bullets_snapshot: Vec::new(),
             grenades_snapshot: Vec::new(),
             pending_fx: Vec::new(),
@@ -3757,6 +3994,8 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.aim_world_dir, &mut p.aim_world_dir);
         std::mem::swap(&mut self.aim_hit_pos, &mut p.aim_hit_pos);
         std::mem::swap(&mut self.laser_hit_pos, &mut p.laser_hit_pos);
+        std::mem::swap(&mut self.aim_locked_on_enemy, &mut p.aim_locked_on_enemy);
+        std::mem::swap(&mut self.hovered_creep_id, &mut p.hovered_creep_id);
         std::mem::swap(&mut self.is_moving, &mut p.is_moving);
         std::mem::swap(&mut self.move_input, &mut p.move_input);
         std::mem::swap(&mut self.fire_cooldown_remaining, &mut p.fire_cooldown_remaining);
@@ -3773,6 +4012,7 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.hero_model_path, &mut p.hero_model_path);
         std::mem::swap(&mut self.hero_team, &mut p.hero_team);
         std::mem::swap(&mut self.hero_gold, &mut p.hero_gold);
+        std::mem::swap(&mut self.hero_level, &mut p.hero_level);
         std::mem::swap(&mut self.hero_xp, &mut p.hero_xp);
         std::mem::swap(&mut self.hero_xp_gain_radius, &mut p.hero_xp_gain_radius);
         std::mem::swap(&mut self.hero_hp, &mut p.hero_hp);
@@ -3879,6 +4119,8 @@ impl AuthoritativeWorldState {
                 aim_world_dir: facing_dir,
                 aim_hit_pos: aim_hit,
                 laser_hit_pos: aim_hit,
+                aim_locked_on_enemy: false,
+                hovered_creep_id: None,
                 is_moving: false,
                 move_input: Vec3::ZERO,
                 fire_cooldown_remaining: 0.0,
@@ -3895,6 +4137,7 @@ impl AuthoritativeWorldState {
                 hero_model_path: hero.model_path,
                 hero_team: lp.team,
                 hero_gold: hero.starting_gold,
+                hero_level: 1,
                 hero_xp: 0,
                 hero_xp_gain_radius: hero.xp_gain_radius,
                 hero_hp: hero.max_hp,
@@ -3933,10 +4176,10 @@ impl AuthoritativeWorldState {
 
     pub fn build_snapshot_for_slot(&mut self, config: &GameConfig, slot_index: usize) -> ServerWorldSnapshot {
         if self.players.is_empty() {
-            return self.build_snapshot();
+            return self.build_snapshot(config);
         }
         self.swap_slot_in(slot_index);
-        let mut snap = self.build_snapshot();
+        let mut snap = self.build_snapshot(config);
         let mut others = Vec::with_capacity(self.players.len().saturating_sub(1));
         for p in &self.players {
             if p.slot_index == slot_index {
@@ -3981,6 +4224,28 @@ impl AuthoritativeWorldState {
             });
         }
         snap.other_players = others;
+        snap.creeps = self
+            .creeps
+            .iter()
+            .map(|c| {
+                let is_vis = c.team == self.hero_team
+                    || self.fog_of_war.is_world_point_visible(config, c.pos.x, c.pos.z);
+                CreepSnapshot {
+                    id: c.id,
+                    team: c.team,
+                    pos: c.pos,
+                    facing_dir: c.facing_dir,
+                    hp: if is_vis { c.hp } else { c.max_hp },
+                    max_hp: c.max_hp,
+                    anim_state: c.anim_state,
+                    is_dead: c.is_dead,
+                    is_deniable: !c.is_dead
+                        && c.team == self.hero_team
+                        && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio,
+                    is_visible: is_vis,
+                }
+            })
+            .collect();
         self.swap_slot_in(slot_index);
         snap
     }
@@ -4008,7 +4273,7 @@ impl AuthoritativeWorldState {
         self.fog_of_war = SharedFogOfWar::from_config(config, hero.team);
     }
 
-    pub fn build_snapshot(&mut self) -> ServerWorldSnapshot {
+    pub fn build_snapshot(&mut self, config: &GameConfig) -> ServerWorldSnapshot {
         self.tick += 1;
         ServerWorldSnapshot {
             tick: self.tick,
@@ -4017,6 +4282,8 @@ impl AuthoritativeWorldState {
             aim_world_dir: self.aim_world_dir,
             aim_hit_pos: self.aim_hit_pos,
             laser_hit_pos: self.laser_hit_pos,
+            aim_locked_on_enemy: self.aim_locked_on_enemy,
+            hovered_creep_id: self.hovered_creep_id,
             current_locomotion: self.current_locomotion.clone(),
             upper_action: self.upper_body_action(),
             traversal_active: self.traversal.is_active,
@@ -4029,7 +4296,21 @@ impl AuthoritativeWorldState {
                 display_name: self.hero_display_name.clone(),
                 team: self.hero_team,
                 gold: self.hero_gold,
+                level: self.hero_level,
                 xp: self.hero_xp,
+                xp_into_level: {
+                    let cur_base = config.combat.xp_thresholds_per_level[(self.hero_level as usize - 1).min(24)];
+                    self.hero_xp.saturating_sub(cur_base)
+                },
+                xp_for_next_level: {
+                    if self.hero_level >= 25 {
+                        0
+                    } else {
+                        let cur_base = config.combat.xp_thresholds_per_level[self.hero_level as usize - 1];
+                        let next_base = config.combat.xp_thresholds_per_level[self.hero_level as usize];
+                        next_base.saturating_sub(cur_base)
+                    }
+                },
                 xp_gain_radius: self.hero_xp_gain_radius,
                 hp: self.hero_hp,
                 max_hp: self.hero_max_hp,
@@ -4055,6 +4336,7 @@ impl AuthoritativeWorldState {
             fog_visible_mask: self.fog_of_war.pack_visible_mask(),
             bullets: self.bullets_snapshot.clone(),
             grenades: self.grenades_snapshot.clone(),
+            creeps: Vec::new(),
             targets: self
                 .targets
                 .iter()
@@ -4146,11 +4428,12 @@ where
 pub fn reconcile_soldier_physics_pos(
     soldier_physics_tf: &mut Transform,
     authoritative_feet_pos: Vec3,
+    hero_scale: f32,
     config: &GameConfig,
 ) {
     let auth_capsule_pos = Vec3::new(
         authoritative_feet_pos.x,
-        authoritative_feet_pos.y + config.physics.soldier_capsule_center_y,
+        authoritative_feet_pos.y + config.physics.soldier_capsule_center_y * hero_scale,
         authoritative_feet_pos.z,
     );
     let dist = soldier_physics_tf.translation.distance(auth_capsule_pos);
@@ -4160,6 +4443,43 @@ pub fn reconcile_soldier_physics_pos(
         soldier_physics_tf.translation = soldier_physics_tf
             .translation
             .lerp(auth_capsule_pos, config.physics.position_reconcile_lerp_factor);
+    }
+}
+
+
+pub fn grant_xp_to_player_slot(
+    p: &mut PlayerSlotState,
+    amount: u32,
+    config: &GameConfig,
+    pending_fx: &mut Vec<GameplayFxEvent>,
+) {
+    if amount == 0 || p.hero_level >= 25 {
+        return;
+    }
+    p.hero_xp = p.hero_xp.saturating_add(amount);
+    let growth = &config.active_hero(p.hero_index).level_growth;
+
+    while p.hero_level < 25 {
+        let next_idx = p.hero_level as usize;
+        if p.hero_xp >= config.combat.xp_thresholds_per_level[next_idx] {
+            p.hero_level += 1;
+            p.hero_weapon.fire_rate_secs = (p.hero_weapon.fire_rate_secs
+                - growth.fire_rate_reduction_per_level)
+                .max(config.combat.min_fire_rate_secs);
+            p.hero_weapon.damage += growth.damage_per_level;
+            p.hero_weapon.max_range += growth.max_range_per_level;
+            p.hero_max_hp += growth.max_hp_per_level;
+            p.hero_hp = (p.hero_hp + growth.max_hp_per_level).min(p.hero_max_hp);
+            p.hero_hp_regen_per_sec += growth.hp_regen_per_level;
+            p.hero_armor += growth.armor_per_level;
+
+            pending_fx.push(GameplayFxEvent::HeroLeveledUp {
+                pos: p.soldier_pos,
+                new_level: p.hero_level,
+            });
+        } else {
+            break;
+        }
     }
 }
 
@@ -4499,6 +4819,16 @@ fn shared_authoritative_drive_system(
         }
     }
 
+    // تولید موج سربازان هر لاین (دقیقاً پس از دقیقه‌ی اول، هر ۳۰ ثانیه) و هوش مصنوعی حرکت/شلیک
+    step_lane_creeps_system(
+        &mut commands,
+        dt,
+        &config,
+        &physics_world,
+        &mut world,
+        &target_query,
+    );
+
     // حل برخورد فیزیکی هیروها با یکدیگر (هیچ دو هیرویی نمی‌توانند از داخل هم عبور کنند)
     if world.players.len() > 1 {
         let n = world.players.len();
@@ -4527,6 +4857,40 @@ fn shared_authoritative_drive_system(
                     world.players[i].soldier_pos.z -= push_dir.y * half_push;
                     world.players[j].soldier_pos.x += push_dir.x * half_push;
                     world.players[j].soldier_pos.z += push_dir.y * half_push;
+                }
+            }
+        }
+        for (soldier_marker, mut soldier_tf, _) in &mut soldier_query {
+            let p = &world.players[soldier_marker.slot_index];
+            soldier_tf.translation.x = p.soldier_pos.x;
+            soldier_tf.translation.z = p.soldier_pos.z;
+        }
+    }
+
+    // حل برخورد فیزیکی هیروها با سربازان لاین (مانع فیزیکی کامل، عدم عبور از داخل سربازها)
+    if !world.creeps.is_empty() && !world.players.is_empty() {
+        let base_r = config.soldier.player_radius;
+        let creep_r = config.creeps.collider_radius;
+        let world_inner = &mut *world;
+        for p in &mut world_inner.players {
+            if p.is_dead {
+                continue;
+            }
+            let min_dist = base_r * p.hero_scale + creep_r;
+            for c in &world_inner.creeps {
+                if c.is_dead || (p.soldier_pos.y - c.pos.y).abs() > 1.8 {
+                    continue;
+                }
+                let delta = Vec2::new(p.soldier_pos.x - c.pos.x, p.soldier_pos.z - c.pos.z);
+                let dist = delta.length();
+                if dist < min_dist {
+                    let push_dir = if dist > 0.0001 {
+                        delta / dist
+                    } else {
+                        Vec2::new(1.0, 0.0)
+                    };
+                    p.soldier_pos.x = c.pos.x + push_dir.x * min_dist;
+                    p.soldier_pos.z = c.pos.z + push_dir.y * min_dist;
                 }
             }
         }
@@ -4639,16 +5003,33 @@ fn shared_drive_single_player(
             world.base_stance
         };
 
-        // ۵. هدف‌گیری ۳بعدی استاندارد روی سطوح مختلف و هیروی دشمن (ایستاده یا نشسته)
+        // ۵. هدف‌گیری ۳بعدی دقیق روی سطوح مختلف و قفل نرم روی هیروی دشمن (ایستاده، نشسته یا پشت سنگر)
         if !world.traversal.is_active
             && input.has_aim_ray
             && input.aim_ray_dir.y.abs() > config.physics.aim_ray_min_dir_y_epsilon
         {
             let ray_dir = input.aim_ray_dir.normalize();
-            let mut resolved_hit: Option<Vec3> = None;
+            let max_aim_dist = config.combat.aim_lock_ray_max_distance;
+            let aim_groups = soldier_collision_groups();
 
-            // الف) اگر نشانه‌گر ماوس روی کپسول یک هیروی دشمن قابل مشاهده است، دقیقاً به ارتفاع سینه همان هیرو قفل شو
-            let mut best_enemy_toi = f32::MAX;
+            // الف) ابتدا برخورد اشعه ماوس با هندسه واقعی نقشه (پلتفرم‌ها، دیوارها، رمپ‌ها و اهداف) را پیدا کن
+            let world_hit_opt = physics_world.cast_ray(
+                input.aim_ray_origin,
+                ray_dir,
+                max_aim_dist,
+                aim_groups,
+                |ent| {
+                    if let Ok(t) = target_query.get(ent) {
+                        !world.targets[t.index].is_dead
+                    } else {
+                        true
+                    }
+                },
+            );
+            let world_toi = world_hit_opt.as_ref().map(|(_, h)| h.toi).unwrap_or(f32::MAX);
+
+            // ب) بررسی برخورد تحلیلی اشعه ماوس با کپسول هیروهای دشمن قابل مشاهده (فقط اگر قبل از مانع به هیرو بخورد)
+            let mut best_enemy_hit: Option<(f32, Vec3)> = None;
             for &(e_slot, e_team, e_pos, e_scale, e_stance, e_dead) in hero_aim_targets {
                 if e_slot == world.active_slot || e_team == world.hero_team || e_dead {
                     continue;
@@ -4656,55 +5037,116 @@ fn shared_drive_single_player(
                 if !world.fog_of_war.is_world_point_visible(config, e_pos.x, e_pos.z) {
                     continue;
                 }
-                let e_rad = config.soldier.player_radius * e_scale * 1.45;
+                let e_rad =
+                    config.soldier.player_radius * e_scale * config.combat.aim_lock_radius_multiplier;
                 let e_height = if e_stance == Stance::Crouch {
-                    1.35 * e_scale
+                    config.combat.hero_crouch_hitbox_height * e_scale
                 } else {
-                    1.95 * e_scale
+                    config.combat.hero_stand_hitbox_height * e_scale
                 };
-                if let Some(toi) =
-                    segment_hits_hero_capsule(input.aim_ray_origin, ray_dir, 180.0, e_pos, e_rad, e_height)
-                {
-                    if toi < best_enemy_toi {
-                        best_enemy_toi = toi;
+                if let Some(toi) = segment_hits_hero_capsule(
+                    input.aim_ray_origin,
+                    ray_dir,
+                    max_aim_dist,
+                    e_pos,
+                    e_rad,
+                    e_height,
+                    config.combat.bullet_hit_forgiveness_height_bottom,
+                    config.combat.bullet_hit_forgiveness_height_top,
+                ) {
+                    if toi <= world_toi + 0.05
+                        && best_enemy_hit.map_or(true, |(prev_toi, _)| toi < prev_toi)
+                    {
                         let chest_h = if e_stance == Stance::Crouch {
-                            0.72 * e_scale
+                            config.combat.hero_crouch_aim_chest_height * e_scale
                         } else {
-                            1.10 * e_scale
+                            config.combat.hero_stand_aim_chest_height * e_scale
                         };
-                        resolved_hit = Some(e_pos + Vec3::Y * chest_h);
+                        best_enemy_hit = Some((toi, e_pos + Vec3::Y * chest_h));
                     }
                 }
             }
 
-            // ب) در غیر این صورت، اشعه ماوس را با زمین/پلتفرم/رمپ واقعی نقشه در هر ارتفاعی تقاطع بده
-            if resolved_hit.is_none() {
-                let aim_groups = soldier_collision_groups();
-                if let Some((_ent, hit)) = physics_world.cast_ray(
+            // ج) بررسی برخورد اشعه موس با سربازان لاین (سرباز دشمن یا سرباز خودی قابل دیناید)
+            let mut best_creep_hit: Option<(u64, f32, Vec3)> = None;
+            let c_rad = config.creeps.collider_radius * config.combat.aim_lock_radius_multiplier;
+            let c_height = config.creeps.hitbox_height;
+            for c in &world.creeps {
+                if c.is_dead {
+                    continue;
+                }
+                let is_enemy = c.team != world.hero_team;
+                let is_deniable =
+                    c.team == world.hero_team && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio;
+                if !is_enemy && !is_deniable {
+                    continue;
+                }
+                if is_enemy && !world.fog_of_war.is_world_point_visible(config, c.pos.x, c.pos.z) {
+                    continue;
+                }
+                if let Some(toi) = segment_hits_hero_capsule(
                     input.aim_ray_origin,
                     ray_dir,
-                    180.0,
-                    aim_groups,
-                    |ent| {
-                        if let Ok(t) = target_query.get(ent) {
-                            !world.targets[t.index].is_dead
-                        } else {
-                            true
-                        }
-                    },
+                    max_aim_dist,
+                    c.pos,
+                    c_rad,
+                    c_height,
+                    config.combat.bullet_hit_forgiveness_height_bottom,
+                    config.combat.bullet_hit_forgiveness_height_top,
                 ) {
-                    resolved_hit = Some(hit.point + Vec3::Y * config.soldier.aim_plane_height_offset);
+                    let prev_best_toi = best_creep_hit.map(|(_, t, _)| t).unwrap_or(world_toi + 0.05);
+                    if toi <= world_toi + 0.05 && toi < prev_best_toi {
+                        best_creep_hit = Some((c.id, toi, c.pos + Vec3::Y * config.creeps.aim_chest_height));
+                    }
                 }
             }
 
-            // ج) Fallback به صفحه افقی در صورت عدم برخورد با هندسه نقشه
-            if resolved_hit.is_none() {
+            let mut resolved_hit: Option<Vec3> = None;
+            let mut locked_enemy = false;
+            let mut hovered_creep: Option<u64> = None;
+
+            let hero_wins_aim = match (best_enemy_hit, best_creep_hit) {
+                (Some((h_t, _)), Some((_, c_t, _))) => h_t <= c_t,
+                (Some(_), None) => true,
+                _ => false,
+            };
+
+            if hero_wins_aim {
+                resolved_hit = Some(best_enemy_hit.unwrap().1);
+                locked_enemy = true;
+            } else if let Some((c_id, _, c_chest_pos)) = best_creep_hit {
+                resolved_hit = Some(c_chest_pos);
+                locked_enemy = true;
+                hovered_creep = Some(c_id);
+            } else if let Some((hit_ent, hit)) = world_hit_opt {
+                if target_query.get(hit_ent).is_ok() {
+                    resolved_hit = Some(hit.point);
+                    locked_enemy = true;
+                } else if hit.normal.y > 0.7 {
+                    // تقاطع خود اشعه دوربین با صفحه ارتفاعی هم‌تراز سینه روی همان سطح زمین
+                    // تا انتهای خط لیزر دقیقاً روی پیکسل مرکز نشانه‌گر موس منطبق بماند
+                    let elevated_plane_y = hit.point.y + config.soldier.aim_plane_height_offset;
+                    let t_elevated = (elevated_plane_y - input.aim_ray_origin.y) / ray_dir.y;
+                    if t_elevated > 0.0 {
+                        resolved_hit = Some(input.aim_ray_origin + ray_dir * t_elevated);
+                    } else {
+                        resolved_hit = Some(hit.point);
+                    }
+                } else {
+                    // برخورد با دیواره عمودی، صخره یا مانع: خود نقطه برخورد روی اشعه موس است
+                    resolved_hit = Some(hit.point);
+                }
+            } else {
+                // ج) Fallback به صفحه افقی در صورت عدم برخورد با هندسه نقشه
                 let aim_plane_y = world.soldier_pos.y + config.soldier.aim_plane_height_offset;
                 let t = (aim_plane_y - input.aim_ray_origin.y) / ray_dir.y;
                 if t > 0.0 {
                     resolved_hit = Some(input.aim_ray_origin + ray_dir * t);
                 }
             }
+
+            world.aim_locked_on_enemy = locked_enemy;
+            world.hovered_creep_id = hovered_creep;
 
             if let Some(hit) = resolved_hit {
                 world.aim_hit_pos = hit;
@@ -5101,8 +5543,9 @@ fn step_shooting_and_grenade_spawn(
         let to_aim = world.aim_hit_pos - muzzle_pos;
         let shot_dir = if to_aim.length_squared() > config.physics.muzzle_aim_min_dist_sq {
             let mut dir = to_aim.normalize();
-            // محدود کردن زاویه عمودی معقول تا تیر بین سطوح بالا و پایین روان حرکت کند
-            dir.y = dir.y.clamp(-0.60, 0.60);
+            // محدود کردن زاویه عمودی از روی کانفیگ تا تیر بین سطوح بالا و پایین روان حرکت کند
+            let max_sin = config.combat.max_vertical_aim_pitch_sin;
+            dir.y = dir.y.clamp(-max_sin, max_sin);
             dir.normalize()
         } else {
             world.aim_world_dir
@@ -5131,7 +5574,7 @@ fn step_shooting_and_grenade_spawn(
             commands.spawn((
                 PhysicsBullet {
                     id,
-                    owner_slot: world.active_slot,
+                    owner_slot: Some(world.active_slot),
                     owner_team: world.hero_team,
                     velocity: final_dir * proj_speed,
                     damage: dmg,
@@ -5274,22 +5717,64 @@ fn shared_authoritative_react_system(
         bullet.remaining_range -= step_dist;
 
         let mut best_hero_hit: Option<(usize, f32)> = None;
+        let mut best_creep_hit: Option<(usize, f32)> = None;
         if step_dist > f32::EPSILON {
             for (p_idx, p) in world.players.iter().enumerate() {
-                if p.slot_index == bullet.owner_slot || p.hero_team == bullet.owner_team || p.is_dead {
+                if Some(p.slot_index) == bullet.owner_slot || p.hero_team == bullet.owner_team || p.is_dead {
                     continue;
                 }
-                let h_rad = config.soldier.player_radius * p.hero_scale * 1.15;
+                let h_rad = config.soldier.player_radius
+                    * p.hero_scale
+                    * config.combat.hero_hitbox_radius_multiplier
+                    + config.combat.bullet_hit_forgiveness_radius;
                 let h_height = if p.effective_stance == Stance::Crouch {
-                    1.35 * p.hero_scale
+                    config.combat.hero_crouch_hitbox_height * p.hero_scale
                 } else {
-                    1.95 * p.hero_scale
+                    config.combat.hero_stand_hitbox_height * p.hero_scale
                 };
-                if let Some(toi) =
-                    segment_hits_hero_capsule(old_pos, step_dir, step_dist, p.soldier_pos, h_rad, h_height)
-                {
+                if let Some(toi) = segment_hits_hero_capsule(
+                    old_pos,
+                    step_dir,
+                    step_dist,
+                    p.soldier_pos,
+                    h_rad,
+                    h_height,
+                    config.combat.bullet_hit_forgiveness_height_bottom,
+                    config.combat.bullet_hit_forgiveness_height_top,
+                ) {
                     if best_hero_hit.map_or(true, |(_, prev_toi)| toi < prev_toi) {
                         best_hero_hit = Some((p_idx, toi));
+                    }
+                }
+            }
+        }
+
+        if step_dist > f32::EPSILON {
+            let c_rad = config.creeps.collider_radius + config.combat.bullet_hit_forgiveness_radius;
+            let c_height = config.creeps.hitbox_height;
+            for (c_idx, c) in world.creeps.iter().enumerate() {
+                if c.is_dead {
+                    continue;
+                }
+                let is_enemy = c.team != bullet.owner_team;
+                let is_deniable_by_hero = bullet.owner_slot.is_some()
+                    && c.team == bullet.owner_team
+                    && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio;
+                if !is_enemy && !is_deniable_by_hero {
+                    continue;
+                }
+                if let Some(toi) = segment_hits_hero_capsule(
+                    old_pos,
+                    step_dir,
+                    step_dist,
+                    c.pos,
+                    c_rad,
+                    c_height,
+                    config.combat.bullet_hit_forgiveness_height_bottom,
+                    config.combat.bullet_hit_forgiveness_height_top,
+                ) {
+                    if best_creep_hit.map_or(true, |(_, prev_toi)| toi < prev_toi) {
+                        best_creep_hit = Some((c_idx, toi));
                     }
                 }
             }
@@ -5332,11 +5817,13 @@ fn shared_authoritative_react_system(
                 trigger_random_death(&mut world, &config);
                 world.swap_slot_in(enemy_idx);
 
-                let owner_slot = bullet.owner_slot;
-                if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
-                    attacker.kills += 1;
-                    attacker.hero_gold += 225;
-                    attacker.hero_xp += 150;
+                if let Some(owner_slot) = bullet.owner_slot {
+                    let world_inner = &mut *world;
+                    if let Some(attacker) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        attacker.kills += 1;
+                        attacker.hero_gold += 225;
+                        grant_xp_to_player_slot(attacker, 150, &config, &mut world_inner.pending_fx);
+                    }
                 }
             }
 
@@ -5355,6 +5842,110 @@ fn shared_authoritative_react_system(
             continue;
         }
 
+        let creep_wins = match (best_creep_hit, ray_hit.as_ref()) {
+            (Some((_, c_toi)), Some((_, _, s_toi))) => c_toi <= *s_toi,
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        if creep_wins {
+            let (c_idx, c_toi) = best_creep_hit.unwrap();
+            let impact_pos = old_pos + step_dir * c_toi;
+            let dmg_mult = dota2_armor_multiplier(config.creeps.armor);
+            let effective_dmg = (bullet.damage * dmg_mult).max(1.0);
+            world.creeps[c_idx].hp = (world.creeps[c_idx].hp - effective_dmg).max(0.0);
+
+            let creep_killed = world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead;
+            if creep_killed {
+                world.creeps[c_idx].is_dead = true;
+                world.creeps[c_idx].anim_state = CreepAnimState::Die;
+                world.creeps[c_idx].despawn_timer = config.creeps.die_despawn_delay_secs;
+                let creep_pos = world.creeps[c_idx].pos;
+                let creep_team = world.creeps[c_idx].team;
+                let is_deny = bullet.owner_team == creep_team;
+
+                if is_deny {
+                    // دیناید موفق: هیچ گلد و XP به دینایدکننده نمی‌رسد؛ XP دشمن کاهش می‌یابد و بین دشمنان در رنج تقسیم می‌شود
+                    if let Some(owner_slot) = bullet.owner_slot {
+                        if let Some(denier) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                            denier.denies += 1;
+                        }
+                    }
+                    let total_denied_xp =
+                        ((config.creeps.xp_bounty as f32) * config.creeps.deny_enemy_xp_multiplier).round() as u32;
+                    let eligible_indices: Vec<usize> = world
+                        .players
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            !p.is_dead
+                                && p.hero_team != creep_team
+                                && p.soldier_pos.distance(creep_pos) <= p.hero_xp_gain_radius
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !eligible_indices.is_empty() && total_denied_xp > 0 {
+                        let share = total_denied_xp / (eligible_indices.len() as u32);
+                        let world_inner = &mut *world;
+                        for idx in eligible_indices {
+                            grant_xp_to_player_slot(
+                                &mut world_inner.players[idx],
+                                share,
+                                &config,
+                                &mut world_inner.pending_fx,
+                            );
+                        }
+                    }
+                } else {
+                    // کشتن سرباز دشمن: گلد فقط به آخرین ضربه‌زننده (Last Hit) و XP به همه‌ی هم‌تیمی‌های در رنج تقسیم می‌شود
+                    if let Some(owner_slot) = bullet.owner_slot {
+                        if let Some(killer) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                            killer.last_hits += 1;
+                            killer.hero_gold += config.creeps.gold_bounty;
+                        }
+                    }
+                    let killer_team = bullet.owner_team;
+                    let eligible_indices: Vec<usize> = world
+                        .players
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            !p.is_dead
+                                && p.hero_team == killer_team
+                                && p.soldier_pos.distance(creep_pos) <= p.hero_xp_gain_radius
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !eligible_indices.is_empty() {
+                        let share = config.creeps.xp_bounty / (eligible_indices.len() as u32);
+                        let world_inner = &mut *world;
+                        for idx in eligible_indices {
+                            grant_xp_to_player_slot(
+                                &mut world_inner.players[idx],
+                                share,
+                                &config,
+                                &mut world_inner.pending_fx,
+                            );
+                        }
+                    }
+                }
+            }
+
+            world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
+                start: old_pos,
+                end: impact_pos,
+            });
+            world.pending_fx.push(GameplayFxEvent::BulletImpact {
+                impact_pos,
+                bullet_dir: step_dir,
+                target_destroyed: creep_killed,
+                trauma_add: config.combat.shot_fire_trauma_add * 0.5,
+                trauma_max: config.combat.shot_fire_trauma_max,
+            });
+            commands.entity(entity).despawn();
+            continue;
+        }
+
         if let Some((hit_entity, impact_pos, _)) = ray_hit {
             let mut target_destroyed = false;
             if let Some(&t_idx) = target_idx_by_entity.get(&hit_entity) {
@@ -5367,12 +5958,14 @@ fn shared_authoritative_react_system(
                     target_destroyed = true;
                     let t_pos = target.base_pos;
                     commands.entity(hit_entity).insert(ColliderDisabled);
-                    let owner_slot = bullet.owner_slot;
-                    if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
-                        attacker.last_hits += 1;
-                        attacker.hero_gold += 35;
-                        if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
-                            attacker.hero_xp += 45;
+                    if let Some(owner_slot) = bullet.owner_slot {
+                        let world_inner = &mut *world;
+                        if let Some(attacker) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                            attacker.last_hits += 1;
+                            attacker.hero_gold += 35;
+                            if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
+                                grant_xp_to_player_slot(attacker, 45, &config, &mut world_inner.pending_fx);
+                            }
                         }
                     } else {
                         world.last_hits += 1;
@@ -5445,6 +6038,20 @@ fn shared_authoritative_react_system(
     }
 
     let dead_flags: Vec<bool> = world.targets.iter().map(|t| t.is_dead).collect();
+    let laser_hero_targets: Vec<(usize, TeamId, Vec3, f32, Stance, bool)> = world
+        .players
+        .iter()
+        .map(|p| {
+            (
+                p.slot_index,
+                p.hero_team,
+                p.soldier_pos,
+                p.hero_scale,
+                p.effective_stance,
+                p.is_dead,
+            )
+        })
+        .collect();
     let num_slots = world.players.len().max(1);
     let has_slots = !world.players.is_empty();
 
@@ -5455,7 +6062,7 @@ fn shared_authoritative_react_system(
         if let Some(input) = world.active_input.clone() {
             let muzzle_pos = resolve_muzzle_pos(&world, &input, &config);
             let raw_target = world.aim_hit_pos;
-            world.laser_hit_pos = compute_laser_hit(
+            let world_laser_hit = compute_laser_hit(
                 &physics_world,
                 muzzle_pos,
                 raw_target,
@@ -5467,10 +6074,83 @@ fn shared_authoritative_react_system(
                     }
                 },
             );
+            let mut final_laser_hit = world_laser_hit;
+            let to_laser = world_laser_hit - muzzle_pos;
+            let max_laser_dist = to_laser.length();
+            if max_laser_dist > f32::EPSILON {
+                let laser_dir = to_laser / max_laser_dist;
+                let mut best_toi = max_laser_dist;
+                for &(e_slot, e_team, e_pos, e_scale, e_stance, e_dead) in &laser_hero_targets {
+                    if e_slot == world.active_slot || e_team == world.hero_team || e_dead {
+                        continue;
+                    }
+                    let h_rad = config.soldier.player_radius
+                        * e_scale
+                        * config.combat.hero_hitbox_radius_multiplier;
+                    let h_height = if e_stance == Stance::Crouch {
+                        config.combat.hero_crouch_hitbox_height * e_scale
+                    } else {
+                        config.combat.hero_stand_hitbox_height * e_scale
+                    };
+                    if let Some(toi) = segment_hits_hero_capsule(
+                        muzzle_pos,
+                        laser_dir,
+                        best_toi,
+                        e_pos,
+                        h_rad,
+                        h_height,
+                        config.combat.bullet_hit_forgiveness_height_bottom,
+                        config.combat.bullet_hit_forgiveness_height_top,
+                    ) {
+                        if toi < best_toi {
+                            best_toi = toi;
+                            final_laser_hit = muzzle_pos + laser_dir * toi;
+                        }
+                    }
+                }
+                let c_rad = config.creeps.collider_radius;
+                let c_height = config.creeps.hitbox_height;
+                for c in &world.creeps {
+                    if c.is_dead {
+                        continue;
+                    }
+                    let is_enemy = c.team != world.hero_team;
+                    let is_deniable = c.team == world.hero_team
+                        && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio;
+                    if !is_enemy && !is_deniable {
+                        continue;
+                    }
+                    if let Some(toi) = segment_hits_hero_capsule(
+                        muzzle_pos,
+                        laser_dir,
+                        best_toi,
+                        c.pos,
+                        c_rad,
+                        c_height,
+                        config.combat.bullet_hit_forgiveness_height_bottom,
+                        config.combat.bullet_hit_forgiveness_height_top,
+                    ) {
+                        if toi < best_toi {
+                            best_toi = toi;
+                            final_laser_hit = muzzle_pos + laser_dir * toi;
+                        }
+                    }
+                }
+            }
+            world.laser_hit_pos = final_laser_hit;
         }
         if let Some(hero) = config.heroes.get(world.hero_index) {
             let hero_pos = world.soldier_pos;
-            world.fog_of_war.update_for_hero(&config, hero_pos, hero);
+            let my_team = world.hero_team;
+            let allied_creep_positions: Vec<Vec3> = world
+                .creeps
+                .iter()
+                .filter(|c| !c.is_dead && c.team == my_team)
+                .map(|c| c.pos)
+                .collect();
+            world
+                .fog_of_war
+                .update_for_hero(&config, hero_pos, hero, &allied_creep_positions);
         }
         if let Some(ref mut active_input) = world.active_input {
             active_input.consume_just_pressed();
@@ -5578,6 +6258,273 @@ fn shared_client_react_system(
         }
         if particle.lifetime.is_finished() {
             commands.entity(entity).despawn();
+        }
+    }
+}
+
+fn step_lane_creeps_system(
+    commands: &mut Commands,
+    dt: f32,
+    config: &GameConfig,
+    physics_world: &CustomPhysicsWorld,
+    world: &mut AuthoritativeWorldState,
+    target_query: &Query<&PhysicsTarget>,
+) {
+    world.match_elapsed_secs += dt;
+
+    // ۱. تولید موج سربازان در هر ۳ لاین پس از دقیقه‌ی ۱ بازی و هر ۳۰ ثانیه
+    if world.match_elapsed_secs >= world.next_wave_time_secs {
+        world.next_wave_time_secs += config.creeps.wave_interval_secs;
+        for lane_def in &config.map.lanes {
+            if lane_def.waypoints.len() < 2 {
+                continue;
+            }
+            for &team in &[TeamId::Dawn, TeamId::Dusk] {
+                let (start_wp_idx, next_wp_idx) = match team {
+                    TeamId::Dawn => (0, 1),
+                    TeamId::Dusk => (lane_def.waypoints.len() - 1, lane_def.waypoints.len() - 2),
+                    TeamId::Neutral => continue,
+                };
+                let wp0 = lane_def.waypoints[start_wp_idx];
+                let wp1 = lane_def.waypoints[next_wp_idx];
+                let p0 = Vec3::new(wp0.0, wp0.1, wp0.2);
+                let p1 = Vec3::new(wp1.0, wp1.1, wp1.2);
+                let dir = Vec3::new(p1.x - p0.x, 0.0, p1.z - p0.z).normalize_or_zero();
+                let side = dir.cross(Vec3::Y).normalize_or_zero();
+
+                let count = config.creeps.creeps_per_wave;
+                for i in 0..count {
+                    let row = (i / 2) as f32;
+                    let col = if i % 2 == 0 { -0.5 } else { 0.5 };
+                    let spawn_pos = p0
+                        - dir * (row * config.creeps.wave_spawn_spacing)
+                        + side * (col * config.creeps.wave_spawn_spacing);
+                    let id = world.next_creep_id;
+                    world.next_creep_id += 1;
+                    world.creeps.push(LaneCreepState {
+                        id,
+                        team,
+                        lane: lane_def.lane,
+                        waypoint_index: next_wp_idx,
+                        pos: spawn_pos,
+                        facing_dir: dir,
+                        hp: config.creeps.max_hp,
+                        max_hp: config.creeps.max_hp,
+                        fire_cooldown: 0.0,
+                        fire_anim_timer: 0.0,
+                        anim_state: CreepAnimState::Run,
+                        is_dead: false,
+                        despawn_timer: 0.0,
+                    });
+                }
+            }
+        }
+    }
+
+    // ۲. به‌روزرسانی تایمر مرگ و حذف سربازان مرده پس از اتمام انیمیشن die
+    for c in &mut world.creeps {
+        if c.is_dead {
+            c.despawn_timer -= dt;
+        }
+    }
+    world.creeps.retain(|c| !c.is_dead || c.despawn_timer > 0.0);
+
+    // ۳. جمع‌آوری لیست اهداف بالقوه (سربازان زنده و هیروهای زنده)
+    let creep_snap: Vec<(u64, TeamId, Vec3, bool)> = world
+        .creeps
+        .iter()
+        .map(|c| (c.id, c.team, c.pos, c.is_dead))
+        .collect();
+    let hero_snap: Vec<(TeamId, Vec3, bool)> = world
+        .players
+        .iter()
+        .map(|p| (p.hero_team, p.soldier_pos, p.is_dead))
+        .collect();
+
+    let query_groups = soldier_collision_groups();
+    let c_len = world.creeps.len();
+
+    for idx in 0..c_len {
+        if world.creeps[idx].is_dead {
+            world.creeps[idx].anim_state = CreepAnimState::Die;
+            continue;
+        }
+
+        world.creeps[idx].fire_cooldown = (world.creeps[idx].fire_cooldown - dt).max(0.0);
+        world.creeps[idx].fire_anim_timer = (world.creeps[idx].fire_anim_timer - dt).max(0.0);
+
+        let my_id = world.creeps[idx].id;
+        let my_team = world.creeps[idx].team;
+        let my_pos = world.creeps[idx].pos;
+        let my_lane = world.creeps[idx].lane;
+
+        // الف) یافتن نزدیک‌ترین دشمن (سرباز یا هیرو) در میدان دید و برد شلیک
+        let mut best_target: Option<(Vec3, f32)> = None;
+        for &(other_id, other_team, other_pos, other_dead) in &creep_snap {
+            if other_id == my_id || other_team == my_team || other_dead {
+                continue;
+            }
+            let d = my_pos.distance(other_pos);
+            if d <= config.creeps.vision_range && best_target.map_or(true, |(_, bd)| d < bd) {
+                best_target = Some((other_pos, d));
+            }
+        }
+        for &(h_team, h_pos, h_dead) in &hero_snap {
+            if h_team == my_team || h_dead {
+                continue;
+            }
+            let d = my_pos.distance(h_pos);
+            if d <= config.creeps.vision_range && best_target.map_or(true, |(_, bd)| d < bd) {
+                best_target = Some((h_pos, d));
+            }
+        }
+
+        let mut moved = false;
+        let mut fired_or_aiming = false;
+
+        if let Some((target_pos, dist)) = best_target {
+            let to_target = Vec3::new(target_pos.x - my_pos.x, 0.0, target_pos.z - my_pos.z);
+            if to_target.length_squared() > 0.0001 {
+                world.creeps[idx].facing_dir = to_target.normalize();
+            }
+
+            if dist <= config.creeps.attack_range {
+                fired_or_aiming = true;
+                if world.creeps[idx].fire_cooldown <= 0.0 {
+                    world.creeps[idx].fire_cooldown = config.creeps.fire_rate_secs;
+                    world.creeps[idx].fire_anim_timer =
+                        (config.creeps.fire_rate_secs * 0.45).min(0.35);
+
+                    let muzzle_pos = my_pos
+                        + Vec3::Y * config.creeps.muzzle_offset_y
+                        + world.creeps[idx].facing_dir * config.creeps.muzzle_forward;
+                    let aim_target = target_pos + Vec3::Y * config.creeps.aim_chest_height;
+                    let shot_dir = (aim_target - muzzle_pos).normalize_or_zero();
+                    let b_id = world.next_entity_id;
+                    world.next_entity_id += 1;
+
+                    commands.spawn((
+                        PhysicsBullet {
+                            id: b_id,
+                            owner_slot: None,
+                            owner_team: my_team,
+                            velocity: shot_dir * config.creeps.projectile_speed,
+                            damage: config.creeps.bullet_damage,
+                            remaining_range: config.creeps.bullet_max_range,
+                        },
+                        Transform::from_translation(muzzle_pos),
+                    ));
+                    world.pending_fx.push(GameplayFxEvent::ShotFired {
+                        muzzle_pos,
+                        shot_dir,
+                        trauma_add: 0.0,
+                        trauma_max: config.combat.shot_fire_trauma_max,
+                    });
+                }
+            } else {
+                // حرکت به سمت دشمن درون دید
+                let step = world.creeps[idx].facing_dir * config.creeps.move_speed * dt;
+                world.creeps[idx].pos.x += step.x;
+                world.creeps[idx].pos.z += step.z;
+                moved = true;
+            }
+        } else {
+            // ب) حرکت در امتداد Waypointهای لاین مربوطه به سمت پایگاه دشمن
+            if let Some(lane_def) = config.map.lanes.iter().find(|l| l.lane == my_lane) {
+                let wp_idx = world.creeps[idx]
+                    .waypoint_index
+                    .min(lane_def.waypoints.len().saturating_sub(1));
+                let wp = lane_def.waypoints[wp_idx];
+                let wp_pos = Vec3::new(wp.0, wp.1, wp.2);
+                let to_wp = Vec3::new(wp_pos.x - my_pos.x, 0.0, wp_pos.z - my_pos.z);
+                let dist_wp = to_wp.length();
+
+                if dist_wp <= config.creeps.waypoint_reach_dist {
+                    match my_team {
+                        TeamId::Dawn => {
+                            if wp_idx + 1 < lane_def.waypoints.len() {
+                                world.creeps[idx].waypoint_index = wp_idx + 1;
+                            }
+                        }
+                        TeamId::Dusk => {
+                            if wp_idx > 0 {
+                                world.creeps[idx].waypoint_index = wp_idx - 1;
+                            }
+                        }
+                        TeamId::Neutral => {}
+                    }
+                } else if dist_wp > 0.01 {
+                    let dir = to_wp / dist_wp;
+                    world.creeps[idx].facing_dir = dir;
+                    let step = dir * config.creeps.move_speed * dt;
+                    world.creeps[idx].pos.x += step.x;
+                    world.creeps[idx].pos.z += step.z;
+                    moved = true;
+                }
+            }
+        }
+
+        // ج) هم‌ترازی ارتفاع سرباز با سطح واقعی زمین/رمپ/پلتفرم
+        let ray_origin = Vec3::new(
+            world.creeps[idx].pos.x,
+            world.creeps[idx].pos.y + 3.0,
+            world.creeps[idx].pos.z,
+        );
+        if let Some((_ent, hit)) = physics_world.cast_ray(
+            ray_origin,
+            Vec3::NEG_Y,
+            12.0,
+            query_groups,
+            |ent| target_query.get(ent).is_err(),
+        ) {
+            if hit.normal.y > 0.5 {
+                world.creeps[idx].pos.y = hit.point.y;
+            }
+        }
+
+        world.creeps[idx].anim_state = if fired_or_aiming {
+            if world.creeps[idx].fire_anim_timer > 0.0 {
+                CreepAnimState::Fire
+            } else {
+                CreepAnimState::Idle
+            }
+        } else if moved {
+            CreepAnimState::Run
+        } else {
+            CreepAnimState::Idle
+        };
+    }
+
+    // ۴. حل برخورد فیزیکی سربازان با یکدیگر (عدم تداخل فیزیکی سربازها)
+    let min_creep_dist = config.creeps.collider_radius * 2.0;
+    for i in 0..c_len {
+        if world.creeps[i].is_dead {
+            continue;
+        }
+        for j in (i + 1)..c_len {
+            if world.creeps[j].is_dead {
+                continue;
+            }
+            if (world.creeps[i].pos.y - world.creeps[j].pos.y).abs() > 1.8 {
+                continue;
+            }
+            let delta = Vec2::new(
+                world.creeps[j].pos.x - world.creeps[i].pos.x,
+                world.creeps[j].pos.z - world.creeps[i].pos.z,
+            );
+            let dist = delta.length();
+            if dist < min_creep_dist {
+                let push_dir = if dist > 0.0001 {
+                    delta / dist
+                } else {
+                    Vec2::new(1.0, 0.0)
+                };
+                let half_push = (min_creep_dist - dist) * 0.5;
+                world.creeps[i].pos.x -= push_dir.x * half_push;
+                world.creeps[i].pos.z -= push_dir.y * half_push;
+                world.creeps[j].pos.x += push_dir.x * half_push;
+                world.creeps[j].pos.z += push_dir.y * half_push;
+            }
         }
     }
 }

@@ -30,6 +30,7 @@ pub struct GameConfig {
     pub cursor_reticle: CursorReticleConfig,
     pub laser: LaserConfig,
     pub creeps: CreepConfig,
+    pub neutral_camps: NeutralCampsConfig,
     pub animations: AnimationConfig,
     pub map: MapConfig,
     pub obstacles: Vec<ObstacleDef>,
@@ -49,6 +50,7 @@ impl GameConfig {
         cfg.validate_unique_map_ids();
         cfg.validate_heroes();
         cfg.validate_creeps();
+        cfg.validate_neutral_camps();
         cfg
     }
 
@@ -99,6 +101,38 @@ impl GameConfig {
             assert!(hero.weapon.projectile_speed > 0.0, "projectile_speed اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.max_range > 0.0, "max_range اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.pellets_per_shot > 0, "pellets_per_shot اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+        }
+    }
+
+    pub fn validate_neutral_camps(&self) {
+        let nc = &self.neutral_camps;
+        assert!(nc.respawn_interval_secs > 0.0, "respawn_interval_secs کمپ‌ها باید بزرگ‌تر از صفر باشد");
+        assert!(nc.aggro_leash_radius > 0.0, "aggro_leash_radius کمپ‌ها باید بزرگ‌تر از صفر باشد");
+        assert!(!nc.creep_types.is_empty(), "creep_types کمپ‌ها نمی‌تواند خالی باشد");
+        for (k, ct) in &nc.creep_types {
+            assert!(!ct.model_path.trim().is_empty(), "model_path سرباز کمپ '{}' خالی است", k);
+            assert!(ct.scale > 0.0, "scale سرباز کمپ '{}' باید بزرگ‌تر از صفر باشد", k);
+            assert!(ct.collider_radius > 0.0, "collider_radius سرباز کمپ '{}' باید بزرگ‌تر از صفر باشد", k);
+            assert!(ct.hitbox_height > 0.0, "hitbox_height سرباز کمپ '{}' باید بزرگ‌تر از صفر باشد", k);
+            assert!(ct.max_hp > 0.0, "max_hp سرباز کمپ '{}' باید بزرگ‌تر از صفر باشد", k);
+            assert!(ct.fire_rate_secs > 0.0, "fire_rate_secs سرباز کمپ '{}' باید بزرگ‌تر از صفر باشد", k);
+            assert!(ct.projectile_speed > 0.0, "projectile_speed سرباز کمپ '{}' باید بزرگ‌تر از صفر باشد", k);
+            assert!(ct.bullet_max_range > 0.0, "bullet_max_range سرباز کمپ '{}' باید بزرگ‌تر از صفر باشد", k);
+        }
+        let mut seen_camp_ids = HashSet::new();
+        for camp in &nc.camps {
+            assert!(!camp.id.trim().is_empty(), "شناسه کمپ نمی‌تواند خالی باشد");
+            assert!(seen_camp_ids.insert(camp.id.clone()), "شناسه کمپ '{}' تکراری است", camp.id);
+            assert!(camp.spawn_box_radius > 0.0, "spawn_box_radius کمپ '{}' باید بزرگ‌تر از صفر باشد", camp.id);
+            assert!(!camp.creep_type_ids.is_empty(), "لیست سربازان کمپ '{}' خالی است", camp.id);
+            for tid in &camp.creep_type_ids {
+                assert!(
+                    nc.creep_types.contains_key(tid),
+                    "نوع سرباز '{}' در کمپ '{}' درون neutral_camps.creep_types تعریف نشده است!",
+                    tid,
+                    camp.id
+                );
+            }
         }
     }
 
@@ -648,6 +682,53 @@ pub struct CreepConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NeutralCreepTypeDef {
+    pub model_path: String,
+    pub scale: f32,
+    pub collider_radius: f32,
+    pub hitbox_height: f32,
+    pub aim_chest_height: f32,
+    pub muzzle_offset_y: f32,
+    pub muzzle_forward: f32,
+    pub move_speed: f32,
+    pub fire_rate_secs: f32,
+    pub vision_range: f32,
+    pub attack_range: f32,
+    pub bullet_damage: f32,
+    pub projectile_speed: f32,
+    pub bullet_max_range: f32,
+    pub armor: f32,
+    pub max_hp: f32,
+    pub gold_bounty: u32,
+    pub xp_bounty: u32,
+    pub anim_run: String,
+    pub anim_idle: String,
+    pub anim_fire: String,
+    pub anim_die: String,
+    pub die_despawn_delay_secs: f32,
+    pub hovered_tint_emissive_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NeutralCampDef {
+    pub id: String,
+    pub team_side: TeamId,
+    pub center: (f32, f32, f32),
+    pub spawn_box_radius: f32,
+    pub creep_type_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NeutralCampsConfig {
+    pub first_spawn_delay_secs: f32,
+    pub respawn_interval_secs: f32,
+    pub spawn_spacing: f32,
+    pub aggro_leash_radius: f32,
+    pub creep_types: HashMap<String, NeutralCreepTypeDef>,
+    pub camps: Vec<NeutralCampDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FxConfig {
     pub trail_lifetime_secs: f32,
     pub muzzle_flash_lifetime_secs: f32,
@@ -1094,6 +1175,7 @@ pub enum CreepAnimState {
 pub struct CreepSnapshot {
     pub id: u64,
     pub team: TeamId,
+    pub creep_type_id: Option<String>,
     pub pos: Vec3,
     pub facing_dir: Vec3,
     pub hp: f32,
@@ -3729,6 +3811,10 @@ impl SharedFogOfWar {
 pub struct LaneCreepState {
     pub id: u64,
     pub team: TeamId,
+    pub creep_type_id: Option<String>,
+    pub camp_index: Option<usize>,
+    pub is_aggroed: bool,
+    pub home_pos: Vec3,
     pub lane: LaneId,
     pub waypoint_index: usize,
     pub pos: Vec3,
@@ -3905,6 +3991,7 @@ pub struct AuthoritativeWorldState {
     pub creeps: Vec<LaneCreepState>,
     pub match_elapsed_secs: f32,
     pub next_wave_time_secs: f32,
+    pub next_camp_spawn_time_secs: f32,
     pub next_creep_id: u64,
     pub bullets_snapshot: Vec<BulletSnapshot>,
     pub grenades_snapshot: Vec<GrenadeSnapshot>,
@@ -4018,6 +4105,7 @@ impl AuthoritativeWorldState {
             creeps: Vec::new(),
             match_elapsed_secs: 0.0,
             next_wave_time_secs: config.creeps.first_wave_delay_secs,
+            next_camp_spawn_time_secs: config.neutral_camps.first_spawn_delay_secs,
             next_creep_id: 1,
             bullets_snapshot: Vec::new(),
             grenades_snapshot: Vec::new(),
@@ -4333,6 +4421,7 @@ impl AuthoritativeWorldState {
                 Some(CreepSnapshot {
                     id: c.id,
                     team: c.team,
+                    creep_type_id: c.creep_type_id.clone(),
                     pos: c.pos,
                     facing_dir: c.facing_dir,
                     hp: c.hp,
@@ -4979,14 +5068,14 @@ fn shared_authoritative_drive_system(
     // حل برخورد فیزیکی هیروها با سربازان لاین (مانع فیزیکی کامل، عدم عبور از داخل سربازها)
     if !world.creeps.is_empty() && !world.players.is_empty() {
         let base_r = config.soldier.player_radius;
-        let creep_r = config.creeps.collider_radius;
         let world_inner = &mut *world;
         for p in &mut world_inner.players {
             if p.is_dead {
                 continue;
             }
-            let min_dist = base_r * p.hero_scale + creep_r;
             for c in &world_inner.creeps {
+                let c_stats = resolve_creep_stats(&config, c.creep_type_id.as_deref());
+                let min_dist = base_r * p.hero_scale + c_stats.collider_radius;
                 if c.is_dead || (p.soldier_pos.y - c.pos.y).abs() > 1.8 {
                     continue;
                 }
@@ -5175,10 +5264,8 @@ fn shared_drive_single_player(
                 }
             }
 
-            // ج) بررسی برخورد اشعه موس با سربازان لاین (سرباز دشمن یا سرباز خودی قابل دیناید)
+            // ج) بررسی برخورد اشعه موس با سربازان لاین و کمپ (سرباز دشمن/کمپ یا سرباز خودی قابل دیناید)
             let mut best_creep_hit: Option<(u64, f32, Vec3)> = None;
-            let c_rad = config.creeps.collider_radius * config.combat.aim_lock_radius_multiplier;
-            let c_height = config.creeps.hitbox_height;
             for c in &world.creeps {
                 if c.is_dead {
                     continue;
@@ -5192,19 +5279,21 @@ fn shared_drive_single_player(
                 if is_enemy && !world.fog_of_war.is_world_point_visible(config, c.pos.x, c.pos.z) {
                     continue;
                 }
+                let c_stats = resolve_creep_stats(config, c.creep_type_id.as_deref());
+                let c_rad = c_stats.collider_radius * config.combat.aim_lock_radius_multiplier;
                 if let Some(toi) = segment_hits_hero_capsule(
                     input.aim_ray_origin,
                     ray_dir,
                     max_aim_dist,
                     c.pos,
                     c_rad,
-                    c_height,
+                    c_stats.hitbox_height,
                     config.combat.bullet_hit_forgiveness_height_bottom,
                     config.combat.bullet_hit_forgiveness_height_top,
                 ) {
                     let prev_best_toi = best_creep_hit.map(|(_, t, _)| t).unwrap_or(world_toi + 0.05);
                     if toi <= world_toi + 0.05 && toi < prev_best_toi {
-                        best_creep_hit = Some((c.id, toi, c.pos + Vec3::Y * config.creeps.aim_chest_height));
+                        best_creep_hit = Some((c.id, toi, c.pos + Vec3::Y * c_stats.aim_chest_height));
                     }
                 }
             }
@@ -5857,8 +5946,6 @@ fn shared_authoritative_react_system(
         }
 
         if step_dist > f32::EPSILON {
-            let c_rad = config.creeps.collider_radius + config.combat.bullet_hit_forgiveness_radius;
-            let c_height = config.creeps.hitbox_height;
             for (c_idx, c) in world.creeps.iter().enumerate() {
                 if c.is_dead {
                     continue;
@@ -5870,13 +5957,15 @@ fn shared_authoritative_react_system(
                 if !is_enemy && !is_deniable_by_hero {
                     continue;
                 }
+                let c_stats = resolve_creep_stats(&config, c.creep_type_id.as_deref());
+                let c_rad = c_stats.collider_radius + config.combat.bullet_hit_forgiveness_radius;
                 if let Some(toi) = segment_hits_hero_capsule(
                     old_pos,
                     step_dir,
                     step_dist,
                     c.pos,
                     c_rad,
-                    c_height,
+                    c_stats.hitbox_height,
                     config.combat.bullet_hit_forgiveness_height_bottom,
                     config.combat.bullet_hit_forgiveness_height_top,
                 ) {
@@ -5958,21 +6047,30 @@ fn shared_authoritative_react_system(
         if creep_wins {
             let (c_idx, c_toi) = best_creep_hit.unwrap();
             let impact_pos = old_pos + step_dir * c_toi;
-            let dmg_mult = dota2_armor_multiplier(config.creeps.armor);
+            let c_stats = resolve_creep_stats(&config, world.creeps[c_idx].creep_type_id.as_deref());
+            let dmg_mult = dota2_armor_multiplier(c_stats.armor);
             let effective_dmg = (bullet.damage * dmg_mult).max(1.0);
             world.creeps[c_idx].hp = (world.creeps[c_idx].hp - effective_dmg).max(0.0);
+            if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
+                for c in &mut world.creeps {
+                    if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
+                        c.is_aggroed = true;
+                    }
+                }
+            }
 
             let creep_killed = world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead;
             if creep_killed {
                 world.creeps[c_idx].is_dead = true;
                 world.creeps[c_idx].anim_state = CreepAnimState::Die;
-                world.creeps[c_idx].despawn_timer = config.creeps.die_despawn_delay_secs;
+                world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
                 let creep_pos = world.creeps[c_idx].pos;
                 let creep_team = world.creeps[c_idx].team;
+                let gold_bounty = c_stats.gold_bounty;
+                let xp_bounty = c_stats.xp_bounty;
                 let is_deny = bullet.owner_team == creep_team;
 
                 if is_deny {
-                    // دیناید موفق: هیچ گلد و XP به دینایدکننده نمی‌رسد؛ XP دشمن کاهش می‌یابد و بین دشمنان در رنج تقسیم می‌شود
                     if let Some(owner_slot) = bullet.owner_slot {
                         if let Some(denier) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
                             denier.denies += 1;
@@ -5980,7 +6078,7 @@ fn shared_authoritative_react_system(
                     }
                     world.pending_fx.push(GameplayFxEvent::CreepDenied { pos: creep_pos });
                     let total_denied_xp =
-                        ((config.creeps.xp_bounty as f32) * config.creeps.deny_enemy_xp_multiplier).round() as u32;
+                        ((xp_bounty as f32) * config.creeps.deny_enemy_xp_multiplier).round() as u32;
                     let eligible_indices: Vec<usize> = world
                         .players
                         .iter()
@@ -6005,14 +6103,14 @@ fn shared_authoritative_react_system(
                         }
                     }
                 } else {
-                    // کشتن سرباز دشمن: گلد فقط به آخرین ضربه‌زننده (Last Hit) و XP به همه‌ی هم‌تیمی‌های در رنج تقسیم می‌شود
                     if let Some(owner_slot) = bullet.owner_slot {
-                        if let Some(killer) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        let world_inner = &mut *world;
+                        if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
                             killer.last_hits += 1;
-                            killer.hero_gold += config.creeps.gold_bounty;
-                            world.pending_fx.push(GameplayFxEvent::LastHitGold {
+                            killer.hero_gold += gold_bounty;
+                            world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
                                 pos: creep_pos,
-                                gold: config.creeps.gold_bounty,
+                                gold: gold_bounty,
                             });
                         }
                     }
@@ -6029,7 +6127,7 @@ fn shared_authoritative_react_system(
                         .map(|(i, _)| i)
                         .collect();
                     if !eligible_indices.is_empty() {
-                        let share = config.creeps.xp_bounty / (eligible_indices.len() as u32);
+                        let share = xp_bounty / (eligible_indices.len() as u32);
                         let world_inner = &mut *world;
                         for idx in eligible_indices {
                             grant_xp_to_player_slot(
@@ -6374,6 +6472,75 @@ fn shared_client_react_system(
     }
 }
 
+
+struct ResolvedCreepStats<'a> {
+    collider_radius: f32,
+    hitbox_height: f32,
+    aim_chest_height: f32,
+    muzzle_offset_y: f32,
+    muzzle_forward: f32,
+    move_speed: f32,
+    fire_rate_secs: f32,
+    vision_range: f32,
+    attack_range: f32,
+    bullet_damage: f32,
+    projectile_speed: f32,
+    bullet_max_range: f32,
+    armor: f32,
+    gold_bounty: u32,
+    xp_bounty: u32,
+    die_despawn_delay_secs: f32,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+fn resolve_creep_stats<'a>(config: &'a GameConfig, creep_type_id: Option<&str>) -> ResolvedCreepStats<'a> {
+    if let Some(tid) = creep_type_id {
+        let ct = config.neutral_camps.creep_types.get(tid).unwrap_or_else(|| {
+            panic!("نوع سرباز کمپ '{}' در config.ron یافت نشد!", tid)
+        });
+        ResolvedCreepStats {
+            collider_radius: ct.collider_radius,
+            hitbox_height: ct.hitbox_height,
+            aim_chest_height: ct.aim_chest_height,
+            muzzle_offset_y: ct.muzzle_offset_y,
+            muzzle_forward: ct.muzzle_forward,
+            move_speed: ct.move_speed,
+            fire_rate_secs: ct.fire_rate_secs,
+            vision_range: ct.vision_range,
+            attack_range: ct.attack_range,
+            bullet_damage: ct.bullet_damage,
+            projectile_speed: ct.projectile_speed,
+            bullet_max_range: ct.bullet_max_range,
+            armor: ct.armor,
+            gold_bounty: ct.gold_bounty,
+            xp_bounty: ct.xp_bounty,
+            die_despawn_delay_secs: ct.die_despawn_delay_secs,
+            _phantom: std::marker::PhantomData,
+        }
+    } else {
+        let c = &config.creeps;
+        ResolvedCreepStats {
+            collider_radius: c.collider_radius,
+            hitbox_height: c.hitbox_height,
+            aim_chest_height: c.aim_chest_height,
+            muzzle_offset_y: c.muzzle_offset_y,
+            muzzle_forward: c.muzzle_forward,
+            move_speed: c.move_speed,
+            fire_rate_secs: c.fire_rate_secs,
+            vision_range: c.vision_range,
+            attack_range: c.attack_range,
+            bullet_damage: c.bullet_damage,
+            projectile_speed: c.projectile_speed,
+            bullet_max_range: c.bullet_max_range,
+            armor: c.armor,
+            gold_bounty: c.gold_bounty,
+            xp_bounty: c.xp_bounty,
+            die_despawn_delay_secs: c.die_despawn_delay_secs,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
 fn step_lane_creeps_system(
     commands: &mut Commands,
     dt: f32,
@@ -6416,6 +6583,10 @@ fn step_lane_creeps_system(
                     world.creeps.push(LaneCreepState {
                         id,
                         team,
+                        creep_type_id: None,
+                        camp_index: None,
+                        is_aggroed: true,
+                        home_pos: spawn_pos,
                         lane: lane_def.lane,
                         waypoint_index: next_wp_idx,
                         pos: spawn_pos,
@@ -6433,6 +6604,63 @@ fn step_lane_creeps_system(
         }
     }
 
+    // ۱-ب. تولید و استک شدن سربازان ۳۰ کمپ جنگلی از دقیقه‌ی ۱ بازی و هر ۶۰ ثانیه (در صورت خالی بودن شعاع کمپ)
+    if world.match_elapsed_secs >= world.next_camp_spawn_time_secs {
+        world.next_camp_spawn_time_secs += config.neutral_camps.respawn_interval_secs;
+        for (camp_idx, camp) in config.neutral_camps.camps.iter().enumerate() {
+            let camp_center = Vec3::new(camp.center.0, camp.center.1, camp.center.2);
+            let box_r = camp.spawn_box_radius;
+
+            let hero_blocking = world
+                .players
+                .iter()
+                .any(|p| !p.is_dead && Vec2::new(p.soldier_pos.x - camp_center.x, p.soldier_pos.z - camp_center.z).length() <= box_r);
+            let creep_blocking = world
+                .creeps
+                .iter()
+                .any(|c| !c.is_dead && Vec2::new(c.pos.x - camp_center.x, c.pos.z - camp_center.z).length() <= box_r);
+
+            if hero_blocking || creep_blocking {
+                continue;
+            }
+
+            let count = camp.creep_type_ids.len();
+            let face_dir = if camp.team_side == TeamId::Dawn {
+                Vec3::new(1.0, 0.0, 0.0)
+            } else {
+                Vec3::new(-1.0, 0.0, 0.0)
+            };
+            let side = face_dir.cross(Vec3::Y).normalize_or_zero();
+
+            for (i, tid) in camp.creep_type_ids.iter().enumerate() {
+                let ct = &config.neutral_camps.creep_types[tid];
+                let offset_idx = (i as f32) - ((count.saturating_sub(1) as f32) * 0.5);
+                let spawn_pos = camp_center + side * (offset_idx * config.neutral_camps.spawn_spacing);
+                let id = world.next_creep_id;
+                world.next_creep_id += 1;
+                world.creeps.push(LaneCreepState {
+                    id,
+                    team: TeamId::Neutral,
+                    creep_type_id: Some(tid.clone()),
+                    camp_index: Some(camp_idx),
+                    is_aggroed: false,
+                    home_pos: spawn_pos,
+                    lane: LaneId::Mid,
+                    waypoint_index: 0,
+                    pos: spawn_pos,
+                    facing_dir: face_dir,
+                    hp: ct.max_hp,
+                    max_hp: ct.max_hp,
+                    fire_cooldown: 0.0,
+                    fire_anim_timer: 0.0,
+                    anim_state: CreepAnimState::Idle,
+                    is_dead: false,
+                    despawn_timer: 0.0,
+                });
+            }
+        }
+    }
+
     // ۲. به‌روزرسانی تایمر مرگ و حذف سربازان مرده پس از اتمام انیمیشن die
     for c in &mut world.creeps {
         if c.is_dead {
@@ -6442,10 +6670,10 @@ fn step_lane_creeps_system(
     world.creeps.retain(|c| !c.is_dead || c.despawn_timer > 0.0);
 
     // ۳. جمع‌آوری لیست اهداف بالقوه (سربازان زنده و هیروهای زنده)
-    let creep_snap: Vec<(u64, TeamId, Vec3, bool)> = world
+    let creep_snap: Vec<(u64, TeamId, Vec3, bool, bool)> = world
         .creeps
         .iter()
-        .map(|c| (c.id, c.team, c.pos, c.is_dead))
+        .map(|c| (c.id, c.team, c.pos, c.is_dead, c.is_aggroed))
         .collect();
     let hero_snap: Vec<(TeamId, Vec3, bool)> = world
         .players
@@ -6468,49 +6696,66 @@ fn step_lane_creeps_system(
         let my_id = world.creeps[idx].id;
         let my_team = world.creeps[idx].team;
         let my_pos = world.creeps[idx].pos;
+        let my_home = world.creeps[idx].home_pos;
         let my_lane = world.creeps[idx].lane;
+        let c_stats = resolve_creep_stats(config, world.creeps[idx].creep_type_id.as_deref());
+        let is_neutral = my_team == TeamId::Neutral;
+        let leashed_back = is_neutral && my_pos.distance(my_home) > config.neutral_camps.aggro_leash_radius;
+        if leashed_back {
+            world.creeps[idx].is_aggroed = false;
+        }
+        let can_attack_now = !is_neutral || (world.creeps[idx].is_aggroed && !leashed_back);
 
         // الف) یافتن نزدیک‌ترین دشمن (سرباز یا هیرو) با رعایت کامل مه جنگ، برتری ارتفاع و خط دید موانع
         let mut best_target: Option<(Vec3, f32)> = None;
-        for &(other_id, other_team, other_pos, other_dead) in &creep_snap {
-            if other_id == my_id || other_team == my_team || other_dead {
-                continue;
+        if can_attack_now {
+            for &(other_id, other_team, other_pos, other_dead, other_aggroed) in &creep_snap {
+                if other_id == my_id || other_team == my_team || other_dead {
+                    continue;
+                }
+                // سرباز لاین به کمپ حمله نمی‌کند مگر اینکه کمپ در حالت تهاجمی (Aggro) باشد
+                if !is_neutral && other_team == TeamId::Neutral && !other_aggroed {
+                    continue;
+                }
+                let d = my_pos.distance(other_pos);
+                if d <= c_stats.vision_range
+                    && best_target.map_or(true, |(_, bd)| d < bd)
+                    && can_observer_see_point_with_range(
+                        physics_world,
+                        config,
+                        my_pos,
+                        other_pos,
+                        c_stats.aim_chest_height,
+                        c_stats.vision_range,
+                        0.0,
+                    )
+                {
+                    best_target = Some((other_pos, d));
+                }
             }
-            let d = my_pos.distance(other_pos);
-            if d <= config.creeps.vision_range
-                && best_target.map_or(true, |(_, bd)| d < bd)
-                && can_observer_see_point_with_range(
-                    physics_world,
-                    config,
-                    my_pos,
-                    other_pos,
-                    config.creeps.aim_chest_height,
-                    config.creeps.vision_range,
-                    0.0,
-                )
-            {
-                best_target = Some((other_pos, d));
+            for &(h_team, h_pos, h_dead) in &hero_snap {
+                if h_team == my_team || h_dead {
+                    continue;
+                }
+                let d = my_pos.distance(h_pos);
+                if d <= c_stats.vision_range
+                    && best_target.map_or(true, |(_, bd)| d < bd)
+                    && can_observer_see_point_with_range(
+                        physics_world,
+                        config,
+                        my_pos,
+                        h_pos,
+                        c_stats.aim_chest_height,
+                        c_stats.vision_range,
+                        0.0,
+                    )
+                {
+                    best_target = Some((h_pos, d));
+                }
             }
         }
-        for &(h_team, h_pos, h_dead) in &hero_snap {
-            if h_team == my_team || h_dead {
-                continue;
-            }
-            let d = my_pos.distance(h_pos);
-            if d <= config.creeps.vision_range
-                && best_target.map_or(true, |(_, bd)| d < bd)
-                && can_observer_see_point_with_range(
-                    physics_world,
-                    config,
-                    my_pos,
-                    h_pos,
-                    config.creeps.aim_chest_height,
-                    config.creeps.vision_range,
-                    0.0,
-                )
-            {
-                best_target = Some((h_pos, d));
-            }
+        if is_neutral && best_target.is_none() && my_pos.distance(my_home) <= 0.5 {
+            world.creeps[idx].is_aggroed = false;
         }
 
         let mut moved = false;
@@ -6522,17 +6767,17 @@ fn step_lane_creeps_system(
                 world.creeps[idx].facing_dir = to_target.normalize();
             }
 
-            if dist <= config.creeps.attack_range {
+            if dist <= c_stats.attack_range {
                 fired_or_aiming = true;
                 if world.creeps[idx].fire_cooldown <= 0.0 {
-                    world.creeps[idx].fire_cooldown = config.creeps.fire_rate_secs;
+                    world.creeps[idx].fire_cooldown = c_stats.fire_rate_secs;
                     world.creeps[idx].fire_anim_timer =
-                        (config.creeps.fire_rate_secs * 0.45).min(0.35);
+                        (c_stats.fire_rate_secs * 0.45).min(0.35);
 
                     let muzzle_pos = my_pos
-                        + Vec3::Y * config.creeps.muzzle_offset_y
-                        + world.creeps[idx].facing_dir * config.creeps.muzzle_forward;
-                    let aim_target = target_pos + Vec3::Y * config.creeps.aim_chest_height;
+                        + Vec3::Y * c_stats.muzzle_offset_y
+                        + world.creeps[idx].facing_dir * c_stats.muzzle_forward;
+                    let aim_target = target_pos + Vec3::Y * c_stats.aim_chest_height;
                     let shot_dir = (aim_target - muzzle_pos).normalize_or_zero();
                     let b_id = world.next_entity_id;
                     world.next_entity_id += 1;
@@ -6542,9 +6787,9 @@ fn step_lane_creeps_system(
                             id: b_id,
                             owner_slot: None,
                             owner_team: my_team,
-                            velocity: shot_dir * config.creeps.projectile_speed,
-                            damage: config.creeps.bullet_damage,
-                            remaining_range: config.creeps.bullet_max_range,
+                            velocity: shot_dir * c_stats.projectile_speed,
+                            damage: c_stats.bullet_damage,
+                            remaining_range: c_stats.bullet_max_range,
                         },
                         Transform::from_translation(muzzle_pos),
                     ));
@@ -6556,8 +6801,18 @@ fn step_lane_creeps_system(
                     });
                 }
             } else {
-                // حرکت به سمت دشمن درون دید
-                let step = world.creeps[idx].facing_dir * config.creeps.move_speed * dt;
+                let step = world.creeps[idx].facing_dir * c_stats.move_speed * dt;
+                world.creeps[idx].pos.x += step.x;
+                world.creeps[idx].pos.z += step.z;
+                moved = true;
+            }
+        } else if is_neutral {
+            // سرباز کمپ اگر دشمنی نباشد به جایگاه کمپ خودش برمی‌گردد و منتظر می‌ماند
+            let to_home = Vec3::new(my_home.x - my_pos.x, 0.0, my_home.z - my_pos.z);
+            if to_home.length() > 0.35 {
+                let dir = to_home.normalize();
+                world.creeps[idx].facing_dir = dir;
+                let step = dir * c_stats.move_speed * dt;
                 world.creeps[idx].pos.x += step.x;
                 world.creeps[idx].pos.z += step.z;
                 moved = true;

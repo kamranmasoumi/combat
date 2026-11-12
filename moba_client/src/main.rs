@@ -448,6 +448,14 @@ struct MinimapTargetDot {
 #[derive(Component)]
 struct MinimapCameraBox;
 
+#[derive(Component)]
+struct MinimapRoot;
+
+#[derive(Component)]
+struct MinimapCreepDot {
+    creep_id: u64,
+}
+
 #[derive(Resource)]
 struct LatestHeroSnapshot(HeroSnapshot);
 
@@ -3935,6 +3943,7 @@ fn spawn_minimap_ui(commands: &mut Commands, config: &GameConfig, minimap_handle
 
     commands
         .spawn((
+            MinimapRoot,
             Node {
                 position_type: PositionType::Absolute,
                 right: px(MINIMAP_MARGIN_PX),
@@ -4105,23 +4114,33 @@ fn minimap_interaction_system(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn minimap_overlay_update_system(
+    mut commands: Commands,
     config: Res<GameConfig>,
     render_state: Res<ClientRenderState>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    latest_creeps: Res<LatestCreeps>,
     camera_control: Res<CameraControlState>,
     soldier_query: Query<&Transform, With<SoldierMarker>>,
     target_query: Query<&VisualTarget>,
+    minimap_root_q: Query<Entity, With<MinimapRoot>>,
     mut soldier_dot_query: Query<
         &mut Node,
         (
             With<MinimapSoldierDot>,
             Without<MinimapTargetDot>,
             Without<MinimapCameraBox>,
+            Without<MinimapCreepDot>,
         ),
     >,
     mut target_dot_query: Query<
         (&MinimapTargetDot, &mut Node, &mut Visibility),
-        (Without<MinimapSoldierDot>, Without<MinimapCameraBox>),
+        (
+            Without<MinimapSoldierDot>,
+            Without<MinimapCameraBox>,
+            Without<MinimapCreepDot>,
+        ),
     >,
     mut cam_box_query: Query<
         &mut Node,
@@ -4129,6 +4148,15 @@ fn minimap_overlay_update_system(
             With<MinimapCameraBox>,
             Without<MinimapSoldierDot>,
             Without<MinimapTargetDot>,
+            Without<MinimapCreepDot>,
+        ),
+    >,
+    mut creep_dot_query: Query<
+        (Entity, &MinimapCreepDot, &mut Node, &mut BackgroundColor),
+        (
+            Without<MinimapSoldierDot>,
+            Without<MinimapTargetDot>,
+            Without<MinimapCameraBox>,
         ),
     >,
 ) {
@@ -4162,6 +4190,66 @@ fn minimap_overlay_update_system(
                 node.left = px(uv.x * MINIMAP_WIDTH_PX - 3.0);
                 node.top = px(uv.y * MINIMAP_HEIGHT_PX - 3.0);
             }
+        }
+    }
+
+    // نمایش زنده سربازان لاین (سبز خودی / قرمز دشمن) و کمپ‌های قابل‌مشاهده روی مینی‌مپ
+    let my_team = hero_hud.0.team;
+    let alive_creeps: HashMap<u64, &CreepSnapshot> = latest_creeps
+        .0
+        .iter()
+        .filter(|c| !c.is_dead && c.is_visible)
+        .map(|c| (c.id, c))
+        .collect();
+
+    let mut existing_dots = HashSet::new();
+    for (ent, dot, mut node, mut bg) in &mut creep_dot_query {
+        let Some(&cs) = alive_creeps.get(&dot.creep_id) else {
+            commands.entity(ent).despawn();
+            continue;
+        };
+        existing_dots.insert(cs.id);
+        let uv = world_to_minimap_uv(&config, cs.pos.x, cs.pos.z);
+        node.left = px(uv.x * MINIMAP_WIDTH_PX - 2.2);
+        node.top = px(uv.y * MINIMAP_HEIGHT_PX - 2.2);
+        *bg = if cs.team == my_team {
+            Color::srgb(0.20, 0.92, 0.38).into()
+        } else if cs.team == TeamId::Neutral {
+            Color::srgb(0.98, 0.62, 0.16).into()
+        } else {
+            Color::srgb(0.95, 0.22, 0.22).into()
+        };
+    }
+
+    if let Ok(root_ent) = minimap_root_q.single() {
+        for cs in alive_creeps.values() {
+            if existing_dots.contains(&cs.id) {
+                continue;
+            }
+            let uv = world_to_minimap_uv(&config, cs.pos.x, cs.pos.z);
+            let dot_col = if cs.team == my_team {
+                Color::srgb(0.20, 0.92, 0.38)
+            } else if cs.team == TeamId::Neutral {
+                Color::srgb(0.98, 0.62, 0.16)
+            } else {
+                Color::srgb(0.95, 0.22, 0.22)
+            };
+            commands.entity(root_ent).with_children(|parent| {
+                parent.spawn((
+                    MinimapCreepDot { creep_id: cs.id },
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(uv.x * MINIMAP_WIDTH_PX - 2.2),
+                        top: px(uv.y * MINIMAP_HEIGHT_PX - 2.2),
+                        width: px(4.5),
+                        height: px(4.5),
+                        border_radius: BorderRadius::MAX,
+                        ..default()
+                    },
+                    BackgroundColor(dot_col),
+                ));
+            });
         }
     }
 }
@@ -4491,6 +4579,12 @@ fn bake_minimap_image(config: &GameConfig) -> Image {
         draw_circle(&mut pixels, loc.0, loc.2, 4.5, [15, 18, 22, 255]);
         draw_circle(&mut pixels, loc.0, loc.2, 3.3, col);
         draw_circle(&mut pixels, loc.0, loc.2, 1.3, [255, 255, 255, 255]);
+    }
+
+    // ۱۱-ب. جایگاه ۳۰ کمپ جنگلی (Neutral Camps)
+    for camp in &config.neutral_camps.camps {
+        draw_circle(&mut pixels, camp.center.0, camp.center.2, 4.0, [18, 16, 12, 235]);
+        draw_circle(&mut pixels, camp.center.0, camp.center.2, 2.7, [245, 185, 48, 255]);
     }
 
     // ۱۲. ساختمان‌های باستانی (Ancients)
@@ -6468,7 +6562,13 @@ fn sync_lane_creeps_system(
         seen_ids.insert(cs.id);
 
         tf.translation = tf.translation.lerp(cs.pos, (16.0 * dt).clamp(0.0, 1.0));
-        tf.scale = Vec3::splat(res.config.creeps.scale);
+        let c_scale = cs
+            .creep_type_id
+            .as_deref()
+            .and_then(|tid| res.config.neutral_camps.creep_types.get(tid))
+            .map(|ct| ct.scale)
+            .unwrap_or(res.config.creeps.scale);
+        tf.scale = Vec3::splat(c_scale);
 
         let flat_dir = Vec3::new(cs.facing_dir.x, 0.0, cs.facing_dir.z);
         if flat_dir.length_squared() > 0.0001 {
@@ -6503,15 +6603,19 @@ fn sync_lane_creeps_system(
                     CreepAnimState::Fire => assets.fire_node,
                     CreepAnimState::Die => assets.die_node,
                 };
+                let mut played = false;
                 for (cp, mut player, mut trans) in &mut anim_player_query {
                     if cp.creep_id == cs.id {
                         let active = trans.play(&mut player, target_node, Duration::from_millis(100));
                         if cs.anim_state == CreepAnimState::Run || cs.anim_state == CreepAnimState::Idle {
                             active.repeat();
                         }
+                        played = true;
                     }
                 }
-                vis_comp.last_anim = Some(cs.anim_state);
+                if played {
+                    vis_comp.last_anim = Some(cs.anim_state);
+                }
             }
         }
 
@@ -6551,7 +6655,13 @@ fn sync_lane_creeps_system(
         if seen_ids.contains(&cs.id) {
             continue;
         }
-        let scene_h = res.asset_server.load(format!("{}#Scene0", res.config.creeps.model_path));
+        let (c_model, c_scale) = cs
+            .creep_type_id
+            .as_deref()
+            .and_then(|tid| res.config.neutral_camps.creep_types.get(tid))
+            .map(|ct| (ct.model_path.as_str(), ct.scale))
+            .unwrap_or((res.config.creeps.model_path.as_str(), res.config.creeps.scale));
+        let scene_h = res.asset_server.load(format!("{}#Scene0", c_model));
         commands.spawn((
             CreepVisual {
                 creep_id: cs.id,
@@ -6559,7 +6669,7 @@ fn sync_lane_creeps_system(
                 is_highlighted: false,
             },
             WorldAssetRoot(scene_h),
-            Transform::from_translation(cs.pos).with_scale(Vec3::splat(res.config.creeps.scale)),
+            Transform::from_translation(cs.pos).with_scale(Vec3::splat(c_scale)),
             if cs.is_visible {
                 Visibility::Visible
             } else {
@@ -6611,7 +6721,13 @@ fn update_overhead_creep_bars_system(
             continue;
         }
 
-        let world_head = cs.pos + Vec3::Y * (config.creeps.hitbox_height + 0.45);
+        let c_height = cs
+            .creep_type_id
+            .as_deref()
+            .and_then(|tid| config.neutral_camps.creep_types.get(tid))
+            .map(|ct| ct.hitbox_height)
+            .unwrap_or(config.creeps.hitbox_height);
+        let world_head = cs.pos + Vec3::Y * (c_height + 0.45);
         if let Ok(sp) = camera.world_to_viewport(cam_gtf, world_head) {
             node.display = Display::Flex;
             node.left = px(sp.x - 28.0);
@@ -6668,6 +6784,8 @@ fn update_overhead_creep_bars_system(
                 } else {
                     Color::srgb(0.18, 0.84, 0.38).into()
                 }
+            } else if cs.team == TeamId::Neutral {
+                Color::srgb(0.96, 0.56, 0.14).into()
             } else {
                 Color::srgb(0.90, 0.20, 0.20).into()
             };

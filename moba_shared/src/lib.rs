@@ -345,6 +345,8 @@ pub struct HeroDef {
     pub vision_range: f32,
     pub high_ground_vision_bonus: f32,
     pub move_speed_multiplier: f32,
+    pub shallow_water_speed_multiplier: f32,
+    pub deep_water_speed_multiplier: f32,
     pub max_hp: f32,
 }
 
@@ -892,6 +894,24 @@ pub fn fx_collision_groups() -> CollisionGroups {
     CollisionGroups::new(GROUP_FX, GROUP_WORLD)
 }
 
+/// محاسبه عمق اضافی کف برکه در نزدیکی آبشارها (هرچه به آبشار نزدیک‌تر شویم کف آب عمیق‌تر می‌شود)
+pub fn sample_waterfall_depth_offset(config: &GameConfig, wx: f32, wz: f32) -> f32 {
+    let mut max_extra_depth = 0.0_f32;
+    let basin_radius = 16.0_f32;
+    for wf in &config.map.waterfalls {
+        let loc = wf.model_transform.location;
+        let dx = wx - loc.0;
+        let dz = wz - loc.2;
+        let dist = (dx * dx + dz * dz).sqrt();
+        if dist < basin_radius {
+            let t = 1.0 - (dist / basin_radius);
+            let smooth = t * t * (3.0 - 2.0 * t);
+            max_extra_depth = max_extra_depth.max(smooth * 1.15);
+        }
+    }
+    max_extra_depth
+}
+
 /// بررسی قرار گرفتن یک نقطه ۳بعدی درون برکه‌ها و رودخانه‌های نقشه و برگرداندن ارتفاع سطح آب و بردار جریان
 pub fn sample_water_surface_at(config: &GameConfig, world_pos: Vec3) -> Option<(f32, Vec2)> {
     for seg in &config.map.river_segments {
@@ -904,7 +924,7 @@ pub fn sample_water_surface_at(config: &GameConfig, world_pos: Vec3) -> Option<(
         );
         let water_top_y = seg_pos.y + half.y;
 
-        if world_pos.y < water_top_y - 1.35 || world_pos.y > water_top_y + 0.45 {
+        if world_pos.y < water_top_y - 2.40 || world_pos.y > water_top_y + 0.45 {
             continue;
         }
 
@@ -1263,35 +1283,46 @@ impl CustomPhysicsWorld {
                     }
 
                     if let Some(wall_hit) = deepest_wall_contact {
-                        let step_origin = Vec3::new(
-                            center.x,
-                            feet_y + autostep_max_h + 0.15,
-                            center.z,
-                        );
+                        let horiz_normal = Vec3::new(wall_hit.normal.x, 0.0, wall_hit.normal.z)
+                            .normalize_or_zero();
                         let mut stepped_up = false;
-                        if let Some(top_hit) = ray_intersect_single_entry(
-                            step_origin,
-                            Vec3::NEG_Y,
-                            autostep_max_h + 0.20,
-                            entry,
-                        ) {
-                            if top_hit.normal.y >= max_slope_cos
-                                && top_hit.point.y >= feet_y - 0.02
-                                && top_hit.point.y <= feet_y + autostep_max_h
-                            {
-                                center.y = top_hit.point.y + center_y_offset;
-                                stepped_up = true;
+
+                        // اگر برخورد در پایین پا و زیر سقف Autostep باشد، هم زیر مرکز و هم کمی جلوتر روی لبه مانع تست می‌کنیم
+                        if wall_hit.contact_point.y <= feet_y + autostep_max_h + 0.08 {
+                            let probe_points = [
+                                Vec2::new(center.x, center.z),
+                                Vec2::new(
+                                    wall_hit.contact_point.x - horiz_normal.x * 0.06,
+                                    wall_hit.contact_point.z - horiz_normal.z * 0.06,
+                                ),
+                            ];
+                            for pt in &probe_points {
+                                let step_origin = Vec3::new(
+                                    pt.x,
+                                    feet_y + autostep_max_h + 0.15,
+                                    pt.y,
+                                );
+                                if let Some(top_hit) = ray_intersect_single_entry(
+                                    step_origin,
+                                    Vec3::NEG_Y,
+                                    autostep_max_h + 0.22,
+                                    entry,
+                                ) {
+                                    if top_hit.normal.y >= max_slope_cos
+                                        && top_hit.point.y >= feet_y - 0.05
+                                        && top_hit.point.y <= feet_y + autostep_max_h
+                                    {
+                                        center.y = top_hit.point.y + center_y_offset;
+                                        stepped_up = true;
+                                        break;
+                                    }
+                                }
                             }
                         }
 
-                        if !stepped_up {
-                            let horiz_normal =
-                                Vec3::new(wall_hit.normal.x, 0.0, wall_hit.normal.z)
-                                    .normalize_or_zero();
-                            if horiz_normal != Vec3::ZERO {
-                                center += horiz_normal * (wall_hit.penetration + nudge);
-                                any_wall_push = true;
-                            }
+                        if !stepped_up && horiz_normal != Vec3::ZERO {
+                            center += horiz_normal * (wall_hit.penetration + nudge);
+                            any_wall_push = true;
                         }
                     }
                 }
@@ -1346,9 +1377,18 @@ impl CustomPhysicsWorld {
             }
         }
 
-        // ۳. اعمال گرانش و چسبیدن نرم به سطح رمپ، زمین یا کف برکه‌ها
+        // ۳. اعمال گرانش و چسبیدن نرم به سطح رمپ، زمین یا کف شیب‌دار برکه‌ها (عمیق‌تر در نزدیکی آبشار)
+        let mut adjusted_walkable_y = highest_walkable_y;
+        if let Some(gy) = adjusted_walkable_y {
+            let probe_pos = Vec3::new(center.x, gy, center.z);
+            if sample_water_surface_at(config, probe_pos).is_some() {
+                let extra_depth = sample_waterfall_depth_offset(config, center.x, center.z);
+                adjusted_walkable_y = Some((gy - extra_depth).max(-1.6));
+            }
+        }
+
         let mut grounded = false;
-        let new_feet_y = if let Some(ground_y) = highest_walkable_y {
+        let new_feet_y = if let Some(ground_y) = adjusted_walkable_y {
             let free_fall_feet_y = feet_y + desired_delta.y;
             if free_fall_feet_y <= ground_y + snap_dist {
                 grounded = true;
@@ -1380,6 +1420,11 @@ impl CustomPhysicsWorld {
                             grounded = true;
                         }
                     } else {
+                        let cur_feet_y = center.y - center_y_offset;
+                        // از درزهای ناچیز کف زمین (اختلاف ارتفاع زیر 15 سانتی‌متر در کره پایینی) صرف‌نظر کن تا کاراکتر گیر نکند
+                        if oy < 0.0 && contact.contact_point.y <= cur_feet_y + autostep_max_h {
+                            continue;
+                        }
                         let horiz_normal = Vec3::new(contact.normal.x, 0.0, contact.normal.z)
                             .normalize_or_zero();
                         if horiz_normal != Vec3::ZERO {
@@ -3584,6 +3629,36 @@ fn shared_authoritative_drive_system(
         world.water_splash_cooldown = (world.water_splash_cooldown - dt).max(0.0);
 
         if let Some((water_y, flow_dir)) = water_sample {
+            let water_depth = (water_y - world.soldier_pos.y).max(0.0);
+            let is_deep_water = water_depth >= 0.85;
+
+            let (hero_move_mult, shallow_mult, deep_mult) = config
+                .heroes
+                .get(world.hero_index)
+                .map(|h| {
+                    (
+                        h.move_speed_multiplier,
+                        h.shallow_water_speed_multiplier,
+                        h.deep_water_speed_multiplier,
+                    )
+                })
+                .unwrap_or((
+                    1.0,
+                    config.physics.water_move_speed_multiplier,
+                    config.physics.water_move_speed_multiplier * 0.6,
+                ));
+
+            if is_deep_water && !world.traversal.is_active {
+                if world.is_moving {
+                    world.current_locomotion = "swimming".to_string();
+                    world.firing_anim_remaining = None;
+                    // در عمق زیاد آب، هیرو به سمت جهت حرکت خود می‌چرخد
+                    world.soldier_facing_dir = world.move_input.normalize();
+                } else {
+                    world.current_locomotion = "treading_water".to_string();
+                }
+            }
+
             // استخراج نقطه پاشش قبل از push کردن برای رفع خطای Borrow Checker
             let splash_pos = Vec3::new(world.soldier_pos.x, water_y, world.soldier_pos.z);
 
@@ -3609,8 +3684,13 @@ fn shared_authoritative_drive_system(
                         Stance::Run => config.soldier.run_speed,
                         Stance::Walk => config.soldier.walk_speed,
                         Stance::Crouch => config.soldier.crouch_speed,
+                    } * hero_move_mult;
+                    let depth_mult = if is_deep_water {
+                        deep_mult
+                    } else {
+                        shallow_mult
                     };
-                    let water_speed = base_speed * config.physics.water_move_speed_multiplier;
+                    let water_speed = base_speed * depth_mult;
                     let desired_delta =
                         world.move_input.normalize() * water_speed * dt + flow_drift;
                     controller.translation =
@@ -3622,11 +3702,16 @@ fn shared_authoritative_drive_system(
         } else if !world.traversal.is_active {
             let grav_y = config.physics.character_gravity_step_y * dt;
             if world.is_moving {
+                let hero_move_mult = config
+                    .heroes
+                    .get(world.hero_index)
+                    .map(|h| h.move_speed_multiplier)
+                    .unwrap_or(1.0);
                 let speed = match world.effective_stance {
                     Stance::Run => config.soldier.run_speed,
                     Stance::Walk => config.soldier.walk_speed,
                     Stance::Crouch => config.soldier.crouch_speed,
-                };
+                } * hero_move_mult;
                 let desired_delta = world.move_input.normalize() * speed * dt;
                 controller.translation = Some(Vec3::new(desired_delta.x, grav_y, desired_delta.z));
             } else {
@@ -3704,6 +3789,12 @@ fn step_traversal_custom(
 
     if !input.space_just_pressed {
         return;
+    }
+
+    if let Some((water_y, _)) = sample_water_surface_at(config, world.soldier_pos) {
+        if (water_y - world.soldier_pos.y) >= 0.85 {
+            return;
+        }
     }
 
     let travel_dir = if world.is_moving {
@@ -3821,7 +3912,7 @@ fn step_shooting_and_grenade_spawn(
 ) {
     world.fire_cooldown_remaining = (world.fire_cooldown_remaining - dt).max(0.0);
 
-    if world.is_dead || world.traversal.is_active {
+    if world.is_dead || world.traversal.is_active || world.current_locomotion == "swimming" {
         return;
     }
 
@@ -4055,6 +4146,19 @@ fn shared_authoritative_react_system(
             });
             commands.entity(entity).despawn();
         } else {
+            // بررسی برخورد گلوله با سطح آب برکه‌ها و رودخانه‌ها
+            let mid_pos = (old_pos + new_pos) * 0.5;
+            if let Some((water_y, _)) = sample_water_surface_at(&config, mid_pos) {
+                let crossed_water = (old_pos.y >= water_y - 0.15 && new_pos.y <= water_y + 0.15)
+                    || (mid_pos.y - water_y).abs() <= 0.35;
+                if crossed_water {
+                    world.pending_fx.push(GameplayFxEvent::WaterSplash {
+                        pos: Vec3::new(mid_pos.x, water_y, mid_pos.z),
+                        intensity: 1.15,
+                    });
+                }
+            }
+
             tf.translation = new_pos;
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
                 start: old_pos,
@@ -4157,10 +4261,30 @@ fn shared_client_drive_system(
         soldier_tf.translation.z,
     );
     let water_sample = sample_water_surface_at(&config, feet_pos);
-    let speed_mult = if water_sample.is_some() {
-        config.physics.water_move_speed_multiplier
+    let (hero_move_mult, shallow_mult, deep_mult) = config
+        .heroes
+        .first()
+        .map(|h| {
+            (
+                h.move_speed_multiplier,
+                h.shallow_water_speed_multiplier,
+                h.deep_water_speed_multiplier,
+            )
+        })
+        .unwrap_or((
+            1.0,
+            config.physics.water_move_speed_multiplier,
+            config.physics.water_move_speed_multiplier * 0.6,
+        ));
+    let speed_mult = if let Some((water_y, _)) = water_sample {
+        let depth = (water_y - feet_pos.y).max(0.0);
+        if depth >= 0.85 {
+            hero_move_mult * deep_mult
+        } else {
+            hero_move_mult * shallow_mult
+        }
     } else {
-        1.0
+        hero_move_mult
     };
     let flow_drift = water_sample
         .map(|(_, flow)| Vec3::new(flow.x, 0.0, flow.y) * 0.35 * dt)

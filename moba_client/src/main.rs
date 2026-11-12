@@ -1,6 +1,10 @@
 use bevy::animation::AnimatedBy;
 use bevy::asset::RenderAssetUsages;
-use bevy::image::ImageSampler;
+use bevy::gltf::GltfMaterialName;
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::math::Affine2;
+use bevy::shader::ShaderRef;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::gltf::Gltf;
 use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight, NotShadowCaster};
@@ -75,6 +79,7 @@ fn main() {
             is_pointer_over_minimap: false,
             is_dragging_minimap: false,
         })
+        .add_plugins(MaterialPlugin::<WaterSurfaceMaterial>::default())
         .add_plugins(MobaSharedPhysicsPlugin {
             role: PhysicsRole::Client,
             tick_rate_hz: tick_hz,
@@ -97,12 +102,21 @@ fn main() {
                 soldier_animation_player_system,
                 laser_sight_gizmo_system,
                 gameplay_fx_system,
+            )
+                .chain(),
+        )
+        .add_systems(
+            Update,
+            (
                 update_map_object_labels_system,
                 minimap_interaction_system,
                 minimap_overlay_update_system,
                 fog_of_war_update_system,
                 occlusion_transparency_system,
                 optimize_tree_shadows_system,
+                water_shader_update_system,
+                waterfall_mist_particle_system,
+                animate_glb_waterfall_materials_system,
             )
                 .chain(),
         )
@@ -208,6 +222,64 @@ struct CascadingWaterfallSheet {
 }
 
 /// کامپوننت حلقه‌های موج آب (هم در پای آبشارها و هم هنگام راه رفتن بازیکن در آب)
+#[derive(ShaderType, Debug, Clone)]
+struct WaterUniforms {
+    base_color: Vec4,
+    foam_color: Vec4,
+    flow_and_params: Vec4,
+    player_ripple: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+struct WaterSurfaceMaterial {
+    #[uniform(0)]
+    uniforms: WaterUniforms,
+    #[texture(1)]
+    #[sampler(2)]
+    foam_tex: Handle<Image>,
+}
+
+impl Material for WaterSurfaceMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/water.wesl".into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        "shaders/water.wesl".into()
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+}
+
+#[derive(Component)]
+struct WaterfallMistEmitter {
+    base_pos: Vec3,
+    width: f32,
+    timer: Timer,
+}
+
+#[derive(Component)]
+struct WaterfallMistParticle {
+    vel: Vec3,
+    timer: Timer,
+    start_scale: f32,
+    end_scale: f32,
+}
+
+#[derive(Resource)]
+struct SharedWaterFoamTexture(Handle<Image>);
+
+#[derive(Component)]
+struct GlbAnimatedWaterTag {
+    is_waterfall: bool,
+}
+
 #[derive(Component)]
 struct WaterRippleRing {
     timer: Timer,
@@ -311,6 +383,14 @@ impl SoldierAnimationAssets {
                 anim_name
             )
         })
+    }
+
+    fn get_or_fallback(&self, anim_name: &str, fallback: &str) -> AnimationNodeIndex {
+        if let Some(&node) = self.nodes.get(anim_name) {
+            node
+        } else {
+            self.require_node(fallback)
+        }
     }
 }
 
@@ -462,6 +542,7 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut water_materials: ResMut<Assets<WaterSurfaceMaterial>>,
 ) {
     let spawn_pos = Vec3::new(
         config.soldier.spawn_pos.0,
@@ -699,6 +780,15 @@ fn setup_scene(
         ..default()
     });
 
+    let foam_noise_handle = images.add(bake_water_foam_noise_texture());
+    commands.insert_resource(SharedWaterFoamTexture(foam_noise_handle.clone()));
+    let subdivided_water_mesh = meshes.add(
+        Plane3d::default()
+            .mesh()
+            .size(1.0, 1.0)
+            .subdivisions(20),
+    );
+
     for (seg_idx, seg) in config.map.river_segments.iter().enumerate() {
         let tf = seg.model_transform.to_transform();
         let pos = tf.translation;
@@ -709,6 +799,7 @@ fn setup_scene(
         );
         let c = seg.color_rgb;
         let em = seg.emissive_rgb;
+        let flow_n = Vec2::new(seg.flow_dir.0, seg.flow_dir.1).normalize_or_zero();
 
         let mut ent_cmds = commands.spawn((
             MapObjectId(seg.id.clone()),
@@ -726,34 +817,27 @@ fn setup_scene(
                 ));
             });
         } else {
-            // استفاده از استوانه بیضوی برای برکه‌های طبیعی و شفافیت آب
+            let water_mat = water_materials.add(WaterSurfaceMaterial {
+                uniforms: WaterUniforms {
+                    base_color: Vec4::new(c.0, c.1, c.2, 0.76),
+                    foam_color: Vec4::new(
+                        (c.0 + 0.55 + em.0 * 0.25).min(1.0),
+                        (c.1 + 0.42 + em.1 * 0.25).min(1.0),
+                        (c.2 + 0.35 + em.2 * 0.25).min(1.0),
+                        1.0,
+                    ),
+                    flow_and_params: Vec4::new(flow_n.x, flow_n.y, 0.0, 0.0),
+                    player_ripple: Vec4::new(0.0, 0.0, 0.0, 0.14),
+                },
+                foam_tex: foam_noise_handle.clone(),
+            });
             ent_cmds.with_children(|parent| {
                 parent.spawn((
-                    Mesh3d(meshes.add(Cylinder::new(0.5, size.y))),
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: Color::srgba(c.0, c.1, c.2, 0.78),
-                        emissive: LinearRgba::new(em.0, em.1, em.2, 0.78),
-                        perceptual_roughness: seg.roughness,
-                        metallic: 0.15,
-                        reflectance: 0.92,
-                        alpha_mode: AlphaMode::Blend,
-                        ..default()
-                    })),
-                    Transform::from_scale(Vec3::new(size.x, 1.0, size.z)),
+                    Mesh3d(subdivided_water_mesh.clone()),
+                    MeshMaterial3d(water_mat),
+                    Transform::from_xyz(0.0, size.y * 0.45, 0.0)
+                        .with_scale(Vec3::new(size.x * 1.12, 1.0, size.z * 1.12)),
                 ));
-
-                // صخره‌های خزه‌دار حاشیه برکه برای ظاهر کاملاً طبیعی
-                for k in 0..8 {
-                    let angle = (k as f32) * (PI * 2.0 / 8.0) + (seg_idx as f32) * 0.4;
-                    let rx = angle.cos() * (size.x * 0.48);
-                    let rz = angle.sin() * (size.z * 0.48);
-                    parent.spawn((
-                        Mesh3d(meshes.add(Sphere::new(0.95))),
-                        MeshMaterial3d(shore_rock_mat.clone()),
-                        Transform::from_xyz(rx, -0.05, rz)
-                            .with_scale(Vec3::new(1.4, 0.55, 1.1)),
-                    ));
-                }
             });
         }
 
@@ -771,38 +855,7 @@ fn setup_scene(
             Transform::from_translation(pos + Vec3::Y * 1.4),
         ));
 
-        // رگه‌های جریان آب متحرک روی سطح هر برکه و جویبار
-        let flow_dir_3d =
-            Vec3::new(seg.flow_dir.0, 0.0, seg.flow_dir.1).normalize_or_zero();
-        let right_3d = Vec3::new(-flow_dir_3d.z, 0.0, flow_dir_3d.x);
-        let streak_rot = Transform::IDENTITY
-            .looking_to(
-                if flow_dir_3d != Vec3::ZERO {
-                    flow_dir_3d
-                } else {
-                    Vec3::Z
-                },
-                Vec3::Y,
-            )
-            .rotation;
-        let span = (size.x.min(size.z) * 0.65).max(3.0);
 
-        for s_i in 0..5 {
-            let lateral = ((s_i as f32) - 2.0) * (span * 0.22);
-            let start_p =
-                pos + Vec3::Y * (size.y * 0.55) + right_3d * lateral - flow_dir_3d * (span * 0.4);
-            commands.spawn((
-                Mesh3d(streak_mesh.clone()),
-                MeshMaterial3d(streak_mat.clone()),
-                Transform::from_translation(start_p).with_rotation(streak_rot),
-                FlowingWaterStreak {
-                    origin: start_p,
-                    travel_vec: flow_dir_3d * (span * 0.8),
-                    cycle_secs: 1.8 + (s_i as f32) * 0.25,
-                    phase: (s_i as f32) * 0.37,
-                },
-            ));
-        }
     }
 
     // ۵. آبشارهای طبیعی چندطبقه همراه با ریزش متحرک آب، کف درخشان و مه آبشار
@@ -838,50 +891,39 @@ fn setup_scene(
                 ));
             });
         } else {
-            ent_cmds.insert((
-                Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgba(c.0, c.1, c.2, 0.88),
-                    emissive: LinearRgba::new(em.0, em.1, em.2, 1.0),
-                    perceptual_roughness: 0.12,
-                    alpha_mode: AlphaMode::Blend,
-                    ..default()
-                })),
-            ));
+            let wf_mat = water_materials.add(WaterSurfaceMaterial {
+                uniforms: WaterUniforms {
+                    base_color: Vec4::new(c.0, c.1, c.2, 0.84),
+                    foam_color: Vec4::new(
+                        (0.85 + em.0 * 0.15).min(1.0),
+                        (0.95 + em.1 * 0.10).min(1.0),
+                        1.0,
+                        1.0,
+                    ),
+                    flow_and_params: Vec4::new(0.0, 1.0, 0.0, 1.0),
+                    player_ripple: Vec4::new(0.0, 0.0, 0.0, 0.22),
+                },
+                foam_tex: foam_noise_handle.clone(),
+            });
+            let tall_h = size.y * 1.65;
+            let lift_y = (tall_h - size.y) * 0.5;
+            ent_cmds.with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(subdivided_water_mesh.clone()),
+                    MeshMaterial3d(wf_mat),
+                    Transform::from_xyz(0.0, lift_y, 0.0)
+                        .with_rotation(Quat::from_rotation_x(PI * 0.5))
+                        .with_scale(Vec3::new(size.x, 1.0, tall_h)),
+                ));
+            });
         }
 
-        ent_cmds.with_children(|parent| {
-            // حوضچه کف درخشان در پای آبشار
-            parent.spawn((
-                Mesh3d(meshes.add(Cylinder::new(size.x * 0.68, 0.28))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgba(0.90, 0.98, 1.0, 0.85),
-                    emissive: LinearRgba::new(em.0 * 1.4, em.1 * 1.4, em.2 * 1.4, 1.0),
-                    alpha_mode: AlphaMode::Blend,
-                    unlit: true,
-                    ..default()
-                })),
-                Transform::from_xyz(0.0, -size.y * 0.48, 0.65),
-            ));
-
-            // ورقه‌های آب در حال ریزش از بالا به پایین آبشار
-            for col_i in 0..3 {
-                let lx = ((col_i as f32) - 1.0) * (size.x * 0.28);
-                for row_i in 0..3 {
-                    let top_p = Vec3::new(lx, size.y * 0.42, size.z * 0.52);
-                    parent.spawn((
-                        Mesh3d(cascade_drop_mesh.clone()),
-                        MeshMaterial3d(cascade_drop_mat.clone()),
-                        Transform::from_translation(top_p),
-                        CascadingWaterfallSheet {
-                            top_pos: top_p,
-                            drop_height: size.y * 0.88,
-                            speed: 1.65 + (col_i as f32) * 0.2,
-                            phase: (row_i as f32) * 0.33 + (col_i as f32) * 0.15,
-                        },
-                    ));
-                }
-            }
+        // سیستم ذرات مه در پای هر آبشار
+        let mist_pos = tf.translation - Vec3::Y * (size.y * 0.45 * tf.scale.y);
+        commands.spawn(WaterfallMistEmitter {
+            base_pos: mist_pos,
+            width: size.x * tf.scale.x,
+            timer: Timer::from_seconds(wf.mist_particle_interval_secs.max(0.05), TimerMode::Repeating),
         });
         spawn_map_object_label(&mut commands, config.map.show_object_labels, wf_ent, &wf.id, size.y * 0.5 + 0.8);
     }
@@ -1616,31 +1658,7 @@ fn environment_vfx_and_water_animation_system(
         }
     }
 
-    // ۶. موج و پاشش آب محلی هنگام ایستادن یا حرکت سرباز درون برکه‌ها
-    render_state.local_wade_ripple_timer = (render_state.local_wade_ripple_timer - dt).max(0.0);
-    if !render_state.is_dead && render_state.local_wade_ripple_timer <= 0.0 {
-        if let Some((water_y, _flow)) = sample_water_surface_at(&config, render_state.soldier_pos) {
-            let is_moving = render_state.current_locomotion != "idle"
-                && render_state.current_locomotion != "idle_crouching";
-            let interval = if is_moving { 0.18 } else { 0.55 };
-            render_state.local_wade_ripple_timer = interval;
-            let ripple_pos = Vec3::new(
-                render_state.soldier_pos.x,
-                water_y + 0.03,
-                render_state.soldier_pos.z,
-            );
 
-            spawn_water_ripple_and_droplets(
-                &mut commands,
-                &config,
-                &mut render_state,
-                &mut meshes,
-                &mut materials,
-                ripple_pos,
-                if is_moving { 0.95 } else { 0.45 },
-            );
-        }
-    }
 }
 
 fn spawn_water_ripple_and_droplets(
@@ -1652,30 +1670,13 @@ fn spawn_water_ripple_and_droplets(
     water_pos: Vec3,
     intensity: f32,
 ) {
-    // حلقه موج دایره‌ای درخشان روی سطح آب
-    commands.spawn((
-        Mesh3d(meshes.add(Torus::new(0.42, 0.50))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(0.65, 0.96, 1.0, 0.80),
-            emissive: LinearRgba::new(0.6, 2.2, 2.8, 0.80),
-            alpha_mode: AlphaMode::Blend,
-            unlit: true,
-            ..default()
-        })),
-        Transform::from_translation(water_pos),
-        WaterRippleRing {
-            timer: Timer::from_seconds(0.65, TimerMode::Once),
-            start_scale: 0.55,
-            end_scale: 2.2 + intensity * 1.1,
-        },
-    ));
-
-    if intensity >= 0.75 {
-        let drop_count = ((intensity * 7.0) as u32).clamp(4, 16);
+    // فقط ذرات ظریف پاشش آب (بدون حلقه‌ها و دایره‌های مزاحم دور کاراکتر)
+    if intensity >= 0.9 {
+        let drop_count = ((intensity * 9.0) as u32).clamp(6, 18);
         let drop_mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(0.75, 0.96, 1.0, 0.9),
-            emissive: LinearRgba::new(0.8, 2.4, 3.2, 1.0),
-            unlit: true,
+            base_color: Color::srgba(0.75, 0.88, 0.92, 0.55),
+            alpha_mode: AlphaMode::Blend,
+            perceptual_roughness: 0.15,
             ..default()
         });
         let drop_mesh = meshes.add(Sphere::new(0.045));
@@ -1685,14 +1686,14 @@ fn spawn_water_ripple_and_droplets(
             let ry = render_state.next_fx_rand();
             let rz = render_state.next_fx_rand();
             let vel = Vec3::new(
-                (rx - 0.5) * 3.2 * intensity,
-                (1.6 + ry * 2.2) * intensity,
-                (rz - 0.5) * 3.2 * intensity,
+                (rx - 0.5) * 3.0 * intensity,
+                (1.8 + ry * 2.2) * intensity,
+                (rz - 0.5) * 3.0 * intensity,
             );
             commands.spawn((
                 Mesh3d(drop_mesh.clone()),
                 MeshMaterial3d(drop_mat.clone()),
-                particle_physics_bundle(config, water_pos + Vec3::Y * 0.08, vel, 0.42, true),
+                particle_physics_bundle(config, water_pos + Vec3::Y * 0.08, vel, 0.38, true),
             ));
         }
     }
@@ -2684,7 +2685,10 @@ fn laser_sight_gizmo_system(
         gizmos.line(trail.start - right, trail.end - right, glow_color);
     }
 
-    if render_state.is_dead || render_state.traversal_active {
+    if render_state.is_dead
+        || render_state.traversal_active
+        || render_state.current_locomotion == "swimming"
+    {
         return;
     }
 
@@ -2830,7 +2834,12 @@ fn soldier_animation_player_system(
         return;
     }
 
-    let lower_node = anim_assets.require_node(&render_state.current_locomotion);
+    let fallback_anim = if render_state.current_locomotion == "swimming" {
+        "walk_forward"
+    } else {
+        "idle"
+    };
+    let lower_node = anim_assets.get_or_fallback(&render_state.current_locomotion, fallback_anim);
     let loco_blend = Duration::from_millis(config.animations.locomotion_blend_ms);
 
     if render_state.current_locomotion != render_state.previous_lower_anim {
@@ -3141,7 +3150,6 @@ fn minimap_interaction_system(
 
 fn minimap_overlay_update_system(
     config: Res<GameConfig>,
-    fow: Option<Res<FogOfWarState>>,
     render_state: Res<ClientRenderState>,
     camera_control: Res<CameraControlState>,
     soldier_query: Query<&Transform, With<SoldierMarker>>,
@@ -3788,5 +3796,234 @@ fn occlusion_transparency_system(
         }
 
         occ.is_faded = is_blocking || any_still_faded;
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم‌های شیدر آب (WESL)، مه آبشار و انیمیشن آبشارهای درون فایل GLB
+// -----------------------------------------------------------------------------
+
+fn bake_water_foam_noise_texture() -> Image {
+    let size = 256_usize;
+    let mut data = vec![0u8; size * size * 4];
+
+    for y in 0..size {
+        for x in 0..size {
+            let u = (x as f32) / (size as f32);
+            let v = (y as f32) / (size as f32);
+            let a = u * std::f32::consts::TAU;
+            let b = v * std::f32::consts::TAU;
+
+            let w1 = (a.sin() * b.cos() + (a * 2.0 + 1.1).cos() * (b * 2.0 - 0.7).sin()) * 0.25 + 0.5;
+            let w2 = ((a * 3.0 - b * 2.0).sin() * (b * 3.0 + a).cos()) * 0.5 + 0.5;
+            let w3 = ((a * 5.0 + b * 4.0).sin() * 0.5 + 0.5).powi(2);
+
+            let r = (w1 * 0.65 + w3 * 0.35).clamp(0.0, 1.0);
+            let g = (w2 * 0.65 + w3 * 0.35).clamp(0.0, 1.0);
+            let bl = ((r + g) * 0.5).clamp(0.0, 1.0);
+
+            let idx = (y * size + x) * 4;
+            data[idx] = (r * 255.0) as u8;
+            data[idx + 1] = (g * 255.0) as u8;
+            data[idx + 2] = (bl * 255.0) as u8;
+            data[idx + 3] = 255;
+        }
+    }
+
+    let mut img = Image::new(
+        Extent3d {
+            width: size as u32,
+            height: size as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    img
+}
+
+fn water_shader_update_system(
+    time: Res<Time>,
+    camera_query: Query<&GlobalTransform, With<MobaCamera>>,
+    mut water_materials: ResMut<Assets<WaterSurfaceMaterial>>,
+) {
+    let t = time.elapsed_secs();
+    let cam_pos = camera_query
+        .single()
+        .map(|gtf| gtf.translation())
+        .unwrap_or(Vec3::new(0.0, 23.0, 17.5));
+    for (_, mat) in water_materials.iter_mut() {
+        mat.uniforms.flow_and_params.z = t;
+        mat.uniforms.player_ripple.x = cam_pos.x;
+        mat.uniforms.player_ripple.y = cam_pos.y;
+        mat.uniforms.player_ripple.z = cam_pos.z;
+    }
+}
+
+fn waterfall_mist_particle_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut render_state: ResMut<ClientRenderState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut emitter_query: Query<&mut WaterfallMistEmitter>,
+    mut mist_query: Query<(Entity, &mut Transform, &mut WaterfallMistParticle)>,
+    mut cached_assets: Local<Option<(Handle<Mesh>, Handle<StandardMaterial>)>>,
+) {
+    let (mist_mesh, mist_mat) = cached_assets.get_or_insert_with(|| {
+        let m = meshes.add(Sphere::new(0.45));
+        let mat = materials.add(StandardMaterial {
+            base_color: Color::srgba(0.88, 0.97, 1.0, 0.42),
+            emissive: LinearRgba::new(0.65, 1.25, 1.55, 0.42),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        });
+        (m, mat)
+    });
+
+    let dt = time.delta_secs();
+
+    for mut emitter in &mut emitter_query {
+        emitter.timer.tick(time.delta());
+        if emitter.timer.just_finished() {
+            for _ in 0..2 {
+                let rx = render_state.next_fx_rand() - 0.5;
+                let rz = render_state.next_fx_rand() - 0.5;
+                let ry = render_state.next_fx_rand();
+                let spawn_p = emitter.base_pos + Vec3::new(rx * emitter.width * 0.85, 0.2, rz * 1.6);
+                let vel = Vec3::new(rx * 1.8, 1.4 + ry * 1.4, rz * 1.8);
+                commands.spawn((
+                    Mesh3d(mist_mesh.clone()),
+                    MeshMaterial3d(mist_mat.clone()),
+                    Transform::from_translation(spawn_p).with_scale(Vec3::splat(0.75)),
+                    WaterfallMistParticle {
+                        vel,
+                        timer: Timer::from_seconds(1.45, TimerMode::Once),
+                        start_scale: 0.75,
+                        end_scale: 2.8,
+                    },
+                ));
+            }
+        }
+    }
+
+    for (entity, mut tf, mut p) in &mut mist_query {
+        p.timer.tick(time.delta());
+        tf.translation += p.vel * dt;
+        p.vel *= (1.0 - 0.9 * dt).max(0.1);
+        let frac = p.timer.fraction();
+        let s = p.start_scale.lerp(p.end_scale, frac) * (1.0 - (frac - 0.65).max(0.0) * 2.4).max(0.05);
+        tf.scale = Vec3::splat(s);
+        if p.timer.is_finished() {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+fn ensure_repeat_sampler(img: &mut Image) {
+    let desc = match &mut img.sampler {
+        ImageSampler::Descriptor(d) => d,
+        ImageSampler::Default => {
+            img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::linear());
+            match &mut img.sampler {
+                ImageSampler::Descriptor(d) => d,
+                _ => return,
+            }
+        }
+    };
+    desc.address_mode_u = ImageAddressMode::Repeat;
+    desc.address_mode_v = ImageAddressMode::Repeat;
+}
+
+/// انیمیت خودکار آبشارها و آب‌های عمیق درون مدل‌های `.glb` با حفظ کامل متریال و تکسچر اصلی مدل
+fn animate_glb_waterfall_materials_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut candidate_query: Query<
+        (Entity, &mut MeshMaterial3d<StandardMaterial>, Option<&Name>, Option<&GltfMaterialName>),
+        Without<GlbAnimatedWaterTag>,
+    >,
+    tagged_query: Query<(&MeshMaterial3d<StandardMaterial>, &GlbAnimatedWaterTag)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut logged_names: Local<HashSet<String>>,
+) {
+    for (ent, mut mat_comp, name_opt, gltf_mat_opt) in &mut candidate_query {
+        let debug_key = format!(
+            "node={:?} | mat={:?}",
+            name_opt.map(|n| n.as_str()),
+            gltf_mat_opt.map(|m| m.0.as_str())
+        );
+        if logged_names.insert(debug_key.clone()) {
+            println!("مش/متریال GLB: {}", debug_key);
+        }
+
+        let name_str = name_opt.map(|n| n.as_str().to_lowercase()).unwrap_or_default();
+        let mat_str = gltf_mat_opt.map(|m| m.0.to_lowercase()).unwrap_or_default();
+
+        let is_waterfall = name_str.contains("waterfall")
+            || name_str.contains("cascade")
+            || name_str.contains("abshar")
+            || mat_str.contains("waterfall")
+            || mat_str.contains("cascade")
+            || mat_str.contains("abshar");
+
+        let is_deep_water = !is_waterfall
+            && (name_str.contains("water")
+                || name_str.contains("river")
+                || name_str.contains("pond")
+                || name_str.contains("pool")
+                || name_str.contains("lake")
+                || mat_str.contains("water")
+                || mat_str.contains("river")
+                || mat_str.contains("pond")
+                || mat_str.contains("pool")
+                || mat_str.contains("lake"));
+
+        if is_waterfall || is_deep_water {
+            if let Some(cloned_mat) = materials.get(&mat_comp.0).cloned() {
+                mat_comp.0 = materials.add(cloned_mat);
+            }
+            if let Some(mat) = materials.get(&mat_comp.0) {
+                if let Some(ref tex_h) = mat.base_color_texture {
+                    if let Some(mut img) = images.get_mut(tex_h) {
+                        ensure_repeat_sampler(&mut img);
+                    }
+                }
+                if let Some(ref norm_h) = mat.normal_map_texture {
+                    if let Some(mut img) = images.get_mut(norm_h) {
+                        ensure_repeat_sampler(&mut img);
+                    }
+                }
+            }
+            commands
+                .entity(ent)
+                .insert(GlbAnimatedWaterTag { is_waterfall });
+        }
+    }
+
+    let t = time.elapsed_secs();
+    for (mat_comp, tag) in &tagged_query {
+        if let Some(mut mat) = materials.get_mut(&mat_comp.0) {
+            if tag.is_waterfall {
+                let offset_y = -(t * 1.25).fract();
+                mat.uv_transform = Affine2::from_translation(Vec2::new(0.0, offset_y));
+            } else {
+                let offset_x = (t * 0.14).fract();
+                let offset_y = (t * 0.10).fract();
+                mat.uv_transform = Affine2::from_translation(Vec2::new(offset_x, offset_y));
+            }
+        }
     }
 }

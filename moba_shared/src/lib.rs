@@ -44,6 +44,7 @@ impl GameConfig {
             )
         });
         cfg.validate_unique_map_ids();
+        cfg.validate_heroes();
         cfg
     }
 
@@ -58,6 +59,34 @@ impl GameConfig {
                     anim_name
                 )
             })
+    }
+
+    pub fn validate_heroes(&self) {
+        assert!(
+            !self.heroes.is_empty(),
+            "خطای بحرانی کانفیگ: لیست heroes خالی است! حداقل یک هیرو باید در config.ron تعریف شود."
+        );
+        for hero in &self.heroes {
+            assert!(!hero.id.trim().is_empty(), "شناسه هیرو نمی‌تواند خالی باشد");
+            assert!(!hero.model_path.trim().is_empty(), "model_path هیرو '{}' نمی‌تواند خالی باشد", hero.id);
+            assert!(hero.max_hp > 0.0, "max_hp هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.hero_scale > 0.0, "hero_scale هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.xp_gain_radius > 0.0, "xp_gain_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.weapon.magazine_size > 0, "magazine_size اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.weapon.fire_rate_secs > 0.0, "fire_rate_secs اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.weapon.projectile_speed > 0.0, "projectile_speed اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.weapon.max_range > 0.0, "max_range اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.weapon.pellets_per_shot > 0, "pellets_per_shot اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+        }
+    }
+
+    pub fn active_hero(&self, index: usize) -> &HeroDef {
+        self.heroes.get(index).unwrap_or_else(|| {
+            panic!(
+                "خطای بحرانی: هیرو با اندیس {} در config.ron تعریف نشده است!",
+                index
+            )
+        })
     }
 
     pub fn validate_unique_map_ids(&self) {
@@ -118,6 +147,54 @@ impl GameConfig {
 
 pub const CHANNEL_UNRELIABLE_STATE: u8 = 0;
 pub const CHANNEL_RELIABLE_FX: u8 = 1;
+pub const CHANNEL_RELIABLE_LOBBY: u8 = 2;
+
+/// خواندن اجباری آرگومان‌های خط فرمان سرور: `<port> <required_players>` (بدون مقدار پیش‌فرض)
+pub fn parse_server_cli_args() -> (u16, usize) {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        panic!(
+            "خطای بحرانی: پورت سرور و تعداد نفرات مجاز باید به کامند ارسال شوند! مثال:\n  cargo run -p moba_server -- 5000 2"
+        );
+    }
+    let port: u16 = args[1].parse().unwrap_or_else(|e| {
+        panic!("خطای بحرانی: پورت '{}' معتبر نیست: {}", args[1], e)
+    });
+    assert!(port > 0, "خطای بحرانی: شماره پورت باید بزرگ‌تر از صفر باشد");
+    let required_players: usize = args[2].parse().unwrap_or_else(|e| {
+        panic!("خطای بحرانی: تعداد نفرات '{}' معتبر نیست: {}", args[2], e)
+    });
+    assert!(
+        required_players >= 1,
+        "خطای بحرانی: تعداد نفرات مجاز باید حداقل ۱ نفر باشد"
+    );
+    (port, required_players)
+}
+
+/// خواندن اختیاری پورت و client_id برای کلاینت جهت اتصال چند بازیکن هم‌زمان: `<port> <client_id>`
+pub fn apply_client_cli_overrides(net: &mut NetworkConfig) {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 {
+        let port: u16 = args[1].parse().unwrap_or_else(|e| {
+            panic!("خطای بحرانی کلاینت: پورت '{}' معتبر نیست: {}", args[1], e)
+        });
+        let ip = net
+            .server_bind_addr
+            .split(':')
+            .next()
+            .expect("آدرس سرور نامعتبر است");
+        net.server_bind_addr = format!("{}:{}", ip, port);
+    }
+    if args.len() >= 3 {
+        let cid: u64 = args[2].parse().unwrap_or_else(|e| {
+            panic!(
+                "خطای بحرانی کلاینت: شناسه کلاینت '{}' معتبر نیست: {}",
+                args[2], e
+            )
+        });
+        net.client_id = cid;
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NetworkConfig {
@@ -144,6 +221,13 @@ pub fn build_shared_renet_connection_config(net: &NetworkConfig) -> ConnectionCo
         },
         ChannelConfig {
             channel_id: CHANNEL_RELIABLE_FX,
+            max_memory_usage_bytes: net.channel_max_memory_bytes,
+            send_type: SendType::ReliableOrdered {
+                resend_time: Duration::from_millis(net.reliable_resend_time_ms),
+            },
+        },
+        ChannelConfig {
+            channel_id: CHANNEL_RELIABLE_LOBBY,
             max_memory_usage_bytes: net.channel_max_memory_bytes,
             send_type: SendType::ReliableOrdered {
                 resend_time: Duration::from_millis(net.reliable_resend_time_ms),
@@ -337,17 +421,44 @@ pub struct PhysicsConfig {
     pub water_splash_interval_secs: f32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WeaponKind {
+    AutomaticRifle,
+    Sniper,
+    Shotgun,
+    Throwable,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroWeaponDef {
+    pub weapon_kind: WeaponKind,
+    pub magazine_size: u32,
+    pub fire_rate_secs: f32,
+    pub damage: f32,
+    pub projectile_speed: f32,
+    pub max_range: f32,
+    pub pellets_per_shot: u32,
+    pub spread_rad: f32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HeroDef {
     pub id: String,
     pub display_name: String,
+    pub model_path: String,
     pub team: TeamId,
-    pub vision_range: f32,
-    pub high_ground_vision_bonus: f32,
+    pub starting_gold: u32,
+    pub xp_gain_radius: f32,
+    pub max_hp: f32,
+    pub hp_regen_per_sec: f32,
+    pub armor: f32,
+    pub hero_scale: f32,
     pub move_speed_multiplier: f32,
     pub shallow_water_speed_multiplier: f32,
     pub deep_water_speed_multiplier: f32,
-    pub max_hp: f32,
+    pub vision_range: f32,
+    pub high_ground_vision_bonus: f32,
+    pub weapon: HeroWeaponDef,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -827,6 +938,388 @@ pub struct TargetSnapshot {
     pub is_visible: bool,
 }
 
+
+pub const HERO_PICK_TIME_SECS: f32 = 30.0;
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MatchPhase {
+    WaitingForPlayers,
+    HeroSelect,
+    BattleLoading,
+    InGame,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LobbyPlayerInfo {
+    pub slot_index: usize,
+    pub client_id: Option<u64>,
+    pub team: TeamId,
+    pub connected: bool,
+    pub selected_hero_id: Option<String>,
+    pub map_loaded: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MatchStateSnapshot {
+    pub phase: MatchPhase,
+    pub required_players: usize,
+    pub connected_count: usize,
+    pub players: Vec<LobbyPlayerInfo>,
+    pub draft_order: Vec<usize>,
+    pub current_draft_step: usize,
+    pub current_pick_slot: Option<usize>,
+    pub pick_time_remaining: f32,
+    pub taken_hero_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ClientLobbyMessage {
+    SelectHero { hero_id: String },
+    ReportMapLoaded,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ServerMatchMessage {
+    pub your_slot: usize,
+    pub state: MatchStateSnapshot,
+}
+
+#[derive(Resource, Clone, Debug)]
+pub struct AuthoritativeMatchState {
+    pub phase: MatchPhase,
+    pub required_players: usize,
+    pub players: Vec<LobbyPlayerInfo>,
+    pub draft_order: Vec<usize>,
+    pub current_draft_step: usize,
+    pub pick_time_remaining: f32,
+    pub battle_loading_timer: f32,
+    pub rng_state: u64,
+    pub dirty: bool,
+}
+
+impl AuthoritativeMatchState {
+    pub fn new(required_players: usize) -> Self {
+        assert!(required_players >= 1, "تعداد نفرات مجاز باید حداقل ۱ نفر باشد");
+        let players = (0..required_players)
+            .map(|slot_index| LobbyPlayerInfo {
+                slot_index,
+                client_id: None,
+                team: if slot_index % 2 == 0 {
+                    TeamId::Dawn
+                } else {
+                    TeamId::Dusk
+                },
+                connected: false,
+                selected_hero_id: None,
+                map_loaded: false,
+            })
+            .collect();
+
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x5EED_CAFE_1234)
+            | 1;
+
+        Self {
+            phase: MatchPhase::WaitingForPlayers,
+            required_players,
+            players,
+            draft_order: Vec::new(),
+            current_draft_step: 0,
+            pick_time_remaining: HERO_PICK_TIME_SECS,
+            battle_loading_timer: 0.0,
+            rng_state: seed,
+            dirty: true,
+        }
+    }
+
+    fn next_rand(&mut self) -> usize {
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.rng_state >> 32) as usize
+    }
+
+    fn shuffle_vec(&mut self, items: &mut Vec<usize>) {
+        if items.len() <= 1 {
+            return;
+        }
+        for i in (1..items.len()).rev() {
+            let j = self.next_rand() % (i + 1);
+            items.swap(i, j);
+        }
+    }
+
+    pub fn connected_count(&self) -> usize {
+        self.players.iter().filter(|p| p.connected).count()
+    }
+
+    pub fn slot_for_client(&self, client_id: u64) -> Option<usize> {
+        self.players
+            .iter()
+            .find(|p| p.connected && p.client_id == Some(client_id))
+            .map(|p| p.slot_index)
+    }
+
+    pub fn on_client_connected(&mut self, client_id: u64, config: &GameConfig) -> bool {
+        if self.slot_for_client(client_id).is_some() {
+            return false;
+        }
+        let Some(slot) = self.players.iter_mut().find(|p| !p.connected) else {
+            return false;
+        };
+        slot.connected = true;
+        slot.client_id = Some(client_id);
+        self.dirty = true;
+
+        if self.phase == MatchPhase::WaitingForPlayers
+            && self.connected_count() == self.required_players
+        {
+            self.start_hero_select(config);
+        }
+        true
+    }
+
+    pub fn on_client_disconnected(&mut self, client_id: u64) {
+        if let Some(slot) = self
+            .players
+            .iter_mut()
+            .find(|p| p.connected && p.client_id == Some(client_id))
+        {
+            slot.connected = false;
+            slot.client_id = None;
+            slot.map_loaded = false;
+            if self.phase == MatchPhase::WaitingForPlayers {
+                slot.selected_hero_id = None;
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn start_hero_select(&mut self, config: &GameConfig) {
+        assert!(
+            config.heroes.len() >= self.required_players,
+            "خطای بحرانی: تعداد هیروهای تعریف‌شده ({}) کمتر از تعداد بازیکنان ({}) است و انتخاب تکراری مجاز نیست!",
+            config.heroes.len(),
+            self.required_players
+        );
+
+        let mut dawn_slots: Vec<usize> = self
+            .players
+            .iter()
+            .filter(|p| p.team == TeamId::Dawn)
+            .map(|p| p.slot_index)
+            .collect();
+        let mut dusk_slots: Vec<usize> = self
+            .players
+            .iter()
+            .filter(|p| p.team == TeamId::Dusk)
+            .map(|p| p.slot_index)
+            .collect();
+
+        self.shuffle_vec(&mut dawn_slots);
+        self.shuffle_vec(&mut dusk_slots);
+
+        let mut order = Vec::with_capacity(self.required_players);
+        let max_len = dawn_slots.len().max(dusk_slots.len());
+        for i in 0..max_len {
+            if let Some(&s) = dawn_slots.get(i) {
+                order.push(s);
+            }
+            if let Some(&s) = dusk_slots.get(i) {
+                order.push(s);
+            }
+        }
+
+        self.draft_order = order;
+        self.current_draft_step = 0;
+        self.pick_time_remaining = HERO_PICK_TIME_SECS;
+        self.phase = MatchPhase::HeroSelect;
+        self.dirty = true;
+    }
+
+    pub fn current_pick_slot(&self) -> Option<usize> {
+        if self.phase != MatchPhase::HeroSelect {
+            return None;
+        }
+        self.draft_order.get(self.current_draft_step).copied()
+    }
+
+    pub fn taken_hero_ids(&self) -> Vec<String> {
+        self.players
+            .iter()
+            .filter_map(|p| p.selected_hero_id.clone())
+            .collect()
+    }
+
+    pub fn try_select_hero(&mut self, client_id: u64, hero_id: &str, config: &GameConfig) -> bool {
+        if self.phase != MatchPhase::HeroSelect {
+            return false;
+        }
+        let Some(turn_slot) = self.current_pick_slot() else {
+            return false;
+        };
+        if self.slot_for_client(client_id) != Some(turn_slot) {
+            return false;
+        }
+        if !config.heroes.iter().any(|h| h.id == hero_id) {
+            return false;
+        }
+        if self
+            .players
+            .iter()
+            .any(|p| p.selected_hero_id.as_deref() == Some(hero_id))
+        {
+            return false;
+        }
+
+        self.players[turn_slot].selected_hero_id = Some(hero_id.to_string());
+        self.advance_draft_turn();
+        true
+    }
+
+    fn advance_draft_turn(&mut self) {
+        self.current_draft_step += 1;
+        if self.current_draft_step >= self.draft_order.len() {
+            self.phase = MatchPhase::BattleLoading;
+            self.battle_loading_timer = 0.0;
+        } else {
+            self.pick_time_remaining = HERO_PICK_TIME_SECS;
+        }
+        self.dirty = true;
+    }
+
+    pub fn on_map_loaded(&mut self, client_id: u64) -> bool {
+        if self.phase != MatchPhase::BattleLoading {
+            return false;
+        }
+        let Some(slot) = self.slot_for_client(client_id) else {
+            return false;
+        };
+        if !self.players[slot].map_loaded {
+            self.players[slot].map_loaded = true;
+            self.dirty = true;
+        }
+        true
+    }
+
+    pub fn tick(&mut self, dt: f32, config: &GameConfig) -> Option<usize> {
+        match self.phase {
+            MatchPhase::HeroSelect => {
+                self.pick_time_remaining -= dt;
+                if self.pick_time_remaining <= 0.0 {
+                    if let Some(turn_slot) = self.current_pick_slot() {
+                        let taken = self.taken_hero_ids();
+                        let available: Vec<String> = config
+                            .heroes
+                            .iter()
+                            .filter(|h| !taken.contains(&h.id))
+                            .map(|h| h.id.clone())
+                            .collect();
+                        if !available.is_empty() {
+                            let idx = self.next_rand() % available.len();
+                            self.players[turn_slot].selected_hero_id = Some(available[idx].clone());
+                        }
+                        self.advance_draft_turn();
+                    }
+                }
+            }
+            MatchPhase::BattleLoading => {
+                self.battle_loading_timer += dt;
+                let all_loaded = self
+                    .players
+                    .iter()
+                    .all(|p| !p.connected || p.map_loaded);
+                if all_loaded && self.connected_count() > 0 && self.battle_loading_timer >= 2.5 {
+                    self.phase = MatchPhase::InGame;
+                    self.dirty = true;
+                    let first_hero_id = self
+                        .players
+                        .iter()
+                        .find_map(|p| p.selected_hero_id.as_deref())
+                        .expect("هیروی انتخاب‌شده در پایان درفت یافت نشد");
+                    let hero_idx = config
+                        .heroes
+                        .iter()
+                        .position(|h| h.id == first_hero_id)
+                        .expect("هیروی انتخاب‌شده در config.ron یافت نشد");
+                    return Some(hero_idx);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    pub fn snapshot(&self) -> MatchStateSnapshot {
+        MatchStateSnapshot {
+            phase: self.phase,
+            required_players: self.required_players,
+            connected_count: self.connected_count(),
+            players: self.players.clone(),
+            draft_order: self.draft_order.clone(),
+            current_draft_step: self.current_draft_step,
+            current_pick_slot: self.current_pick_slot(),
+            pick_time_remaining: self.pick_time_remaining.max(0.0),
+            taken_hero_ids: self.taken_hero_ids(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroSnapshot {
+    pub hero_id: String,
+    pub display_name: String,
+    pub team: TeamId,
+    pub gold: u32,
+    pub xp: u32,
+    pub xp_gain_radius: f32,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub hp_regen_per_sec: f32,
+    pub armor: f32,
+    pub hero_scale: f32,
+    pub move_speed: f32,
+    pub vision_range: f32,
+    pub weapon_kind: WeaponKind,
+    pub ammo_in_mag: u32,
+    pub magazine_size: u32,
+    pub fire_rate_secs: f32,
+    pub weapon_damage: f32,
+    pub projectile_speed: f32,
+    pub weapon_max_range: f32,
+    pub last_hits: u32,
+    pub denies: u32,
+    pub assists: u32,
+    pub kills: u32,
+    pub deaths: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RemotePlayerSnapshot {
+    pub slot_index: usize,
+    pub team: TeamId,
+    pub hero_id: String,
+    pub display_name: String,
+    pub model_path: String,
+    pub hero_scale: f32,
+    pub weapon_kind: WeaponKind,
+    pub pos: Vec3,
+    pub facing_dir: Vec3,
+    pub current_locomotion: String,
+    pub traversal_anim: Option<String>,
+    pub upper_anim: Option<String>,
+    pub death_anim: String,
+    pub is_dead: bool,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub ammo_in_mag: u32,
+    pub magazine_size: u32,
+    pub is_visible: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerWorldSnapshot {
     pub tick: u64,
@@ -842,6 +1335,8 @@ pub struct ServerWorldSnapshot {
     pub is_dead: bool,
     pub death_anim_name: String,
     pub in_water: bool,
+    pub hero: HeroSnapshot,
+    pub other_players: Vec<RemotePlayerSnapshot>,
     pub fog_visible_mask: Vec<u8>,
     pub bullets: Vec<BulletSnapshot>,
     pub grenades: Vec<GrenadeSnapshot>,
@@ -895,6 +1390,37 @@ pub fn fx_collision_groups() -> CollisionGroups {
 }
 
 /// محاسبه عمق اضافی کف برکه در نزدیکی آبشارها (هرچه به آبشار نزدیک‌تر شویم کف آب عمیق‌تر می‌شود)
+/// فرمول استاندارد کاهش دمیج بر اساس Armor در بازی‌های MOBA (مشابه Dota 2)
+#[inline]
+pub fn dota2_armor_multiplier(armor: f32) -> f32 {
+    1.0 - (0.06 * armor) / (1.0 + 0.06 * armor.abs())
+}
+
+/// بررسی برخورد پاره‌خط حرکت تیر با کپسول عمودی هیرو
+fn segment_hits_hero_capsule(
+    seg_start: Vec3,
+    seg_dir: Vec3,
+    seg_len: f32,
+    hero_feet_pos: Vec3,
+    hero_radius: f32,
+    hero_height: f32,
+) -> Option<f32> {
+    let steps = 5_usize;
+    for i in 0..=steps {
+        let t = (i as f32 / steps as f32) * seg_len;
+        let pt = seg_start + seg_dir * t;
+        if pt.y < hero_feet_pos.y - 0.1 || pt.y > hero_feet_pos.y + hero_height {
+            continue;
+        }
+        let dx = pt.x - hero_feet_pos.x;
+        let dz = pt.z - hero_feet_pos.z;
+        if dx * dx + dz * dz <= hero_radius * hero_radius {
+            return Some(t);
+        }
+    }
+    None
+}
+
 pub fn sample_waterfall_depth_offset(config: &GameConfig, wx: f32, wz: f32) -> f32 {
     let mut max_extra_depth = 0.0_f32;
     let basin_radius = 16.0_f32;
@@ -1998,19 +2524,26 @@ pub struct PhysicsFountain {
 }
 
 #[derive(Component)]
-pub struct PhysicsSoldier;
+pub struct PhysicsSoldier {
+    pub slot_index: usize,
+}
 
 #[derive(Component)]
 pub struct PhysicsGrenade {
     pub id: u64,
+    pub owner_slot: usize,
+    pub owner_team: TeamId,
     pub remaining_fuse: f32,
 }
 
 #[derive(Component)]
 pub struct PhysicsBullet {
     pub id: u64,
+    pub owner_slot: usize,
+    pub owner_team: TeamId,
     pub velocity: Vec3,
-    pub remaining_lifetime: f32,
+    pub damage: f32,
+    pub remaining_range: f32,
 }
 
 #[derive(Component)]
@@ -2411,6 +2944,58 @@ pub fn target_physics_bundle(
     )
 }
 
+pub fn team_spawn_pos(config: &GameConfig, team: TeamId, team_slot_offset: usize) -> Vec3 {
+    let z_off = (team_slot_offset as f32) * 2.6;
+    match team {
+        TeamId::Dawn => Vec3::new(
+            config.soldier.spawn_pos.0,
+            config.soldier.spawn_pos.1,
+            config.soldier.spawn_pos.2 + z_off,
+        ),
+        TeamId::Dusk => Vec3::new(
+            -config.soldier.spawn_pos.0,
+            config.soldier.spawn_pos.1,
+            config.soldier.spawn_pos.2 + z_off,
+        ),
+        TeamId::Neutral => Vec3::new(
+            config.soldier.spawn_pos.0,
+            config.soldier.spawn_pos.1,
+            config.soldier.spawn_pos.2 + z_off,
+        ),
+    }
+}
+
+pub fn soldier_physics_bundle_for_slot(
+    config: &GameConfig,
+    slot_index: usize,
+    spawn_base: Vec3,
+    hero_scale: f32,
+) -> (
+    PhysicsSoldier,
+    CustomRigidBody,
+    CustomCollider,
+    CollisionGroups,
+    CustomCharacterController,
+    Transform,
+) {
+    let spawn_pos = Vec3::new(
+        spawn_base.x,
+        spawn_base.y + config.physics.soldier_capsule_center_y * hero_scale,
+        spawn_base.z,
+    );
+    (
+        PhysicsSoldier { slot_index },
+        CustomRigidBody::KinematicPositionBased,
+        CustomCollider::capsule_y(
+            config.physics.soldier_capsule_half_segment * hero_scale,
+            config.soldier.player_radius * hero_scale,
+        ),
+        soldier_collision_groups(),
+        CustomCharacterController::default(),
+        Transform::from_translation(spawn_pos),
+    )
+}
+
 pub fn soldier_physics_bundle(
     config: &GameConfig,
 ) -> (
@@ -2421,17 +3006,18 @@ pub fn soldier_physics_bundle(
     CustomCharacterController,
     Transform,
 ) {
+    let hero = config.active_hero(0);
     let spawn_pos = Vec3::new(
         config.soldier.spawn_pos.0,
-        config.soldier.spawn_pos.1 + config.physics.soldier_capsule_center_y,
+        config.soldier.spawn_pos.1 + config.physics.soldier_capsule_center_y * hero.hero_scale,
         config.soldier.spawn_pos.2,
     );
     (
-        PhysicsSoldier,
+        PhysicsSoldier { slot_index: 0 },
         CustomRigidBody::KinematicPositionBased,
         CustomCollider::capsule_y(
-            config.physics.soldier_capsule_half_segment,
-            config.soldier.player_radius,
+            config.physics.soldier_capsule_half_segment * hero.hero_scale,
+            config.soldier.player_radius * hero.hero_scale,
         ),
         soldier_collision_groups(),
         CustomCharacterController {
@@ -2461,6 +3047,8 @@ pub fn grenade_physics_bundle(
     (
         PhysicsGrenade {
             id,
+            owner_slot: 0,
+            owner_team: TeamId::Dawn,
             remaining_fuse: config.combat.grenade_fuse_secs,
         },
         CustomRigidBody::Dynamic,
@@ -2881,6 +3469,7 @@ pub struct SharedTarget {
     pub respawn_duration: f32,
 }
 
+#[derive(Clone, Debug)]
 pub struct SharedTraversalState {
     pub is_active: bool,
     pub kind: TraversalKind,
@@ -2911,11 +3500,70 @@ impl ClientPhysicsPredictionState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PlayerSlotState {
+    pub slot_index: usize,
+    pub client_id: Option<u64>,
+    pub active_input: Option<ClientInputCommand>,
+    pub soldier_pos: Vec3,
+    pub soldier_facing_dir: Vec3,
+    pub spawn_pos: Vec3,
+    pub base_stance: Stance,
+    pub effective_stance: Stance,
+    pub current_locomotion: String,
+    pub aim_world_dir: Vec3,
+    pub aim_hit_pos: Vec3,
+    pub laser_hit_pos: Vec3,
+    pub is_moving: bool,
+    pub move_input: Vec3,
+    pub fire_cooldown_remaining: f32,
+    pub firing_anim_remaining: Option<f32>,
+    pub reload_remaining: Option<f32>,
+    pub grenade_elapsed_and_duration: Option<(f32, f32)>,
+    pub grenade_spawned_for_throw: bool,
+    pub is_dead: bool,
+    pub death_anim_name: String,
+    pub respawn_remaining: f32,
+    pub hero_model_path: String,
+    pub hero_index: usize,
+    pub hero_id: String,
+    pub hero_display_name: String,
+    pub hero_team: TeamId,
+    pub hero_gold: u32,
+    pub hero_xp: u32,
+    pub hero_xp_gain_radius: f32,
+    pub hero_hp: f32,
+    pub hero_max_hp: f32,
+    pub hero_hp_regen_per_sec: f32,
+    pub hero_armor: f32,
+    pub hero_scale: f32,
+    pub hero_move_speed_multiplier: f32,
+    pub hero_shallow_water_speed_multiplier: f32,
+    pub hero_deep_water_speed_multiplier: f32,
+    pub hero_vision_range: f32,
+    pub hero_weapon: HeroWeaponDef,
+    pub ammo_in_mag: u32,
+    pub current_move_speed: f32,
+    pub last_hits: u32,
+    pub denies: u32,
+    pub assists: u32,
+    pub kills: u32,
+    pub deaths: u32,
+    pub fog_of_war: SharedFogOfWar,
+    pub in_water: bool,
+    pub water_splash_cooldown: f32,
+    pub traversal: SharedTraversalState,
+}
+
 #[derive(Resource)]
 pub struct AuthoritativeWorldState {
     pub tick: u64,
     pub rng_seed: u32,
     pub next_entity_id: u64,
+    pub active_slot: usize,
+    pub active_spawn_pos: Vec3,
+    pub hero_model_path: String,
+    pub players: Vec<PlayerSlotState>,
     pub active_input: Option<ClientInputCommand>,
     pub soldier_pos: Vec3,
     pub soldier_facing_dir: Vec3,
@@ -2936,6 +3584,29 @@ pub struct AuthoritativeWorldState {
     pub death_anim_name: String,
     pub respawn_remaining: f32,
     pub hero_index: usize,
+    pub hero_id: String,
+    pub hero_display_name: String,
+    pub hero_team: TeamId,
+    pub hero_gold: u32,
+    pub hero_xp: u32,
+    pub hero_xp_gain_radius: f32,
+    pub hero_hp: f32,
+    pub hero_max_hp: f32,
+    pub hero_hp_regen_per_sec: f32,
+    pub hero_armor: f32,
+    pub hero_scale: f32,
+    pub hero_move_speed_multiplier: f32,
+    pub hero_shallow_water_speed_multiplier: f32,
+    pub hero_deep_water_speed_multiplier: f32,
+    pub hero_vision_range: f32,
+    pub hero_weapon: HeroWeaponDef,
+    pub ammo_in_mag: u32,
+    pub current_move_speed: f32,
+    pub last_hits: u32,
+    pub denies: u32,
+    pub assists: u32,
+    pub kills: u32,
+    pub deaths: u32,
     pub fog_of_war: SharedFogOfWar,
     pub in_water: bool,
     pub water_splash_cooldown: f32,
@@ -2974,12 +3645,8 @@ impl AuthoritativeWorldState {
             config.soldier.initial_aim_dir.2,
         )
         .normalize();
-        let hero_team = config
-            .heroes
-            .first()
-            .map(|h| h.team)
-            .unwrap_or(TeamId::Dawn);
-        let fog_of_war = SharedFogOfWar::from_config(config, hero_team);
+        let hero = config.active_hero(0).clone();
+        let fog_of_war = SharedFogOfWar::from_config(config, hero.team);
         let initial_aim_hit = Vec3::new(
             config.soldier.initial_aim_hit_pos.0,
             config.soldier.initial_aim_hit_pos.1,
@@ -3009,7 +3676,34 @@ impl AuthoritativeWorldState {
             is_dead: false,
             death_anim_name: String::new(),
             respawn_remaining: 0.0,
+            active_slot: 0,
+            active_spawn_pos: Vec3::new(config.soldier.spawn_pos.0, config.soldier.spawn_pos.1, config.soldier.spawn_pos.2),
+            hero_model_path: hero.model_path.clone(),
+            players: Vec::new(),
             hero_index: 0,
+            hero_id: hero.id,
+            hero_display_name: hero.display_name,
+            hero_team: hero.team,
+            hero_gold: hero.starting_gold,
+            hero_xp: 0,
+            hero_xp_gain_radius: hero.xp_gain_radius,
+            hero_hp: hero.max_hp,
+            hero_max_hp: hero.max_hp,
+            hero_hp_regen_per_sec: hero.hp_regen_per_sec,
+            hero_armor: hero.armor,
+            hero_scale: hero.hero_scale,
+            hero_move_speed_multiplier: hero.move_speed_multiplier,
+            hero_shallow_water_speed_multiplier: hero.shallow_water_speed_multiplier,
+            hero_deep_water_speed_multiplier: hero.deep_water_speed_multiplier,
+            hero_vision_range: hero.vision_range,
+            ammo_in_mag: hero.weapon.magazine_size,
+            hero_weapon: hero.weapon,
+            current_move_speed: config.soldier.run_speed * hero.move_speed_multiplier,
+            last_hits: 0,
+            denies: 0,
+            assists: 0,
+            kills: 0,
+            deaths: 0,
             fog_of_war,
             in_water: false,
             water_splash_cooldown: 0.0,
@@ -3051,6 +3745,269 @@ impl AuthoritativeWorldState {
         }
     }
 
+    pub fn swap_slot_in(&mut self, idx: usize) {
+        let p = &mut self.players[idx];
+        std::mem::swap(&mut self.active_input, &mut p.active_input);
+        std::mem::swap(&mut self.soldier_pos, &mut p.soldier_pos);
+        std::mem::swap(&mut self.soldier_facing_dir, &mut p.soldier_facing_dir);
+        std::mem::swap(&mut self.active_spawn_pos, &mut p.spawn_pos);
+        std::mem::swap(&mut self.base_stance, &mut p.base_stance);
+        std::mem::swap(&mut self.effective_stance, &mut p.effective_stance);
+        std::mem::swap(&mut self.current_locomotion, &mut p.current_locomotion);
+        std::mem::swap(&mut self.aim_world_dir, &mut p.aim_world_dir);
+        std::mem::swap(&mut self.aim_hit_pos, &mut p.aim_hit_pos);
+        std::mem::swap(&mut self.laser_hit_pos, &mut p.laser_hit_pos);
+        std::mem::swap(&mut self.is_moving, &mut p.is_moving);
+        std::mem::swap(&mut self.move_input, &mut p.move_input);
+        std::mem::swap(&mut self.fire_cooldown_remaining, &mut p.fire_cooldown_remaining);
+        std::mem::swap(&mut self.firing_anim_remaining, &mut p.firing_anim_remaining);
+        std::mem::swap(&mut self.reload_remaining, &mut p.reload_remaining);
+        std::mem::swap(&mut self.grenade_elapsed_and_duration, &mut p.grenade_elapsed_and_duration);
+        std::mem::swap(&mut self.grenade_spawned_for_throw, &mut p.grenade_spawned_for_throw);
+        std::mem::swap(&mut self.is_dead, &mut p.is_dead);
+        std::mem::swap(&mut self.death_anim_name, &mut p.death_anim_name);
+        std::mem::swap(&mut self.respawn_remaining, &mut p.respawn_remaining);
+        std::mem::swap(&mut self.hero_index, &mut p.hero_index);
+        std::mem::swap(&mut self.hero_id, &mut p.hero_id);
+        std::mem::swap(&mut self.hero_display_name, &mut p.hero_display_name);
+        std::mem::swap(&mut self.hero_model_path, &mut p.hero_model_path);
+        std::mem::swap(&mut self.hero_team, &mut p.hero_team);
+        std::mem::swap(&mut self.hero_gold, &mut p.hero_gold);
+        std::mem::swap(&mut self.hero_xp, &mut p.hero_xp);
+        std::mem::swap(&mut self.hero_xp_gain_radius, &mut p.hero_xp_gain_radius);
+        std::mem::swap(&mut self.hero_hp, &mut p.hero_hp);
+        std::mem::swap(&mut self.hero_max_hp, &mut p.hero_max_hp);
+        std::mem::swap(&mut self.hero_hp_regen_per_sec, &mut p.hero_hp_regen_per_sec);
+        std::mem::swap(&mut self.hero_armor, &mut p.hero_armor);
+        std::mem::swap(&mut self.hero_scale, &mut p.hero_scale);
+        std::mem::swap(&mut self.hero_move_speed_multiplier, &mut p.hero_move_speed_multiplier);
+        std::mem::swap(&mut self.hero_shallow_water_speed_multiplier, &mut p.hero_shallow_water_speed_multiplier);
+        std::mem::swap(&mut self.hero_deep_water_speed_multiplier, &mut p.hero_deep_water_speed_multiplier);
+        std::mem::swap(&mut self.hero_vision_range, &mut p.hero_vision_range);
+        std::mem::swap(&mut self.hero_weapon, &mut p.hero_weapon);
+        std::mem::swap(&mut self.ammo_in_mag, &mut p.ammo_in_mag);
+        std::mem::swap(&mut self.current_move_speed, &mut p.current_move_speed);
+        std::mem::swap(&mut self.last_hits, &mut p.last_hits);
+        std::mem::swap(&mut self.denies, &mut p.denies);
+        std::mem::swap(&mut self.assists, &mut p.assists);
+        std::mem::swap(&mut self.kills, &mut p.kills);
+        std::mem::swap(&mut self.deaths, &mut p.deaths);
+        std::mem::swap(&mut self.fog_of_war, &mut p.fog_of_war);
+        std::mem::swap(&mut self.in_water, &mut p.in_water);
+        std::mem::swap(&mut self.water_splash_cooldown, &mut p.water_splash_cooldown);
+        std::mem::swap(&mut self.traversal, &mut p.traversal);
+        self.active_slot = idx;
+    }
+
+    pub fn set_slot_input(&mut self, slot_index: usize, cmd: ClientInputCommand) {
+        if let Some(p) = self.players.get_mut(slot_index) {
+            if let Some(ref mut prev) = p.active_input {
+                prev.accumulate_from(cmd);
+            } else {
+                p.active_input = Some(cmd);
+            }
+        } else {
+            self.active_input = Some(cmd);
+        }
+    }
+
+    pub fn init_multiplayer_players(
+        &mut self,
+        config: &GameConfig,
+        match_state: &AuthoritativeMatchState,
+        commands: &mut Commands,
+        existing_soldiers: &[Entity],
+    ) {
+        for &ent in existing_soldiers {
+            commands.entity(ent).despawn();
+        }
+        self.players.clear();
+
+        let mut dawn_count = 0_usize;
+        let mut dusk_count = 0_usize;
+
+        for lp in &match_state.players {
+            let hero_id = lp
+                .selected_hero_id
+                .as_deref()
+                .expect("خطای بحرانی: بازیکن بدون هیروی انتخاب‌شده وارد فاز بازی شد");
+            let hero_index = config
+                .heroes
+                .iter()
+                .position(|h| h.id == hero_id)
+                .expect("خطای بحرانی: هیروی انتخاب‌شده در config.ron یافت نشد");
+            let hero = config.active_hero(hero_index).clone();
+
+            let team_offset = match lp.team {
+                TeamId::Dawn => {
+                    let c = dawn_count;
+                    dawn_count += 1;
+                    c
+                }
+                TeamId::Dusk => {
+                    let c = dusk_count;
+                    dusk_count += 1;
+                    c
+                }
+                TeamId::Neutral => 0,
+            };
+
+            let spawn_pos = team_spawn_pos(config, lp.team, team_offset);
+            let facing_dir = match lp.team {
+                TeamId::Dusk => Vec3::new(-1.0, 0.0, 0.0),
+                _ => Vec3::new(1.0, 0.0, 0.0),
+            };
+            let aim_hit = spawn_pos + facing_dir * 12.0;
+
+            commands.spawn(soldier_physics_bundle_for_slot(
+                config,
+                lp.slot_index,
+                spawn_pos,
+                hero.hero_scale,
+            ));
+
+            self.players.push(PlayerSlotState {
+                slot_index: lp.slot_index,
+                client_id: lp.client_id,
+                active_input: None,
+                soldier_pos: spawn_pos,
+                soldier_facing_dir: facing_dir,
+                spawn_pos,
+                base_stance: Stance::Run,
+                effective_stance: Stance::Run,
+                current_locomotion: "idle".to_string(),
+                aim_world_dir: facing_dir,
+                aim_hit_pos: aim_hit,
+                laser_hit_pos: aim_hit,
+                is_moving: false,
+                move_input: Vec3::ZERO,
+                fire_cooldown_remaining: 0.0,
+                firing_anim_remaining: None,
+                reload_remaining: None,
+                grenade_elapsed_and_duration: None,
+                grenade_spawned_for_throw: false,
+                is_dead: false,
+                death_anim_name: "die_1".to_string(),
+                respawn_remaining: 0.0,
+                hero_index,
+                hero_id: hero.id,
+                hero_display_name: hero.display_name,
+                hero_model_path: hero.model_path,
+                hero_team: lp.team,
+                hero_gold: hero.starting_gold,
+                hero_xp: 0,
+                hero_xp_gain_radius: hero.xp_gain_radius,
+                hero_hp: hero.max_hp,
+                hero_max_hp: hero.max_hp,
+                hero_hp_regen_per_sec: hero.hp_regen_per_sec,
+                hero_armor: hero.armor,
+                hero_scale: hero.hero_scale,
+                hero_move_speed_multiplier: hero.move_speed_multiplier,
+                hero_shallow_water_speed_multiplier: hero.shallow_water_speed_multiplier,
+                hero_deep_water_speed_multiplier: hero.deep_water_speed_multiplier,
+                hero_vision_range: hero.vision_range,
+                ammo_in_mag: hero.weapon.magazine_size,
+                hero_weapon: hero.weapon,
+                current_move_speed: config.soldier.run_speed * hero.move_speed_multiplier,
+                last_hits: 0,
+                denies: 0,
+                assists: 0,
+                kills: 0,
+                deaths: 0,
+                fog_of_war: SharedFogOfWar::from_config(config, lp.team),
+                in_water: false,
+                water_splash_cooldown: 0.0,
+                traversal: SharedTraversalState {
+                    is_active: false,
+                    kind: TraversalKind::RunningJump,
+                    anim_name: String::new(),
+                    elapsed: 0.0,
+                    duration: 0.0,
+                    start_pos: spawn_pos,
+                    target_pos: spawn_pos,
+                    travel_dir: facing_dir,
+                },
+            });
+        }
+    }
+
+    pub fn build_snapshot_for_slot(&mut self, config: &GameConfig, slot_index: usize) -> ServerWorldSnapshot {
+        if self.players.is_empty() {
+            return self.build_snapshot();
+        }
+        self.swap_slot_in(slot_index);
+        let mut snap = self.build_snapshot();
+        let mut others = Vec::with_capacity(self.players.len().saturating_sub(1));
+        for p in &self.players {
+            if p.slot_index == slot_index {
+                continue;
+            }
+            let is_vis = p.hero_team == self.hero_team
+                || self.fog_of_war.is_world_point_visible(config, p.soldier_pos.x, p.soldier_pos.z);
+            let trav_anim = if p.traversal.is_active {
+                Some(p.traversal.anim_name.clone())
+            } else {
+                None
+            };
+            let upper_anim = if p.grenade_elapsed_and_duration.is_some() {
+                Some("toss_grenade".to_string())
+            } else if p.reload_remaining.is_some() {
+                Some("reloading".to_string())
+            } else if p.firing_anim_remaining.is_some() {
+                Some("firing_rifle".to_string())
+            } else {
+                None
+            };
+            others.push(RemotePlayerSnapshot {
+                slot_index: p.slot_index,
+                team: p.hero_team,
+                hero_id: p.hero_id.clone(),
+                display_name: p.hero_display_name.clone(),
+                model_path: p.hero_model_path.clone(),
+                hero_scale: p.hero_scale,
+                weapon_kind: p.hero_weapon.weapon_kind,
+                pos: p.soldier_pos,
+                facing_dir: p.soldier_facing_dir,
+                current_locomotion: p.current_locomotion.clone(),
+                traversal_anim: trav_anim,
+                upper_anim,
+                death_anim: p.death_anim_name.clone(),
+                is_dead: p.is_dead,
+                hp: if is_vis { p.hero_hp } else { p.hero_max_hp },
+                max_hp: p.hero_max_hp,
+                ammo_in_mag: p.ammo_in_mag,
+                magazine_size: p.hero_weapon.magazine_size,
+                is_visible: is_vis,
+            });
+        }
+        snap.other_players = others;
+        self.swap_slot_in(slot_index);
+        snap
+    }
+
+    pub fn apply_selected_hero(&mut self, config: &GameConfig, hero_index: usize) {
+        let hero = config.active_hero(hero_index).clone();
+        self.hero_index = hero_index;
+        self.hero_id = hero.id;
+        self.hero_display_name = hero.display_name;
+        self.hero_team = hero.team;
+        self.hero_gold = hero.starting_gold;
+        self.hero_xp_gain_radius = hero.xp_gain_radius;
+        self.hero_hp = hero.max_hp;
+        self.hero_max_hp = hero.max_hp;
+        self.hero_hp_regen_per_sec = hero.hp_regen_per_sec;
+        self.hero_armor = hero.armor;
+        self.hero_scale = hero.hero_scale;
+        self.hero_move_speed_multiplier = hero.move_speed_multiplier;
+        self.hero_shallow_water_speed_multiplier = hero.shallow_water_speed_multiplier;
+        self.hero_deep_water_speed_multiplier = hero.deep_water_speed_multiplier;
+        self.hero_vision_range = hero.vision_range;
+        self.ammo_in_mag = hero.weapon.magazine_size;
+        self.hero_weapon = hero.weapon;
+        self.current_move_speed = config.soldier.run_speed * hero.move_speed_multiplier;
+        self.fog_of_war = SharedFogOfWar::from_config(config, hero.team);
+    }
+
     pub fn build_snapshot(&mut self) -> ServerWorldSnapshot {
         self.tick += 1;
         ServerWorldSnapshot {
@@ -3067,6 +4024,34 @@ impl AuthoritativeWorldState {
             is_dead: self.is_dead,
             death_anim_name: self.death_anim_name.clone(),
             in_water: self.in_water,
+            hero: HeroSnapshot {
+                hero_id: self.hero_id.clone(),
+                display_name: self.hero_display_name.clone(),
+                team: self.hero_team,
+                gold: self.hero_gold,
+                xp: self.hero_xp,
+                xp_gain_radius: self.hero_xp_gain_radius,
+                hp: self.hero_hp,
+                max_hp: self.hero_max_hp,
+                hp_regen_per_sec: self.hero_hp_regen_per_sec,
+                armor: self.hero_armor,
+                hero_scale: self.hero_scale,
+                move_speed: self.current_move_speed,
+                vision_range: self.hero_vision_range,
+                weapon_kind: self.hero_weapon.weapon_kind,
+                ammo_in_mag: self.ammo_in_mag,
+                magazine_size: self.hero_weapon.magazine_size,
+                fire_rate_secs: self.hero_weapon.fire_rate_secs,
+                weapon_damage: self.hero_weapon.damage,
+                projectile_speed: self.hero_weapon.projectile_speed,
+                weapon_max_range: self.hero_weapon.max_range,
+                last_hits: self.last_hits,
+                denies: self.denies,
+                assists: self.assists,
+                kills: self.kills,
+                deaths: self.deaths,
+            },
+            other_players: Vec::new(),
             fog_visible_mask: self.fog_of_war.pack_visible_mask(),
             bullets: self.bullets_snapshot.clone(),
             grenades: self.grenades_snapshot.clone(),
@@ -3186,6 +4171,8 @@ fn trigger_random_death(world: &mut AuthoritativeWorldState, config: &GameConfig
     let duration = config.exact_anim_duration(&chosen);
 
     world.is_dead = true;
+    world.hero_hp = 0.0;
+    world.deaths += 1;
     world.death_anim_name = chosen;
     world.respawn_remaining = duration + config.soldier.death_extra_respawn_delay_secs;
     world.reload_remaining = None;
@@ -3457,23 +4444,96 @@ fn shared_authoritative_drive_system(
     mut commands: Commands,
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
+    match_state: Option<Res<AuthoritativeMatchState>>,
     physics_world: Res<CustomPhysicsWorld>,
     mut world: ResMut<AuthoritativeWorldState>,
-    mut soldier_query: Query<
-        (&mut Transform, &mut CustomCharacterController),
-        With<PhysicsSoldier>,
-    >,
+    mut soldier_query: Query<(&PhysicsSoldier, &mut Transform, &mut CustomCharacterController)>,
     obstacle_query: Query<&PhysicsObstacle>,
     target_query: Query<&PhysicsTarget>,
 ) {
-    let Some(input) = world.active_input.clone() else {
+    if match_state
+        .as_ref()
+        .is_some_and(|m| m.phase != MatchPhase::InGame)
+    {
         return;
-    };
-
+    }
     let dt = time.delta_secs();
-    let (mut soldier_tf, mut controller) = soldier_query
-        .single_mut()
-        .expect("خطای بحرانی: موجودیت PhysicsSoldier یافت نشد");
+    for (soldier_marker, mut soldier_tf, mut controller) in &mut soldier_query {
+        let slot_idx = soldier_marker.slot_index;
+        let has_slots = !world.players.is_empty();
+        if has_slots {
+            world.swap_slot_in(slot_idx);
+        }
+        if let Some(input) = world.active_input.clone() {
+            shared_drive_single_player(
+                &mut commands,
+                dt,
+                &config,
+                &physics_world,
+                &mut world,
+                &input,
+                &mut soldier_tf,
+                &mut controller,
+                &obstacle_query,
+                &target_query,
+            );
+        }
+        if has_slots {
+            world.swap_slot_in(slot_idx);
+        }
+    }
+
+    // حل برخورد فیزیکی هیروها با یکدیگر (هیچ دو هیرویی نمی‌توانند از داخل هم عبور کنند)
+    if world.players.len() > 1 {
+        let n = world.players.len();
+        let base_r = config.soldier.player_radius;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if world.players[i].is_dead || world.players[j].is_dead {
+                    continue;
+                }
+                let p_i = world.players[i].soldier_pos;
+                let p_j = world.players[j].soldier_pos;
+                if (p_i.y - p_j.y).abs() > 1.8 {
+                    continue;
+                }
+                let min_dist = base_r * (world.players[i].hero_scale + world.players[j].hero_scale);
+                let delta = Vec2::new(p_j.x - p_i.x, p_j.z - p_i.z);
+                let dist = delta.length();
+                if dist < min_dist {
+                    let push_dir = if dist > 0.0001 {
+                        delta / dist
+                    } else {
+                        Vec2::new(1.0, 0.0)
+                    };
+                    let half_push = (min_dist - dist) * 0.5;
+                    world.players[i].soldier_pos.x -= push_dir.x * half_push;
+                    world.players[i].soldier_pos.z -= push_dir.y * half_push;
+                    world.players[j].soldier_pos.x += push_dir.x * half_push;
+                    world.players[j].soldier_pos.z += push_dir.y * half_push;
+                }
+            }
+        }
+        for (soldier_marker, mut soldier_tf, _) in &mut soldier_query {
+            let p = &world.players[soldier_marker.slot_index];
+            soldier_tf.translation.x = p.soldier_pos.x;
+            soldier_tf.translation.z = p.soldier_pos.z;
+        }
+    }
+}
+
+fn shared_drive_single_player(
+    commands: &mut Commands,
+    dt: f32,
+    config: &GameConfig,
+    physics_world: &CustomPhysicsWorld,
+    world: &mut AuthoritativeWorldState,
+    input: &ClientInputCommand,
+    soldier_tf: &mut Transform,
+    controller: &mut CustomCharacterController,
+    obstacle_query: &Query<&PhysicsObstacle>,
+    target_query: &Query<&PhysicsTarget>,
+) {
 
     // ۱. بررسی کلید X (تست مرگ) و تایمر زنده شدن مجدد در چشمه پایگاه
     if input.kill_toggle_just_pressed {
@@ -3482,7 +4542,7 @@ fn shared_authoritative_drive_system(
             world.base_stance = Stance::Run;
         } else {
             world.traversal.is_active = false;
-            trigger_random_death(&mut world, &config);
+            trigger_random_death(world, config);
         }
     }
 
@@ -3491,22 +4551,23 @@ fn shared_authoritative_drive_system(
         world.respawn_remaining -= dt;
         if world.respawn_remaining <= 0.0 {
             world.is_dead = false;
+            world.hero_hp = world.hero_max_hp;
+            world.ammo_in_mag = world.hero_weapon.magazine_size;
             world.base_stance = Stance::Run;
-            let spawn_pos = Vec3::new(
-                config.soldier.spawn_pos.0,
-                config.soldier.spawn_pos.1,
-                config.soldier.spawn_pos.2,
-            );
+            let spawn_pos = world.active_spawn_pos;
             world.soldier_pos = spawn_pos;
             soldier_tf.translation =
                 spawn_pos + Vec3::Y * config.physics.soldier_capsule_center_y;
         }
     } else {
-        // ۲. آپدیت تایمرهای بالاتنه
+        // ۲. بازسازی سلامتی در ثانیه (HP Regen) و آپدیت تایمرهای بالاتنه
+        world.hero_hp = (world.hero_hp + world.hero_hp_regen_per_sec * dt).min(world.hero_max_hp);
+
         if let Some(rem) = &mut world.reload_remaining {
             *rem -= dt;
             if *rem <= 0.0 {
                 world.reload_remaining = None;
+                world.ammo_in_mag = world.hero_weapon.magazine_size;
             }
         }
 
@@ -3611,19 +4672,19 @@ fn shared_authoritative_drive_system(
 
         // ۷. سیستم پرش، غلت و عبور از مانع با پرتو و کپسول فیزیک اختصاصی
         step_traversal_custom(
-            &mut world,
-            &input,
-            &config,
-            &physics_world,
-            &obstacle_query,
-            &target_query,
-            &mut soldier_tf,
-            &mut controller,
+            world,
+            input,
+            config,
+            physics_world,
+            obstacle_query,
+            target_query,
+            soldier_tf,
+            controller,
             dt,
         );
 
         // ۸. جابجایی فیزیکی ۳بعدی کاراکتر همراه با مقاومت طبیعی آب و رانش جریان برکه‌ها
-        let water_sample = sample_water_surface_at(&config, world.soldier_pos);
+        let water_sample = sample_water_surface_at(config, world.soldier_pos);
         let was_in_water = world.in_water;
         world.in_water = water_sample.is_some();
         world.water_splash_cooldown = (world.water_splash_cooldown - dt).max(0.0);
@@ -3632,21 +4693,10 @@ fn shared_authoritative_drive_system(
             let water_depth = (water_y - world.soldier_pos.y).max(0.0);
             let is_deep_water = water_depth >= 0.85;
 
-            let (hero_move_mult, shallow_mult, deep_mult) = config
-                .heroes
-                .get(world.hero_index)
-                .map(|h| {
-                    (
-                        h.move_speed_multiplier,
-                        h.shallow_water_speed_multiplier,
-                        h.deep_water_speed_multiplier,
-                    )
-                })
-                .unwrap_or((
-                    1.0,
-                    config.physics.water_move_speed_multiplier,
-                    config.physics.water_move_speed_multiplier * 0.6,
-                ));
+            let hero_cfg = config.active_hero(world.hero_index);
+            let hero_move_mult = hero_cfg.move_speed_multiplier;
+            let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
+            let deep_mult = hero_cfg.deep_water_speed_multiplier;
 
             if is_deep_water && !world.traversal.is_active {
                 if world.is_moving {
@@ -3691,6 +4741,7 @@ fn shared_authoritative_drive_system(
                         shallow_mult
                     };
                     let water_speed = base_speed * depth_mult;
+                    world.current_move_speed = water_speed;
                     let desired_delta =
                         world.move_input.normalize() * water_speed * dt + flow_drift;
                     controller.translation =
@@ -3702,16 +4753,13 @@ fn shared_authoritative_drive_system(
         } else if !world.traversal.is_active {
             let grav_y = config.physics.character_gravity_step_y * dt;
             if world.is_moving {
-                let hero_move_mult = config
-                    .heroes
-                    .get(world.hero_index)
-                    .map(|h| h.move_speed_multiplier)
-                    .unwrap_or(1.0);
+                let hero_move_mult = config.active_hero(world.hero_index).move_speed_multiplier;
                 let speed = match world.effective_stance {
                     Stance::Run => config.soldier.run_speed,
                     Stance::Walk => config.soldier.walk_speed,
                     Stance::Crouch => config.soldier.crouch_speed,
                 } * hero_move_mult;
+                world.current_move_speed = speed;
                 let desired_delta = world.move_input.normalize() * speed * dt;
                 controller.translation = Some(Vec3::new(desired_delta.x, grav_y, desired_delta.z));
             } else {
@@ -3721,7 +4769,7 @@ fn shared_authoritative_drive_system(
     }
 
     // ۹. شلیک گلوله و پرتاب نارنجک
-    step_shooting_and_grenade_spawn(&mut commands, &mut world, &input, &config, dt);
+    step_shooting_and_grenade_spawn(commands, world, input, config, dt);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3961,7 +5009,15 @@ fn step_shooting_and_grenade_spawn(
         input.fire_just_pressed || (input.fire_held && world.fire_cooldown_remaining <= 0.0);
 
     if wants_fire {
-        world.fire_cooldown_remaining = config.combat.fire_cooldown_secs;
+        if world.ammo_in_mag == 0 {
+            let dur = config.exact_anim_duration("reloading");
+            world.reload_remaining = Some(dur);
+            world.firing_anim_remaining = None;
+            return;
+        }
+
+        world.ammo_in_mag -= 1;
+        world.fire_cooldown_remaining = world.hero_weapon.fire_rate_secs;
         let dur = config.exact_anim_duration("firing_rifle");
         world.firing_anim_remaining = Some(dur);
 
@@ -3977,23 +5033,37 @@ fn step_shooting_and_grenade_spawn(
             world.aim_world_dir
         };
 
-        let spread = (world.next_rand() - 0.5) * config.combat.bullet_spread_rad;
-        let final_dir = (Quat::from_rotation_y(spread) * shot_dir).normalize();
+        let pellets = world.hero_weapon.pellets_per_shot;
+        let spread_rad = world.hero_weapon.spread_rad;
+        let proj_speed = world.hero_weapon.projectile_speed;
+        let dmg = world.hero_weapon.damage;
+        let max_range = world.hero_weapon.max_range;
 
-        let id = world.next_entity_id;
-        world.next_entity_id += 1;
-        commands.spawn((
-            PhysicsBullet {
-                id,
-                velocity: final_dir * config.combat.bullet_speed,
-                remaining_lifetime: config.combat.bullet_lifetime_secs,
-            },
-            Transform::from_translation(muzzle_pos),
-        ));
+        let mut first_dir = shot_dir;
+        for p_idx in 0..pellets {
+            let spread = (world.next_rand() - 0.5) * spread_rad;
+            let final_dir = (Quat::from_rotation_y(spread) * shot_dir).normalize();
+            if p_idx == 0 {
+                first_dir = final_dir;
+            }
+            let id = world.next_entity_id;
+            world.next_entity_id += 1;
+            commands.spawn((
+                PhysicsBullet {
+                    id,
+                    owner_slot: world.active_slot,
+                    owner_team: world.hero_team,
+                    velocity: final_dir * proj_speed,
+                    damage: dmg,
+                    remaining_range: max_range,
+                },
+                Transform::from_translation(muzzle_pos),
+            ));
+        }
 
         world.pending_fx.push(GameplayFxEvent::ShotFired {
             muzzle_pos,
-            shot_dir: final_dir,
+            shot_dir: first_dir,
             trauma_add: config.combat.shot_fire_trauma_add,
             trauma_max: config.combat.shot_fire_trauma_max,
         });
@@ -4005,9 +5075,10 @@ fn shared_authoritative_react_system(
     mut commands: Commands,
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
+    match_state: Option<Res<AuthoritativeMatchState>>,
     physics_world: Res<CustomPhysicsWorld>,
     mut world: ResMut<AuthoritativeWorldState>,
-    soldier_query: Query<&Transform, With<PhysicsSoldier>>,
+    soldier_query: Query<(&PhysicsSoldier, &Transform)>,
     mut bullet_query: Query<
         (Entity, &mut PhysicsBullet, &mut Transform),
         (Without<PhysicsSoldier>, Without<PhysicsGrenade>),
@@ -4018,20 +5089,30 @@ fn shared_authoritative_react_system(
     >,
     target_query: Query<(Entity, &PhysicsTarget)>,
 ) {
-    let Some(input) = world.active_input.clone() else {
+    if match_state
+        .as_ref()
+        .is_some_and(|m| m.phase != MatchPhase::InGame)
+    {
         return;
-    };
+    }
     let dt = time.delta_secs();
 
-    let soldier_tf = soldier_query
-        .single()
-        .expect("خطای بحرانی: موجودیت PhysicsSoldier یافت نشد");
-    if world.traversal.kind != TraversalKind::ObstacleVault || !world.traversal.is_active {
-        world.soldier_pos = Vec3::new(
-            soldier_tf.translation.x,
-            soldier_tf.translation.y - config.physics.soldier_capsule_center_y,
-            soldier_tf.translation.z,
-        );
+    for (p_soldier, soldier_tf) in &soldier_query {
+        let slot_idx = p_soldier.slot_index;
+        let has_slots = !world.players.is_empty();
+        if has_slots {
+            world.swap_slot_in(slot_idx);
+        }
+        if world.traversal.kind != TraversalKind::ObstacleVault || !world.traversal.is_active {
+            world.soldier_pos = Vec3::new(
+                soldier_tf.translation.x,
+                soldier_tf.translation.y - config.physics.soldier_capsule_center_y * world.hero_scale,
+                soldier_tf.translation.z,
+            );
+        }
+        if has_slots {
+            world.swap_slot_in(slot_idx);
+        }
     }
 
     let mut target_entity_by_idx = HashMap::new();
@@ -4061,15 +5142,22 @@ fn shared_authoritative_react_system(
     }
 
     for pos in exploded_positions {
-        for (idx, target) in world.targets.iter_mut().enumerate() {
+        let world_inner = &mut *world;
+        for (idx, target) in world_inner.targets.iter_mut().enumerate() {
             if !target.is_dead
                 && target.base_pos.distance(pos) < config.combat.grenade_target_kill_radius
             {
                 target.hp = 0.0;
                 target.is_dead = true;
                 target.respawn_remaining = target.respawn_duration;
+                let t_pos = target.base_pos;
                 if let Some(&t_ent) = target_entity_by_idx.get(&idx) {
                     commands.entity(t_ent).insert(ColliderDisabled);
+                }
+                world_inner.last_hits += 1;
+                world_inner.hero_gold += 35;
+                if world_inner.soldier_pos.distance(t_pos) <= world_inner.hero_xp_gain_radius {
+                    world_inner.hero_xp += 45;
                 }
             }
         }
@@ -4103,7 +5191,25 @@ fn shared_authoritative_react_system(
         let step_dist = step_vec.length();
         let step_dir = step_vec.normalize_or_zero();
         let new_pos = old_pos + step_vec;
-        bullet.remaining_lifetime -= dt;
+        bullet.remaining_range -= step_dist;
+
+        let mut best_hero_hit: Option<(usize, f32)> = None;
+        if step_dist > f32::EPSILON {
+            for (p_idx, p) in world.players.iter().enumerate() {
+                if p.slot_index == bullet.owner_slot || p.hero_team == bullet.owner_team || p.is_dead {
+                    continue;
+                }
+                let h_rad = config.soldier.player_radius * p.hero_scale * 1.15;
+                let h_height = 1.95 * p.hero_scale;
+                if let Some(toi) =
+                    segment_hits_hero_capsule(old_pos, step_dir, step_dist, p.soldier_pos, h_rad, h_height)
+                {
+                    if best_hero_hit.map_or(true, |(_, prev_toi)| toi < prev_toi) {
+                        best_hero_hit = Some((p_idx, toi));
+                    }
+                }
+            }
+        }
 
         let ray_hit = if step_dist > f32::EPSILON {
             physics_world
@@ -4114,22 +5220,83 @@ fn shared_authoritative_react_system(
                         true
                     }
                 })
-                .map(|(hit_ent, hit)| (hit_ent, hit.point))
+                .map(|(hit_ent, hit)| (hit_ent, hit.point, hit.toi))
         } else {
             None
         };
 
-        if let Some((hit_entity, impact_pos)) = ray_hit {
+        let hero_wins = match (best_hero_hit, ray_hit.as_ref()) {
+            (Some((_, h_toi)), Some((_, _, s_toi))) => h_toi <= *s_toi,
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        if hero_wins {
+            let (enemy_idx, h_toi) = best_hero_hit.unwrap();
+            let impact_pos = old_pos + step_dir * h_toi;
+            let armor = world.players[enemy_idx].hero_armor;
+            let dmg_mult = dota2_armor_multiplier(armor);
+            let effective_dmg = (bullet.damage * dmg_mult).max(1.0);
+
+            world.players[enemy_idx].hero_hp =
+                (world.players[enemy_idx].hero_hp - effective_dmg).max(0.0);
+
+            let enemy_killed = world.players[enemy_idx].hero_hp <= 0.0
+                && !world.players[enemy_idx].is_dead;
+            if enemy_killed {
+                world.swap_slot_in(enemy_idx);
+                trigger_random_death(&mut world, &config);
+                world.swap_slot_in(enemy_idx);
+
+                let owner_slot = bullet.owner_slot;
+                if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                    attacker.kills += 1;
+                    attacker.hero_gold += 225;
+                    attacker.hero_xp += 150;
+                }
+            }
+
+            world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
+                start: old_pos,
+                end: impact_pos,
+            });
+            world.pending_fx.push(GameplayFxEvent::BulletImpact {
+                impact_pos,
+                bullet_dir: step_dir,
+                target_destroyed: enemy_killed,
+                trauma_add: config.combat.shot_fire_trauma_add,
+                trauma_max: config.combat.shot_fire_trauma_max,
+            });
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        if let Some((hit_entity, impact_pos, _)) = ray_hit {
             let mut target_destroyed = false;
             if let Some(&t_idx) = target_idx_by_entity.get(&hit_entity) {
                 let target = &mut world.targets[t_idx];
-                target.hp -= config.combat.bullet_damage;
+                target.hp -= bullet.damage;
                 target.hit_flash_timer = config.fx.target_hit_flash_secs;
                 if target.hp <= 0.0 && !target.is_dead {
                     target.is_dead = true;
                     target.respawn_remaining = target.respawn_duration;
                     target_destroyed = true;
+                    let t_pos = target.base_pos;
                     commands.entity(hit_entity).insert(ColliderDisabled);
+                    let owner_slot = bullet.owner_slot;
+                    if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        attacker.last_hits += 1;
+                        attacker.hero_gold += 35;
+                        if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
+                            attacker.hero_xp += 45;
+                        }
+                    } else {
+                        world.last_hits += 1;
+                        world.hero_gold += 35;
+                        if world.soldier_pos.distance(t_pos) <= world.hero_xp_gain_radius {
+                            world.hero_xp += 45;
+                        }
+                    }
                 }
             }
 
@@ -4165,7 +5332,7 @@ fn shared_authoritative_react_system(
                 end: new_pos,
             });
 
-            if bullet.remaining_lifetime <= 0.0 {
+            if bullet.remaining_range <= 0.0 {
                 commands.entity(entity).despawn();
             } else {
                 world.bullets_snapshot.push(BulletSnapshot {
@@ -4193,42 +5360,50 @@ fn shared_authoritative_react_system(
         }
     }
 
-    let muzzle_pos = resolve_muzzle_pos(&world, &input, &config);
-    let raw_target = Vec3::new(world.aim_hit_pos.x, muzzle_pos.y, world.aim_hit_pos.z);
     let dead_flags: Vec<bool> = world.targets.iter().map(|t| t.is_dead).collect();
+    let num_slots = world.players.len().max(1);
+    let has_slots = !world.players.is_empty();
 
-    world.laser_hit_pos = compute_laser_hit(
-        &physics_world,
-        muzzle_pos,
-        raw_target,
-        |hit_ent| {
-            if let Some(&t_idx) = target_idx_by_entity.get(&hit_ent) {
-                !dead_flags[t_idx]
-            } else {
-                true
-            }
-        },
-    );
+    for slot_idx in 0..num_slots {
+        if has_slots {
+            world.swap_slot_in(slot_idx);
+        }
+        if let Some(input) = world.active_input.clone() {
+            let muzzle_pos = resolve_muzzle_pos(&world, &input, &config);
+            let raw_target = Vec3::new(world.aim_hit_pos.x, muzzle_pos.y, world.aim_hit_pos.z);
+            world.laser_hit_pos = compute_laser_hit(
+                &physics_world,
+                muzzle_pos,
+                raw_target,
+                |hit_ent| {
+                    if let Some(&t_idx) = target_idx_by_entity.get(&hit_ent) {
+                        !dead_flags[t_idx]
+                    } else {
+                        true
+                    }
+                },
+            );
+        }
+        if let Some(hero) = config.heroes.get(world.hero_index) {
+            let hero_pos = world.soldier_pos;
+            world.fog_of_war.update_for_hero(&config, hero_pos, hero);
+        }
+        if let Some(ref mut active_input) = world.active_input {
+            active_input.consume_just_pressed();
+        }
+        if has_slots {
+            world.swap_slot_in(slot_idx);
+        }
+    }
 
-    // محاسبه Authoritative مه جنگ (Fog of War) در سرور بر اساس ویژگی vision هیرو
-    if let Some(hero) = config.heroes.get(world.hero_index) {
-        let hero_pos = world.soldier_pos;
-        world.fog_of_war.update_for_hero(&config, hero_pos, hero);
-
-        for idx in 0..world.targets.len() {
-            let t_pos = world.targets[idx].base_pos;
+    for idx in 0..world.targets.len() {
+        let t_pos = world.targets[idx].base_pos;
+        if world.players.is_empty() {
             world.targets_visible[idx] =
                 world.fog_of_war.is_world_point_visible(&config, t_pos.x, t_pos.z);
+        } else {
+            world.targets_visible[idx] = true;
         }
-
-        let world_inner = &mut *world;
-        let fow_ref = &world_inner.fog_of_war;
-        world_inner
-            .bullets_snapshot
-            .retain(|b| fow_ref.is_world_point_visible(&config, b.translation.x, b.translation.z));
-        world_inner
-            .grenades_snapshot
-            .retain(|g| fow_ref.is_world_point_visible(&config, g.translation.x, g.translation.z));
     }
 
     if let Some(ref mut active_input) = world.active_input {
@@ -4261,21 +5436,10 @@ fn shared_client_drive_system(
         soldier_tf.translation.z,
     );
     let water_sample = sample_water_surface_at(&config, feet_pos);
-    let (hero_move_mult, shallow_mult, deep_mult) = config
-        .heroes
-        .first()
-        .map(|h| {
-            (
-                h.move_speed_multiplier,
-                h.shallow_water_speed_multiplier,
-                h.deep_water_speed_multiplier,
-            )
-        })
-        .unwrap_or((
-            1.0,
-            config.physics.water_move_speed_multiplier,
-            config.physics.water_move_speed_multiplier * 0.6,
-        ));
+    let hero_cfg = config.active_hero(0);
+    let hero_move_mult = hero_cfg.move_speed_multiplier;
+    let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
+    let deep_mult = hero_cfg.deep_water_speed_multiplier;
     let speed_mult = if let Some((water_y, _)) = water_sample {
         let depth = (water_y - feet_pos.y).max(0.0);
         if depth >= 0.85 {

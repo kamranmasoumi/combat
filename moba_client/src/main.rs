@@ -8,6 +8,7 @@ use bevy::shader::ShaderRef;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::gltf::Gltf;
 use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight, NotShadowCaster};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use bevy::window::{PresentMode, PrimaryWindow, WindowResolution};
@@ -16,9 +17,12 @@ use moba_shared::{
     grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
     mountain_physics_bundle, obstacle_physics_bundle, orient_soldier_towards,
     particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
-    sample_water_surface_at, shell_casing_physics_bundle, target_physics_bundle,
+    shell_casing_physics_bundle, target_physics_bundle,
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
-    ClientInputCommand, ClientPhysicsPredictionState, ModelTransformConfig, SharedFogOfWar, FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
+    apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage,
+    ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
+    ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
     CHANNEL_UNRELIABLE_STATE,
@@ -31,7 +35,8 @@ use std::path::Path;
 use std::time::Duration;
 
 fn main() {
-    let config = GameConfig::load_from_file("config.ron");
+    let mut config = GameConfig::load_from_file("config.ron");
+    apply_client_cli_overrides(&mut config.network);
     let tick_hz = config.network.server_tick_rate_hz;
     let substeps = config.physics.substeps;
 
@@ -52,6 +57,36 @@ fn main() {
     };
 
     let render_state = ClientRenderState::new_from_config(&config);
+    let initial_hero_snapshot = {
+        let h = config.active_hero(0);
+        HeroSnapshot {
+            hero_id: h.id.clone(),
+            display_name: h.display_name.clone(),
+            team: h.team,
+            gold: h.starting_gold,
+            xp: 0,
+            xp_gain_radius: h.xp_gain_radius,
+            hp: h.max_hp,
+            max_hp: h.max_hp,
+            hp_regen_per_sec: h.hp_regen_per_sec,
+            armor: h.armor,
+            hero_scale: h.hero_scale,
+            move_speed: config.soldier.run_speed * h.move_speed_multiplier,
+            vision_range: h.vision_range,
+            weapon_kind: h.weapon.weapon_kind,
+            ammo_in_mag: h.weapon.magazine_size,
+            magazine_size: h.weapon.magazine_size,
+            fire_rate_secs: h.weapon.fire_rate_secs,
+            weapon_damage: h.weapon.damage,
+            projectile_speed: h.weapon.projectile_speed,
+            weapon_max_range: h.weapon.max_range,
+            last_hits: 0,
+            denies: 0,
+            assists: 0,
+            kills: 0,
+            deaths: 0,
+        }
+    };
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -74,6 +109,16 @@ fn main() {
         })
         .insert_resource(tuner)
         .insert_resource(CameraShake { trauma: 0.0 })
+        .insert_resource(LatestHeroSnapshot(initial_hero_snapshot))
+        .insert_resource(LatestRemotePlayers::default())
+        .insert_resource(ClientMatchFlow {
+            your_slot: None,
+            snapshot: None,
+            preview_hero_index: 0,
+            spawned_preview_hero_index: None,
+            map_loaded_reported: false,
+            prev_phase: None,
+        })
         .insert_resource(CameraControlState {
             free_look_target: None,
             is_pointer_over_minimap: false,
@@ -117,6 +162,12 @@ fn main() {
                 water_shader_update_system,
                 waterfall_mist_particle_system,
                 animate_glb_waterfall_materials_system,
+                update_hero_hud_system,
+                client_lobby_sync_system,
+                hero_preview_system,
+                match_overlay_ui_system,
+                sync_remote_players_system,
+                update_overhead_hero_bars_system,
             )
                 .chain(),
         )
@@ -340,6 +391,15 @@ struct MinimapTargetDot {
 
 #[derive(Component)]
 struct MinimapCameraBox;
+
+#[derive(Resource)]
+struct LatestHeroSnapshot(HeroSnapshot);
+
+#[derive(Component)]
+struct HeroHudMainText;
+
+#[derive(Component)]
+struct HeroHpBarFill;
 
 #[derive(Component)]
 struct TreeVisualMarker {
@@ -789,7 +849,7 @@ fn setup_scene(
             .subdivisions(20),
     );
 
-    for (seg_idx, seg) in config.map.river_segments.iter().enumerate() {
+    for seg in &config.map.river_segments {
         let tf = seg.model_transform.to_transform();
         let pos = tf.translation;
         let size = Vec3::new(
@@ -1568,6 +1628,8 @@ fn setup_scene(
     let minimap_image = bake_minimap_image(&config);
     let minimap_handle = images.add(minimap_image);
     spawn_minimap_ui(&mut commands, &config, minimap_handle, fog_handle);
+    spawn_hero_hud_ui(&mut commands);
+    spawn_match_overlay_ui(&mut commands, &config);
 
     let gltf_handle = asset_server.load(&config.animations.model_path);
     commands.insert_resource(SoldierGltfHandle(gltf_handle));
@@ -1581,10 +1643,6 @@ fn setup_scene(
 fn environment_vfx_and_water_animation_system(
     mut commands: Commands,
     time: Res<Time>,
-    config: Res<GameConfig>,
-    mut render_state: ResMut<ClientRenderState>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut streak_query: Query<(&mut Transform, &FlowingWaterStreak), Without<CascadingWaterfallSheet>>,
     mut waterfall_query: Query<
         (&mut Transform, &CascadingWaterfallSheet),
@@ -1613,7 +1671,6 @@ fn environment_vfx_and_water_animation_system(
     >,
 ) {
     let t = time.elapsed_secs();
-    let dt = time.delta_secs();
 
     // ۱. حرکت پیوسته رگه‌های جریان آب روی برکه‌ها و جویبارها
     for (mut tf, streak) in &mut streak_query {
@@ -1758,10 +1815,11 @@ fn load_gltf_and_build_graph(
         config.soldier.spawn_pos.1,
         config.soldier.spawn_pos.2,
     );
+    let hero_scale = config.active_hero(0).hero_scale;
     commands.spawn((
         WorldAssetRoot(gltf.scenes[0].clone()),
         SoldierMarker,
-        Transform::from_translation(spawn_pos),
+        Transform::from_translation(spawn_pos).with_scale(Vec3::splat(hero_scale)),
     ));
 }
 
@@ -1824,6 +1882,7 @@ fn is_upper_body_in_hierarchy(
 fn attach_split_body_animation_graphs(
     mut commands: Commands,
     player_query: Query<Entity, (With<AnimationPlayer>, Without<AnimationGraphHandle>)>,
+    soldier_marker_query: Query<(), With<SoldierMarker>>,
     mut target_query: Query<(Entity, &mut AnimatedBy)>,
     names_query: Query<&Name>,
     parents_query: Query<&ChildOf>,
@@ -1832,6 +1891,23 @@ fn attach_split_body_animation_graphs(
     let Some(anim_assets) = anim_assets else { return };
 
     for lower_player_entity in &player_query {
+        // فقط به سرباز اصلی بازی (SoldierMarker) وصل شو، نه مدل پیش‌نمایش انتخاب هیرو!
+        let mut cur = lower_player_entity;
+        let mut belongs_to_soldier = soldier_marker_query.contains(cur);
+        while !belongs_to_soldier {
+            if let Ok(parent) = parents_query.get(cur) {
+                cur = parent.parent();
+                if soldier_marker_query.contains(cur) {
+                    belongs_to_soldier = true;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if !belongs_to_soldier {
+            continue;
+        }
         commands.entity(lower_player_entity).insert((
             AnimationGraphHandle(anim_assets.graph_handle.clone()),
             AnimationTransitions::new(),
@@ -1864,13 +1940,17 @@ fn attach_split_body_animation_graphs(
 fn attach_weapon_to_left_hand(
     mut commands: Commands,
     config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    hero_state: Res<LatestHeroSnapshot>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut status: ResMut<WeaponAttachmentStatus>,
     tuner: Res<WeaponTuner>,
+    soldier_marker_query: Query<(), With<SoldierMarker>>,
+    parents_query: Query<&ChildOf>,
     hand_query: Query<(Entity, &Name)>,
 ) {
-    if status.attached {
+    if status.attached || !match_flow.is_in_game() {
         return;
     }
 
@@ -1888,15 +1968,44 @@ fn attach_weapon_to_left_hand(
             || n.contains("twist");
 
         if is_hand && is_left && !is_finger {
+            // اطمینان از اینکه دست متعلق به SoldierMarker اصلی است نه مدل پیش‌نمایش
+            let mut cur = entity;
+            let mut belongs_to_soldier = soldier_marker_query.contains(cur);
+            while !belongs_to_soldier {
+                if let Ok(parent) = parents_query.get(cur) {
+                    cur = parent.parent();
+                    if soldier_marker_query.contains(cur) {
+                        belongs_to_soldier = true;
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if !belongs_to_soldier {
+                continue;
+            }
+
+            let weapon_kind = hero_state.0.weapon_kind;
             let body_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(0.14, 0.15, 0.18),
+                base_color: match weapon_kind {
+                    WeaponKind::AutomaticRifle => Color::srgb(0.14, 0.15, 0.18),
+                    WeaponKind::Sniper => Color::srgb(0.16, 0.22, 0.18),
+                    WeaponKind::Shotgun => Color::srgb(0.18, 0.16, 0.14),
+                    WeaponKind::Throwable => Color::srgb(0.24, 0.16, 0.12),
+                },
                 metallic: 0.85,
                 perceptual_roughness: 0.35,
                 ..default()
             });
             let accent_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(0.24, 0.26, 0.3),
-                metallic: 0.65,
+                base_color: match weapon_kind {
+                    WeaponKind::AutomaticRifle => Color::srgb(0.24, 0.26, 0.30),
+                    WeaponKind::Sniper => Color::srgb(0.28, 0.34, 0.30),
+                    WeaponKind::Shotgun => Color::srgb(0.46, 0.28, 0.14),
+                    WeaponKind::Throwable => Color::srgb(0.85, 0.42, 0.10),
+                },
+                metallic: if weapon_kind == WeaponKind::Shotgun { 0.25 } else { 0.65 },
                 perceptual_roughness: 0.45,
                 ..default()
             });
@@ -1919,50 +2028,145 @@ fn attach_weapon_to_left_hand(
                         Visibility::Visible,
                     ))
                     .with_children(|weapon| {
-                        weapon.spawn((
-                            Mesh3d(meshes.add(Cuboid::new(0.055, 0.10, 0.44))),
-                            MeshMaterial3d(body_mat.clone()),
-                            Transform::from_xyz(0.0, 0.03, -0.12),
-                        ));
-                        weapon.spawn((
-                            Mesh3d(meshes.add(Cuboid::new(0.048, 0.075, 0.30))),
-                            MeshMaterial3d(accent_mat.clone()),
-                            Transform::from_xyz(0.0, 0.035, -0.42),
-                        ));
-                        weapon.spawn((
-                            Mesh3d(meshes.add(Cylinder::new(0.013, 0.40))),
-                            MeshMaterial3d(body_mat.clone()),
-                            Transform::from_xyz(0.0, 0.045, -0.60)
-                                .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                        ));
-                        weapon.spawn((
-                            Mesh3d(meshes.add(Cylinder::new(0.019, 0.07))),
-                            MeshMaterial3d(accent_mat.clone()),
-                            Transform::from_xyz(0.0, 0.045, -0.80)
-                                .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                        ));
-                        weapon.spawn((
-                            Mesh3d(meshes.add(Cuboid::new(0.048, 0.085, 0.22))),
-                            MeshMaterial3d(accent_mat.clone()),
-                            Transform::from_xyz(0.0, 0.02, 0.18),
-                        ));
-                        weapon.spawn((
-                            Mesh3d(meshes.add(Cuboid::new(0.04, 0.19, 0.072))),
-                            MeshMaterial3d(accent_mat.clone()),
-                            Transform::from_xyz(0.0, -0.09, -0.24)
-                                .with_rotation(Quat::from_rotation_x(0.22)),
-                        ));
-                        weapon.spawn((
-                            Mesh3d(meshes.add(Cuboid::new(0.042, 0.13, 0.055))),
-                            MeshMaterial3d(body_mat),
-                            Transform::from_xyz(0.0, -0.05, -0.02)
-                                .with_rotation(Quat::from_rotation_x(-0.25)),
-                        ));
-                        weapon.spawn((
-                            Mesh3d(meshes.add(Cuboid::new(0.044, 0.05, 0.10))),
-                            MeshMaterial3d(accent_mat),
-                            Transform::from_xyz(0.0, 0.10, -0.14),
-                        ));
+                        match weapon_kind {
+                            WeaponKind::AutomaticRifle => {
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.055, 0.10, 0.44))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.03, -0.12),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.048, 0.075, 0.30))),
+                                    MeshMaterial3d(accent_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.035, -0.42),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.013, 0.40))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.045, -0.60)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.019, 0.07))),
+                                    MeshMaterial3d(accent_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.045, -0.80)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.048, 0.085, 0.22))),
+                                    MeshMaterial3d(accent_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.02, 0.18),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.04, 0.19, 0.072))),
+                                    MeshMaterial3d(accent_mat.clone()),
+                                    Transform::from_xyz(0.0, -0.09, -0.24)
+                                        .with_rotation(Quat::from_rotation_x(0.22)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.042, 0.13, 0.055))),
+                                    MeshMaterial3d(body_mat),
+                                    Transform::from_xyz(0.0, -0.05, -0.02)
+                                        .with_rotation(Quat::from_rotation_x(-0.25)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.044, 0.05, 0.10))),
+                                    MeshMaterial3d(accent_mat),
+                                    Transform::from_xyz(0.0, 0.10, -0.14),
+                                ));
+                            }
+                            WeaponKind::Sniper => {
+                                // بدنه کشیده اسنایپر + لوله بلند سایلنسردار + دوربین بزرگ
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.052, 0.09, 0.56))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.03, -0.16),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.014, 0.78))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.048, -0.78)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.024, 0.22))),
+                                    MeshMaterial3d(accent_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.048, -1.16)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                // دوربین اسنایپر
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.032, 0.34))),
+                                    MeshMaterial3d(accent_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.115, -0.18)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.050, 0.095, 0.28))),
+                                    MeshMaterial3d(body_mat),
+                                    Transform::from_xyz(0.0, 0.02, 0.22),
+                                ));
+                            }
+                            WeaponKind::Shotgun => {
+                                // شات‌گان سنگین با دو لوله ضخیم و دستگیره پمپی چوبی/برنزی
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.072, 0.11, 0.42))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.03, -0.10),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.024, 0.52))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.055, -0.48)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.020, 0.46))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.015, -0.46)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                // دستگیره پمپی و قنداق چوبی
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.068, 0.065, 0.24))),
+                                    MeshMaterial3d(accent_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.005, -0.44),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.058, 0.095, 0.26))),
+                                    MeshMaterial3d(accent_mat),
+                                    Transform::from_xyz(0.0, 0.015, 0.20),
+                                ));
+                            }
+                            WeaponKind::Throwable => {
+                                // نارنجک‌انداز سنگین با خشاب استوانه‌ای چرخان و لوله پهن
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.08, 0.12, 0.36))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.03, -0.08),
+                                ));
+                                // خشاب درام چرخان نارنجی/فلزی
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.095, 0.15))),
+                                    MeshMaterial3d(accent_mat.clone()),
+                                    Transform::from_xyz(0.0, -0.02, -0.22)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                // لوله پهن پرتاب‌کننده
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.042, 0.38))),
+                                    MeshMaterial3d(body_mat),
+                                    Transform::from_xyz(0.0, 0.04, -0.44)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.056, 0.09, 0.22))),
+                                    MeshMaterial3d(accent_mat),
+                                    Transform::from_xyz(0.0, 0.02, 0.18),
+                                ));
+                            }
+                        }
+
                         weapon.spawn((
                             Mesh3d(meshes.add(Cuboid::new(0.028, 0.028, 0.08))),
                             MeshMaterial3d(laser_box_mat),
@@ -2078,6 +2282,7 @@ fn weapon_live_calibration_system(
 // -----------------------------------------------------------------------------
 
 fn client_sample_input_system(
+    match_flow: Res<ClientMatchFlow>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     camera_control: Res<CameraControlState>,
@@ -2086,6 +2291,9 @@ fn client_sample_input_system(
     muzzle_query: Query<&GlobalTransform, With<MuzzlePoint>>,
     mut prediction: ResMut<ClientPhysicsPredictionState>,
 ) {
+    if !match_flow.is_in_game() {
+        return;
+    }
     let mut move_vec = Vec3::ZERO;
     if keyboard.pressed(KeyCode::KeyW) {
         move_vec.z -= 1.0;
@@ -2169,6 +2377,7 @@ fn client_receive_snapshot_and_sync_system(
     mut render_state: ResMut<ClientRenderState>,
     mut prediction: ResMut<ClientPhysicsPredictionState>,
     mut shake: ResMut<CameraShake>,
+    mut hud_sync: SnapshotHudSyncParams,
     mut fow: Option<ResMut<FogOfWarState>>,
     mut soldier_visual_query: Query<
         &mut Transform,
@@ -2246,6 +2455,8 @@ fn client_receive_snapshot_and_sync_system(
         render_state.is_dead = snap.is_dead;
         render_state.death_anim_name = snap.death_anim_name;
         render_state.in_water = snap.in_water;
+        hud_sync.hero_hud.0 = snap.hero.clone();
+        hud_sync.remote_players.0 = snap.other_players.clone();
         if let Some(ref mut fow_state) = fow {
             fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
         }
@@ -2749,12 +2960,16 @@ fn gameplay_fx_system(
 fn camera_follow_system(
     time: Res<Time>,
     config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
     mut shake: ResMut<CameraShake>,
     mut render_state: ResMut<ClientRenderState>,
     camera_control: Res<CameraControlState>,
     soldier_query: Query<&Transform, (With<SoldierMarker>, Without<MobaCamera>)>,
     mut camera_query: Query<&mut Transform, With<MobaCamera>>,
 ) {
+    if !match_flow.is_in_game() {
+        return;
+    }
     let Ok(soldier_tf) = soldier_query.single() else { return };
     let Ok(mut camera_tf) = camera_query.single_mut() else { return };
 
@@ -3568,11 +3783,7 @@ fn bake_minimap_image(config: &GameConfig) -> Image {
 // -----------------------------------------------------------------------------
 
 fn init_fog_of_war(config: &GameConfig, images: &mut Assets<Image>) -> FogOfWarState {
-    let hero_team = config
-        .heroes
-        .first()
-        .map(|h| h.team)
-        .unwrap_or(TeamId::Dawn);
+    let hero_team = config.active_hero(0).team;
     let shared = SharedFogOfWar::from_config(config, hero_team);
     let total = FOW_GRID_W * FOW_GRID_H;
 
@@ -4023,6 +4234,1040 @@ fn animate_glb_waterfall_materials_system(
                 let offset_x = (t * 0.14).fract();
                 let offset_y = (t * 0.10).fract();
                 mat.uv_transform = Affine2::from_translation(Vec2::new(offset_x, offset_y));
+            }
+        }
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// رابط کاربری نمایش تمام پارامترهای هیرو و اسلحه (Server-Authoritative HUD)
+// -----------------------------------------------------------------------------
+
+fn spawn_hero_hud_ui(commands: &mut Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(16.0),
+                bottom: px(16.0),
+                width: px(390.0),
+                padding: UiRect::all(px(12.0)),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(6.0),
+                border: UiRect::all(px(1.5)),
+                border_radius: BorderRadius::all(px(8.0)),
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.45, 0.62, 0.72, 0.75)),
+            BackgroundColor(Color::srgba(0.05, 0.07, 0.11, 0.86)),
+        ))
+        .with_children(|parent| {
+            // نوار سلامتی (HP Bar)
+            parent
+                .spawn((
+                    Node {
+                        width: percent(100),
+                        height: px(14.0),
+                        border: UiRect::all(px(1.0)),
+                        border_radius: BorderRadius::all(px(4.0)),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.2, 0.25, 0.3, 0.9)),
+                    BackgroundColor(Color::srgb(0.12, 0.14, 0.16)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        HeroHpBarFill,
+                        Node {
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.16, 0.78, 0.38)),
+                    ));
+                });
+
+            // متن تمام آمار هیرو و اسلحه
+            parent.spawn((
+                HeroHudMainText,
+                Text::new(""),
+                TextFont {
+                    font_size: FontSize::Px(12.5),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.92, 0.95, 0.98)),
+            ));
+        });
+}
+
+fn update_hero_hud_system(
+    hero_state: Res<LatestHeroSnapshot>,
+    mut text_query: Query<&mut Text, With<HeroHudMainText>>,
+    mut hp_bar_query: Query<(&mut Node, &mut BackgroundColor), With<HeroHpBarFill>>,
+) {
+    let h = &hero_state.0;
+    let hp_pct = ((h.hp / h.max_hp) * 100.0).clamp(0.0, 100.0);
+
+    if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
+        bar_node.width = percent(hp_pct);
+        *bar_col = if hp_pct > 50.0 {
+            Color::srgb(0.16, 0.78, 0.38).into()
+        } else if hp_pct > 25.0 {
+            Color::srgb(0.88, 0.65, 0.15).into()
+        } else {
+            Color::srgb(0.88, 0.20, 0.20).into()
+        };
+    }
+
+    if let Ok(mut txt) = text_query.single_mut() {
+        **txt = format!(
+            "{} [{:?}]  |  Scale: {:.2}  |  Speed: {:.2}
+             HP: {:.0} / {:.0} (+{:.1}/s)  |  Armor: {:.1}  |  Vision: {:.0}m
+             Gold: {}  |  XP: {} (Radius: {:.0}m)
+             K: {}   D: {}   A: {}   |   LH: {}   DN: {}
+             Weapon: {:?}  |  Ammo: {}/{}
+             DMG: {:.0}  |  Rate: {:.2}s  |  Speed: {:.0}  |  Range: {:.0}m",
+            h.display_name,
+            h.team,
+            h.hero_scale,
+            h.move_speed,
+            h.hp,
+            h.max_hp,
+            h.hp_regen_per_sec,
+            h.armor,
+            h.vision_range,
+            h.gold,
+            h.xp,
+            h.xp_gain_radius,
+            h.kills,
+            h.deaths,
+            h.assists,
+            h.last_hits,
+            h.denies,
+            h.weapon_kind,
+            h.ammo_in_mag,
+            h.magazine_size,
+            h.weapon_damage,
+            h.fire_rate_secs,
+            h.projectile_speed,
+            h.weapon_max_range,
+        );
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم ۴ فازی کلاینت: اتصال -> انتخاب هیرو (۳۰ ثانیه + GLB Idle) -> صفحه نبرد -> بازی
+// -----------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct ClientMatchFlow {
+    your_slot: Option<usize>,
+    snapshot: Option<MatchStateSnapshot>,
+    preview_hero_index: usize,
+    spawned_preview_hero_index: Option<usize>,
+    map_loaded_reported: bool,
+    prev_phase: Option<MatchPhase>,
+}
+
+impl ClientMatchFlow {
+    fn current_phase(&self) -> MatchPhase {
+        self.snapshot
+            .as_ref()
+            .map(|s| s.phase)
+            .unwrap_or(MatchPhase::WaitingForPlayers)
+    }
+
+    fn is_in_game(&self) -> bool {
+        self.current_phase() == MatchPhase::InGame
+    }
+}
+
+#[derive(Component)]
+struct MatchOverlayRoot;
+
+#[derive(Component)]
+struct MatchPhaseHeaderText;
+
+#[derive(Component)]
+struct MatchStatusBodyText;
+
+#[derive(Component)]
+struct HeroPickRowRoot;
+
+#[derive(Component)]
+struct HeroPickButton {
+    hero_index: usize,
+}
+
+#[derive(Component)]
+struct HeroLockInButton;
+
+#[derive(Component)]
+struct HeroPreviewRoot;
+
+#[derive(Component)]
+struct HeroPreviewAnimStarted;
+
+#[derive(Component)]
+struct RemotePlayerVisual {
+    slot_index: usize,
+    last_lower: String,
+    last_upper: String,
+}
+
+#[derive(Component)]
+struct RemoteLowerAnimPlayer {
+    slot_index: usize,
+}
+
+#[derive(Component)]
+struct RemoteUpperAnimPlayer {
+    slot_index: usize,
+}
+
+#[derive(Component)]
+struct RemoteWeaponAttached;
+
+#[derive(Resource, Default)]
+struct LatestRemotePlayers(Vec<RemotePlayerSnapshot>);
+
+#[derive(SystemParam)]
+struct SnapshotHudSyncParams<'w> {
+    hero_hud: ResMut<'w, LatestHeroSnapshot>,
+    remote_players: ResMut<'w, LatestRemotePlayers>,
+}
+
+fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
+    commands
+        .spawn((
+            MatchOverlayRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: percent(100),
+                height: percent(100),
+                padding: UiRect::all(px(28.0)),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::SpaceBetween,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.90)),
+        ))
+        .with_children(|root| {
+            root.spawn((
+                MatchPhaseHeaderText,
+                Text::new("Connecting to MOBA Server..."),
+                TextFont {
+                    font_size: FontSize::Px(26.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.95, 0.86, 0.45)),
+            ));
+
+            root.spawn(Node {
+                width: percent(100),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::FlexStart,
+                column_gap: px(24.0),
+                ..default()
+            })
+            .with_children(|mid| {
+                mid.spawn((
+                    HeroPickRowRoot,
+                    Node {
+                        width: px(420.0),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(8.0),
+                        display: Display::None,
+                        ..default()
+                    },
+                ))
+                .with_children(|list| {
+                    for (idx, hero) in config.heroes.iter().enumerate() {
+                        list.spawn((
+                            Interaction::default(),
+                            HeroPickButton { hero_index: idx },
+                            Node {
+                                width: percent(100),
+                                padding: UiRect::all(px(10.0)),
+                                border: UiRect::all(px(1.5)),
+                                border_radius: BorderRadius::all(px(6.0)),
+                                flex_direction: FlexDirection::Column,
+                                ..default()
+                            },
+                            BorderColor::all(Color::srgba(0.45, 0.65, 0.80, 0.8)),
+                            BackgroundColor(Color::srgba(0.08, 0.12, 0.18, 0.95)),
+                        ))
+                        .with_children(|btn| {
+                            btn.spawn((
+                                Text::new(format!(
+                                    "{} [{:?}] | {:?} | HP:{:.0} DMG:{:.0} RNG:{:.0}m",
+                                    hero.display_name,
+                                    hero.team,
+                                    hero.weapon.weapon_kind,
+                                    hero.max_hp,
+                                    hero.weapon.damage,
+                                    hero.weapon.max_range
+                                )),
+                                TextFont {
+                                    font_size: FontSize::Px(13.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.92, 0.96, 1.0)),
+                            ));
+                        });
+                    }
+
+                    list.spawn((
+                        Interaction::default(),
+                        HeroLockInButton,
+                        Node {
+                            width: percent(100),
+                            margin: UiRect::top(px(8.0)),
+                            padding: UiRect::all(px(12.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border: UiRect::all(px(2.0)),
+                            border_radius: BorderRadius::all(px(6.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgb(0.25, 0.90, 0.55)),
+                        BackgroundColor(Color::srgb(0.10, 0.42, 0.25)),
+                    ))
+                    .with_children(|btn| {
+                        btn.spawn((
+                            Text::new("LOCK IN HERO"),
+                            TextFont {
+                                font_size: FontSize::Px(16.0),
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                        ));
+                    });
+                });
+
+                mid.spawn((
+                    MatchStatusBodyText,
+                    Text::new("Waiting for server state..."),
+                    TextFont {
+                        font_size: FontSize::Px(16.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.88, 0.92, 0.96)),
+                ));
+            });
+
+            root.spawn((
+                Text::new("MOBA Tactical Shooter - Server Authoritative Draft & Match Flow"),
+                TextFont {
+                    font_size: FontSize::Px(12.0),
+                    ..default()
+                },
+                TextColor(Color::srgba(0.65, 0.72, 0.80, 0.8)),
+            ));
+        });
+}
+
+fn client_lobby_sync_system(
+    mut net: ResMut<ClientNetwork>,
+    mut match_flow: ResMut<ClientMatchFlow>,
+    soldier_loaded: Query<(), With<SoldierMarker>>,
+) {
+    while let Some(bytes) = net.client.receive_message(CHANNEL_RELIABLE_LOBBY) {
+        if let Ok(msg) = bincode::deserialize::<ServerMatchMessage>(&bytes) {
+            match_flow.your_slot = Some(msg.your_slot);
+            match_flow.snapshot = Some(msg.state);
+        }
+    }
+
+    if match_flow.current_phase() == MatchPhase::BattleLoading
+        && !match_flow.map_loaded_reported
+        && !soldier_loaded.is_empty()
+    {
+        if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::ReportMapLoaded) {
+            net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
+            match_flow.map_loaded_reported = true;
+        }
+    }
+}
+
+fn hero_preview_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    config: Res<GameConfig>,
+    asset_server: Res<AssetServer>,
+    mut match_flow: ResMut<ClientMatchFlow>,
+    mut camera_query: Query<&mut Transform, With<MobaCamera>>,
+    mut preview_query: Query<(Entity, &mut Transform), (With<HeroPreviewRoot>, Without<MobaCamera>)>,
+    children_query: Query<&Children>,
+    mut anim_player_query: Query<(Entity, &mut AnimationPlayer), Without<HeroPreviewAnimStarted>>,
+    anim_assets: Option<Res<SoldierAnimationAssets>>,
+) {
+    let phase = match_flow.current_phase();
+    if phase != MatchPhase::HeroSelect {
+        for (ent, _) in &preview_query {
+            commands.entity(ent).despawn();
+        }
+        match_flow.spawned_preview_hero_index = None;
+        return;
+    }
+
+    let preview_origin = Vec3::new(0.0, 2.4, 0.0);
+    if let Ok(mut cam_tf) = camera_query.single_mut() {
+        let cam_pos = preview_origin + Vec3::new(0.0, 1.8, 4.4);
+        *cam_tf = Transform::from_translation(cam_pos).looking_at(preview_origin + Vec3::Y * 0.9, Vec3::Y);
+    }
+
+    if match_flow.spawned_preview_hero_index != Some(match_flow.preview_hero_index) {
+        for (ent, _) in &preview_query {
+            commands.entity(ent).despawn();
+        }
+        let hero = config.active_hero(match_flow.preview_hero_index);
+        let gltf_scene = asset_server.load(format!("{}#Scene0", hero.model_path));
+        commands.spawn((
+            HeroPreviewRoot,
+            WorldAssetRoot(gltf_scene),
+            Transform::from_translation(preview_origin)
+                .with_scale(Vec3::splat(hero.hero_scale)),
+        ));
+        match_flow.spawned_preview_hero_index = Some(match_flow.preview_hero_index);
+    }
+
+    for (root_ent, mut tf) in &mut preview_query {
+        tf.rotate_y(0.55 * time.delta_secs());
+        if let Some(ref assets) = anim_assets {
+            for desc in children_query.iter_descendants(root_ent) {
+                if let Ok((p_ent, mut player)) = anim_player_query.get_mut(desc) {
+                    let idle_node = assets.require_node("idle");
+                    player.play(idle_node).repeat();
+                    commands
+                        .entity(p_ent)
+                        .insert((AnimationGraphHandle(assets.graph_handle.clone()), HeroPreviewAnimStarted));
+                }
+            }
+        }
+    }
+}
+
+fn match_overlay_ui_system(
+    config: Res<GameConfig>,
+    mut net: ResMut<ClientNetwork>,
+    mut match_flow: ResMut<ClientMatchFlow>,
+    mut overlay_query: Query<(&mut Node, &mut BackgroundColor), With<MatchOverlayRoot>>,
+    mut header_query: Query<&mut Text, With<MatchPhaseHeaderText>>,
+    mut body_query: Query<&mut Text, (With<MatchStatusBodyText>, Without<MatchPhaseHeaderText>)>,
+    mut pick_row_query: Query<&mut Node, (With<HeroPickRowRoot>, Without<MatchOverlayRoot>)>,
+    mut hero_btn_query: Query<
+        (&Interaction, &HeroPickButton, &mut BackgroundColor, &mut BorderColor),
+        (Changed<Interaction>, Without<MatchOverlayRoot>, Without<HeroLockInButton>),
+    >,
+    lock_btn_query: Query<&Interaction, (Changed<Interaction>, With<HeroLockInButton>)>,
+) {
+    let phase = match_flow.current_phase();
+
+    if let Ok((mut root_node, mut root_bg)) = overlay_query.single_mut() {
+        if phase == MatchPhase::InGame {
+            root_node.display = Display::None;
+            return;
+        }
+        root_node.display = Display::Flex;
+        *root_bg = match phase {
+            MatchPhase::HeroSelect => BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.35)),
+            _ => BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.92)),
+        };
+    }
+
+    if let Ok(mut row_node) = pick_row_query.single_mut() {
+        row_node.display = if phase == MatchPhase::HeroSelect {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+
+    for (interaction, btn, mut bg, mut border) in &mut hero_btn_query {
+        if *interaction == Interaction::Pressed {
+            match_flow.preview_hero_index = btn.hero_index;
+            *bg = BackgroundColor(Color::srgba(0.16, 0.28, 0.42, 0.95));
+            *border = BorderColor::all(Color::srgb(0.95, 0.82, 0.30));
+        }
+    }
+
+    if let Ok(interaction) = lock_btn_query.single() {
+        if *interaction == Interaction::Pressed && phase == MatchPhase::HeroSelect {
+            let hero = config.active_hero(match_flow.preview_hero_index);
+            if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::SelectHero {
+                hero_id: hero.id.clone(),
+            }) {
+                net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
+            }
+        }
+    }
+
+    let Some(snap) = &match_flow.snapshot else {
+        return;
+    };
+
+    if let Ok(mut header) = header_query.single_mut() {
+        **header = match snap.phase {
+            MatchPhase::WaitingForPlayers => format!(
+                "PHASE 1: WAITING FOR PLAYERS ({} / {})",
+                snap.connected_count, snap.required_players
+            ),
+            MatchPhase::HeroSelect => {
+                let is_my_turn = snap.current_pick_slot == match_flow.your_slot;
+                let turn_txt = if is_my_turn {
+                    "YOUR TURN TO PICK!".to_string()
+                } else if let Some(s) = snap.current_pick_slot {
+                    format!("Slot {} Picking...", s + 1)
+                } else {
+                    "Draft Complete".to_string()
+                };
+                format!(
+                    "PHASE 2: HERO SELECT  |  {}  |  Time: {:.0}s",
+                    turn_txt, snap.pick_time_remaining
+                )
+            }
+            MatchPhase::BattleLoading => {
+                "PHASE 3: BATTLE LOADING (Preparing Arena...)".to_string()
+            }
+            MatchPhase::InGame => String::new(),
+        };
+    }
+
+    if let Ok(mut body) = body_query.single_mut() {
+        let mut lines = Vec::new();
+        match snap.phase {
+            MatchPhase::WaitingForPlayers => {
+                lines.push("Player Lobby Status:".to_string());
+                for p in &snap.players {
+                    let status = if p.connected {
+                        format!("CONNECTED (ID: {})", p.client_id.unwrap_or(0))
+                    } else {
+                        "WAITING...".to_string()
+                    };
+                    let me = if Some(p.slot_index) == match_flow.your_slot {
+                        " <-- YOU"
+                    } else {
+                        ""
+                    };
+                    lines.push(format!("  Slot {} [{:?}] : {}{}", p.slot_index + 1, p.team, status, me));
+                }
+            }
+            MatchPhase::HeroSelect => {
+                let preview_h = config.active_hero(match_flow.preview_hero_index);
+                let taken = snap.taken_hero_ids.contains(&preview_h.id);
+                lines.push(format!(
+                    "Previewing: {} [{}]",
+                    preview_h.display_name,
+                    if taken { "TAKEN" } else { "AVAILABLE" }
+                ));
+                lines.push(format!(
+                    "Weapon: {:?} | Mag: {} | DMG: {:.0} | Rate: {:.2}s | Range: {:.0}m",
+                    preview_h.weapon.weapon_kind,
+                    preview_h.weapon.magazine_size,
+                    preview_h.weapon.damage,
+                    preview_h.weapon.fire_rate_secs,
+                    preview_h.weapon.max_range
+                ));
+                lines.push(format!(
+                    "HP: {:.0} (+{:.1}/s) | Armor: {:.1} | Vision: {:.0}m | Gold: {}",
+                    preview_h.max_hp,
+                    preview_h.hp_regen_per_sec,
+                    preview_h.armor,
+                    preview_h.vision_range,
+                    preview_h.starting_gold
+                ));
+                lines.push(String::new());
+                lines.push("Draft Order & Picks:".to_string());
+                for (step, &slot_idx) in snap.draft_order.iter().enumerate() {
+                    let p = &snap.players[slot_idx];
+                    let marker = if step == snap.current_draft_step { ">> " } else { "   " };
+                    let pick_name = p
+                        .selected_hero_id
+                        .as_deref()
+                        .unwrap_or("...");
+                    lines.push(format!(
+                        "{}Slot {} [{:?}] -> {}",
+                        marker,
+                        slot_idx + 1,
+                        p.team,
+                        pick_name
+                    ));
+                }
+            }
+            MatchPhase::BattleLoading => {
+                lines.push("TEAM DAWN  vs  TEAM DUSK".to_string());
+                lines.push("----------------------------------------".to_string());
+                for p in &snap.players {
+                    let hero_name = p
+                        .selected_hero_id
+                        .as_deref()
+                        .and_then(|id| config.heroes.iter().find(|h| h.id == id))
+                        .map(|h| h.display_name.as_str())
+                        .unwrap_or("Unknown");
+                    let load_txt = if p.map_loaded { "READY" } else { "LOADING..." };
+                    lines.push(format!(
+                        "  [{:?}] Slot {} -> {} ({})",
+                        p.team,
+                        p.slot_index + 1,
+                        hero_name,
+                        load_txt
+                    ));
+                }
+            }
+            MatchPhase::InGame => {}
+        }
+        **body = lines.join("
+");
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// همگام‌سازی کامل سایر بازیکنان آنلاین (انیمیشن بالاتنه/پایین‌تنه + سلاح در دست)
+// -----------------------------------------------------------------------------
+
+#[derive(SystemParam)]
+struct RemoteAssetsParams<'w> {
+    config: Res<'w, GameConfig>,
+    asset_server: Res<'w, AssetServer>,
+    match_flow: Res<'w, ClientMatchFlow>,
+    remote_players: Res<'w, LatestRemotePlayers>,
+    anim_assets: Option<Res<'w, SoldierAnimationAssets>>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+}
+
+#[derive(SystemParam)]
+struct RemoteHierarchyParams<'w, 's> {
+    children_query: Query<'w, 's, &'static Children>,
+    names_query: Query<'w, 's, &'static Name>,
+    parents_query: Query<'w, 's, &'static ChildOf>,
+    target_query: Query<'w, 's, (Entity, &'static mut AnimatedBy)>,
+    unbound_player_query: Query<'w, 's, Entity, (With<AnimationPlayer>, Without<AnimationGraphHandle>)>,
+    hand_query: Query<'w, 's, (Entity, &'static Name), Without<RemoteWeaponAttached>>,
+}
+
+fn sync_remote_players_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut res: RemoteAssetsParams,
+    mut hier: RemoteHierarchyParams,
+    mut existing_query: Query<(Entity, &mut RemotePlayerVisual, &mut Transform, &mut Visibility)>,
+    mut lower_query: Query<
+        (&RemoteLowerAnimPlayer, &mut AnimationPlayer, &mut AnimationTransitions),
+        Without<RemoteUpperAnimPlayer>,
+    >,
+    mut upper_query: Query<
+        (&RemoteUpperAnimPlayer, &mut AnimationPlayer, &mut AnimationTransitions),
+        Without<RemoteLowerAnimPlayer>,
+    >,
+) {
+    if !res.match_flow.is_in_game() {
+        return;
+    }
+
+    let dt = time.delta_secs();
+
+    for rp in &res.remote_players.0 {
+        let mut root_opt: Option<Entity> = None;
+
+        for (root_ent, mut vis_comp, mut tf, mut vis) in &mut existing_query {
+            if vis_comp.slot_index == rp.slot_index {
+                root_opt = Some(root_ent);
+                tf.translation = tf.translation.lerp(rp.pos, (18.0 * dt).clamp(0.0, 1.0));
+                tf.scale = Vec3::splat(rp.hero_scale);
+
+                let flat_dir = Vec3::new(rp.facing_dir.x, 0.0, rp.facing_dir.z);
+                if flat_dir.length_squared() > 0.0001 {
+                    let target_rot = Transform::IDENTITY
+                        .looking_to(-flat_dir.normalize(), Vec3::Y)
+                        .rotation;
+                    tf.rotation = tf.rotation.slerp(target_rot, (16.0 * dt).clamp(0.0, 1.0));
+                }
+
+                *vis = if rp.is_visible {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
+
+                // ۱. اتصال گراف انیمیشن Split-Body به مدل بازیکن ریموت (فقط یک بار پس از لود GLB)
+                if let Some(ref assets) = res.anim_assets {
+                    for desc in hier.children_query.iter_descendants(root_ent) {
+                        if hier.unbound_player_query.contains(desc) {
+                            commands.entity(desc).insert((
+                                AnimationGraphHandle(assets.graph_handle.clone()),
+                                AnimationTransitions::new(),
+                                RemoteLowerAnimPlayer {
+                                    slot_index: rp.slot_index,
+                                },
+                            ));
+
+                            let upper_ent = commands
+                                .spawn((
+                                    AnimationPlayer::default(),
+                                    AnimationGraphHandle(assets.graph_handle.clone()),
+                                    AnimationTransitions::new(),
+                                    RemoteUpperAnimPlayer {
+                                        slot_index: rp.slot_index,
+                                    },
+                                ))
+                                .id();
+
+                            for (bone_ent, mut animated_by) in &mut hier.target_query {
+                                if animated_by.0 == desc
+                                    && is_upper_body_in_hierarchy(bone_ent, &hier.names_query, &hier.parents_query)
+                                {
+                                    animated_by.0 = upper_ent;
+                                }
+                            }
+                        }
+
+                        // اتصال سلاح بازیکن ریموت به دست چپش
+                        if let Ok((h_ent, h_name)) = hier.hand_query.get(desc) {
+                            let n = h_name.as_str().to_lowercase();
+                            let is_left = n.contains("left")
+                                || n.contains("_l")
+                                || n.contains(".l")
+                                || n.contains("l_");
+                            let is_hand =
+                                n.contains("hand") || n.contains("wrist") || n.contains("palm");
+                            let is_finger = n.contains("thumb")
+                                || n.contains("index")
+                                || n.contains("middle")
+                                || n.contains("ring")
+                                || n.contains("pinky")
+                                || n.contains("finger")
+                                || n.contains("twist");
+                            if is_hand && is_left && !is_finger {
+                                let w_mat = res.materials.add(StandardMaterial {
+                                    base_color: match rp.weapon_kind {
+                                        WeaponKind::AutomaticRifle => Color::srgb(0.14, 0.15, 0.18),
+                                        WeaponKind::Sniper => Color::srgb(0.16, 0.22, 0.18),
+                                        WeaponKind::Shotgun => Color::srgb(0.35, 0.22, 0.14),
+                                        WeaponKind::Throwable => Color::srgb(0.80, 0.38, 0.10),
+                                    },
+                                    metallic: 0.75,
+                                    perceptual_roughness: 0.35,
+                                    ..default()
+                                });
+                                commands.entity(h_ent).insert(RemoteWeaponAttached).with_children(|parent| {
+                                    parent.spawn((
+                                        Mesh3d(res.meshes.add(Cuboid::new(0.06, 0.09, 0.52))),
+                                        MeshMaterial3d(w_mat),
+                                        Transform::from_xyz(0.0, 0.03, -0.22)
+                                            .with_scale(Vec3::splat(res.config.weapon_tuner.initial_scale)),
+                                    ));
+                                });
+                            }
+                        }
+                    }
+
+                    // ۲. پخش تمام انیمیشن‌های بالاتنه و پایین‌تنه با AnimationTransitions
+                    let desired_lower = if rp.is_dead {
+                        rp.death_anim.clone()
+                    } else if let Some(ref trav) = rp.traversal_anim {
+                        trav.clone()
+                    } else {
+                        rp.current_locomotion.clone()
+                    };
+
+                    let desired_upper = if rp.is_dead {
+                        rp.death_anim.clone()
+                    } else if let Some(ref trav) = rp.traversal_anim {
+                        trav.clone()
+                    } else if let Some(ref up) = rp.upper_anim {
+                        up.clone()
+                    } else {
+                        rp.current_locomotion.clone()
+                    };
+
+                    if vis_comp.last_lower != desired_lower {
+                        for (lp, mut player, mut trans) in &mut lower_query {
+                            if lp.slot_index == rp.slot_index {
+                                let node = assets.get_or_fallback(&desired_lower, "idle");
+                                let active = trans.play(&mut player, node, Duration::from_millis(120));
+                                if !rp.is_dead && rp.traversal_anim.is_none() {
+                                    active.repeat();
+                                }
+                                vis_comp.last_lower = desired_lower.clone();
+                            }
+                        }
+                    }
+
+                    if vis_comp.last_upper != desired_upper {
+                        for (up, mut player, mut trans) in &mut upper_query {
+                            if up.slot_index == rp.slot_index {
+                                let node = assets.get_or_fallback(&desired_upper, "idle");
+                                let active = trans.play(&mut player, node, Duration::from_millis(90));
+                                if !rp.is_dead && rp.traversal_anim.is_none() && rp.upper_anim.is_none() {
+                                    active.repeat();
+                                }
+                                vis_comp.last_upper = desired_upper.clone();
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        if root_opt.is_none() {
+            let gltf_scene = res.asset_server.load(format!("{}#Scene0", rp.model_path));
+            commands.spawn((
+                RemotePlayerVisual {
+                    slot_index: rp.slot_index,
+                    last_lower: String::new(),
+                    last_upper: String::new(),
+                },
+                WorldAssetRoot(gltf_scene),
+                Transform::from_translation(rp.pos).with_scale(Vec3::splat(rp.hero_scale)),
+                if rp.is_visible {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                },
+            ));
+        }
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// نوار سلامتی (سبز برای خودی / قرمز برای دشمن) + آیکون فشنگ‌های جداگانه بالای سر هر هیرو
+// -----------------------------------------------------------------------------
+
+#[derive(Component)]
+struct OverheadHeroBarRoot {
+    key_id: usize,
+    ammo_total: u32,
+}
+
+#[derive(Component)]
+struct OverheadHpFill {
+    key_id: usize,
+}
+
+#[derive(Component)]
+struct OverheadBulletPip {
+    key_id: usize,
+    bullet_index: u32,
+}
+
+#[derive(SystemParam)]
+struct OverheadBarQueries<'w, 's> {
+    root_q: Query<'w, 's, (Entity, &'static OverheadHeroBarRoot, &'static mut Node)>,
+    hp_q: Query<'w, 's, (&'static OverheadHpFill, &'static mut Node, &'static mut BackgroundColor), Without<OverheadHeroBarRoot>>,
+    pip_q: Query<'w, 's, (&'static OverheadBulletPip, &'static mut BackgroundColor), (Without<OverheadHeroBarRoot>, Without<OverheadHpFill>)>,
+}
+
+fn spawn_overhead_bar(commands: &mut Commands, key_id: usize, ammo_total: u32) {
+    let total = ammo_total.max(1);
+    let pip_w = ((136.0 / total as f32) - 1.5).clamp(2.5, 10.0);
+
+    commands
+        .spawn((
+            OverheadHeroBarRoot { key_id, ammo_total: total },
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: px(140.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(3.0),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::NONE),
+        ))
+        .with_children(|root| {
+            // نوار سلامتی (سبز برای خودی و هم‌تیمی، قرمز برای دشمن)
+            root.spawn((
+                Node {
+                    width: percent(100),
+                    height: px(7.5),
+                    border: UiRect::all(px(1.0)),
+                    border_radius: BorderRadius::all(px(2.0)),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.05, 0.06, 0.08, 0.85)),
+                BackgroundColor(Color::srgba(0.08, 0.09, 0.12, 0.78)),
+            ))
+            .with_children(|bar| {
+                bar.spawn((
+                    OverheadHpFill { key_id },
+                    Node {
+                        width: percent(100),
+                        height: percent(100),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.16, 0.82, 0.35)),
+                ));
+            });
+
+            // ردیف آیکون فشنگ‌ها زیر نوار سلامتی (زرد = باقی‌مانده، مشکی = مصرف‌شده)
+            root.spawn((
+                Node {
+                    width: percent(100),
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    column_gap: px(1.5),
+                    row_gap: px(1.5),
+                    ..default()
+                },
+                BackgroundColor(Color::NONE),
+            ))
+            .with_children(|row| {
+                for b_idx in 0..total {
+                    row.spawn((
+                        OverheadBulletPip {
+                            key_id,
+                            bullet_index: b_idx,
+                        },
+                        Node {
+                            width: px(pip_w),
+                            height: px(8.0),
+                            border_radius: BorderRadius::top(px(1.5)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.98, 0.80, 0.16)),
+                    ));
+                }
+            });
+        });
+}
+
+fn update_overhead_hero_bars_system(
+    mut commands: Commands,
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    remote_players: Res<LatestRemotePlayers>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut bars: OverheadBarQueries,
+) {
+    if !match_flow.is_in_game() {
+        for (_, _, mut node) in &mut bars.root_q {
+            node.display = Display::None;
+        }
+        return;
+    }
+
+    let Ok((camera, cam_gtf)) = camera_query.single() else {
+        return;
+    };
+
+    let my_team = hero_hud.0.team;
+
+    struct BarTarget {
+        key_id: usize,
+        world_head: Vec3,
+        visible: bool,
+        is_ally: bool,
+        hp: f32,
+        max_hp: f32,
+        ammo_rem: u32,
+        ammo_total: u32,
+    }
+
+    let mut targets: Vec<BarTarget> = Vec::with_capacity(1 + remote_players.0.len());
+
+    // ۱. خود هیروی بازیکن (همیشه سبز، بالاتر از سر بر اساس hero_scale)
+    let h = &hero_hud.0;
+    targets.push(BarTarget {
+        key_id: usize::MAX,
+        world_head: render_state.soldier_pos + Vec3::Y * (3.15 * h.hero_scale),
+        visible: !render_state.is_dead,
+        is_ally: true,
+        hp: h.hp,
+        max_hp: h.max_hp,
+        ammo_rem: h.ammo_in_mag,
+        ammo_total: h.magazine_size,
+    });
+
+    // ۲. سایر هیروهای بازی (هم‌تیمی‌ها سبز، دشمنان قرمز)
+    for rp in &remote_players.0 {
+        targets.push(BarTarget {
+            key_id: rp.slot_index,
+            world_head: rp.pos + Vec3::Y * (3.15 * rp.hero_scale),
+            visible: rp.is_visible && !rp.is_dead,
+            is_ally: rp.team == my_team,
+            hp: rp.hp,
+            max_hp: rp.max_hp,
+            ammo_rem: rp.ammo_in_mag,
+            ammo_total: rp.magazine_size,
+        });
+    }
+
+    for tgt in &targets {
+        let mut existing_ent: Option<(Entity, u32)> = None;
+        for (ent, root, _) in &bars.root_q {
+            if root.key_id == tgt.key_id {
+                existing_ent = Some((ent, root.ammo_total));
+                break;
+            }
+        }
+        match existing_ent {
+            None => {
+                spawn_overhead_bar(&mut commands, tgt.key_id, tgt.ammo_total);
+                continue;
+            }
+            Some((ent, cur_total)) if cur_total != tgt.ammo_total.max(1) => {
+                commands.entity(ent).despawn();
+                spawn_overhead_bar(&mut commands, tgt.key_id, tgt.ammo_total);
+                continue;
+            }
+            _ => {}
+        }
+
+        let screen_opt = if tgt.visible {
+            camera.world_to_viewport(cam_gtf, tgt.world_head).ok()
+        } else {
+            None
+        };
+
+        for (_, root, mut node) in &mut bars.root_q {
+            if root.key_id == tgt.key_id {
+                if let Some(sp) = screen_opt {
+                    node.display = Display::Flex;
+                    node.left = px(sp.x - 70.0);
+                    node.top = px(sp.y - 38.0);
+                } else {
+                    node.display = Display::None;
+                }
+            }
+        }
+
+        let hp_pct = ((tgt.hp / tgt.max_hp.max(1.0)) * 100.0).clamp(0.0, 100.0);
+        let hp_col = if tgt.is_ally {
+            Color::srgb(0.16, 0.82, 0.35)
+        } else {
+            Color::srgb(0.88, 0.18, 0.18)
+        };
+        for (fill, mut fnode, mut fbg) in &mut bars.hp_q {
+            if fill.key_id == tgt.key_id {
+                fnode.width = percent(hp_pct);
+                *fbg = hp_col.into();
+            }
+        }
+
+        let yellow_bullet = Color::srgb(0.98, 0.80, 0.16);
+        let used_black = Color::srgb(0.06, 0.06, 0.08);
+        for (pip, mut pbg) in &mut bars.pip_q {
+            if pip.key_id == tgt.key_id {
+                *pbg = if pip.bullet_index < tgt.ammo_rem {
+                    yellow_bullet.into()
+                } else {
+                    used_black.into()
+                };
             }
         }
     }

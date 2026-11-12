@@ -4458,6 +4458,21 @@ fn shared_authoritative_drive_system(
         return;
     }
     let dt = time.delta_secs();
+    let hero_aim_targets: Vec<(usize, TeamId, Vec3, f32, Stance, bool)> = world
+        .players
+        .iter()
+        .map(|p| {
+            (
+                p.slot_index,
+                p.hero_team,
+                p.soldier_pos,
+                p.hero_scale,
+                p.effective_stance,
+                p.is_dead,
+            )
+        })
+        .collect();
+
     for (soldier_marker, mut soldier_tf, mut controller) in &mut soldier_query {
         let slot_idx = soldier_marker.slot_index;
         let has_slots = !world.players.is_empty();
@@ -4476,6 +4491,7 @@ fn shared_authoritative_drive_system(
                 &mut controller,
                 &obstacle_query,
                 &target_query,
+                &hero_aim_targets,
             );
         }
         if has_slots {
@@ -4533,6 +4549,7 @@ fn shared_drive_single_player(
     controller: &mut CustomCharacterController,
     obstacle_query: &Query<&PhysicsObstacle>,
     target_query: &Query<&PhysicsTarget>,
+    hero_aim_targets: &[(usize, TeamId, Vec3, f32, Stance, bool)],
 ) {
 
     // ۱. بررسی کلید X (تست مرگ) و تایمر زنده شدن مجدد در چشمه پایگاه
@@ -4622,15 +4639,74 @@ fn shared_drive_single_player(
             world.base_stance
         };
 
-        // ۵. محاسبه جهت هدف‌گیری با ماوس (Aim Ray) با در نظر گرفتن ارتفاع فعلی کاراکتر
+        // ۵. هدف‌گیری ۳بعدی استاندارد روی سطوح مختلف و هیروی دشمن (ایستاده یا نشسته)
         if !world.traversal.is_active
             && input.has_aim_ray
             && input.aim_ray_dir.y.abs() > config.physics.aim_ray_min_dir_y_epsilon
         {
-            let aim_plane_y = world.soldier_pos.y + config.soldier.aim_plane_height_offset;
-            let t = (aim_plane_y - input.aim_ray_origin.y) / input.aim_ray_dir.y;
-            if t > 0.0 {
-                let hit = input.aim_ray_origin + input.aim_ray_dir * t;
+            let ray_dir = input.aim_ray_dir.normalize();
+            let mut resolved_hit: Option<Vec3> = None;
+
+            // الف) اگر نشانه‌گر ماوس روی کپسول یک هیروی دشمن قابل مشاهده است، دقیقاً به ارتفاع سینه همان هیرو قفل شو
+            let mut best_enemy_toi = f32::MAX;
+            for &(e_slot, e_team, e_pos, e_scale, e_stance, e_dead) in hero_aim_targets {
+                if e_slot == world.active_slot || e_team == world.hero_team || e_dead {
+                    continue;
+                }
+                if !world.fog_of_war.is_world_point_visible(config, e_pos.x, e_pos.z) {
+                    continue;
+                }
+                let e_rad = config.soldier.player_radius * e_scale * 1.45;
+                let e_height = if e_stance == Stance::Crouch {
+                    1.35 * e_scale
+                } else {
+                    1.95 * e_scale
+                };
+                if let Some(toi) =
+                    segment_hits_hero_capsule(input.aim_ray_origin, ray_dir, 180.0, e_pos, e_rad, e_height)
+                {
+                    if toi < best_enemy_toi {
+                        best_enemy_toi = toi;
+                        let chest_h = if e_stance == Stance::Crouch {
+                            0.72 * e_scale
+                        } else {
+                            1.10 * e_scale
+                        };
+                        resolved_hit = Some(e_pos + Vec3::Y * chest_h);
+                    }
+                }
+            }
+
+            // ب) در غیر این صورت، اشعه ماوس را با زمین/پلتفرم/رمپ واقعی نقشه در هر ارتفاعی تقاطع بده
+            if resolved_hit.is_none() {
+                let aim_groups = soldier_collision_groups();
+                if let Some((_ent, hit)) = physics_world.cast_ray(
+                    input.aim_ray_origin,
+                    ray_dir,
+                    180.0,
+                    aim_groups,
+                    |ent| {
+                        if let Ok(t) = target_query.get(ent) {
+                            !world.targets[t.index].is_dead
+                        } else {
+                            true
+                        }
+                    },
+                ) {
+                    resolved_hit = Some(hit.point + Vec3::Y * config.soldier.aim_plane_height_offset);
+                }
+            }
+
+            // ج) Fallback به صفحه افقی در صورت عدم برخورد با هندسه نقشه
+            if resolved_hit.is_none() {
+                let aim_plane_y = world.soldier_pos.y + config.soldier.aim_plane_height_offset;
+                let t = (aim_plane_y - input.aim_ray_origin.y) / ray_dir.y;
+                if t > 0.0 {
+                    resolved_hit = Some(input.aim_ray_origin + ray_dir * t);
+                }
+            }
+
+            if let Some(hit) = resolved_hit {
                 world.aim_hit_pos = hit;
                 let to_target = Vec3::new(
                     hit.x - world.soldier_pos.x,
@@ -5022,19 +5098,23 @@ fn step_shooting_and_grenade_spawn(
         world.firing_anim_remaining = Some(dur);
 
         let muzzle_pos = resolve_muzzle_pos(world, input, config);
-        let to_aim = Vec3::new(
-            world.aim_hit_pos.x - muzzle_pos.x,
-            0.0,
-            world.aim_hit_pos.z - muzzle_pos.z,
-        );
+        let to_aim = world.aim_hit_pos - muzzle_pos;
         let shot_dir = if to_aim.length_squared() > config.physics.muzzle_aim_min_dist_sq {
-            to_aim.normalize()
+            let mut dir = to_aim.normalize();
+            // محدود کردن زاویه عمودی معقول تا تیر بین سطوح بالا و پایین روان حرکت کند
+            dir.y = dir.y.clamp(-0.60, 0.60);
+            dir.normalize()
         } else {
             world.aim_world_dir
         };
 
         let pellets = world.hero_weapon.pellets_per_shot;
-        let spread_rad = world.hero_weapon.spread_rad;
+        let crouch_accuracy_mult = if world.effective_stance == Stance::Crouch {
+            0.60
+        } else {
+            1.0
+        };
+        let spread_rad = world.hero_weapon.spread_rad * crouch_accuracy_mult;
         let proj_speed = world.hero_weapon.projectile_speed;
         let dmg = world.hero_weapon.damage;
         let max_range = world.hero_weapon.max_range;
@@ -5200,7 +5280,11 @@ fn shared_authoritative_react_system(
                     continue;
                 }
                 let h_rad = config.soldier.player_radius * p.hero_scale * 1.15;
-                let h_height = 1.95 * p.hero_scale;
+                let h_height = if p.effective_stance == Stance::Crouch {
+                    1.35 * p.hero_scale
+                } else {
+                    1.95 * p.hero_scale
+                };
                 if let Some(toi) =
                     segment_hits_hero_capsule(old_pos, step_dir, step_dist, p.soldier_pos, h_rad, h_height)
                 {
@@ -5370,7 +5454,7 @@ fn shared_authoritative_react_system(
         }
         if let Some(input) = world.active_input.clone() {
             let muzzle_pos = resolve_muzzle_pos(&world, &input, &config);
-            let raw_target = Vec3::new(world.aim_hit_pos.x, muzzle_pos.y, world.aim_hit_pos.z);
+            let raw_target = world.aim_hit_pos;
             world.laser_hit_pos = compute_laser_hit(
                 &physics_world,
                 muzzle_pos,

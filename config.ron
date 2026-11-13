@@ -18,6 +18,18 @@ GameConfig(
             25, 26, 27, 28, 29, 30, 31, 32,
         )
     ),
+    ping: PingConfig(
+        duration_secs: 3.5,
+        max_active_pings: 8,
+        world_ring_radius: 2.2,
+        beam_height: 7.5,
+        minimap_pulse_speed: 6.5,
+    ),
+    chat: ChatConfig(
+        max_message_len: 140,
+        max_visible_messages: 7,
+        message_fade_secs: 9.0,
+    ),
     window: WindowConfig(
         title: "MOBA Tactical Shooter - Ruined Highland Sanctuary (Bevy 0.20 Custom Physics)",
         width: 1280,

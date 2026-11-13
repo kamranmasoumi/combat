@@ -89,6 +89,11 @@ fn server_network_receive_system(
         match event {
             ServerEvent::ClientConnected { client_id } => {
                 if match_state.on_client_connected(client_id, &config) {
+                    if match_state.phase == MatchPhase::InGame {
+                        if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                            world.set_slot_connected(slot_idx, true, &config);
+                        }
+                    }
                     println!(
                         "بازیکن {} متصل شد ({}/{}).",
                         client_id,
@@ -101,7 +106,11 @@ fn server_network_receive_system(
             }
             ServerEvent::ClientDisconnected { client_id, reason } => {
                 println!("بازیکن {} قطع شد: {:?}", client_id, reason);
-                match_state.on_client_disconnected(client_id);
+                if let Some(slot_idx) = match_state.on_client_disconnected(client_id) {
+                    if match_state.phase == MatchPhase::InGame {
+                        world.set_slot_connected(slot_idx, false, &config);
+                    }
+                }
             }
         }
     }
@@ -121,14 +130,28 @@ fn server_network_receive_system(
                     }
                     ClientLobbyMessage::ReportMapLoaded => {
                         if match_state.on_map_loaded(client_id) {
-                            println!("کلاینت {} آبجکت‌های نقشه را لود کرد.", client_id);
+                            println!("کلاینت {} آبجکتهای نقشه را لود کرد.", client_id);
+                        }
+                    }
+                    ClientLobbyMessage::SendChat { all_chat, text } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                world.push_chat_message(slot_idx, all_chat, &text, &config);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::SendPing { world_pos } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                world.push_ping(slot_idx, world_pos, &config);
+                            }
                         }
                     }
                 }
             }
         }
 
-        // ورودی هر بازیکن فقط به اسلات خودش در دنیای بازی اعمال می‌شود (عدم تداخل بازیکن‌ها)
+        // ورودی هر بازیکن فقط به اسلات خودش در دنیای بازی اعمال میشود (عدم تداخل بازیکنها)
         while let Some(bytes) = net_inner
             .server
             .receive_message(client_id, CHANNEL_UNRELIABLE_STATE)

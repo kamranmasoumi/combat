@@ -1,4 +1,6 @@
 use bevy::animation::AnimatedBy;
+use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::ButtonState;
 use bevy::asset::RenderAssetUsages;
 use bevy::gltf::GltfMaterialName;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -21,7 +23,7 @@ use moba_shared::{
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
-    AncientSnapshot, BarracksKind, BarracksSnapshot, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
@@ -123,6 +125,8 @@ fn main() {
         .insert_resource(LatestBarracks::default())
         .insert_resource(LatestAncients::default())
         .insert_resource(LatestMatchResult::default())
+        .insert_resource(ChatUiState::default())
+        .insert_resource(ClientPingState::default())
         .insert_resource(ClientMatchFlow {
             your_slot: None,
             snapshot: None,
@@ -189,7 +193,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system)
+            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system, client_chat_input_system, update_chat_ui_system, client_ping_input_system, update_ping_visuals_system)
                 .chain()
                 .after(sync_remote_players_system),
         )
@@ -1846,6 +1850,7 @@ fn setup_scene(
     spawn_top_match_hud_ui(&mut commands);
     spawn_death_screen_overlay(&mut commands);
     spawn_end_of_match_overlay(&mut commands);
+    spawn_chat_ui(&mut commands);
     spawn_match_overlay_ui(&mut commands, &config);
     spawn_laser_and_reticle_visuals(
         &mut commands,
@@ -2468,9 +2473,13 @@ fn align_weapon_horizontally_system(
 fn weapon_live_calibration_system(
     time: Res<Time>,
     config: Res<GameConfig>,
+    chat_state: Res<ChatUiState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut tuner: ResMut<WeaponTuner>,
 ) {
+    if chat_state.is_open {
+        return;
+    }
     let dt = time.delta_secs();
     let move_speed = config.weapon_tuner.calibration_move_speed * dt;
     let rot_speed = config.weapon_tuner.calibration_rot_speed_deg * dt;
@@ -2527,6 +2536,7 @@ fn weapon_live_calibration_system(
 fn client_sample_input_system(
     match_flow: Res<ClientMatchFlow>,
     match_result: Res<LatestMatchResult>,
+    chat_state: Res<ChatUiState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     camera_control: Res<CameraControlState>,
@@ -2536,6 +2546,24 @@ fn client_sample_input_system(
     mut prediction: ResMut<ClientPhysicsPredictionState>,
 ) {
     if !match_flow.is_in_game() || match_result.0.is_some() {
+        return;
+    }
+    if chat_state.is_open {
+        prediction.latest_input = Some(ClientInputCommand {
+            move_input: Vec3::ZERO,
+            shift_held: false,
+            toggle_crouch_just_pressed: false,
+            reload_just_pressed: false,
+            grenade_just_pressed: false,
+            space_just_pressed: false,
+            kill_toggle_just_pressed: false,
+            fire_just_pressed: false,
+            fire_held: false,
+            aim_ray_origin: Vec3::ZERO,
+            aim_ray_dir: Vec3::NEG_Z,
+            has_aim_ray: false,
+            client_muzzle_world_pos: None,
+        });
         return;
     }
     let mut move_vec = Vec3::ZERO;
@@ -2568,6 +2596,7 @@ fn client_sample_input_system(
 
     let client_muzzle_world_pos = muzzle_query.single().ok().map(|gtf| gtf.translation());
 
+    let alt_held = keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight);
     let cmd = ClientInputCommand {
         move_input: move_vec,
         shift_held: keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight),
@@ -2577,10 +2606,12 @@ fn client_sample_input_system(
         grenade_just_pressed: keyboard.just_pressed(KeyCode::KeyF),
         space_just_pressed: keyboard.just_pressed(KeyCode::Space),
         kill_toggle_just_pressed: keyboard.just_pressed(KeyCode::KeyX),
-        fire_just_pressed: !camera_control.is_pointer_over_minimap
+        fire_just_pressed: !alt_held
+            && !camera_control.is_pointer_over_minimap
             && !camera_control.is_dragging_minimap
             && mouse_button.just_pressed(MouseButton::Left),
-        fire_held: !camera_control.is_pointer_over_minimap
+        fire_held: !alt_held
+            && !camera_control.is_pointer_over_minimap
             && !camera_control.is_dragging_minimap
             && mouse_button.pressed(MouseButton::Left),
         aim_ray_origin,
@@ -2720,6 +2751,34 @@ fn client_receive_snapshot_and_sync_system(
         hud_sync.barracks.0 = snap.barracks.clone();
         hud_sync.ancients.0 = snap.ancients.clone();
         hud_sync.match_result.0 = snap.winning_team;
+        for msg in snap.recent_chat {
+            if hud_sync.chat_state.seen_ids.insert(msg.id) {
+                hud_sync.chat_state.messages.push(ClientChatItem {
+                    entry: msg,
+                    fade_remaining: config.chat.message_fade_secs,
+                });
+                let max_vis = config.chat.max_visible_messages;
+                if hud_sync.chat_state.messages.len() > max_vis {
+                    let drain_n = hud_sync.chat_state.messages.len() - max_vis;
+                    hud_sync.chat_state.messages.drain(0..drain_n);
+                }
+                hud_sync.chat_state.dirty = true;
+            }
+        }
+        let minimap_ent_opt = hud_sync.minimap_root_q.single().ok();
+        for pg in snap.recent_pings {
+            if hud_sync.ping_state.seen_ids.insert(pg.id) {
+                spawn_team_ping_visuals(
+                    &mut commands,
+                    &config,
+                    &mut fx_res.meshes,
+                    &mut fx_res.materials,
+                    minimap_ent_opt,
+                    pg.world_pos,
+                    &pg.sender_name,
+                );
+            }
+        }
         if let Some(ref mut fow_state) = fow {
             fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
         }
@@ -4252,22 +4311,25 @@ fn spawn_minimap_ui(commands: &mut Commands, config: &GameConfig, minimap_handle
 
 fn minimap_interaction_system(
     config: Res<GameConfig>,
+    chat_state: Res<ChatUiState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     render_state: Res<ClientRenderState>,
     mut camera_control: ResMut<CameraControlState>,
 ) {
-    let wasd_pressed = keyboard.pressed(KeyCode::KeyW)
-        || keyboard.pressed(KeyCode::KeyA)
-        || keyboard.pressed(KeyCode::KeyS)
-        || keyboard.pressed(KeyCode::KeyD);
+    if !chat_state.is_open {
+        let wasd_pressed = keyboard.pressed(KeyCode::KeyW)
+            || keyboard.pressed(KeyCode::KeyA)
+            || keyboard.pressed(KeyCode::KeyS)
+            || keyboard.pressed(KeyCode::KeyD);
 
-    if keyboard.just_pressed(KeyCode::KeyY)
-        || keyboard.just_pressed(KeyCode::Home)
-        || (wasd_pressed && !camera_control.is_dragging_minimap)
-    {
-        camera_control.free_look_target = None;
+        if keyboard.just_pressed(KeyCode::KeyY)
+            || keyboard.just_pressed(KeyCode::Home)
+            || (wasd_pressed && !camera_control.is_dragging_minimap)
+        {
+            camera_control.free_look_target = None;
+        }
     }
 
     let Ok(window) = window_query.single() else {
@@ -4292,7 +4354,8 @@ fn minimap_interaction_system(
     let inside = cursor.x >= min_x && cursor.x <= max_x && cursor.y >= min_y && cursor.y <= max_y;
     camera_control.is_pointer_over_minimap = inside;
 
-    if inside && mouse_button.just_pressed(MouseButton::Left) {
+    let alt_held = keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight);
+    if inside && !alt_held && mouse_button.just_pressed(MouseButton::Left) {
         camera_control.is_dragging_minimap = true;
     }
     if !mouse_button.pressed(MouseButton::Left) {
@@ -5816,7 +5879,7 @@ struct LatestAncients(Vec<AncientSnapshot>);
 struct LatestMatchResult(Option<TeamId>);
 
 #[derive(SystemParam)]
-struct SnapshotHudSyncParams<'w> {
+struct SnapshotHudSyncParams<'w, 's> {
     hero_hud: ResMut<'w, LatestHeroSnapshot>,
     remote_players: ResMut<'w, LatestRemotePlayers>,
     creeps: ResMut<'w, LatestCreeps>,
@@ -5825,6 +5888,9 @@ struct SnapshotHudSyncParams<'w> {
     barracks: ResMut<'w, LatestBarracks>,
     ancients: ResMut<'w, LatestAncients>,
     match_result: ResMut<'w, LatestMatchResult>,
+    chat_state: ResMut<'w, ChatUiState>,
+    ping_state: ResMut<'w, ClientPingState>,
+    minimap_root_q: Query<'w, 's, Entity, With<MinimapRoot>>,
 }
 
 fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
@@ -7128,14 +7194,18 @@ fn spawn_portrait_card(
     asset_server: &AssetServer,
     hero: &TopBarHeroInfo,
 ) {
-    let border_col = if hero.is_dead {
+    let border_col = if hero.is_disconnected {
+        Color::srgb(0.84, 0.20, 0.20)
+    } else if hero.is_dead {
         Color::srgb(0.35, 0.35, 0.38)
     } else if hero.team == TeamId::Dawn {
         Color::srgb(0.20, 0.85, 0.56)
     } else {
         Color::srgb(0.92, 0.28, 0.24)
     };
-    let bg_col = if hero.is_dead {
+    let bg_col = if hero.is_disconnected {
+        Color::srgba(0.08, 0.08, 0.10, 0.72)
+    } else if hero.is_dead {
         Color::srgba(0.10, 0.10, 0.12, 0.85)
     } else if hero.team == TeamId::Dawn {
         Color::srgba(0.08, 0.24, 0.18, 0.92)
@@ -7214,12 +7284,40 @@ fn spawn_portrait_card(
                             font_size: FontSize::Px(if hero.is_dead { 16.0 } else { 14.0 }),
                             ..default()
                         },
-                        TextColor(if hero.is_dead {
+                        TextColor(if hero.is_disconnected {
+                            Color::srgba(0.55, 0.55, 0.58, 0.70)
+                        } else if hero.is_dead {
                             Color::srgb(1.0, 0.35, 0.32)
                         } else {
                             Color::WHITE
                         }),
                     ));
+                }
+                if hero.is_disconnected {
+                    frame.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            width: percent(100),
+                            height: percent(100),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.04, 0.04, 0.06, 0.62)),
+                    ))
+                    .with_children(|dc| {
+                        // خط قرمز افقی روی کارت بازیکن دیسکانکت‌شده
+                        dc.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(0.0),
+                                width: percent(100),
+                                height: px(3.0),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.98, 0.20, 0.20)),
+                        ));
+                    });
                 }
             });
 
@@ -7284,7 +7382,7 @@ fn update_top_match_hud_system(
         .map(|h| {
             let hp_bucket = h.hp_ratio.map(|r| (r * 20.0).round() as i32).unwrap_or(-1);
             let resp_sec = if h.is_dead { h.respawn_remaining.ceil() as i32 } else { 0 };
-            (h.slot_index, format!("{}_{}_{}", h.hero_id, hp_bucket, resp_sec), h.is_dead)
+            (h.slot_index, format!("{}_{}_{}_{}", h.hero_id, hp_bucket, resp_sec, h.is_disconnected), h.is_dead)
         })
         .collect();
 
@@ -8460,5 +8558,714 @@ fn end_of_match_overlay_system(
             h.denies,
             h.gold
         );
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم چت مینیمال درون بازی (مشابه Dota 2: Enter = چت تیمی، Shift+Enter = چت عمومی)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct ClientChatItem {
+    entry: ChatMessageEntry,
+    fade_remaining: f32,
+}
+
+#[derive(Resource, Default)]
+struct ChatUiState {
+    is_open: bool,
+    just_opened: bool,
+    all_chat: bool,
+    draft_text: String,
+    messages: Vec<ClientChatItem>,
+    seen_ids: HashSet<u64>,
+    dirty: bool,
+}
+
+#[derive(Component)]
+struct ChatHudRoot;
+
+#[derive(Component)]
+struct ChatMessagesColumn;
+
+#[derive(Component)]
+struct ChatInputRow;
+
+#[derive(Component)]
+struct ChatModeBadgeText;
+
+#[derive(Component)]
+struct ChatDraftText;
+
+fn spawn_chat_ui(commands: &mut Commands) {
+    commands
+        .spawn((
+            ChatHudRoot,
+            Pickable::IGNORE,
+            GlobalZIndex(210),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(16.0),
+                bottom: px(208.0),
+                width: px(450.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(6.0),
+                display: Display::None,
+                ..default()
+            },
+        ))
+        .with_children(|root| {
+            root.spawn((
+                ChatMessagesColumn,
+                Pickable::IGNORE,
+                Node {
+                    width: percent(100),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(4.0),
+                    ..default()
+                },
+            ));
+
+            root.spawn((
+                ChatInputRow,
+                Pickable::IGNORE,
+                Node {
+                    width: percent(100),
+                    padding: UiRect::axes(px(10.0), px(7.0)),
+                    column_gap: px(8.0),
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(6.0)),
+                    display: Display::None,
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.22, 0.78, 0.65, 0.90)),
+                BackgroundColor(Color::srgba(0.04, 0.06, 0.10, 0.90)),
+            ))
+            .with_children(|row| {
+                row.spawn((
+                    ChatModeBadgeText,
+                    Text::new("[TEAM]"),
+                    TextFont {
+                        font_size: FontSize::Px(12.5),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.24, 0.92, 0.70)),
+                ));
+
+                row.spawn((
+                    ChatDraftText,
+                    Text::new("|"),
+                    TextFont {
+                        font_size: FontSize::Px(13.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.97, 1.0)),
+                ));
+            });
+        });
+}
+
+fn client_chat_input_system(
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut key_events: MessageReader<KeyboardInput>,
+    mut net: ResMut<ClientNetwork>,
+    mut chat_state: ResMut<ChatUiState>,
+) {
+    if !match_flow.is_in_game() {
+        key_events.clear();
+        if chat_state.is_open {
+            chat_state.is_open = false;
+            chat_state.draft_text.clear();
+            chat_state.dirty = true;
+        }
+        return;
+    }
+
+    if !chat_state.is_open {
+        key_events.clear();
+        if keyboard.just_pressed(KeyCode::Enter) || keyboard.just_pressed(KeyCode::NumpadEnter) {
+            chat_state.is_open = true;
+            chat_state.just_opened = true;
+            chat_state.all_chat =
+                keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight);
+            chat_state.draft_text.clear();
+            chat_state.dirty = true;
+        }
+        return;
+    }
+
+    if chat_state.just_opened {
+        chat_state.just_opened = false;
+        key_events.clear();
+        return;
+    }
+
+    for ev in key_events.read() {
+        if ev.state != ButtonState::Pressed {
+            continue;
+        }
+        match ev.logical_key {
+            Key::Escape => {
+                chat_state.is_open = false;
+                chat_state.draft_text.clear();
+                chat_state.dirty = true;
+                break;
+            }
+            Key::Enter => {
+                let text = chat_state.draft_text.trim().to_string();
+                if !text.is_empty() {
+                    if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::SendChat {
+                        all_chat: chat_state.all_chat,
+                        text,
+                    }) {
+                        net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
+                    }
+                }
+                chat_state.is_open = false;
+                chat_state.draft_text.clear();
+                chat_state.dirty = true;
+                break;
+            }
+            Key::Backspace => {
+                if chat_state.draft_text.pop().is_some() {
+                    chat_state.dirty = true;
+                }
+            }
+            Key::Space => {
+                if chat_state.draft_text.chars().count() < config.chat.max_message_len {
+                    chat_state.draft_text.push(' ');
+                    chat_state.dirty = true;
+                }
+            }
+            Key::Character(ref s) => {
+                let mut added = false;
+                for ch in s.chars() {
+                    if ch.is_control() {
+                        continue;
+                    }
+                    if chat_state.draft_text.chars().count() >= config.chat.max_message_len {
+                        break;
+                    }
+                    chat_state.draft_text.push(ch);
+                    added = true;
+                }
+                if added {
+                    chat_state.dirty = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn update_chat_ui_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    match_flow: Res<ClientMatchFlow>,
+    mut chat_state: ResMut<ChatUiState>,
+    mut root_q: Query<&mut Node, With<ChatHudRoot>>,
+    mut input_row_q: Query<
+        (&mut Node, &mut BorderColor),
+        (With<ChatInputRow>, Without<ChatHudRoot>),
+    >,
+    mut badge_q: Query<(&mut Text, &mut TextColor), With<ChatModeBadgeText>>,
+    mut draft_q: Query<
+        (&mut Text, &mut TextColor),
+        (With<ChatDraftText>, Without<ChatModeBadgeText>),
+    >,
+    msg_col_q: Query<(Entity, Option<&Children>), With<ChatMessagesColumn>>,
+) {
+    let Ok(mut root_node) = root_q.single_mut() else {
+        return;
+    };
+    if !match_flow.is_in_game() {
+        root_node.display = Display::None;
+        return;
+    }
+    root_node.display = Display::Flex;
+
+    let dt = time.delta_secs();
+    if !chat_state.is_open {
+        let mut faded_any = false;
+        for item in &mut chat_state.messages {
+            if item.fade_remaining > 0.0 {
+                item.fade_remaining = (item.fade_remaining - dt).max(0.0);
+                if item.fade_remaining <= 0.0 {
+                    faded_any = true;
+                }
+            }
+        }
+        if faded_any {
+            chat_state.dirty = true;
+        }
+    }
+
+    if let Ok((mut row_node, mut row_border)) = input_row_q.single_mut() {
+        row_node.display = if chat_state.is_open {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        *row_border = if chat_state.all_chat {
+            BorderColor::all(Color::srgba(0.96, 0.72, 0.20, 0.92))
+        } else {
+            BorderColor::all(Color::srgba(0.22, 0.84, 0.65, 0.92))
+        };
+    }
+
+    if chat_state.is_open {
+        if let Ok((mut badge_txt, mut badge_col)) = badge_q.single_mut() {
+            if chat_state.all_chat {
+                **badge_txt = "[ALL]".to_string();
+                *badge_col = TextColor(Color::srgb(0.98, 0.76, 0.24));
+            } else {
+                **badge_txt = "[TEAM]".to_string();
+                *badge_col = TextColor(Color::srgb(0.26, 0.92, 0.70));
+            }
+        }
+        if let Ok((mut draft_txt, mut draft_col)) = draft_q.single_mut() {
+            let cursor = if (time.elapsed_secs() * 2.4).sin() >= 0.0 {
+                "|"
+            } else {
+                ""
+            };
+            if chat_state.draft_text.is_empty() {
+                **draft_txt = format!("{} Type message... (Enter: Send, Esc: Cancel)", cursor);
+                *draft_col = TextColor(Color::srgba(0.68, 0.74, 0.82, 0.75));
+            } else {
+                **draft_txt = format!("{}{}", chat_state.draft_text, cursor);
+                *draft_col = TextColor(Color::srgb(0.96, 0.98, 1.0));
+            }
+        }
+    }
+
+    if !chat_state.dirty {
+        return;
+    }
+    chat_state.dirty = false;
+
+    if let Ok((col_ent, children_opt)) = msg_col_q.single() {
+        if let Some(children) = children_opt {
+            for child in children.iter() {
+                commands.entity(child).despawn();
+            }
+        }
+        commands.entity(col_ent).with_children(|col| {
+            for item in &chat_state.messages {
+                if !chat_state.is_open && item.fade_remaining <= 0.0 {
+                    continue;
+                }
+                let e = &item.entry;
+                match e.kind {
+                    ChatMessageKind::SystemDisconnect => {
+                        col.spawn((
+                            Pickable::IGNORE,
+                            Node {
+                                padding: UiRect::axes(px(9.0), px(4.0)),
+                                column_gap: px(6.0),
+                                flex_direction: FlexDirection::Row,
+                                flex_wrap: FlexWrap::Wrap,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(px(5.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.24, 0.04, 0.05, 0.82)),
+                        ))
+                        .with_children(|line| {
+                            line.spawn((
+                                Text::new(&e.text),
+                                TextFont {
+                                    font_size: FontSize::Px(12.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(1.0, 0.32, 0.32)),
+                            ));
+                        });
+                    }
+                    ChatMessageKind::SystemReconnect => {
+                        col.spawn((
+                            Pickable::IGNORE,
+                            Node {
+                                padding: UiRect::axes(px(9.0), px(4.0)),
+                                column_gap: px(6.0),
+                                flex_direction: FlexDirection::Row,
+                                flex_wrap: FlexWrap::Wrap,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(px(5.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.04, 0.22, 0.09, 0.82)),
+                        ))
+                        .with_children(|line| {
+                            line.spawn((
+                                Text::new(&e.text),
+                                TextFont {
+                                    font_size: FontSize::Px(12.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.28, 0.98, 0.50)),
+                            ));
+                        });
+                    }
+                    ChatMessageKind::PlayerTeam | ChatMessageKind::PlayerAll => {
+                        let scope_tag = if e.all_chat { "[ALL]" } else { "[TEAM]" };
+                        let scope_col = if e.all_chat {
+                            Color::srgb(0.98, 0.76, 0.24)
+                        } else {
+                            Color::srgb(0.26, 0.92, 0.70)
+                        };
+                        let name_col = if e.sender_team == TeamId::Dawn {
+                            Color::srgb(0.32, 0.95, 0.65)
+                        } else {
+                            Color::srgb(0.96, 0.36, 0.32)
+                        };
+
+                        col.spawn((
+                            Pickable::IGNORE,
+                            Node {
+                                padding: UiRect::axes(px(9.0), px(4.0)),
+                                column_gap: px(5.0),
+                                flex_direction: FlexDirection::Row,
+                                flex_wrap: FlexWrap::Wrap,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(px(5.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.03, 0.05, 0.09, 0.68)),
+                        ))
+                        .with_children(|line| {
+                            line.spawn((
+                                Text::new(scope_tag),
+                                TextFont {
+                                    font_size: FontSize::Px(12.0),
+                                    ..default()
+                                },
+                                TextColor(scope_col),
+                            ));
+                            line.spawn((
+                                Text::new(format!("{}:", e.sender_name)),
+                                TextFont {
+                                    font_size: FontSize::Px(12.5),
+                                    ..default()
+                                },
+                                TextColor(name_col),
+                            ));
+                            line.spawn((
+                                Text::new(&e.text),
+                                TextFont {
+                                    font_size: FontSize::Px(12.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.94, 0.96, 0.99)),
+                            ));
+                        });
+                    }
+                }
+            }
+        });
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم پینگ تیمی (Alt + Left Click روی دنیای ۳بعدی یا مینی‌مپ)
+// -----------------------------------------------------------------------------
+
+#[derive(Resource, Default)]
+struct ClientPingState {
+    seen_ids: HashSet<u64>,
+}
+
+#[derive(Component)]
+struct WorldPingRing {
+    timer: Timer,
+    base_radius: f32,
+}
+
+#[derive(Component)]
+struct WorldPingBeam {
+    timer: Timer,
+    base_pos: Vec3,
+    beam_height: f32,
+}
+
+#[derive(Component)]
+struct WorldPingBadge {
+    world_pos: Vec3,
+    timer: Timer,
+}
+
+#[derive(Component)]
+struct MinimapPingDot {
+    uv: Vec2,
+    timer: Timer,
+}
+
+fn spawn_team_ping_visuals(
+    commands: &mut Commands,
+    config: &GameConfig,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    minimap_ent_opt: Option<Entity>,
+    world_pos: Vec3,
+    sender_name: &str,
+) {
+    let dur = config.ping.duration_secs;
+    let ring_r = config.ping.world_ring_radius;
+    let beam_h = config.ping.beam_height;
+
+    let ping_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.20, 0.96, 0.86, 0.92),
+        emissive: LinearRgba::new(1.5, 9.0, 8.0, 0.92),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+
+    commands.spawn((
+        WorldPingRing {
+            timer: Timer::from_seconds(dur, TimerMode::Once),
+            base_radius: ring_r,
+        },
+        Mesh3d(meshes.add(Torus::new(0.78, 1.0))),
+        MeshMaterial3d(ping_mat.clone()),
+        Transform::from_translation(world_pos + Vec3::Y * 0.14)
+            .with_scale(Vec3::splat(ring_r * 0.2)),
+        NotShadowCaster,
+    ));
+
+    commands.spawn((
+        WorldPingBeam {
+            timer: Timer::from_seconds(dur, TimerMode::Once),
+            base_pos: world_pos,
+            beam_height: beam_h,
+        },
+        Mesh3d(meshes.add(Cylinder::new(0.16, beam_h))),
+        MeshMaterial3d(ping_mat),
+        Transform::from_translation(world_pos + Vec3::Y * (beam_h * 0.5)),
+        PointLight {
+            color: Color::srgb(0.22, 0.96, 0.88),
+            intensity: 260_000.0,
+            range: 12.0,
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        NotShadowCaster,
+    ));
+
+    commands
+        .spawn((
+            WorldPingBadge {
+                world_pos: world_pos + Vec3::Y * 2.6,
+                timer: Timer::from_seconds(dur, TimerMode::Once),
+            },
+            Pickable::IGNORE,
+            GlobalZIndex(205),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                padding: UiRect::axes(px(9.0), px(4.0)),
+                border: UiRect::all(px(1.5)),
+                border_radius: BorderRadius::all(px(6.0)),
+                ..default()
+            },
+            BorderColor::all(Color::srgb(0.22, 0.96, 0.88)),
+            BackgroundColor(Color::srgba(0.03, 0.12, 0.14, 0.88)),
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(format!("! {}", sender_name)),
+                TextFont {
+                    font_size: FontSize::Px(13.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.45, 1.0, 0.92)),
+            ));
+        });
+
+    if let Some(minimap_ent) = minimap_ent_opt {
+        let uv = world_to_minimap_uv(config, world_pos.x, world_pos.z);
+        commands.entity(minimap_ent).with_children(|parent| {
+            parent.spawn((
+                MinimapPingDot {
+                    uv,
+                    timer: Timer::from_seconds(dur, TimerMode::Once),
+                },
+                Pickable::IGNORE,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(uv.x * MINIMAP_WIDTH_PX - 10.0),
+                    top: px(uv.y * MINIMAP_HEIGHT_PX - 10.0),
+                    width: px(20.0),
+                    height: px(20.0),
+                    border: UiRect::all(px(2.5)),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BorderColor::all(Color::srgb(0.22, 0.98, 0.88)),
+                BackgroundColor(Color::srgba(0.22, 0.98, 0.88, 0.35)),
+            ));
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn client_ping_input_system(
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    match_result: Res<LatestMatchResult>,
+    chat_state: Res<ChatUiState>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    physics_world: Res<CustomPhysicsWorld>,
+    render_state: Res<ClientRenderState>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut net: ResMut<ClientNetwork>,
+) {
+    if !match_flow.is_in_game() || match_result.0.is_some() || chat_state.is_open {
+        return;
+    }
+
+    let alt_held = keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight);
+    if !alt_held || !mouse_button.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    let Ok(window) = window_query.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+
+    let min_x = window.width() - MINIMAP_MARGIN_PX - MINIMAP_WIDTH_PX;
+    let max_x = window.width() - MINIMAP_MARGIN_PX;
+    let min_y = window.height() - MINIMAP_MARGIN_PX - MINIMAP_HEIGHT_PX;
+    let max_y = window.height() - MINIMAP_MARGIN_PX;
+
+    let mut ping_world_pos: Option<Vec3> = None;
+
+    if cursor.x >= min_x && cursor.x <= max_x && cursor.y >= min_y && cursor.y <= max_y {
+        let u = ((cursor.x - min_x) / MINIMAP_WIDTH_PX).clamp(0.0, 1.0);
+        let v = ((cursor.y - min_y) / MINIMAP_HEIGHT_PX).clamp(0.0, 1.0);
+        let wx = (u - 0.5) * config.map.map_dimensions.0;
+        let wz = (v - 0.5) * config.map.map_dimensions.1;
+        let ground_y = physics_world
+            .cast_ray(
+                Vec3::new(wx, 25.0, wz),
+                Vec3::NEG_Y,
+                50.0,
+                soldier_collision_groups(),
+                |_| true,
+            )
+            .map(|(_, hit)| hit.point.y)
+            .unwrap_or(0.0);
+        ping_world_pos = Some(Vec3::new(wx, ground_y, wz));
+    } else if let Ok((camera, cam_gtf)) = camera_query.single() {
+        if let Ok(ray) = camera.viewport_to_world(cam_gtf, cursor) {
+            if let Some((_, hit)) = physics_world.cast_ray(
+                ray.origin,
+                *ray.direction,
+                350.0,
+                soldier_collision_groups(),
+                |_| true,
+            ) {
+                ping_world_pos = Some(hit.point);
+            } else if ray.direction.y.abs() > 1e-4 {
+                let t = (render_state.soldier_pos.y - ray.origin.y) / ray.direction.y;
+                if t > 0.0 {
+                    ping_world_pos = Some(ray.origin + *ray.direction * t);
+                }
+            }
+        }
+    }
+
+    if let Some(world_pos) = ping_world_pos {
+        if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::SendPing { world_pos }) {
+            net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn update_ping_visuals_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    config: Res<GameConfig>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut ring_q: Query<(Entity, &mut Transform, &mut WorldPingRing)>,
+    mut beam_q: Query<
+        (Entity, &mut Transform, &mut WorldPingBeam),
+        Without<WorldPingRing>,
+    >,
+    mut badge_q: Query<(Entity, &mut WorldPingBadge, &mut Node, &mut Visibility)>,
+    mut mini_q: Query<
+        (Entity, &mut MinimapPingDot, &mut Node),
+        Without<WorldPingBadge>,
+    >,
+) {
+    let dt = time.delta();
+    let t = time.elapsed_secs();
+    let pulse_spd = config.ping.minimap_pulse_speed;
+
+    for (ent, mut tf, mut ring) in &mut ring_q {
+        ring.timer.tick(dt);
+        let frac = ring.timer.fraction();
+        let pulse = ((frac * 3.0).fract()).powf(0.65);
+        let s = ring.base_radius * (0.25 + pulse * 0.95);
+        tf.scale = Vec3::new(s, (1.0 - frac).max(0.15), s);
+        if ring.timer.is_finished() {
+            commands.entity(ent).despawn();
+        }
+    }
+
+    for (ent, mut tf, mut beam) in &mut beam_q {
+        beam.timer.tick(dt);
+        let rem = (1.0 - beam.timer.fraction()).max(0.05);
+        tf.translation = beam.base_pos + Vec3::Y * (beam.beam_height * 0.5);
+        tf.scale = Vec3::new(rem, 1.0, rem);
+        if beam.timer.is_finished() {
+            commands.entity(ent).despawn();
+        }
+    }
+
+    let cam_opt = camera_query.single().ok();
+    for (ent, mut badge, mut node, mut vis) in &mut badge_q {
+        badge.timer.tick(dt);
+        if badge.timer.is_finished() {
+            commands.entity(ent).despawn();
+            continue;
+        }
+        if let Some((camera, cam_gtf)) = cam_opt {
+            let bob = (t * 4.5).sin() * 0.25;
+            if let Ok(sp) = camera.world_to_viewport(cam_gtf, badge.world_pos + Vec3::Y * bob) {
+                *vis = Visibility::Visible;
+                node.left = px(sp.x - 28.0);
+                node.top = px(sp.y - 14.0);
+            } else {
+                *vis = Visibility::Hidden;
+            }
+        }
+    }
+
+    for (ent, mut dot, mut node) in &mut mini_q {
+        dot.timer.tick(dt);
+        if dot.timer.is_finished() {
+            commands.entity(ent).despawn();
+            continue;
+        }
+        let pulse = (t * pulse_spd).sin() * 0.5 + 0.5;
+        let size = 10.0 + pulse * 14.0;
+        node.width = px(size);
+        node.height = px(size);
+        node.left = px(dot.uv.x * MINIMAP_WIDTH_PX - size * 0.5);
+        node.top = px(dot.uv.y * MINIMAP_HEIGHT_PX - size * 0.5);
     }
 }

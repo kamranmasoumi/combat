@@ -15,8 +15,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // ۱. ساختارهای کانفیگ (بدون هیچ Default یا serde(default))
 // -----------------------------------------------------------------------------
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PingConfig {
+    pub duration_secs: f32,
+    pub max_active_pings: usize,
+    pub world_ring_radius: f32,
+    pub beam_height: f32,
+    pub minimap_pulse_speed: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatConfig {
+    pub max_message_len: usize,
+    pub max_visible_messages: usize,
+    pub message_fade_secs: f32,
+}
+
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
+    pub ping: PingConfig,
+    pub chat: ChatConfig,
     pub network: NetworkConfig,
     pub window: WindowConfig,
     pub camera: CameraConfig,
@@ -51,6 +69,8 @@ impl GameConfig {
         cfg.validate_fountains();
         cfg.validate_barracks();
         cfg.validate_ancients();
+        cfg.validate_chat();
+        cfg.validate_ping();
         cfg.validate_heroes();
         cfg.validate_creeps();
         cfg.validate_neutral_camps();
@@ -155,6 +175,20 @@ impl GameConfig {
             (0.0..=1.0).contains(&c.deny_hp_threshold_ratio),
             "deny_hp_threshold_ratio باید بین 0 و 1 باشد"
         );
+    }
+
+    pub fn validate_ping(&self) {
+        assert!(self.ping.duration_secs > 0.0, "ping.duration_secs باید بزرگ‌تر از صفر باشد");
+        assert!(self.ping.max_active_pings > 0, "ping.max_active_pings باید بزرگ‌تر از صفر باشد");
+        assert!(self.ping.world_ring_radius > 0.0, "ping.world_ring_radius باید بزرگ‌تر از صفر باشد");
+        assert!(self.ping.beam_height > 0.0, "ping.beam_height باید بزرگ‌تر از صفر باشد");
+        assert!(self.ping.minimap_pulse_speed > 0.0, "ping.minimap_pulse_speed باید بزرگ‌تر از صفر باشد");
+    }
+
+    pub fn validate_chat(&self) {
+        assert!(self.chat.max_message_len > 0, "chat.max_message_len باید بزرگ‌تر از صفر باشد");
+        assert!(self.chat.max_visible_messages > 0, "chat.max_visible_messages باید بزرگ‌تر از صفر باشد");
+        assert!(self.chat.message_fade_secs > 0.0, "chat.message_fade_secs باید بزرگ‌تر از صفر باشد");
     }
 
     pub fn validate_ancients(&self) {
@@ -1398,10 +1432,38 @@ pub struct MatchStateSnapshot {
     pub taken_hero_ids: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChatMessageKind {
+    PlayerTeam,
+    PlayerAll,
+    SystemDisconnect,
+    SystemReconnect,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatMessageEntry {
+    pub id: u64,
+    pub sender_name: String,
+    pub sender_team: TeamId,
+    pub kind: ChatMessageKind,
+    pub all_chat: bool,
+    pub text: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PingEntry {
+    pub id: u64,
+    pub sender_name: String,
+    pub sender_team: TeamId,
+    pub world_pos: Vec3,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ClientLobbyMessage {
     SelectHero { hero_id: String },
     ReportMapLoaded,
+    SendChat { all_chat: bool, text: String },
+    SendPing { world_pos: Vec3 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1493,11 +1555,27 @@ impl AuthoritativeMatchState {
         if self.slot_for_client(client_id).is_some() {
             return false;
         }
-        let Some(slot) = self.players.iter_mut().find(|p| !p.connected) else {
+        // اول بررسی کن آیا این بازیکن قبلاً در یکی از اسلات‌ها بوده و دیسکانکت شده است (Reconnect)
+        let reconnect_idx = self
+            .players
+            .iter()
+            .position(|p| !p.connected && p.client_id == Some(client_id));
+        let target_idx = reconnect_idx.or_else(|| {
+            self.players
+                .iter()
+                .position(|p| !p.connected && p.client_id.is_none())
+        }).or_else(|| {
+            self.players.iter().position(|p| !p.connected)
+        });
+        let Some(idx) = target_idx else {
             return false;
         };
+        let slot = &mut self.players[idx];
         slot.connected = true;
         slot.client_id = Some(client_id);
+        if self.phase == MatchPhase::InGame {
+            slot.map_loaded = true;
+        }
         self.dirty = true;
 
         if self.phase == MatchPhase::WaitingForPlayers
@@ -1508,19 +1586,26 @@ impl AuthoritativeMatchState {
         true
     }
 
-    pub fn on_client_disconnected(&mut self, client_id: u64) {
+    pub fn on_client_disconnected(&mut self, client_id: u64) -> Option<usize> {
         if let Some(slot) = self
             .players
             .iter_mut()
             .find(|p| p.connected && p.client_id == Some(client_id))
         {
+            let slot_idx = slot.slot_index;
             slot.connected = false;
-            slot.client_id = None;
-            slot.map_loaded = false;
             if self.phase == MatchPhase::WaitingForPlayers {
+                slot.client_id = None;
                 slot.selected_hero_id = None;
+                slot.map_loaded = false;
+            } else {
+                // client_id را نگه می‌داریم تا بازیکن هنگام ریکانکت به اسلات و هیروی خودش برگردد
+                slot.map_loaded = self.phase == MatchPhase::InGame;
             }
             self.dirty = true;
+            Some(slot_idx)
+        } else {
+            None
         }
     }
 
@@ -1737,6 +1822,7 @@ pub struct TopBarHeroInfo {
     pub display_name: String,
     pub portrait_path: String,
     pub is_dead: bool,
+    pub is_disconnected: bool,
     pub respawn_remaining: f32,
     pub hp_ratio: Option<f32>,
 }
@@ -1797,6 +1883,8 @@ pub struct ServerWorldSnapshot {
     pub turrets: Vec<TurretSnapshot>,
     pub barracks: Vec<BarracksSnapshot>,
     pub ancients: Vec<AncientSnapshot>,
+    pub recent_chat: Vec<ChatMessageEntry>,
+    pub recent_pings: Vec<PingEntry>,
     pub fx_events: Vec<GameplayFxEvent>,
 }
 
@@ -4162,6 +4250,7 @@ impl ClientPhysicsPredictionState {
 pub struct PlayerSlotState {
     pub slot_index: usize,
     pub client_id: Option<u64>,
+    pub is_disconnected: bool,
     pub active_input: Option<ClientInputCommand>,
     pub soldier_pos: Vec3,
     pub soldier_facing_dir: Vec3,
@@ -4287,6 +4376,10 @@ pub struct AuthoritativeWorldState {
     pub turrets: Vec<TurretState>,
     pub barracks: Vec<BarracksState>,
     pub ancients: Vec<AncientState>,
+    pub chat_history: Vec<ChatMessageEntry>,
+    pub next_chat_id: u64,
+    pub ping_history: Vec<PingEntry>,
+    pub next_ping_id: u64,
     pub winning_team: Option<TeamId>,
     pub match_elapsed_secs: f32,
     pub next_wave_time_secs: f32,
@@ -4466,6 +4559,10 @@ impl AuthoritativeWorldState {
                     is_invulnerable: true,
                 })
                 .collect(),
+            chat_history: Vec::new(),
+            next_chat_id: 1,
+            ping_history: Vec::new(),
+            next_ping_id: 1,
             winning_team: None,
             match_elapsed_secs: 0.0,
             next_wave_time_secs: config.creeps.first_wave_delay_secs,
@@ -4557,6 +4654,130 @@ impl AuthoritativeWorldState {
         self.active_slot = idx;
     }
 
+    pub fn push_ping(
+        &mut self,
+        slot_index: usize,
+        world_pos: Vec3,
+        config: &GameConfig,
+    ) {
+        if !world_pos.is_finite() {
+            return;
+        }
+        let (sender_name, sender_team) = if let Some(p) = self.players.get(slot_index) {
+            (p.hero_display_name.clone(), p.hero_team)
+        } else {
+            (self.hero_display_name.clone(), self.hero_team)
+        };
+        let id = self.next_ping_id;
+        self.next_ping_id += 1;
+        self.ping_history.push(PingEntry {
+            id,
+            sender_name,
+            sender_team,
+            world_pos,
+        });
+        let max_keep = config.ping.max_active_pings * 4;
+        if self.ping_history.len() > max_keep {
+            let drain_n = self.ping_history.len() - max_keep;
+            self.ping_history.drain(0..drain_n);
+        }
+    }
+
+    pub fn set_slot_connected(
+        &mut self,
+        slot_index: usize,
+        connected: bool,
+        config: &GameConfig,
+    ) {
+        let Some(p) = self.players.get_mut(slot_index) else {
+            return;
+        };
+        let was_disconnected = p.is_disconnected;
+        p.is_disconnected = !connected;
+        if !connected {
+            p.active_input = None;
+            p.move_input = Vec3::ZERO;
+            p.is_moving = false;
+        }
+        if connected && was_disconnected {
+            let name = p.hero_display_name.clone();
+            let team = p.hero_team;
+            let id = self.next_chat_id;
+            self.next_chat_id += 1;
+            self.chat_history.push(ChatMessageEntry {
+                id,
+                sender_name: name.clone(),
+                sender_team: team,
+                kind: ChatMessageKind::SystemReconnect,
+                all_chat: true,
+                text: format!("{} reconnected to the game.", name),
+            });
+        } else if !connected && !was_disconnected {
+            let name = p.hero_display_name.clone();
+            let team = p.hero_team;
+            let id = self.next_chat_id;
+            self.next_chat_id += 1;
+            self.chat_history.push(ChatMessageEntry {
+                id,
+                sender_name: name.clone(),
+                sender_team: team,
+                kind: ChatMessageKind::SystemDisconnect,
+                all_chat: true,
+                text: format!("{} disconnected from the game.", name),
+            });
+        }
+        let max_keep = config.chat.max_visible_messages * 4;
+        if self.chat_history.len() > max_keep {
+            let drain_n = self.chat_history.len() - max_keep;
+            self.chat_history.drain(0..drain_n);
+        }
+    }
+
+    pub fn push_chat_message(
+        &mut self,
+        slot_index: usize,
+        all_chat: bool,
+        raw_text: &str,
+        config: &GameConfig,
+    ) {
+        let trimmed = raw_text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let clean: String = trimmed
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(config.chat.max_message_len)
+            .collect();
+        if clean.is_empty() {
+            return;
+        }
+        let (sender_name, sender_team) = if let Some(p) = self.players.get(slot_index) {
+            (p.hero_display_name.clone(), p.hero_team)
+        } else {
+            (self.hero_display_name.clone(), self.hero_team)
+        };
+        let id = self.next_chat_id;
+        self.next_chat_id += 1;
+        self.chat_history.push(ChatMessageEntry {
+            id,
+            sender_name,
+            sender_team,
+            kind: if all_chat {
+                ChatMessageKind::PlayerAll
+            } else {
+                ChatMessageKind::PlayerTeam
+            },
+            all_chat,
+            text: clean,
+        });
+        let max_keep = config.chat.max_visible_messages * 4;
+        if self.chat_history.len() > max_keep {
+            let drain_n = self.chat_history.len() - max_keep;
+            self.chat_history.drain(0..drain_n);
+        }
+    }
+
     pub fn set_slot_input(&mut self, slot_index: usize, cmd: ClientInputCommand) {
         if let Some(p) = self.players.get_mut(slot_index) {
             if let Some(ref mut prev) = p.active_input {
@@ -4627,6 +4848,7 @@ impl AuthoritativeWorldState {
             self.players.push(PlayerSlotState {
                 slot_index: lp.slot_index,
                 client_id: lp.client_id,
+                is_disconnected: !lp.connected,
                 active_input: None,
                 soldier_pos: spawn_pos,
                 soldier_facing_dir: facing_dir,
@@ -4713,6 +4935,7 @@ impl AuthoritativeWorldState {
                     display_name: p.hero_display_name.clone(),
                     portrait_path: portrait,
                     is_dead: p.is_dead,
+                    is_disconnected: p.is_disconnected,
                     respawn_remaining: if p.is_dead {
                         p.respawn_remaining.max(0.0)
                     } else {
@@ -4779,6 +5002,24 @@ impl AuthoritativeWorldState {
         }
         snap.other_players = others;
         snap.top_bar_heroes = top_bar;
+        let max_vis = config.chat.max_visible_messages;
+        let filtered_chat: Vec<ChatMessageEntry> = self
+            .chat_history
+            .iter()
+            .filter(|c| c.all_chat || c.sender_team == viewer_team)
+            .cloned()
+            .collect();
+        let start_idx = filtered_chat.len().saturating_sub(max_vis);
+        snap.recent_chat = filtered_chat[start_idx..].to_vec();
+        let max_pings = config.ping.max_active_pings;
+        let filtered_pings: Vec<PingEntry> = self
+            .ping_history
+            .iter()
+            .filter(|pg| pg.sender_team == viewer_team)
+            .cloned()
+            .collect();
+        let ping_start = filtered_pings.len().saturating_sub(max_pings);
+        snap.recent_pings = filtered_pings[ping_start..].to_vec();
         snap.creeps = self
             .creeps
             .iter()
@@ -4959,6 +5200,8 @@ impl AuthoritativeWorldState {
                     is_invulnerable: a.is_invulnerable,
                 })
                 .collect(),
+            recent_chat: Vec::new(),
+            recent_pings: Vec::new(),
             targets: self
                 .targets
                 .iter()
@@ -7538,7 +7781,7 @@ fn step_lane_creeps_system(
                 }
             }
             if !is_neutral {
-                for &(a_team, a_pos, a_rad, a_height, a_dead, a_invuln) in &ancient_snap {
+                for &(a_team, a_pos, a_rad, _a_height, a_dead, a_invuln) in &ancient_snap {
                     if a_team == my_team || a_dead || a_invuln {
                         continue;
                     }
@@ -7637,7 +7880,7 @@ fn step_lane_creeps_system(
             // ب) حرکت در امتداد Waypointهای لاین و پس از آن پیشروی مستقیم به سمت ساختمان اصلی (Ancient) دشمن
             let mut move_target_opt: Option<(Vec3, f32)> = None;
             if world.creeps[idx].waypoint_index == usize::MAX {
-                if let Some(&(_a_team, a_pos, a_rad, _a_h, a_dead, _a_invuln)) = ancient_snap
+                if let Some(&(_a_team, a_pos, a_rad, _a_h, _a_dead, _a_invuln)) = ancient_snap
                     .iter()
                     .find(|&&(a_team, _, _, _, a_dead, _)| a_team != my_team && !a_dead)
                 {

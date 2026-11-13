@@ -21,7 +21,7 @@ use moba_shared::{
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
-    ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
@@ -118,6 +118,7 @@ fn main() {
         .insert_resource(LatestRemotePlayers::default())
         .insert_resource(LatestCreeps::default())
         .insert_resource(LatestTopBarState::default())
+        .insert_resource(LatestTurrets::default())
         .insert_resource(ClientMatchFlow {
             your_slot: None,
             snapshot: None,
@@ -184,7 +185,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system)
+            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system)
                 .chain()
                 .after(sync_remote_players_system),
         )
@@ -574,6 +575,7 @@ struct ClientRenderState {
     laser_hit_pos: Vec3,
     aim_locked_on_enemy: bool,
     hovered_creep_id: Option<u64>,
+    hovered_turret_index: Option<usize>,
     current_locomotion: String,
     previous_lower_anim: String,
     previous_upper_anim: String,
@@ -613,6 +615,7 @@ impl ClientRenderState {
             laser_hit_pos: aim_hit,
             aim_locked_on_enemy: false,
             hovered_creep_id: None,
+            hovered_turret_index: None,
             current_locomotion: "idle".to_string(),
             previous_lower_anim: String::new(),
             previous_upper_anim: String::new(),
@@ -1370,7 +1373,12 @@ fn setup_scene(
         let tc = tur.color_rgb;
         let ce = tur.crystal_emissive_rgb;
         let mut tur_cmds = commands.spawn((
-            turret_physics_bundle(&config, tur),
+            turret_physics_bundle(&config, t_idx, tur),
+            TurretVisualRoot {
+                index: t_idx,
+                is_dead: false,
+                is_highlighted: false,
+            },
             Visibility::Visible,
         ));
 
@@ -1758,6 +1766,24 @@ fn setup_scene(
     commands.insert_resource(SoldierGltfHandle(gltf_handle));
     let creep_gltf_handle = asset_server.load(&config.creeps.model_path);
     commands.insert_resource(CreepGltfHandle(creep_gltf_handle));
+    let dawn_tur_path = config
+        .map
+        .turrets
+        .iter()
+        .find(|t| t.team == TeamId::Dawn)
+        .map(|t| t.model_path.clone())
+        .unwrap_or_else(|| config.creeps.model_path.clone());
+    let dusk_tur_path = config
+        .map
+        .turrets
+        .iter()
+        .find(|t| t.team == TeamId::Dusk)
+        .map(|t| t.model_path.clone())
+        .unwrap_or_else(|| dawn_tur_path.clone());
+    commands.insert_resource(TurretGltfHandles {
+        dawn: asset_server.load(&dawn_tur_path),
+        dusk: asset_server.load(&dusk_tur_path),
+    });
 }
 
 // -----------------------------------------------------------------------------
@@ -2493,6 +2519,14 @@ fn client_flush_input_to_server_system(
     let _ = net.transport.send_packets(&mut net.client);
 }
 
+#[derive(SystemParam)]
+struct TurretFxResources<'w, 's> {
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    turret_gun_q: Query<'w, 's, &'static mut TurretGunBone>,
+    turret_muzzle_q: Query<'w, 's, (&'static TurretMuzzlePoint, &'static GlobalTransform)>,
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn client_receive_snapshot_and_sync_system(
     mut commands: Commands,
@@ -2539,8 +2573,7 @@ fn client_receive_snapshot_and_sync_system(
         ),
     >,
     mut target_query: Query<(Entity, &mut VisualTarget)>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut fx_res: TurretFxResources,
 ) {
     let delta = time.delta();
     let net = &mut *net;
@@ -2575,6 +2608,7 @@ fn client_receive_snapshot_and_sync_system(
         render_state.laser_hit_pos = snap.laser_hit_pos;
         render_state.aim_locked_on_enemy = snap.aim_locked_on_enemy;
         render_state.hovered_creep_id = snap.hovered_creep_id;
+        render_state.hovered_turret_index = snap.hovered_turret_index;
         render_state.current_locomotion = snap.current_locomotion;
         render_state.upper_action = snap.upper_action;
         render_state.traversal_active = snap.traversal_active;
@@ -2587,6 +2621,7 @@ fn client_receive_snapshot_and_sync_system(
         hud_sync.creeps.0 = snap.creeps.clone();
         hud_sync.top_bar.match_elapsed_secs = snap.match_elapsed_secs;
         hud_sync.top_bar.heroes = snap.top_bar_heroes.clone();
+        hud_sync.turrets.0 = snap.turrets.clone();
         if let Some(ref mut fow_state) = fow {
             fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
         }
@@ -2638,11 +2673,11 @@ fn client_receive_snapshot_and_sync_system(
                 let dir = b_snap.velocity.normalize_or_zero();
                 let rot = Quat::from_rotation_arc(Vec3::Y, dir);
                 commands.spawn((
-                    Mesh3d(meshes.add(Cone {
+                    Mesh3d(fx_res.meshes.add(Cone {
                         radius: 0.028,
                         height: 0.42,
                     })),
-                    MeshMaterial3d(materials.add(StandardMaterial {
+                    MeshMaterial3d(fx_res.materials.add(StandardMaterial {
                         base_color: Color::srgb(1.0, 0.92, 0.45),
                         emissive: LinearRgba::new(14.0, 8.5, 1.2, 1.0),
                         unlit: true,
@@ -2678,8 +2713,8 @@ fn client_receive_snapshot_and_sync_system(
         for g_snap in &snap.grenades {
             if !seen_grenades.contains(&g_snap.id) {
                 commands.spawn((
-                    Mesh3d(meshes.add(Sphere::new(config.physics.grenade_collider_radius))),
-                    MeshMaterial3d(materials.add(StandardMaterial {
+                    Mesh3d(fx_res.meshes.add(Sphere::new(config.physics.grenade_collider_radius))),
+                    MeshMaterial3d(fx_res.materials.add(StandardMaterial {
                         base_color: Color::srgb(0.2, 0.38, 0.18),
                         metallic: 0.6,
                         perceptual_roughness: 0.4,
@@ -2707,8 +2742,10 @@ fn client_receive_snapshot_and_sync_system(
             &config,
             &mut render_state,
             &mut shake,
-            &mut meshes,
-            &mut materials,
+            &mut fx_res.meshes,
+            &mut fx_res.materials,
+            &mut fx_res.turret_gun_q,
+            &fx_res.turret_muzzle_q,
             fx,
         );
     }
@@ -2745,6 +2782,8 @@ fn spawn_fx_from_server_event(
     shake: &mut CameraShake,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    turret_gun_q: &mut Query<&mut TurretGunBone>,
+    turret_muzzle_q: &Query<(&TurretMuzzlePoint, &GlobalTransform)>,
     event: GameplayFxEvent,
 ) {
     match event {
@@ -3065,6 +3104,62 @@ fn spawn_fx_from_server_event(
                         TextColor(Color::srgb(1.0, 0.88, 0.22)),
                     ));
                 });
+        }
+        GameplayFxEvent::TurretShotFired {
+            turret_index,
+            barrel_left,
+            target_pos: _,
+            shot_dir,
+        } => {
+            let jitter = (render_state.next_fx_rand() - 0.5) * 2.0 * config.fx.turret_recoil_jitter_rad;
+            for mut gun in turret_gun_q.iter_mut() {
+                if gun.turret_index == turret_index {
+                    gun.current_recoil = config.fx.turret_recoil_offset;
+                    gun.recoil_jitter_z = jitter;
+                }
+            }
+            let mut muzzle_world = None;
+            for (m, gtf) in turret_muzzle_q.iter() {
+                if m.turret_index == turret_index && m.is_left == barrel_left {
+                    muzzle_world = Some(gtf.translation());
+                    break;
+                }
+            }
+            let flash_pos = muzzle_world.unwrap_or_else(|| {
+                let t_def = &config.map.turrets[turret_index];
+                t_def.model_transform.location_vec() + Vec3::Y * (t_def.height * 0.72)
+            });
+            let rot = Quat::from_rotation_arc(Vec3::Y, shot_dir.normalize_or_zero());
+            commands.spawn((
+                Mesh3d(meshes.add(Cone {
+                    radius: 0.14,
+                    height: 0.45,
+                })),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(1.0, 0.85, 0.25),
+                    emissive: LinearRgba::new(18.0, 10.0, 1.8, 1.0),
+                    unlit: true,
+                    ..default()
+                })),
+                PointLight {
+                    color: Color::srgb(1.0, 0.82, 0.30),
+                    intensity: 140_000.0,
+                    range: 8.5,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform {
+                    translation: flash_pos,
+                    rotation: rot,
+                    scale: Vec3::ONE,
+                },
+                MuzzleFlash {
+                    timer: Timer::from_seconds(
+                        config.fx.muzzle_flash_lifetime_secs,
+                        TimerMode::Once,
+                    ),
+                },
+            ));
         }
         GameplayFxEvent::CreepDenied { pos } => {
             commands
@@ -5595,12 +5690,16 @@ struct LatestTopBarState {
     heroes: Vec<TopBarHeroInfo>,
 }
 
+#[derive(Resource, Default)]
+struct LatestTurrets(Vec<TurretSnapshot>);
+
 #[derive(SystemParam)]
 struct SnapshotHudSyncParams<'w> {
     hero_hud: ResMut<'w, LatestHeroSnapshot>,
     remote_players: ResMut<'w, LatestRemotePlayers>,
     creeps: ResMut<'w, LatestCreeps>,
     top_bar: ResMut<'w, LatestTopBarState>,
+    turrets: ResMut<'w, LatestTurrets>,
 }
 
 fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
@@ -7219,6 +7318,485 @@ fn death_screen_overlay_system(
         } else {
             fog.color = Color::srgba(0.68, 0.76, 0.84, 1.0);
             fog.directional_light_color = Color::srgba(1.0, 0.92, 0.78, 0.45);
+        }
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم تاورهای دولول (Rigged Bones: table_4 + gun_0 + MuzzleLeft/Right + Recoil + نوار سلامتی)
+// -----------------------------------------------------------------------------
+
+#[derive(Component)]
+struct TurretVisualRoot {
+    index: usize,
+    is_dead: bool,
+    is_highlighted: bool,
+}
+
+#[derive(Component)]
+struct TurretRigBound;
+
+#[derive(Component)]
+struct TurretYawBone {
+    turret_index: usize,
+    base_quat: Quat,
+}
+
+#[derive(Component)]
+struct TurretGunBone {
+    turret_index: usize,
+    base_quat: Quat,
+    base_pos: Vec3,
+    current_recoil: f32,
+    recoil_jitter_z: f32,
+}
+
+#[derive(Component)]
+struct TurretMuzzlePoint {
+    turret_index: usize,
+    is_left: bool,
+}
+
+#[derive(Component)]
+struct TurretSavedMaterial(Handle<StandardMaterial>);
+
+#[derive(Component)]
+struct OverheadTurretBarRoot {
+    turret_index: usize,
+}
+
+#[derive(Component)]
+struct OverheadTurretHpFill {
+    turret_index: usize,
+}
+
+#[derive(Component)]
+struct OverheadTurretShieldBadge {
+    turret_index: usize,
+}
+
+#[derive(Resource)]
+struct TurretGltfHandles {
+    dawn: Handle<Gltf>,
+    dusk: Handle<Gltf>,
+}
+
+#[derive(Resource)]
+struct TurretAnimationAssets {
+    dawn_graph: Handle<AnimationGraph>,
+    dawn_idle: Option<AnimationNodeIndex>,
+    dusk_graph: Handle<AnimationGraph>,
+    dusk_idle: Option<AnimationNodeIndex>,
+}
+
+#[derive(Component)]
+struct TurretAnimPlayer {
+    turret_index: usize,
+    playing_idle: bool,
+}
+
+#[derive(SystemParam)]
+struct TurretRigQueries<'w, 's> {
+    children_query: Query<'w, 's, &'static Children>,
+    names_query: Query<'w, 's, &'static Name>,
+    parents_query: Query<'w, 's, &'static ChildOf>,
+    global_tfs: Query<'w, 's, &'static GlobalTransform>,
+    anim_players: Query<'w, 's, (&'static mut AnimationPlayer, Option<&'static mut AnimationTransitions>, Option<&'static mut TurretAnimPlayer>)>,
+    turret_gltf_handles: Option<Res<'w, TurretGltfHandles>>,
+    gltf_assets: Res<'w, Assets<Gltf>>,
+    animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
+    turret_anim_assets: Option<Res<'w, TurretAnimationAssets>>,
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn sync_turrets_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    latest_turrets: Res<LatestTurrets>,
+    mut rig: TurretRigQueries,
+    mut root_q: Query<(Entity, &mut TurretVisualRoot, Option<&TurretRigBound>)>,
+    mut bone_tf_q: Query<&mut Transform>,
+    mut yaw_q: Query<(Entity, &TurretYawBone)>,
+    mut gun_q: Query<(Entity, &mut TurretGunBone)>,
+    mut mat_mesh_q: Query<(&mut MeshMaterial3d<StandardMaterial>, Option<&TurretSavedMaterial>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // ساخت گراف انیمیشن Idle برای تاورهای Dawn و Dusk
+    if rig.turret_anim_assets.is_none() {
+        if let Some(ref handles) = rig.turret_gltf_handles {
+            if let (Some(dawn_gltf), Some(dusk_gltf)) = (
+                rig.gltf_assets.get(&handles.dawn),
+                rig.gltf_assets.get(&handles.dusk),
+            ) {
+                let build_idle_graph = |gltf: &Gltf, graphs: &mut Assets<AnimationGraph>| {
+                    let mut graph = AnimationGraph::new();
+                    let mut exact_node = None;
+                    let mut fallback_node = None;
+                    let mut all_names: Vec<String> = Vec::new();
+                    for (name, clip_h) in &gltf.named_animations {
+                        all_names.push(name.to_string());
+                        let idx = graph.add_clip(clip_h.clone(), 1.0, graph.root);
+                        if name.as_ref() == config.fx.turret_idle_anim {
+                            exact_node = Some(idx);
+                        } else if fallback_node.is_none()
+                            && name.eq_ignore_ascii_case(&config.fx.turret_idle_anim)
+                        {
+                            fallback_node = Some(idx);
+                        }
+                    }
+                    if exact_node.is_none() && fallback_node.is_none() {
+                        if let Some((_n, clip_h)) = gltf.named_animations.iter().next() {
+                            fallback_node = Some(graph.add_clip(clip_h.clone(), 1.0, graph.root));
+                        }
+                    }
+                    info!("Turret GLB animations: {:?} (selected: {})", all_names, config.fx.turret_idle_anim);
+                    (graphs.add(graph), exact_node.or(fallback_node))
+                };
+                let (dawn_graph, dawn_idle) = build_idle_graph(dawn_gltf, &mut rig.animation_graphs);
+                let (dusk_graph, dusk_idle) = build_idle_graph(dusk_gltf, &mut rig.animation_graphs);
+                commands.insert_resource(TurretAnimationAssets {
+                    dawn_graph,
+                    dawn_idle,
+                    dusk_graph,
+                    dusk_idle,
+                });
+            }
+        }
+    }
+    if !match_flow.is_in_game() {
+        return;
+    }
+
+    let dt = time.delta_secs();
+    let aim_slerp = (config.fx.turret_aim_slerp_speed * dt).clamp(0.0, 1.0);
+    let recoil_recover = (config.fx.turret_recoil_recover_speed * dt).clamp(0.0, 1.0);
+    let m_left = config.fx.turret_muzzle_left_offset;
+    let m_right = config.fx.turret_muzzle_right_offset;
+
+    for (root_ent, mut root_comp, bound_opt) in &mut root_q {
+        let Some(ts) = latest_turrets.0.get(root_comp.index) else {
+            continue;
+        };
+
+        // ۱. حذف کامل تاور نابودشده از صحنه بازی
+        if ts.is_dead {
+            root_comp.is_dead = true;
+            commands.entity(root_ent).despawn();
+            continue;
+        }
+
+        // ۲. اتصال گراف انیمیشن Idle و استخوان‌های table_4 و gun_0
+        if let Some(ref anim_assets) = rig.turret_anim_assets {
+            let (g_handle, idle_opt) = if ts.team == TeamId::Dawn {
+                (&anim_assets.dawn_graph, anim_assets.dawn_idle)
+            } else {
+                (&anim_assets.dusk_graph, anim_assets.dusk_idle)
+            };
+            for desc in rig.children_query.iter_descendants(root_ent) {
+                if let Ok((mut ap, trans_opt, tap_opt)) = rig.anim_players.get_mut(desc) {
+                    if tap_opt.is_none() {
+                        let mut trans = AnimationTransitions::new();
+                        if let Some(idle_node) = idle_opt {
+                            trans.play(&mut ap, idle_node, Duration::ZERO).repeat();
+                        }
+                        commands.entity(desc).insert((
+                            AnimationGraphHandle(g_handle.clone()),
+                            trans,
+                            TurretAnimPlayer {
+                                turret_index: root_comp.index,
+                                playing_idle: true,
+                            },
+                        ));
+                    } else if let (Some(mut trans), Some(mut tap)) = (trans_opt, tap_opt) {
+                        let should_idle = ts.aim_target_pos.is_none();
+                        if should_idle && !tap.playing_idle {
+                            if let Some(idle_node) = idle_opt {
+                                trans.play(&mut ap, idle_node, Duration::from_millis(180)).repeat();
+                            }
+                            tap.playing_idle = true;
+                        } else if !should_idle && tap.playing_idle {
+                            ap.stop_all();
+                            tap.playing_idle = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if bound_opt.is_none() {
+            let mut found_yaw = false;
+            let mut found_gun = false;
+            for desc in rig.children_query.iter_descendants(root_ent) {
+                let Ok(name) = rig.names_query.get(desc) else {
+                    continue;
+                };
+                if name.as_str() == "table_4" {
+                    if let Ok(tf) = bone_tf_q.get(desc) {
+                        commands.entity(desc).insert(TurretYawBone {
+                            turret_index: root_comp.index,
+                            base_quat: tf.rotation,
+                        });
+                        found_yaw = true;
+                    }
+                } else if name.as_str() == "gun_0" {
+                    if let Ok(tf) = bone_tf_q.get(desc) {
+                        commands
+                            .entity(desc)
+                            .insert(TurretGunBone {
+                                turret_index: root_comp.index,
+                                base_quat: tf.rotation,
+                                base_pos: tf.translation,
+                                current_recoil: 0.0,
+                                recoil_jitter_z: 0.0,
+                            })
+                            .with_children(|gun_children| {
+                                gun_children.spawn((
+                                    TurretMuzzlePoint {
+                                        turret_index: root_comp.index,
+                                        is_left: true,
+                                    },
+                                    Transform::from_xyz(m_left.0, m_left.1, m_left.2),
+                                    Visibility::Visible,
+                                ));
+                                gun_children.spawn((
+                                    TurretMuzzlePoint {
+                                        turret_index: root_comp.index,
+                                        is_left: false,
+                                    },
+                                    Transform::from_xyz(m_right.0, m_right.1, m_right.2),
+                                    Visibility::Visible,
+                                ));
+                            });
+                        found_gun = true;
+                    }
+                }
+            }
+            if found_yaw && found_gun {
+                commands.entity(root_ent).insert(TurretRigBound);
+            }
+        }
+
+        // ۳. هایلایت قرمز هنگام قرار گرفتن نشانه‌گر موس روی تاور دشمن
+        let should_highlight = !ts.is_dead && render_state.hovered_turret_index == Some(root_comp.index);
+        if root_comp.is_highlighted != should_highlight {
+            let tint = config.fx.turret_hovered_tint_emissive_rgb;
+            let mut apply_tint = |ent: Entity| {
+                let Ok((mut mat_comp, saved_opt)) = mat_mesh_q.get_mut(ent) else {
+                    return;
+                };
+                if should_highlight {
+                    if saved_opt.is_none() {
+                        let orig_h = mat_comp.0.clone();
+                        if let Some(mut cloned) = materials.get(&orig_h).cloned() {
+                            cloned.emissive = LinearRgba::new(tint.0, tint.1, tint.2, 1.0);
+                            cloned.base_color = cloned.base_color.mix(&Color::srgb(1.0, 0.35, 0.30), 0.30);
+                            mat_comp.0 = materials.add(cloned);
+                            commands.entity(ent).insert(TurretSavedMaterial(orig_h));
+                        }
+                    }
+                } else if let Some(saved) = saved_opt {
+                    mat_comp.0 = saved.0.clone();
+                    commands.entity(ent).remove::<TurretSavedMaterial>();
+                }
+            };
+            apply_tint(root_ent);
+            for desc in rig.children_query.iter_descendants(root_ent) {
+                apply_tint(desc);
+            }
+            root_comp.is_highlighted = should_highlight;
+        }
+    }
+
+    // ۴. چرخش افقی دیسک (table_4) فقط در زمان هدف‌گیری تا انیمیشن Idle آزادانه اجرا شود
+    for (yaw_ent, yaw_bone) in &mut yaw_q {
+        let Some(ts) = latest_turrets.0.get(yaw_bone.turret_index) else {
+            continue;
+        };
+        if ts.is_dead {
+            continue;
+        }
+        let Some(target_pos) = ts.aim_target_pos else {
+            continue;
+        };
+        let table_world_pos = rig
+            .global_tfs
+            .get(yaw_ent)
+            .map(|g| g.translation())
+            .unwrap_or(Vec3::ZERO);
+        let dx = target_pos.x - table_world_pos.x;
+        let dz = target_pos.z - table_world_pos.z;
+
+        let parent_world_rot = rig
+            .parents_query
+            .get(yaw_ent)
+            .ok()
+            .and_then(|c| rig.global_tfs.get(c.parent()).ok())
+            .map(|g| g.to_scale_rotation_translation().1)
+            .unwrap_or(Quat::IDENTITY);
+        let local_dir = parent_world_rot.inverse() * Vec3::new(dx, 0.0, dz);
+        let yaw_angle = (-local_dir.z).atan2(local_dir.x) + config.fx.turret_yaw_offset_rad;
+        let local_vertical_axis = (parent_world_rot.inverse() * Vec3::Y).normalize_or_zero();
+        let target_rot = if local_vertical_axis.length_squared() > 0.0001 {
+            Quat::from_axis_angle(local_vertical_axis, yaw_angle) * yaw_bone.base_quat
+        } else {
+            yaw_bone.base_quat
+        };
+
+        if let Ok(mut tf) = bone_tf_q.get_mut(yaw_ent) {
+            tf.rotation = tf.rotation.slerp(target_rot, aim_slerp);
+        }
+    }
+
+    // ۵. چرخش عمودی لوله (gun_0) و لگد (Recoil) فقط در زمان هدف‌گیری
+    for (gun_ent, mut gun_bone) in &mut gun_q {
+        let Some(ts) = latest_turrets.0.get(gun_bone.turret_index) else {
+            continue;
+        };
+        if ts.is_dead {
+            continue;
+        }
+        gun_bone.current_recoil = gun_bone.current_recoil.lerp(0.0, recoil_recover);
+        gun_bone.recoil_jitter_z = gun_bone.recoil_jitter_z.lerp(0.0, recoil_recover);
+
+        let Some(target_pos) = ts.aim_target_pos else {
+            if gun_bone.current_recoil > 0.01 {
+                if let Ok(mut tf) = bone_tf_q.get_mut(gun_ent) {
+                    tf.translation.y = gun_bone.base_pos.y - gun_bone.current_recoil;
+                }
+            }
+            continue;
+        };
+
+        let gun_world_pos = rig
+            .global_tfs
+            .get(gun_ent)
+            .map(|g| g.translation())
+            .unwrap_or(Vec3::ZERO);
+        let dx = target_pos.x - gun_world_pos.x;
+        let dy = target_pos.y - gun_world_pos.y;
+        let dz = target_pos.z - gun_world_pos.z;
+        let pitch_angle = dy.atan2(dx.hypot(dz));
+        let target_rot =
+            gun_bone.base_quat * Quat::from_axis_angle(Vec3::Z, pitch_angle + gun_bone.recoil_jitter_z);
+
+        if let Ok(mut tf) = bone_tf_q.get_mut(gun_ent) {
+            tf.rotation = tf.rotation.slerp(target_rot, aim_slerp);
+            tf.translation.y = gun_bone.base_pos.y - gun_bone.current_recoil;
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn update_overhead_turret_bars_system(
+    mut commands: Commands,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    latest_turrets: Res<LatestTurrets>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut bar_root_q: Query<(Entity, &OverheadTurretBarRoot, &mut Node, &mut BorderColor)>,
+    mut bar_fill_q: Query<
+        (&OverheadTurretHpFill, &mut Node, &mut BackgroundColor),
+        Without<OverheadTurretBarRoot>,
+    >,
+    shield_q: Query<&OverheadTurretShieldBadge>,
+) {
+    if !match_flow.is_in_game() {
+        for (_, _, mut node, _) in &mut bar_root_q {
+            node.display = Display::None;
+        }
+        return;
+    }
+
+    let Ok((camera, cam_gtf)) = camera_query.single() else {
+        return;
+    };
+    let my_team = hero_hud.0.team;
+
+    for ts in &latest_turrets.0 {
+        let mut found_ent = None;
+        for (ent, root, _, _) in &bar_root_q {
+            if root.turret_index == ts.index {
+                found_ent = Some(ent);
+                break;
+            }
+        }
+        if found_ent.is_none() && !ts.is_dead {
+            let tidx = ts.index;
+            commands
+                .spawn((
+                    OverheadTurretBarRoot { turret_index: tidx },
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        width: px(96.0),
+                        height: px(9.5),
+                        border: UiRect::all(px(1.5)),
+                        border_radius: BorderRadius::all(px(3.0)),
+                        overflow: Overflow::clip(),
+                        display: Display::None,
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.10, 0.12, 0.16, 0.9)),
+                    BackgroundColor(Color::srgba(0.06, 0.07, 0.10, 0.85)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        OverheadTurretHpFill { turret_index: tidx },
+                        Pickable::IGNORE,
+                        Node {
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.16, 0.82, 0.36)),
+                    ));
+                });
+        }
+    }
+    let _ = shield_q.iter().count();
+
+    for (_, root, mut node, mut border) in &mut bar_root_q {
+        let Some(ts) = latest_turrets.0.get(root.turret_index) else {
+            node.display = Display::None;
+            continue;
+        };
+        if ts.is_dead {
+            node.display = Display::None;
+            continue;
+        }
+        let t_def = &config.map.turrets[ts.index];
+        let scaled_h = t_def.height * t_def.model_transform.scale_vec().y;
+        let world_head = t_def.model_transform.location_vec() + Vec3::Y * (scaled_h.max(3.5) + 1.2);
+        if let Ok(sp) = camera.world_to_viewport(cam_gtf, world_head) {
+            node.display = Display::Flex;
+            node.left = px(sp.x - 48.0);
+            node.top = px(sp.y - 16.0);
+            *border = if ts.is_invulnerable {
+                BorderColor::all(Color::srgb(0.45, 0.78, 1.0))
+            } else {
+                BorderColor::all(Color::srgba(0.08, 0.10, 0.14, 0.92))
+            };
+        } else {
+            node.display = Display::None;
+        }
+    }
+
+    for (fill, mut fnode, mut fbg) in &mut bar_fill_q {
+        if let Some(ts) = latest_turrets.0.get(fill.turret_index) {
+            let pct = ((ts.hp / ts.max_hp.max(1.0)) * 100.0).clamp(0.0, 100.0);
+            fnode.width = percent(pct);
+            *fbg = if ts.team == my_team {
+                Color::srgb(0.16, 0.82, 0.36).into()
+            } else {
+                Color::srgb(0.92, 0.22, 0.20).into()
+            };
         }
     }
 }

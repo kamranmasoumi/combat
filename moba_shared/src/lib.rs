@@ -609,6 +609,8 @@ pub struct CombatConfig {
     pub max_vertical_aim_pitch_sin: f32,
     pub min_fire_rate_secs: f32,
     pub min_reload_duration_secs: f32,
+    pub turret_backdoor_creep_radius: f32,
+    pub turret_bullet_spread_rad: f32,
     pub respawn_times_per_level: Vec<f32>,
     pub xp_thresholds_per_level: Vec<u32>,
 }
@@ -750,6 +752,15 @@ pub struct FxConfig {
     pub coin_lifetime_secs: f32,
     pub floating_popup_duration_secs: f32,
     pub floating_popup_rise_px: f32,
+    pub turret_muzzle_left_offset: (f32, f32, f32),
+    pub turret_muzzle_right_offset: (f32, f32, f32),
+    pub turret_recoil_offset: f32,
+    pub turret_recoil_recover_speed: f32,
+    pub turret_recoil_jitter_rad: f32,
+    pub turret_aim_slerp_speed: f32,
+    pub turret_hovered_tint_emissive_rgb: (f32, f32, f32),
+    pub turret_idle_anim: String,
+    pub turret_yaw_offset_rad: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -966,7 +977,16 @@ pub struct TurretDef {
     pub height: f32,
     pub head_radius: f32,
     pub max_hp: f32,
+    pub armor: f32,
+    pub bullet_damage: f32,
+    pub fire_rate_secs: f32,
+    pub projectile_speed: f32,
+    pub bullet_max_range: f32,
+    pub vision_range: f32,
     pub attack_range: f32,
+    pub gold_bounty: u32,
+    pub xp_bounty: u32,
+    pub backdoor_protection_requires_creeps: bool,
     pub color_rgb: (f32, f32, f32),
     pub crystal_emissive_rgb: (f32, f32, f32),
 }
@@ -1145,6 +1165,12 @@ pub enum GameplayFxEvent {
     CreepDenied {
         pos: Vec3,
     },
+    TurretShotFired {
+        turret_index: usize,
+        barrel_left: bool,
+        target_pos: Vec3,
+        shot_dir: Vec3,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1184,6 +1210,17 @@ pub struct CreepSnapshot {
     pub is_dead: bool,
     pub is_deniable: bool,
     pub is_visible: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TurretSnapshot {
+    pub index: usize,
+    pub team: TeamId,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub is_dead: bool,
+    pub is_invulnerable: bool,
+    pub aim_target_pos: Option<Vec3>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1606,6 +1643,7 @@ pub struct ServerWorldSnapshot {
     pub laser_hit_pos: Vec3,
     pub aim_locked_on_enemy: bool,
     pub hovered_creep_id: Option<u64>,
+    pub hovered_turret_index: Option<usize>,
     pub current_locomotion: String,
     pub upper_action: UpperBodyAction,
     pub traversal_active: bool,
@@ -1621,6 +1659,7 @@ pub struct ServerWorldSnapshot {
     pub grenades: Vec<GrenadeSnapshot>,
     pub targets: Vec<TargetSnapshot>,
     pub creeps: Vec<CreepSnapshot>,
+    pub turrets: Vec<TurretSnapshot>,
     pub fx_events: Vec<GameplayFxEvent>,
 }
 
@@ -2830,6 +2869,7 @@ pub struct PhysicsTree {
 #[derive(Component)]
 pub struct PhysicsTurret {
     pub id: String,
+    pub index: usize,
     pub team: TeamId,
     pub lane: LaneId,
     pub tier: u8,
@@ -3124,6 +3164,7 @@ pub fn tree_physics_bundle(
 
 pub fn turret_physics_bundle(
     config: &GameConfig,
+    index: usize,
     turret: &TurretDef,
 ) -> (
     MapObjectId,
@@ -3143,6 +3184,7 @@ pub fn turret_physics_bundle(
         MapObjectId(turret.id.clone()),
         PhysicsTurret {
             id: turret.id.clone(),
+            index,
             team: turret.team,
             lane: turret.lane,
             tier: turret.tier,
@@ -3828,6 +3870,25 @@ pub struct LaneCreepState {
     pub despawn_timer: f32,
 }
 
+#[derive(Clone, Debug)]
+pub struct TurretState {
+    pub index: usize,
+    pub id: String,
+    pub team: TeamId,
+    pub lane: LaneId,
+    pub tier: u8,
+    pub pos: Vec3,
+    pub height: f32,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub armor: f32,
+    pub is_dead: bool,
+    pub is_invulnerable: bool,
+    pub fire_cooldown: f32,
+    pub barrel_toggle: bool,
+    pub aim_target_pos: Option<Vec3>,
+}
+
 pub struct SharedTarget {
     pub max_hp: f32,
     pub hp: f32,
@@ -3885,6 +3946,7 @@ pub struct PlayerSlotState {
     pub laser_hit_pos: Vec3,
     pub aim_locked_on_enemy: bool,
     pub hovered_creep_id: Option<u64>,
+    pub hovered_turret_index: Option<usize>,
     pub is_moving: bool,
     pub move_input: Vec3,
     pub fire_cooldown_remaining: f32,
@@ -3947,6 +4009,7 @@ pub struct AuthoritativeWorldState {
     pub laser_hit_pos: Vec3,
     pub aim_locked_on_enemy: bool,
     pub hovered_creep_id: Option<u64>,
+    pub hovered_turret_index: Option<usize>,
     pub is_moving: bool,
     pub move_input: Vec3,
     pub fire_cooldown_remaining: f32,
@@ -3989,6 +4052,7 @@ pub struct AuthoritativeWorldState {
     pub targets: Vec<SharedTarget>,
     pub targets_visible: Vec<bool>,
     pub creeps: Vec<LaneCreepState>,
+    pub turrets: Vec<TurretState>,
     pub match_elapsed_secs: f32,
     pub next_wave_time_secs: f32,
     pub next_camp_spawn_time_secs: f32,
@@ -4048,6 +4112,7 @@ impl AuthoritativeWorldState {
             laser_hit_pos: initial_aim_hit,
             aim_locked_on_enemy: false,
             hovered_creep_id: None,
+            hovered_turret_index: None,
             is_moving: false,
             move_input: Vec3::ZERO,
             fire_cooldown_remaining: 0.0,
@@ -4103,6 +4168,29 @@ impl AuthoritativeWorldState {
             targets_visible: vec![true; targets.len()],
             targets,
             creeps: Vec::new(),
+            turrets: config
+                .map
+                .turrets
+                .iter()
+                .enumerate()
+                .map(|(index, t)| TurretState {
+                    index,
+                    id: t.id.clone(),
+                    team: t.team,
+                    lane: t.lane,
+                    tier: t.tier,
+                    pos: t.model_transform.location_vec(),
+                    height: t.height * t.model_transform.scale_vec().y,
+                    hp: t.max_hp,
+                    max_hp: t.max_hp,
+                    armor: t.armor,
+                    is_dead: false,
+                    is_invulnerable: t.tier > 1,
+                    fire_cooldown: 0.0,
+                    barrel_toggle: false,
+                    aim_target_pos: None,
+                })
+                .collect(),
             match_elapsed_secs: 0.0,
             next_wave_time_secs: config.creeps.first_wave_delay_secs,
             next_camp_spawn_time_secs: config.neutral_camps.first_spawn_delay_secs,
@@ -4147,6 +4235,7 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.laser_hit_pos, &mut p.laser_hit_pos);
         std::mem::swap(&mut self.aim_locked_on_enemy, &mut p.aim_locked_on_enemy);
         std::mem::swap(&mut self.hovered_creep_id, &mut p.hovered_creep_id);
+        std::mem::swap(&mut self.hovered_turret_index, &mut p.hovered_turret_index);
         std::mem::swap(&mut self.is_moving, &mut p.is_moving);
         std::mem::swap(&mut self.move_input, &mut p.move_input);
         std::mem::swap(&mut self.fire_cooldown_remaining, &mut p.fire_cooldown_remaining);
@@ -4272,6 +4361,7 @@ impl AuthoritativeWorldState {
                 laser_hit_pos: aim_hit,
                 aim_locked_on_enemy: false,
                 hovered_creep_id: None,
+                hovered_turret_index: None,
                 is_moving: false,
                 move_input: Vec3::ZERO,
                 fire_cooldown_remaining: 0.0,
@@ -4474,6 +4564,7 @@ impl AuthoritativeWorldState {
             laser_hit_pos: self.laser_hit_pos,
             aim_locked_on_enemy: self.aim_locked_on_enemy,
             hovered_creep_id: self.hovered_creep_id,
+            hovered_turret_index: self.hovered_turret_index,
             current_locomotion: self.current_locomotion.clone(),
             upper_action: self.upper_body_action(),
             traversal_active: self.traversal.is_active,
@@ -4530,6 +4621,19 @@ impl AuthoritativeWorldState {
             bullets: self.bullets_snapshot.clone(),
             grenades: self.grenades_snapshot.clone(),
             creeps: Vec::new(),
+            turrets: self
+                .turrets
+                .iter()
+                .map(|t| TurretSnapshot {
+                    index: t.index,
+                    team: t.team,
+                    hp: t.hp,
+                    max_hp: t.max_hp,
+                    is_dead: t.is_dead,
+                    is_invulnerable: t.is_invulnerable,
+                    aim_target_pos: t.aim_target_pos,
+                })
+                .collect(),
             targets: self
                 .targets
                 .iter()
@@ -4759,8 +4863,8 @@ fn spawn_server_environment_colliders_system(mut commands: Commands, config: Res
         commands.spawn(tree_physics_bundle(&config, tree));
     }
 
-    for turret in &config.map.turrets {
-        commands.spawn(turret_physics_bundle(&config, turret));
+    for (index, turret) in config.map.turrets.iter().enumerate() {
+        commands.spawn(turret_physics_bundle(&config, index, turret));
     }
 
     for ancient in &config.map.ancients {
@@ -4968,6 +5072,7 @@ fn shared_authoritative_drive_system(
     mut soldier_query: Query<(&PhysicsSoldier, &mut Transform, &mut CustomCharacterController)>,
     obstacle_query: Query<&PhysicsObstacle>,
     target_query: Query<&PhysicsTarget>,
+    turret_query: Query<&PhysicsTurret>,
 ) {
     if match_state
         .as_ref()
@@ -5009,6 +5114,7 @@ fn shared_authoritative_drive_system(
                 &mut controller,
                 &obstacle_query,
                 &target_query,
+                &turret_query,
                 &hero_aim_targets,
             );
         }
@@ -5025,6 +5131,14 @@ fn shared_authoritative_drive_system(
         &physics_world,
         &mut world,
         &target_query,
+    );
+
+    step_turrets_system(
+        &mut commands,
+        dt,
+        &config,
+        &physics_world,
+        &mut world,
     );
 
     // حل برخورد فیزیکی هیروها با یکدیگر (هیچ دو هیرویی نمی‌توانند از داخل هم عبور کنند)
@@ -5111,6 +5225,7 @@ fn shared_drive_single_player(
     controller: &mut CustomCharacterController,
     obstacle_query: &Query<&PhysicsObstacle>,
     target_query: &Query<&PhysicsTarget>,
+    turret_query: &Query<&PhysicsTurret>,
     hero_aim_targets: &[(usize, TeamId, Vec3, f32, Stance, bool)],
 ) {
 
@@ -5301,6 +5416,7 @@ fn shared_drive_single_player(
             let mut resolved_hit: Option<Vec3> = None;
             let mut locked_enemy = false;
             let mut hovered_creep: Option<u64> = None;
+            let mut hovered_turret: Option<usize> = None;
 
             let hero_wins_aim = match (best_enemy_hit, best_creep_hit) {
                 (Some((h_t, _)), Some((_, c_t, _))) => h_t <= c_t,
@@ -5316,7 +5432,15 @@ fn shared_drive_single_player(
                 locked_enemy = true;
                 hovered_creep = Some(c_id);
             } else if let Some((hit_ent, hit)) = world_hit_opt {
-                if target_query.get(hit_ent).is_ok() {
+                if let Ok(pt) = turret_query.get(hit_ent) {
+                    if pt.team != world.hero_team && !world.turrets[pt.index].is_dead {
+                        resolved_hit = Some(hit.point);
+                        locked_enemy = true;
+                        hovered_turret = Some(pt.index);
+                    } else {
+                        resolved_hit = Some(hit.point);
+                    }
+                } else if target_query.get(hit_ent).is_ok() {
                     resolved_hit = Some(hit.point);
                     locked_enemy = true;
                 } else if hit.normal.y > 0.7 {
@@ -5344,6 +5468,7 @@ fn shared_drive_single_player(
 
             world.aim_locked_on_enemy = locked_enemy;
             world.hovered_creep_id = hovered_creep;
+            world.hovered_turret_index = hovered_turret;
 
             if let Some(hit) = resolved_hit {
                 world.aim_hit_pos = hit;
@@ -5807,6 +5932,7 @@ fn shared_authoritative_react_system(
         (Without<PhysicsSoldier>, Without<PhysicsBullet>),
     >,
     target_query: Query<(Entity, &PhysicsTarget)>,
+    turret_query: Query<(Entity, &PhysicsTurret)>,
 ) {
     if match_state
         .as_ref()
@@ -5839,6 +5965,10 @@ fn shared_authoritative_react_system(
     for (entity, p_target) in &target_query {
         target_entity_by_idx.insert(p_target.index, entity);
         target_idx_by_entity.insert(entity, p_target.index);
+    }
+    let mut turret_idx_by_entity = HashMap::new();
+    for (entity, p_turret) in &turret_query {
+        turret_idx_by_entity.insert(entity, p_turret.index);
     }
 
     let mut exploded_positions = Vec::new();
@@ -6158,7 +6288,51 @@ fn shared_authoritative_react_system(
 
         if let Some((hit_entity, impact_pos, _)) = ray_hit {
             let mut target_destroyed = false;
-            if let Some(&t_idx) = target_idx_by_entity.get(&hit_entity) {
+            if let Some(&tur_idx) = turret_idx_by_entity.get(&hit_entity) {
+                let turret_team = world.turrets[tur_idx].team;
+                let turret_invuln = world.turrets[tur_idx].is_invulnerable;
+                let turret_dead = world.turrets[tur_idx].is_dead;
+                if bullet.owner_team != turret_team && !turret_invuln && !turret_dead {
+                    let dmg_mult = dota2_armor_multiplier(world.turrets[tur_idx].armor);
+                    let eff_dmg = (bullet.damage * dmg_mult).max(1.0);
+                    world.turrets[tur_idx].hp = (world.turrets[tur_idx].hp - eff_dmg).max(0.0);
+                    if world.turrets[tur_idx].hp <= 0.0 && !world.turrets[tur_idx].is_dead {
+                        world.turrets[tur_idx].is_dead = true;
+                        world.turrets[tur_idx].aim_target_pos = None;
+                        target_destroyed = true;
+                        commands.entity(hit_entity).insert(ColliderDisabled);
+                        let tur_pos = world.turrets[tur_idx].pos;
+                        let gold_b = config.map.turrets[tur_idx].gold_bounty;
+                        let xp_b = config.map.turrets[tur_idx].xp_bounty;
+                        if let Some(owner_slot) = bullet.owner_slot {
+                            let world_inner = &mut *world;
+                            if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                                killer.last_hits += 1;
+                                killer.hero_gold += gold_b;
+                                world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
+                                    pos: tur_pos + Vec3::Y * 2.5,
+                                    gold: gold_b,
+                                });
+                            }
+                        }
+                        let killer_team = bullet.owner_team;
+                        let eligible: Vec<usize> = world
+                            .players
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, p)| !p.is_dead && p.hero_team == killer_team && p.soldier_pos.distance(tur_pos) <= p.hero_xp_gain_radius)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if !eligible.is_empty() && xp_b > 0 {
+                            let share = xp_b / (eligible.len() as u32);
+                            let world_inner = &mut *world;
+                            for idx in eligible {
+                                grant_xp_to_player_slot(&mut world_inner.players[idx], share, &config, &mut world_inner.pending_fx);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(&t_idx) = target_idx_by_entity.get(&hit_entity) {
                 let target = &mut world.targets[t_idx];
                 target.hp -= bullet.damage;
                 target.hit_flash_timer = config.fx.target_hit_flash_secs;
@@ -6680,6 +6854,17 @@ fn step_lane_creeps_system(
         .iter()
         .map(|p| (p.hero_team, p.soldier_pos, p.is_dead))
         .collect();
+    let turret_snap: Vec<(TeamId, Vec3, f32, f32, bool)> = world
+        .turrets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let td = &config.map.turrets[i];
+            let s = td.model_transform.scale_vec();
+            let world_r = td.base_radius * s.x.max(s.z);
+            (t.team, t.pos, world_r, t.height, t.is_dead)
+        })
+        .collect();
 
     let query_groups = soldier_collision_groups();
     let c_len = world.creeps.len();
@@ -6751,6 +6936,31 @@ fn step_lane_creeps_system(
                     )
                 {
                     best_target = Some((h_pos, d));
+                }
+            }
+            if !is_neutral {
+                for &(t_team, t_pos, t_rad, t_height, t_dead) in &turret_snap {
+                    if t_team == my_team || t_dead {
+                        continue;
+                    }
+                    let edge_dist = (my_pos.distance(t_pos) - t_rad).max(0.0);
+                    if edge_dist <= c_stats.vision_range
+                        && best_target.map_or(true, |(_, bd)| edge_dist < bd)
+                    {
+                        let to_tur = Vec3::new(my_pos.x - t_pos.x, 0.0, my_pos.z - t_pos.z).normalize_or_zero();
+                        let tur_edge_pos = Vec3::new(t_pos.x, my_pos.y, t_pos.z) + to_tur * (t_rad + 0.45);
+                        if can_observer_see_point_with_range(
+                            physics_world,
+                            config,
+                            my_pos,
+                            tur_edge_pos,
+                            c_stats.aim_chest_height,
+                            c_stats.vision_range,
+                            0.0,
+                        ) {
+                            best_target = Some((Vec3::new(t_pos.x, my_pos.y.max(t_pos.y) + t_height * 0.45, t_pos.z), edge_dist));
+                        }
+                    }
                 }
             }
         }
@@ -6828,7 +7038,15 @@ fn step_lane_creeps_system(
                 let to_wp = Vec3::new(wp_pos.x - my_pos.x, 0.0, wp_pos.z - my_pos.z);
                 let dist_wp = to_wp.length();
 
-                if dist_wp <= config.creeps.waypoint_reach_dist {
+                // اگر Waypoint دقیقاً روی مرکز یک تاور باشد، شعاع رسیدن به Waypoint از شعاع تاور بزرگ‌تر می‌شود تا سرباز پشت تاور گیر نکند
+                let mut reach_dist = config.creeps.waypoint_reach_dist;
+                for &(_t_team, t_pos, t_rad, _t_h, t_dead) in &turret_snap {
+                    if !t_dead && Vec2::new(wp_pos.x - t_pos.x, wp_pos.z - t_pos.z).length() <= t_rad + 2.0 {
+                        reach_dist = reach_dist.max(t_rad + c_stats.collider_radius + 1.5);
+                    }
+                }
+
+                if dist_wp <= reach_dist {
                     match my_team {
                         TeamId::Dawn => {
                             if wp_idx + 1 < lane_def.waypoints.len() {
@@ -6843,9 +7061,27 @@ fn step_lane_creeps_system(
                         TeamId::Neutral => {}
                     }
                 } else if dist_wp > 0.01 {
-                    let dir = to_wp / dist_wp;
+                    let mut dir = to_wp / dist_wp;
+                    // هدایت نرم به طرفین هنگام نزدیک شدن به بدنه تاور
+                    for &(_t_team, t_pos, t_rad, _t_h, t_dead) in &turret_snap {
+                        if t_dead || (my_pos.y - t_pos.y).abs() > 3.0 {
+                            continue;
+                        }
+                        let to_tur = Vec2::new(t_pos.x - my_pos.x, t_pos.z - my_pos.z);
+                        let dist_t = to_tur.length();
+                        let avoid_r = t_rad + c_stats.collider_radius + 1.2;
+                        if dist_t < avoid_r && dist_t > 0.001 {
+                            let fwd2 = Vec2::new(dir.x, dir.z);
+                            if to_tur.normalize().dot(fwd2) > 0.25 {
+                                let perp = Vec2::new(-to_tur.y, to_tur.x).normalize();
+                                let side_sign = if perp.dot(fwd2) >= 0.0 { 1.0 } else { -1.0 };
+                                let steer = (fwd2 + perp * (side_sign * 1.35)).normalize();
+                                dir = Vec3::new(steer.x, 0.0, steer.y);
+                            }
+                        }
+                    }
                     world.creeps[idx].facing_dir = dir;
-                    let step = dir * config.creeps.move_speed * dt;
+                    let step = dir * c_stats.move_speed * dt;
                     world.creeps[idx].pos.x += step.x;
                     world.creeps[idx].pos.z += step.z;
                     moved = true;
@@ -6868,6 +7104,29 @@ fn step_lane_creeps_system(
         ) {
             if hit.normal.y > 0.5 {
                 world.creeps[idx].pos.y = hit.point.y;
+            }
+        }
+
+        // جلوگیری از ورود و گیر افتادن سربازان پشت پایه تاورها (به همراه لغزش مماسی دور تاور)
+        for &(_t_team, t_pos, t_rad, _t_h, t_dead) in &turret_snap {
+            if t_dead || (world.creeps[idx].pos.y - t_pos.y).abs() > 3.0 {
+                continue;
+            }
+            let min_d = t_rad + c_stats.collider_radius + 0.15;
+            let delta = Vec2::new(world.creeps[idx].pos.x - t_pos.x, world.creeps[idx].pos.z - t_pos.z);
+            let dist = delta.length();
+            if dist < min_d {
+                let push = if dist > 0.0001 { delta / dist } else { Vec2::new(0.0, 1.0) };
+                world.creeps[idx].pos.x = t_pos.x + push.x * min_d;
+                world.creeps[idx].pos.z = t_pos.z + push.y * min_d;
+                if moved {
+                    let f = Vec2::new(world.creeps[idx].facing_dir.x, world.creeps[idx].facing_dir.z);
+                    let t1 = Vec2::new(-push.y, push.x);
+                    let tangent = if t1.dot(f) >= 0.0 { t1 } else { -t1 };
+                    let slide = tangent * c_stats.move_speed * dt * 0.85;
+                    world.creeps[idx].pos.x += slide.x;
+                    world.creeps[idx].pos.z += slide.y;
+                }
             }
         }
 
@@ -6913,6 +7172,159 @@ fn step_lane_creeps_system(
                 world.creeps[i].pos.z -= push_dir.y * half_push;
                 world.creeps[j].pos.x += push_dir.x * half_push;
                 world.creeps[j].pos.z += push_dir.y * half_push;
+            }
+        }
+    }
+}
+
+
+fn step_turrets_system(
+    commands: &mut Commands,
+    dt: f32,
+    config: &GameConfig,
+    physics_world: &CustomPhysicsWorld,
+    world: &mut AuthoritativeWorldState,
+) {
+    let turret_status: Vec<(TeamId, LaneId, u8, bool)> = world
+        .turrets
+        .iter()
+        .map(|t| (t.team, t.lane, t.tier, t.is_dead))
+        .collect();
+
+    let creep_snap: Vec<(TeamId, Vec3, bool, bool)> = world
+        .creeps
+        .iter()
+        .map(|c| (c.team, c.pos, c.is_dead, c.camp_index.is_none()))
+        .collect();
+
+    let hero_snap: Vec<(TeamId, Vec3, bool)> = world
+        .players
+        .iter()
+        .map(|p| (p.hero_team, p.soldier_pos, p.is_dead))
+        .collect();
+
+    let backdoor_r = config.combat.turret_backdoor_creep_radius;
+    let spread_rad = config.combat.turret_bullet_spread_rad;
+
+    for idx in 0..world.turrets.len() {
+        if world.turrets[idx].is_dead {
+            world.turrets[idx].aim_target_pos = None;
+            continue;
+        }
+
+        let my_team = world.turrets[idx].team;
+        let my_lane = world.turrets[idx].lane;
+        let my_tier = world.turrets[idx].tier;
+        let my_pos = world.turrets[idx].pos;
+        let t_def = &config.map.turrets[idx];
+        let t_scale = t_def.model_transform.scale_vec();
+        let t_world_radius = t_def.base_radius * t_scale.x.max(t_scale.z);
+        let t_world_height = world.turrets[idx].height;
+
+        // ۱. اولویت تاورها (Tier 1 -> Tier 2 -> Tier 3): اگر تاور جلویی هنوز زنده است، این تاور ضدضربه است
+        let prev_tier_alive = turret_status.iter().any(|&(tm, ln, tr, dead)| {
+            tm == my_team && ln == my_lane && tr < my_tier && !dead
+        });
+
+        // ۲. محافظت Backdoor: دشمن برای ضربه زدن به تاور حتماً باید سرباز لاین زنده در محدوده تاور داشته باشد
+        let has_enemy_lane_creeps = if t_def.backdoor_protection_requires_creeps {
+            creep_snap.iter().any(|&(c_team, c_pos, c_dead, is_lane_creep)| {
+                !c_dead && is_lane_creep && c_team != my_team && c_team != TeamId::Neutral && c_pos.distance(my_pos) <= backdoor_r
+            })
+        } else {
+            true
+        };
+
+        world.turrets[idx].is_invulnerable = prev_tier_alive || !has_enemy_lane_creeps;
+        world.turrets[idx].fire_cooldown = (world.turrets[idx].fire_cooldown - dt).max(0.0);
+
+        // ۳. انتخاب هدف تاور: اولویت با نزدیک‌ترین سرباز دشمن در برد، سپس هیروی دشمن
+        let mut best_creep: Option<(Vec3, f32)> = None;
+        for &(c_team, c_pos, c_dead, is_lane_creep) in &creep_snap {
+            if c_dead || !is_lane_creep || c_team == my_team || c_team == TeamId::Neutral {
+                continue;
+            }
+            let d = my_pos.distance(c_pos);
+            let to_c = Vec3::new(c_pos.x - my_pos.x, 0.0, c_pos.z - my_pos.z).normalize_or_zero();
+            let ray_start = Vec3::new(my_pos.x, c_pos.y, my_pos.z) + to_c * (t_world_radius + 0.45);
+            if d <= t_def.attack_range
+                && best_creep.map_or(true, |(_, bd)| d < bd)
+                && can_observer_see_point_with_range(
+                    physics_world,
+                    config,
+                    ray_start,
+                    c_pos,
+                    1.15,
+                    t_def.vision_range,
+                    0.0,
+                )
+            {
+                best_creep = Some((c_pos + Vec3::Y * config.creeps.aim_chest_height, d));
+            }
+        }
+
+        let mut best_hero: Option<(Vec3, f32)> = None;
+        if best_creep.is_none() {
+            for &(h_team, h_pos, h_dead) in &hero_snap {
+                if h_team == my_team || h_dead {
+                    continue;
+                }
+                let d = my_pos.distance(h_pos);
+                let to_h = Vec3::new(h_pos.x - my_pos.x, 0.0, h_pos.z - my_pos.z).normalize_or_zero();
+                let ray_start = Vec3::new(my_pos.x, h_pos.y, my_pos.z) + to_h * (t_world_radius + 0.45);
+                if d <= t_def.attack_range
+                    && best_hero.map_or(true, |(_, bd)| d < bd)
+                    && can_observer_see_point_with_range(
+                        physics_world,
+                        config,
+                        ray_start,
+                        h_pos,
+                        1.15,
+                        t_def.vision_range,
+                        0.0,
+                    )
+                {
+                    best_hero = Some((h_pos + Vec3::Y * config.combat.hero_stand_aim_chest_height, d));
+                }
+            }
+        }
+
+        let chosen_target = best_creep.or(best_hero).map(|(p, _)| p);
+        world.turrets[idx].aim_target_pos = chosen_target;
+
+        // ۴. شلیک رگباری متناوب دولول
+        if let Some(target_pos) = chosen_target {
+            if world.turrets[idx].fire_cooldown <= 0.0 {
+                world.turrets[idx].fire_cooldown = t_def.fire_rate_secs;
+                world.turrets[idx].barrel_toggle = !world.turrets[idx].barrel_toggle;
+                let barrel_left = world.turrets[idx].barrel_toggle;
+
+                let muzzle_origin = Vec3::new(my_pos.x, my_pos.y.max(0.0) + t_world_height.max(3.5) * 0.72, my_pos.z);
+                let base_dir = (target_pos - muzzle_origin).normalize_or_zero();
+                let rx = (world.next_rand() - 0.5) * 2.0 * spread_rad;
+                let ry = (world.next_rand() - 0.5) * 2.0 * spread_rad * 0.5;
+                let shot_dir = (Quat::from_euler(EulerRot::YXZ, rx, ry, 0.0) * base_dir).normalize_or_zero();
+
+                let b_id = world.next_entity_id;
+                world.next_entity_id += 1;
+                commands.spawn((
+                    PhysicsBullet {
+                        id: b_id,
+                        owner_slot: None,
+                        owner_team: my_team,
+                        velocity: shot_dir * t_def.projectile_speed,
+                        damage: t_def.bullet_damage,
+                        remaining_range: t_def.bullet_max_range,
+                    },
+                    Transform::from_translation(muzzle_origin + shot_dir * (t_world_radius + 0.55)),
+                ));
+
+                world.pending_fx.push(GameplayFxEvent::TurretShotFired {
+                    turret_index: idx,
+                    barrel_left,
+                    target_pos,
+                    shot_dir,
+                });
             }
         }
     }

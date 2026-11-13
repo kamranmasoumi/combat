@@ -23,7 +23,7 @@ use moba_shared::{
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
-    AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
@@ -82,6 +82,7 @@ fn main() {
             hero_scale: h.hero_scale,
             move_speed: config.soldier.run_speed * h.move_speed_multiplier,
             vision_range: h.vision_range,
+            active_weapon: ActiveWeaponSlot::Primary,
             weapon_kind: h.weapon.weapon_kind,
             ammo_in_mag: h.weapon.magazine_size,
             magazine_size: h.weapon.magazine_size,
@@ -104,7 +105,7 @@ fn main() {
             primary_window: Some(Window {
                 title: config.window.title.clone(),
                 resolution: WindowResolution::new(config.window.width, config.window.height),
-                present_mode: PresentMode::AutoVsync,
+                present_mode: PresentMode::AutoNoVsync,
                 ..default()
             }),
             ..default()
@@ -131,6 +132,9 @@ fn main() {
         .insert_resource(ChatUiState::default())
         .insert_resource(ClientPingState::default())
         .insert_resource(LatestPauseState::default())
+        .insert_resource(ClientTelemetryState::default())
+        .insert_resource(FixedSoldierTransformHistory::default())
+        .insert_resource(HeroModelAnimCache::default())
         .insert_resource(ClientMatchFlow {
             your_slot: None,
             snapshot: None,
@@ -146,13 +150,28 @@ fn main() {
             is_dragging_minimap: false,
         })
         .add_plugins(MaterialPlugin::<WaterSurfaceMaterial>::default())
+        .insert_resource(bevy::winit::WinitSettings::game())
+        .insert_resource(Time::<Fixed>::from_hz(60.0))
         .add_plugins(MobaSharedPhysicsPlugin {
             role: PhysicsRole::Client,
             tick_rate_hz: tick_hz,
             substeps,
         })
         .add_systems(Startup, setup_scene)
-        .add_systems(FixedUpdate, client_flush_input_to_server_system)
+        .add_systems(PreUpdate, client_sample_input_system)
+        .add_systems(
+            FixedUpdate,
+            (
+                client_flush_input_to_server_system,
+                record_soldier_fixed_transform_system.after(moba_shared::shared_client_drive_system),
+            ),
+        )
+        .add_systems(
+            PostUpdate,
+            compensate_upper_body_hips_twist_system
+                .after(bevy::app::AnimationSystems)
+                .before(bevy::transform::TransformSystems::Propagate),
+        )
         .add_systems(
             Update,
             (
@@ -160,7 +179,6 @@ fn main() {
                 attach_split_body_animation_graphs,
                 attach_weapon_to_left_hand,
                 weapon_live_calibration_system,
-                client_sample_input_system,
                 client_receive_snapshot_and_sync_system,
                 target_visual_reaction_system,
                 environment_vfx_and_water_animation_system,
@@ -195,11 +213,12 @@ fn main() {
                 sync_remote_players_system,
                 update_overhead_hero_bars_system,
             )
-                .chain(),
+                .chain()
+                .after(camera_follow_system),
         )
         .add_systems(
             Update,
-            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system, client_chat_input_system, update_chat_ui_system, client_ping_input_system, update_ping_visuals_system, client_pause_input_system, update_pause_overlay_ui_system)
+            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system, client_chat_input_system, update_chat_ui_system, client_ping_input_system, update_ping_visuals_system, client_pause_input_system, update_pause_overlay_ui_system, update_telemetry_hud_system)
                 .chain()
                 .after(sync_remote_players_system),
         )
@@ -237,10 +256,19 @@ struct LowerBodyAnimationPlayer;
 struct UpperBodyAnimationPlayer;
 
 #[derive(Component)]
+struct SoldierHipsBone;
+
+#[derive(Component)]
+struct SoldierSpineRootBone;
+
+#[derive(Component)]
 struct MobaCamera;
 
 #[derive(Component)]
 struct WeaponRoot;
+
+#[derive(Component)]
+struct AttachedWeaponKind(WeaponKind);
 
 #[derive(Component)]
 struct MuzzlePoint;
@@ -303,9 +331,21 @@ struct VisualTarget {
     is_server_visible: bool,
 }
 
+#[derive(Resource, Clone)]
+struct SharedFxAssets {
+    bullet_mesh: Handle<Mesh>,
+    bullet_mat: Handle<StandardMaterial>,
+    muzzle_flash_mesh: Handle<Mesh>,
+    muzzle_flash_mat: Handle<StandardMaterial>,
+    shell_mesh: Handle<Mesh>,
+    shell_mat: Handle<StandardMaterial>,
+}
+
 #[derive(Component)]
 struct NetworkBulletVisual {
     server_id: u64,
+    visual_offset: Vec3,
+    visual_offset_blend: f32,
 }
 
 #[derive(Component)]
@@ -560,10 +600,14 @@ struct FogOfWarState {
 }
 
 #[derive(Resource)]
-struct SoldierGltfHandle(Handle<Gltf>);
+struct SoldierGltfHandle {
+    model_path: String,
+    handle: Handle<Gltf>,
+}
 
 #[derive(Resource)]
 struct SoldierAnimationAssets {
+    model_path: String,
     graph_handle: Handle<AnimationGraph>,
     nodes: HashMap<String, AnimationNodeIndex>,
     durations: HashMap<String, f32>,
@@ -607,6 +651,7 @@ struct ClientRenderState {
     current_locomotion: String,
     previous_lower_anim: String,
     previous_upper_anim: String,
+    neutral_hips_yaw: Option<f32>,
     upper_action: UpperBodyAction,
     traversal_active: bool,
     traversal_anim_name: String,
@@ -650,6 +695,7 @@ impl ClientRenderState {
             current_locomotion: "idle".to_string(),
             previous_lower_anim: String::new(),
             previous_upper_anim: String::new(),
+            neutral_hips_yaw: None,
             upper_action: UpperBodyAction::None,
             traversal_active: false,
             traversal_anim_name: String::new(),
@@ -1872,7 +1918,53 @@ fn setup_scene(
     spawn_end_of_match_overlay(&mut commands);
     spawn_chat_ui(&mut commands);
     spawn_pause_overlay_ui(&mut commands);
+    spawn_telemetry_hud_ui(&mut commands);
     spawn_match_overlay_ui(&mut commands, &config);
+
+    let shared_fx = SharedFxAssets {
+        bullet_mesh: meshes.add(Cone {
+            radius: 0.028,
+            height: 0.42,
+        }),
+        bullet_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.92, 0.45),
+            emissive: LinearRgba::new(14.0, 8.5, 1.2, 1.0),
+            unlit: true,
+            ..default()
+        }),
+        muzzle_flash_mesh: meshes.add(Cone {
+            radius: 0.07,
+            height: 0.28,
+        }),
+        muzzle_flash_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.8, 0.2),
+            emissive: LinearRgba::new(16.0, 9.0, 1.5, 1.0),
+            unlit: true,
+            ..default()
+        }),
+        shell_mesh: meshes.add(Cylinder::new(0.014, 0.055)),
+        shell_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.88, 0.72, 0.28),
+            metallic: 0.9,
+            perceptual_roughness: 0.25,
+            ..default()
+        }),
+    };
+    for _ in 0..64 {
+        commands.spawn((
+            Mesh3d(shared_fx.bullet_mesh.clone()),
+            MeshMaterial3d(shared_fx.bullet_mat.clone()),
+            Transform::default(),
+            Visibility::Hidden,
+            NotShadowCaster,
+            NetworkBulletVisual {
+                server_id: 0,
+                visual_offset: Vec3::ZERO,
+                visual_offset_blend: 0.0,
+            },
+        ));
+    }
+    commands.insert_resource(shared_fx);
     spawn_laser_and_reticle_visuals(
         &mut commands,
         &config,
@@ -1881,16 +1973,48 @@ fn setup_scene(
     );
 
     let gltf_handle = asset_server.load(&config.animations.model_path);
-    commands.insert_resource(SoldierGltfHandle(gltf_handle));
-    let creep_gltf_handle = asset_server.load(&config.creeps.model_path);
-    commands.insert_resource(CreepGltfHandle(creep_gltf_handle));
+    commands.insert_resource(SoldierGltfHandle {
+        model_path: config.animations.model_path.clone(),
+        handle: gltf_handle,
+    });
+    let mut creep_anim_cache = CreepModelAnimCache::default();
+    creep_anim_cache.register(
+        "lane_dawn",
+        &config.creeps.dawn_model_path,
+        &config.creeps.anim_run,
+        &config.creeps.anim_idle,
+        &config.creeps.anim_fire,
+        &config.creeps.anim_die,
+        &asset_server,
+    );
+    creep_anim_cache.register(
+        "lane_dusk",
+        &config.creeps.dusk_model_path,
+        &config.creeps.anim_run,
+        &config.creeps.anim_idle,
+        &config.creeps.anim_fire,
+        &config.creeps.anim_die,
+        &asset_server,
+    );
+    for (tid, ct) in &config.neutral_camps.creep_types {
+        creep_anim_cache.register(
+            tid,
+            &ct.model_path,
+            &ct.anim_run,
+            &ct.anim_idle,
+            &ct.anim_fire,
+            &ct.anim_die,
+            &asset_server,
+        );
+    }
+    commands.insert_resource(creep_anim_cache);
     let dawn_tur_path = config
         .map
         .turrets
         .iter()
         .find(|t| t.team == TeamId::Dawn)
         .map(|t| t.model_path.clone())
-        .unwrap_or_else(|| config.creeps.model_path.clone());
+        .unwrap_or_else(|| config.creeps.dawn_model_path.clone());
     let dusk_tur_path = config
         .map
         .turrets
@@ -2029,38 +2153,81 @@ fn spawn_water_ripple_and_droplets(
 // بارگذاری انیمیشن‌ها همراه با بررسی وجود تمام کلیپ‌های تعریف‌شده در کانفیگ
 // -----------------------------------------------------------------------------
 
+fn resolve_local_selected_hero<'a>(
+    config: &'a GameConfig,
+    match_flow: &ClientMatchFlow,
+    hero_hud: &LatestHeroSnapshot,
+) -> Option<&'a moba_shared::HeroDef> {
+    if let (Some(slot), Some(snap)) = (match_flow.your_slot, match_flow.snapshot.as_ref()) {
+        if let Some(lp) = snap.players.get(slot) {
+            if let Some(ref hid) = lp.selected_hero_id {
+                if let Some(h) = config.heroes.iter().find(|h| &h.id == hid) {
+                    return Some(h);
+                }
+            }
+        }
+    }
+    if match_flow.is_in_game() {
+        if let Some(h) = config.heroes.iter().find(|h| h.id == hero_hud.0.hero_id) {
+            return Some(h);
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 fn load_gltf_and_build_graph(
     mut commands: Commands,
     config: Res<GameConfig>,
-    gltf_handle: Option<Res<SoldierGltfHandle>>,
+    asset_server: Res<AssetServer>,
+    match_flow: Res<ClientMatchFlow>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    mut render_state: ResMut<ClientRenderState>,
+    mut weapon_status: ResMut<WeaponAttachmentStatus>,
+    mut gltf_handle: Option<ResMut<SoldierGltfHandle>>,
     gltf_assets: Res<Assets<Gltf>>,
     clip_assets: Res<Assets<AnimationClip>>,
     mut animation_graphs: ResMut<Assets<AnimationGraph>>,
     assets_ready: Option<Res<SoldierAnimationAssets>>,
+    old_soldier_q: Query<Entity, With<SoldierMarker>>,
+    old_upper_q: Query<Entity, With<UpperBodyAnimationPlayer>>,
 ) {
-    if assets_ready.is_some() {
-        return;
+    let selected_hero_opt = resolve_local_selected_hero(&config, &match_flow, &hero_hud);
+    let desired_model_path = selected_hero_opt
+        .map(|h| h.model_path.clone())
+        .unwrap_or_else(|| config.animations.model_path.clone());
+    let desired_scale = selected_hero_opt
+        .map(|h| h.hero_scale)
+        .unwrap_or_else(|| config.active_hero(0).hero_scale);
+
+    let Some(ref mut handle_res) = gltf_handle else { return };
+    if handle_res.model_path != desired_model_path {
+        handle_res.model_path = desired_model_path.clone();
+        handle_res.handle = asset_server.load(&desired_model_path);
     }
 
-    let Some(handle) = gltf_handle else { return };
-    let Some(gltf) = gltf_assets.get(&handle.0) else { return };
+    if let Some(ref ready) = assets_ready {
+        if ready.model_path == desired_model_path && !old_soldier_q.is_empty() {
+            return;
+        }
+    }
+
+    let Some(gltf) = gltf_assets.get(&handle_res.handle) else { return };
 
     let mut graph = AnimationGraph::new();
     let mut nodes = HashMap::new();
     let mut durations = HashMap::new();
 
     for (name, clip_handle) in &gltf.named_animations {
-        let clip = clip_assets.get(clip_handle).unwrap_or_else(|| {
-            panic!(
-                "خطای بحرانی: کلیپ انیمیشن '{}' هنوز در Assets<AnimationClip> بارگذاری نشده است!",
-                name
-            )
-        });
+        let Some(clip) = clip_assets.get(clip_handle) else {
+            return;
+        };
         let node_index = graph.add_clip(clip_handle.clone(), 1.0, graph.root);
         nodes.insert(name.to_string(), node_index);
         durations.insert(name.to_string(), clip.duration());
         println!(
-            "انیمیشن بارگذاری شد: '{}' (مدت‌زمان GLB: {:.3}s)",
+            "انیمیشن بارگذاری شد ({}): '{}' (مدت‌زمان GLB: {:.3}s)",
+            desired_model_path,
             name,
             clip.duration()
         );
@@ -2071,27 +2238,35 @@ fn load_gltf_and_build_graph(
             nodes.contains_key(expected_anim),
             "خطای بحرانی: انیمیشن '{}' که در config.ron تعریف شده در فایل '{}' وجود ندارد!",
             expected_anim,
-            config.animations.model_path
+            desired_model_path
         );
     }
 
+    for ent in &old_soldier_q {
+        commands.entity(ent).despawn();
+    }
+    for ent in &old_upper_q {
+        commands.entity(ent).despawn();
+    }
+    weapon_status.attached = false;
+    weapon_status.hand_entity = None;
+    render_state.previous_lower_anim.clear();
+    render_state.previous_upper_anim.clear();
+    render_state.neutral_hips_yaw = None;
+
     let graph_handle = animation_graphs.add(graph);
     commands.insert_resource(SoldierAnimationAssets {
+        model_path: desired_model_path,
         graph_handle,
         nodes,
         durations,
     });
 
-    let spawn_pos = Vec3::new(
-        config.soldier.spawn_pos.0,
-        config.soldier.spawn_pos.1,
-        config.soldier.spawn_pos.2,
-    );
-    let hero_scale = config.active_hero(0).hero_scale;
+    let spawn_pos = render_state.soldier_pos;
     commands.spawn((
         WorldAssetRoot(gltf.scenes[0].clone()),
         SoldierMarker,
-        Transform::from_translation(spawn_pos).with_scale(Vec3::splat(hero_scale)),
+        Transform::from_translation(spawn_pos).with_scale(Vec3::splat(desired_scale)),
     ));
 }
 
@@ -2153,8 +2328,9 @@ fn is_upper_body_in_hierarchy(
 
 fn attach_split_body_animation_graphs(
     mut commands: Commands,
-    player_query: Query<Entity, (With<AnimationPlayer>, Without<AnimationGraphHandle>)>,
-    soldier_marker_query: Query<(), With<SoldierMarker>>,
+    all_players_query: Query<(Entity, Option<&AnimationGraphHandle>, Option<&LowerBodyAnimationPlayer>), With<AnimationPlayer>>,
+    soldier_marker_query: Query<Entity, With<SoldierMarker>>,
+    upper_player_query: Query<Entity, With<UpperBodyAnimationPlayer>>,
     mut target_query: Query<(Entity, &mut AnimatedBy)>,
     names_query: Query<&Name>,
     parents_query: Query<&ChildOf>,
@@ -2162,9 +2338,9 @@ fn attach_split_body_animation_graphs(
 ) {
     let Some(anim_assets) = anim_assets else { return };
 
-    for lower_player_entity in &player_query {
-        // فقط به سرباز اصلی بازی (SoldierMarker) وصل شو، نه مدل پیش‌نمایش انتخاب هیرو!
-        let mut cur = lower_player_entity;
+    let mut lower_ent_opt: Option<Entity> = None;
+    for (p_ent, graph_opt, lower_opt) in &all_players_query {
+        let mut cur = p_ent;
         let mut belongs_to_soldier = soldier_marker_query.contains(cur);
         while !belongs_to_soldier {
             if let Ok(parent) = parents_query.get(cur) {
@@ -2180,26 +2356,51 @@ fn attach_split_body_animation_graphs(
         if !belongs_to_soldier {
             continue;
         }
-        commands.entity(lower_player_entity).insert((
-            AnimationGraphHandle(anim_assets.graph_handle.clone()),
-            AnimationTransitions::new(),
-            LowerBodyAnimationPlayer,
-        ));
+        lower_ent_opt = Some(p_ent);
+        if lower_opt.is_none() || graph_opt.map_or(true, |g| g.0 != anim_assets.graph_handle) {
+            commands.entity(p_ent).insert((
+                AnimationGraphHandle(anim_assets.graph_handle.clone()),
+                AnimationTransitions::new(),
+                LowerBodyAnimationPlayer,
+            ));
+        }
+        break;
+    }
 
-        let upper_player_entity = commands
+    let Some(lower_player_entity) = lower_ent_opt else { return };
+
+    let upper_player_entity = if let Ok(existing_upper) = upper_player_query.single() {
+        existing_upper
+    } else {
+        commands
             .spawn((
                 AnimationPlayer::default(),
                 AnimationGraphHandle(anim_assets.graph_handle.clone()),
                 AnimationTransitions::new(),
                 UpperBodyAnimationPlayer,
             ))
-            .id();
+            .id()
+    };
 
-        for (bone_entity, mut animated_by) in &mut target_query {
-            if animated_by.0 == lower_player_entity
-                && is_upper_body_in_hierarchy(bone_entity, &names_query, &parents_query)
-            {
+    // اصلاح خودکار استخوان‌های بالاتنه حتی اگر با تأخیر لود شده باشند
+    for (bone_entity, mut animated_by) in &mut target_query {
+        if animated_by.0 == lower_player_entity {
+            if let Ok(bname) = names_query.get(bone_entity) {
+                let ln = bname.as_str().to_lowercase();
+                if ln.contains("hips") || ln.contains("pelvis") {
+                    commands.entity(bone_entity).insert(SoldierHipsBone);
+                }
+            }
+            if is_upper_body_in_hierarchy(bone_entity, &names_query, &parents_query) {
                 animated_by.0 = upper_player_entity;
+                let parent_is_upper = parents_query
+                    .get(bone_entity)
+                    .ok()
+                    .map(|pr| is_upper_body_in_hierarchy(pr.parent(), &names_query, &parents_query))
+                    .unwrap_or(false);
+                if !parent_is_upper {
+                    commands.entity(bone_entity).insert(SoldierSpineRootBone);
+                }
             }
         }
     }
@@ -2221,8 +2422,18 @@ fn attach_weapon_to_left_hand(
     soldier_marker_query: Query<(), With<SoldierMarker>>,
     parents_query: Query<&ChildOf>,
     hand_query: Query<(Entity, &Name)>,
+    existing_weapon_q: Query<(Entity, &AttachedWeaponKind), With<WeaponRoot>>,
 ) {
-    if status.attached || !match_flow.is_in_game() {
+    if !match_flow.is_in_game() {
+        return;
+    }
+    for (w_ent, attached_kind) in &existing_weapon_q {
+        if attached_kind.0 != hero_state.0.weapon_kind {
+            commands.entity(w_ent).despawn();
+            status.attached = false;
+        }
+    }
+    if status.attached {
         return;
     }
 
@@ -2265,6 +2476,7 @@ fn attach_weapon_to_left_hand(
                     WeaponKind::Sniper => Color::srgb(0.16, 0.22, 0.18),
                     WeaponKind::Shotgun => Color::srgb(0.18, 0.16, 0.14),
                     WeaponKind::Throwable => Color::srgb(0.24, 0.16, 0.12),
+                    WeaponKind::Pistol => Color::srgb(0.18, 0.20, 0.24),
                 },
                 metallic: 0.85,
                 perceptual_roughness: 0.35,
@@ -2276,6 +2488,7 @@ fn attach_weapon_to_left_hand(
                     WeaponKind::Sniper => Color::srgb(0.28, 0.34, 0.30),
                     WeaponKind::Shotgun => Color::srgb(0.46, 0.28, 0.14),
                     WeaponKind::Throwable => Color::srgb(0.85, 0.42, 0.10),
+                    WeaponKind::Pistol => Color::srgb(0.55, 0.60, 0.68),
                 },
                 metallic: if weapon_kind == WeaponKind::Shotgun { 0.25 } else { 0.65 },
                 perceptual_roughness: 0.45,
@@ -2292,6 +2505,7 @@ fn attach_weapon_to_left_hand(
                 parent
                     .spawn((
                         WeaponRoot,
+                        AttachedWeaponKind(weapon_kind),
                         Transform {
                             translation: tuner.offset,
                             rotation: Quat::IDENTITY,
@@ -2435,6 +2649,28 @@ fn attach_weapon_to_left_hand(
                                     Mesh3d(meshes.add(Cuboid::new(0.056, 0.09, 0.22))),
                                     MeshMaterial3d(accent_mat),
                                     Transform::from_xyz(0.0, 0.02, 0.18),
+                                ));
+                            }
+                            WeaponKind::Pistol => {
+                                // بدنه و اسلاید جمع‌وجور کلت
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.040, 0.065, 0.24))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.04, -0.08),
+                                ));
+                                // قبضه پیستول
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.036, 0.13, 0.055))),
+                                    MeshMaterial3d(accent_mat),
+                                    Transform::from_xyz(0.0, -0.04, 0.01)
+                                        .with_rotation(Quat::from_rotation_x(-0.22)),
+                                ));
+                                // لوله کوتاه کلت
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.012, 0.12))),
+                                    MeshMaterial3d(body_mat),
+                                    Transform::from_xyz(0.0, 0.045, -0.24)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
                                 ));
                             }
                         }
@@ -2582,6 +2818,7 @@ fn client_sample_input_system(
             grenade_just_pressed: false,
             space_just_pressed: false,
             space_held: false,
+            switch_weapon_just_pressed: false,
             kill_toggle_just_pressed: false,
             fire_just_pressed: false,
             fire_held: false,
@@ -2632,6 +2869,7 @@ fn client_sample_input_system(
         grenade_just_pressed: keyboard.just_pressed(KeyCode::KeyF),
         space_just_pressed: keyboard.just_pressed(KeyCode::Space),
         space_held: keyboard.pressed(KeyCode::Space),
+        switch_weapon_just_pressed: keyboard.just_pressed(KeyCode::KeyE),
         kill_toggle_just_pressed: keyboard.just_pressed(KeyCode::KeyX),
         fire_just_pressed: !alt_held
             && !camera_control.is_pointer_over_minimap
@@ -2708,7 +2946,7 @@ fn client_receive_snapshot_and_sync_system(
         ),
     >,
     mut bullet_query: Query<
-        (Entity, &NetworkBulletVisual, &mut Transform),
+        (Entity, &mut NetworkBulletVisual, &mut Transform, &mut Visibility),
         (
             Without<SoldierMarker>,
             Without<PhysicsSoldier>,
@@ -2816,6 +3054,21 @@ fn client_receive_snapshot_and_sync_system(
         prediction.match_ended = snap.winning_team.is_some();
         prediction.is_paused = snap.pause.phase != PausePhase::Running;
         hud_sync.pause_state.0 = snap.pause.clone();
+        if let Some(prev_tick) = hud_sync.telemetry.last_server_tick {
+            if snap.tick > prev_tick {
+                let delta = snap.tick - prev_tick;
+                let step = match hud_sync.telemetry.min_tick_step {
+                    Some(s) => s.min(delta),
+                    None => delta,
+                };
+                hud_sync.telemetry.min_tick_step = Some(step.max(1));
+                let step_val = hud_sync.telemetry.min_tick_step.unwrap_or(1).max(1);
+                let expected = (delta / step_val).max(1);
+                hud_sync.telemetry.in_expected_window += expected;
+                hud_sync.telemetry.in_lost_window += expected.saturating_sub(1);
+            }
+        }
+        hud_sync.telemetry.last_server_tick = Some(snap.tick);
 
         if let Ok(mut soldier_phys_tf) = soldier_physics_query.single_mut() {
             reconcile_soldier_physics_pos(
@@ -2845,41 +3098,76 @@ fn client_receive_snapshot_and_sync_system(
         let bullet_map: HashMap<u64, _> = snap.bullets.iter().map(|b| (b.id, b)).collect();
         let mut seen_bullets = HashSet::new();
 
-        for (entity, vis, mut tf) in &mut bullet_query {
+        for (_entity, mut vis, mut tf, mut b_vis) in &mut bullet_query {
+            if vis.server_id == 0 {
+                continue;
+            }
             if let Some(b_snap) = bullet_map.get(&vis.server_id) {
                 let dir = b_snap.velocity.normalize_or_zero();
-                tf.translation = b_snap.translation;
+                if vis.visual_offset_blend > 0.0 {
+                    vis.visual_offset_blend =
+                        (vis.visual_offset_blend - time.delta_secs() * 14.0).max(0.0);
+                }
+                tf.translation = b_snap.translation + vis.visual_offset * vis.visual_offset_blend;
                 tf.rotation = Quat::from_rotation_arc(Vec3::Y, dir);
+                *b_vis = Visibility::Visible;
                 seen_bullets.insert(vis.server_id);
             } else {
-                commands.entity(entity).despawn();
+                vis.server_id = 0;
+                vis.visual_offset = Vec3::ZERO;
+                vis.visual_offset_blend = 0.0;
+                *b_vis = Visibility::Hidden;
             }
         }
 
+        let live_muzzle_opt = hud_sync.muzzle_query.single().ok().map(|gtf| gtf.translation());
         for b_snap in &snap.bullets {
             if !seen_bullets.contains(&b_snap.id) {
                 let dir = b_snap.velocity.normalize_or_zero();
                 let rot = Quat::from_rotation_arc(Vec3::Y, dir);
-                commands.spawn((
-                    Mesh3d(fx_res.meshes.add(Cone {
-                        radius: 0.028,
-                        height: 0.42,
-                    })),
-                    MeshMaterial3d(fx_res.materials.add(StandardMaterial {
-                        base_color: Color::srgb(1.0, 0.92, 0.45),
-                        emissive: LinearRgba::new(14.0, 8.5, 1.2, 1.0),
-                        unlit: true,
-                        ..default()
-                    })),
-                    Transform {
-                        translation: b_snap.translation,
-                        rotation: rot,
-                        scale: Vec3::ONE,
-                    },
-                    NetworkBulletVisual {
-                        server_id: b_snap.id,
-                    },
-                ));
+                let (vis_off, vis_blend) = if let Some(muzzle) = live_muzzle_opt {
+                    let diff = muzzle - b_snap.translation;
+                    if diff.length_squared() <= 5.0 * 5.0 {
+                        (diff, 1.0)
+                    } else {
+                        (Vec3::ZERO, 0.0)
+                    }
+                } else {
+                    (Vec3::ZERO, 0.0)
+                };
+                let mut reused = false;
+                for (_e, mut vis, mut tf, mut b_vis) in &mut bullet_query {
+                    if vis.server_id == 0 {
+                        vis.server_id = b_snap.id;
+                        vis.visual_offset = vis_off;
+                        vis.visual_offset_blend = vis_blend;
+                        tf.translation = b_snap.translation + vis_off * vis_blend;
+                        tf.rotation = rot;
+                        *b_vis = Visibility::Visible;
+                        reused = true;
+                        break;
+                    }
+                }
+                if !reused {
+                    if let Some(ref sfx) = hud_sync.shared_fx {
+                        commands.spawn((
+                            Mesh3d(sfx.bullet_mesh.clone()),
+                            MeshMaterial3d(sfx.bullet_mat.clone()),
+                            Transform {
+                                translation: b_snap.translation + vis_off * vis_blend,
+                                rotation: rot,
+                                scale: Vec3::ONE,
+                            },
+                            Visibility::Visible,
+                            NotShadowCaster,
+                            NetworkBulletVisual {
+                                server_id: b_snap.id,
+                                visual_offset: vis_off,
+                                visual_offset_blend: vis_blend,
+                            },
+                        ));
+                    }
+                }
             }
         }
 
@@ -2924,6 +3212,7 @@ fn client_receive_snapshot_and_sync_system(
         }
     }
 
+    let fx_live_muzzle = hud_sync.muzzle_query.single().ok().map(|gtf| gtf.translation());
     for fx in all_fx_events {
         spawn_fx_from_server_event(
             &mut commands,
@@ -2934,6 +3223,7 @@ fn client_receive_snapshot_and_sync_system(
             &mut fx_res.materials,
             &mut fx_res.turret_gun_q,
             &fx_res.turret_muzzle_q,
+            fx_live_muzzle,
             fx,
         );
     }
@@ -2948,11 +3238,28 @@ fn client_receive_snapshot_and_sync_system(
             soldier_phys_tf.translation.y - config.physics.soldier_capsule_center_y * hero_scale,
             soldier_phys_tf.translation.z,
         );
+        let interp_pos = if hud_sync.fixed_history.initialized {
+            if hud_sync.fixed_history.curr_feet.distance(target_feet_pos)
+                > config.physics.position_reconcile_snap_dist
+            {
+                hud_sync.fixed_history.prev_feet = target_feet_pos;
+                hud_sync.fixed_history.curr_feet = target_feet_pos;
+                target_feet_pos
+            } else {
+                let alpha = hud_sync.fixed_time.overstep_fraction();
+                hud_sync
+                    .fixed_history
+                    .prev_feet
+                    .lerp(hud_sync.fixed_history.curr_feet, alpha)
+            }
+        } else {
+            target_feet_pos
+        };
         let smooth_y = soldier_vis_tf
             .translation
             .y
-            .lerp(target_feet_pos.y, config.physics.position_reconcile_lerp_factor);
-        let smoothed_pos = Vec3::new(target_feet_pos.x, smooth_y, target_feet_pos.z);
+            .lerp(interp_pos.y, config.physics.position_reconcile_lerp_factor);
+        let smoothed_pos = Vec3::new(interp_pos.x, smooth_y, interp_pos.z);
         render_state.soldier_pos = smoothed_pos;
         soldier_vis_tf.translation = smoothed_pos;
         orient_soldier_towards(
@@ -2972,6 +3279,7 @@ fn spawn_fx_from_server_event(
     materials: &mut Assets<StandardMaterial>,
     turret_gun_q: &mut Query<&mut TurretGunBone>,
     turret_muzzle_q: &Query<(&TurretMuzzlePoint, &GlobalTransform)>,
+    live_muzzle_opt: Option<Vec3>,
     event: GameplayFxEvent,
 ) {
     match event {
@@ -2981,6 +3289,10 @@ fn spawn_fx_from_server_event(
             trauma_add,
             trauma_max,
         } => {
+            let muzzle_pos = match live_muzzle_opt {
+                Some(lm) if (lm - muzzle_pos).length_squared() <= 5.0 * 5.0 => lm,
+                _ => muzzle_pos,
+            };
             let bullet_rot = Quat::from_rotation_arc(Vec3::Y, shot_dir);
             commands.spawn((
                 Mesh3d(meshes.add(Cone {
@@ -2993,13 +3305,7 @@ fn spawn_fx_from_server_event(
                     unlit: true,
                     ..default()
                 })),
-                PointLight {
-                    color: Color::srgb(1.0, 0.78, 0.25),
-                    intensity: 85_000.0,
-                    range: 5.5,
-                    shadow_maps_enabled: false,
-                    ..default()
-                },
+                NotShadowCaster,
                 Transform {
                     translation: muzzle_pos + shot_dir * 0.1,
                     rotation: bullet_rot,
@@ -4133,7 +4439,9 @@ fn soldier_animation_player_system(
     let lower_node = anim_assets.get_or_fallback(&render_state.current_locomotion, fallback_anim);
     let loco_blend = Duration::from_millis(config.animations.locomotion_blend_ms);
 
-    if render_state.current_locomotion != render_state.previous_lower_anim {
+    if render_state.current_locomotion != render_state.previous_lower_anim
+        || !lower_player.is_playing_animation(lower_node)
+    {
         lower_trans
             .play(&mut lower_player, lower_node, loco_blend)
             .repeat();
@@ -4170,7 +4478,18 @@ fn soldier_animation_player_system(
             }
         }
         UpperBodyAction::FiringRifle => {
-            if render_state.previous_upper_anim != "firing_rifle" {
+            if hero_hud.0.active_weapon == ActiveWeaponSlot::Pistol {
+                let pistol_node = anim_assets.require_node("pistol_run");
+                if render_state.previous_upper_anim != "pistol_run"
+                    || !upper_player.is_playing_animation(pistol_node)
+                {
+                    let node = anim_assets.require_node("pistol_run");
+                    upper_trans
+                        .play(&mut upper_player, node, loco_blend)
+                        .repeat();
+                    render_state.previous_upper_anim = "pistol_run".to_string();
+                }
+            } else if render_state.previous_upper_anim != "firing_rifle" {
                 let node = anim_assets.require_node("firing_rifle");
                 upper_trans
                     .play(
@@ -4183,16 +4502,28 @@ fn soldier_animation_player_system(
             }
         }
         UpperBodyAction::None => {
-            if render_state.previous_upper_anim != render_state.current_locomotion {
-                let lower_seek = lower_player
-                    .animation(lower_node)
-                    .expect("خطای بحرانی: انیمیشن پایین‌تنه فعال نیست!")
-                    .seek_time();
-
+            let in_deep_water_anim = render_state.current_locomotion == "swimming"
+                || render_state.current_locomotion == "treading_water";
+            if hero_hud.0.active_weapon == ActiveWeaponSlot::Pistol && !in_deep_water_anim {
+                let node = anim_assets.require_node("pistol_run");
+                if render_state.previous_upper_anim != "pistol_run"
+                    || !upper_player.is_playing_animation(node)
+                {
+                    upper_trans
+                        .play(&mut upper_player, node, loco_blend)
+                        .repeat();
+                    render_state.previous_upper_anim = "pistol_run".to_string();
+                }
+            } else if render_state.previous_upper_anim != render_state.current_locomotion
+                || !upper_player.is_playing_animation(lower_node)
+            {
+                let lower_seek_opt = lower_player.animation(lower_node).map(|a| a.seek_time());
                 let active = upper_trans
                     .play(&mut upper_player, lower_node, loco_blend)
                     .repeat();
-                active.seek_to(lower_seek);
+                if let Some(lower_seek) = lower_seek_opt {
+                    active.seek_to(lower_seek);
+                }
                 render_state.previous_upper_anim = render_state.current_locomotion.clone();
             }
         }
@@ -5857,7 +6188,12 @@ fn update_hero_hud_system(
         **t = format!("Vis {:.0}m", h.vision_range);
     }
     if let Ok(mut t) = ammo_q.single_mut() {
-        **t = format!("{}/{}", h.ammo_in_mag, h.magazine_size);
+        let tag = if h.active_weapon == ActiveWeaponSlot::Pistol {
+            "PISTOL"
+        } else {
+            "RIFLE"
+        };
+        **t = format!("[E] {} {}/{}", tag, h.ammo_in_mag, h.magazine_size);
     }
 }
 
@@ -5962,16 +6298,163 @@ struct LatestRemotePlayers(Vec<RemotePlayerSnapshot>);
 #[derive(Resource, Default)]
 struct LatestCreeps(Vec<CreepSnapshot>);
 
-#[derive(Resource)]
-struct CreepGltfHandle(Handle<Gltf>);
+struct CachedHeroAnimGraph {
+    graph_handle: Handle<AnimationGraph>,
+    nodes: HashMap<String, AnimationNodeIndex>,
+}
 
-#[derive(Resource)]
-struct CreepAnimationAssets {
+impl CachedHeroAnimGraph {
+    fn get_or_fallback(&self, anim_name: &str, fallback: &str) -> AnimationNodeIndex {
+        if let Some(&node) = self.nodes.get(anim_name) {
+            return node;
+        }
+        if let Some(&fb) = self.nodes.get(fallback) {
+            return fb;
+        }
+        *self.nodes.values().next().unwrap_or_else(|| {
+            panic!("خطای بحرانی: گراف انیمیشن هیرو هیچ کلیپی ندارد!")
+        })
+    }
+}
+
+#[derive(Resource, Default)]
+struct HeroModelAnimCache {
+    gltf_handles: HashMap<String, Handle<Gltf>>,
+    graphs: HashMap<String, CachedHeroAnimGraph>,
+}
+
+impl HeroModelAnimCache {
+    fn ensure_loaded<'a>(
+        &'a mut self,
+        model_path: &str,
+        asset_server: &AssetServer,
+        gltf_assets: &Assets<Gltf>,
+        animation_graphs: &mut Assets<AnimationGraph>,
+    ) -> Option<&'a CachedHeroAnimGraph> {
+        if !self.graphs.contains_key(model_path) {
+            let handle = self
+                .gltf_handles
+                .entry(model_path.to_string())
+                .or_insert_with(|| asset_server.load(model_path.to_string()))
+                .clone();
+            if let Some(gltf) = gltf_assets.get(&handle) {
+                let mut graph = AnimationGraph::new();
+                let mut nodes = HashMap::new();
+                for (name, clip_h) in &gltf.named_animations {
+                    let idx = graph.add_clip(clip_h.clone(), 1.0, graph.root);
+                    nodes.insert(name.to_string(), idx);
+                }
+                let graph_handle = animation_graphs.add(graph);
+                self.graphs.insert(
+                    model_path.to_string(),
+                    CachedHeroAnimGraph {
+                        graph_handle,
+                        nodes,
+                    },
+                );
+            }
+        }
+        self.graphs.get(model_path)
+    }
+}
+
+struct TeamCreepAnimGraph {
     graph_handle: Handle<AnimationGraph>,
     run_node: AnimationNodeIndex,
     idle_node: AnimationNodeIndex,
     fire_node: AnimationNodeIndex,
     die_node: AnimationNodeIndex,
+}
+
+struct CreepAnimSpec {
+    model_path: String,
+    anim_run: String,
+    anim_idle: String,
+    anim_fire: String,
+    anim_die: String,
+}
+
+#[derive(Resource, Default)]
+struct CreepModelAnimCache {
+    specs: HashMap<String, CreepAnimSpec>,
+    gltf_handles: HashMap<String, Handle<Gltf>>,
+    graphs: HashMap<String, TeamCreepAnimGraph>,
+}
+
+impl CreepModelAnimCache {
+    fn register(
+        &mut self,
+        key: &str,
+        model_path: &str,
+        anim_run: &str,
+        anim_idle: &str,
+        anim_fire: &str,
+        anim_die: &str,
+        asset_server: &AssetServer,
+    ) {
+        self.specs.insert(
+            key.to_string(),
+            CreepAnimSpec {
+                model_path: model_path.to_string(),
+                anim_run: anim_run.to_string(),
+                anim_idle: anim_idle.to_string(),
+                anim_fire: anim_fire.to_string(),
+                anim_die: anim_die.to_string(),
+            },
+        );
+        self.gltf_handles
+            .entry(model_path.to_string())
+            .or_insert_with(|| asset_server.load(model_path.to_string()));
+    }
+
+    fn build_pending(
+        &mut self,
+        gltf_assets: &Assets<Gltf>,
+        animation_graphs: &mut Assets<AnimationGraph>,
+    ) {
+        for (key, spec) in &self.specs {
+            if self.graphs.contains_key(key) {
+                continue;
+            }
+            let Some(handle) = self.gltf_handles.get(&spec.model_path) else { continue };
+            let Some(gltf) = gltf_assets.get(handle) else { continue };
+
+            let mut graph = AnimationGraph::new();
+            let mut nodes = HashMap::new();
+            for (name, clip_h) in &gltf.named_animations {
+                let node_idx = graph.add_clip(clip_h.clone(), 1.0, graph.root);
+                nodes.insert(name.to_string(), node_idx);
+            }
+            let find_node = |target: &str, fallbacks: &[&str]| -> AnimationNodeIndex {
+                if let Some(&idx) = nodes.get(target) {
+                    return idx;
+                }
+                for &fb in fallbacks {
+                    if let Some(&idx) = nodes.get(fb) {
+                        return idx;
+                    }
+                }
+                *nodes.values().next().unwrap_or_else(|| {
+                    panic!("فایل GLB سرباز '{}' هیچ انیمیشنی ندارد!", spec.model_path)
+                })
+            };
+            let run_node = find_node(&spec.anim_run, &["run", "run_forward", "walk_forward"]);
+            let idle_node = find_node(&spec.anim_idle, &["idle", "fire"]);
+            let fire_node = find_node(&spec.anim_fire, &["fire", "firing_rifle"]);
+            let die_node = find_node(&spec.anim_die, &["die", "die_1", "die_2"]);
+            let graph_handle = animation_graphs.add(graph);
+            self.graphs.insert(
+                key.clone(),
+                TeamCreepAnimGraph {
+                    graph_handle,
+                    run_node,
+                    idle_node,
+                    fire_node,
+                    die_node,
+                },
+            );
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -6006,6 +6489,11 @@ struct SnapshotHudSyncParams<'w, 's> {
     ping_state: ResMut<'w, ClientPingState>,
     minimap_root_q: Query<'w, 's, Entity, With<MinimapRoot>>,
     pause_state: ResMut<'w, LatestPauseState>,
+    muzzle_query: Query<'w, 's, &'static GlobalTransform, With<MuzzlePoint>>,
+    telemetry: ResMut<'w, ClientTelemetryState>,
+    shared_fx: Option<Res<'w, SharedFxAssets>>,
+    fixed_time: Res<'w, Time<Fixed>>,
+    fixed_history: ResMut<'w, FixedSoldierTransformHistory>,
 }
 
 fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
@@ -6142,8 +6630,11 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
 }
 
 fn client_lobby_sync_system(
+    config: Res<GameConfig>,
+    hero_hud: Res<LatestHeroSnapshot>,
     mut net: ResMut<ClientNetwork>,
     mut match_flow: ResMut<ClientMatchFlow>,
+    anim_assets: Option<Res<SoldierAnimationAssets>>,
     soldier_loaded: Query<(), With<SoldierMarker>>,
 ) {
     while let Some(bytes) = net.client.receive_message(CHANNEL_RELIABLE_LOBBY) {
@@ -6153,9 +6644,17 @@ fn client_lobby_sync_system(
         }
     }
 
+    let desired_model = resolve_local_selected_hero(&config, &match_flow, &hero_hud)
+        .map(|h| h.model_path.as_str())
+        .unwrap_or(config.animations.model_path.as_str());
+    let hero_model_ready = anim_assets
+        .as_ref()
+        .is_some_and(|a| a.model_path == desired_model)
+        && !soldier_loaded.is_empty();
+
     if match_flow.current_phase() == MatchPhase::BattleLoading
         && !match_flow.map_loaded_reported
-        && !soldier_loaded.is_empty()
+        && hero_model_ready
     {
         if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::ReportMapLoaded) {
             net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
@@ -6169,12 +6668,14 @@ fn hero_preview_system(
     time: Res<Time>,
     config: Res<GameConfig>,
     asset_server: Res<AssetServer>,
+    gltf_assets: Res<Assets<Gltf>>,
+    mut animation_graphs: ResMut<Assets<AnimationGraph>>,
+    mut hero_anim_cache: ResMut<HeroModelAnimCache>,
     mut match_flow: ResMut<ClientMatchFlow>,
     mut camera_query: Query<&mut Transform, With<MobaCamera>>,
     mut preview_query: Query<(Entity, &mut Transform), (With<HeroPreviewRoot>, Without<MobaCamera>)>,
     children_query: Query<&Children>,
-    mut anim_player_query: Query<(Entity, &mut AnimationPlayer), Without<HeroPreviewAnimStarted>>,
-    anim_assets: Option<Res<SoldierAnimationAssets>>,
+    mut anim_player_query: Query<(Entity, &mut AnimationPlayer, Option<&AnimationGraphHandle>)>,
 ) {
     let phase = match_flow.current_phase();
     if phase != MatchPhase::HeroSelect {
@@ -6191,11 +6692,11 @@ fn hero_preview_system(
         *cam_tf = Transform::from_translation(cam_pos).looking_at(preview_origin + Vec3::Y * 0.9, Vec3::Y);
     }
 
+    let hero = config.active_hero(match_flow.preview_hero_index);
     if match_flow.spawned_preview_hero_index != Some(match_flow.preview_hero_index) {
         for (ent, _) in &preview_query {
             commands.entity(ent).despawn();
         }
-        let hero = config.active_hero(match_flow.preview_hero_index);
         let gltf_scene = asset_server.load(format!("{}#Scene0", hero.model_path));
         commands.spawn((
             HeroPreviewRoot,
@@ -6204,18 +6705,30 @@ fn hero_preview_system(
                 .with_scale(Vec3::splat(hero.hero_scale)),
         ));
         match_flow.spawned_preview_hero_index = Some(match_flow.preview_hero_index);
+        return;
     }
+
+    let cached_opt = hero_anim_cache.ensure_loaded(
+        &hero.model_path,
+        &asset_server,
+        &gltf_assets,
+        &mut animation_graphs,
+    );
 
     for (root_ent, mut tf) in &mut preview_query {
         tf.rotate_y(0.55 * time.delta_secs());
-        if let Some(ref assets) = anim_assets {
+        if let Some(assets) = cached_opt {
+            let idle_node = assets.get_or_fallback("idle", "walk_forward");
             for desc in children_query.iter_descendants(root_ent) {
-                if let Ok((p_ent, mut player)) = anim_player_query.get_mut(desc) {
-                    let idle_node = assets.require_node("idle");
-                    player.play(idle_node).repeat();
-                    commands
-                        .entity(p_ent)
-                        .insert((AnimationGraphHandle(assets.graph_handle.clone()), HeroPreviewAnimStarted));
+                if let Ok((p_ent, mut player, graph_opt)) = anim_player_query.get_mut(desc) {
+                    if graph_opt.map_or(true, |g| g.0 != assets.graph_handle) {
+                        commands
+                            .entity(p_ent)
+                            .insert((AnimationGraphHandle(assets.graph_handle.clone()), HeroPreviewAnimStarted));
+                    }
+                    if !player.is_playing_animation(idle_node) {
+                        player.play(idle_node).repeat();
+                    }
                 }
             }
         }
@@ -6405,9 +6918,11 @@ fn match_overlay_ui_system(
 struct RemoteAssetsParams<'w> {
     config: Res<'w, GameConfig>,
     asset_server: Res<'w, AssetServer>,
+    gltf_assets: Res<'w, Assets<Gltf>>,
+    animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
+    hero_anim_cache: ResMut<'w, HeroModelAnimCache>,
     match_flow: Res<'w, ClientMatchFlow>,
     remote_players: Res<'w, LatestRemotePlayers>,
-    anim_assets: Option<Res<'w, SoldierAnimationAssets>>,
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
 }
@@ -6418,7 +6933,7 @@ struct RemoteHierarchyParams<'w, 's> {
     names_query: Query<'w, 's, &'static Name>,
     parents_query: Query<'w, 's, &'static ChildOf>,
     target_query: Query<'w, 's, (Entity, &'static mut AnimatedBy)>,
-    unbound_player_query: Query<'w, 's, Entity, (With<AnimationPlayer>, Without<AnimationGraphHandle>)>,
+    anim_player_check_query: Query<'w, 's, (Option<&'static AnimationGraphHandle>, Option<&'static RemoteLowerAnimPlayer>), With<AnimationPlayer>>,
     hand_query: Query<'w, 's, (Entity, &'static Name), Without<RemoteWeaponAttached>>,
 }
 
@@ -6473,35 +6988,42 @@ fn sync_remote_players_system(
                     Visibility::Hidden
                 };
 
-                // ۱. اتصال گراف انیمیشن Split-Body به مدل بازیکن ریموت (فقط یک بار پس از لود GLB)
-                if let Some(ref assets) = res.anim_assets {
-                    for desc in hier.children_query.iter_descendants(root_ent) {
-                        if hier.unbound_player_query.contains(desc) {
-                            commands.entity(desc).insert((
-                                AnimationGraphHandle(assets.graph_handle.clone()),
-                                AnimationTransitions::new(),
-                                RemoteLowerAnimPlayer {
-                                    slot_index: rp.slot_index,
-                                },
-                            ));
+                // ۱. اتصال گراف انیمیشن Split-Body به مدل بازیکن ریموت (خوداصلاح‌شونده بر اساس model_path واقعی هیرو)
+                let cached_opt = res.hero_anim_cache.ensure_loaded(
+                    &rp.model_path,
+                    &res.asset_server,
+                    &res.gltf_assets,
+                    &mut res.animation_graphs,
+                );
+                if let Some(assets) = cached_opt {
+                    let mut existing_upper_ent = upper_query
+                        .iter()
+                        .find(|(up, _, _)| up.slot_index == rp.slot_index)
+                        .map(|_| {
+                            hier.children_query
+                                .iter_descendants(root_ent)
+                                .find(|&d| upper_query.get(d).is_ok())
+                        })
+                        .flatten();
 
-                            let upper_ent = commands
-                                .spawn((
-                                    AnimationPlayer::default(),
+                    let mut lower_player_ent_opt: Option<Entity> = None;
+
+                    for desc in hier.children_query.iter_descendants(root_ent) {
+                        if let Ok((graph_opt, lower_opt)) = hier.anim_player_check_query.get(desc) {
+                            if upper_query.get(desc).is_ok() {
+                                continue;
+                            }
+                            lower_player_ent_opt = Some(desc);
+                            if lower_opt.is_none()
+                                || graph_opt.map_or(true, |g| g.0 != assets.graph_handle)
+                            {
+                                commands.entity(desc).insert((
                                     AnimationGraphHandle(assets.graph_handle.clone()),
                                     AnimationTransitions::new(),
-                                    RemoteUpperAnimPlayer {
+                                    RemoteLowerAnimPlayer {
                                         slot_index: rp.slot_index,
                                     },
-                                ))
-                                .id();
-
-                            for (bone_ent, mut animated_by) in &mut hier.target_query {
-                                if animated_by.0 == desc
-                                    && is_upper_body_in_hierarchy(bone_ent, &hier.names_query, &hier.parents_query)
-                                {
-                                    animated_by.0 = upper_ent;
-                                }
+                                ));
                             }
                         }
 
@@ -6528,6 +7050,7 @@ fn sync_remote_players_system(
                                         WeaponKind::Sniper => Color::srgb(0.16, 0.22, 0.18),
                                         WeaponKind::Shotgun => Color::srgb(0.35, 0.22, 0.14),
                                         WeaponKind::Throwable => Color::srgb(0.80, 0.38, 0.10),
+                                        WeaponKind::Pistol => Color::srgb(0.24, 0.26, 0.30),
                                     },
                                     metallic: 0.75,
                                     perceptual_roughness: 0.35,
@@ -6545,7 +7068,36 @@ fn sync_remote_players_system(
                         }
                     }
 
-                    // ۲. پخش تمام انیمیشن‌های بالاتنه و پایین‌تنه با AnimationTransitions
+                    if let Some(lower_desc) = lower_player_ent_opt {
+                        let upper_ent = if let Some(u) = existing_upper_ent {
+                            u
+                        } else {
+                            let u = commands
+                                .spawn((
+                                    AnimationPlayer::default(),
+                                    AnimationGraphHandle(assets.graph_handle.clone()),
+                                    AnimationTransitions::new(),
+                                    RemoteUpperAnimPlayer {
+                                        slot_index: rp.slot_index,
+                                    },
+                                ))
+                                .id();
+                            commands.entity(root_ent).add_child(u);
+                            existing_upper_ent = Some(u);
+                            u
+                        };
+                        let _ = existing_upper_ent;
+
+                        for (bone_ent, mut animated_by) in &mut hier.target_query {
+                            if animated_by.0 == lower_desc
+                                && is_upper_body_in_hierarchy(bone_ent, &hier.names_query, &hier.parents_query)
+                            {
+                                animated_by.0 = upper_ent;
+                            }
+                        }
+                    }
+
+                    // ۲. پخش تمام انیمیشن‌های بالاتنه و پایین‌تنه با AnimationTransitions و خوداصلاحی در صورت توقف
                     let desired_lower = if rp.is_dead {
                         rp.death_anim.clone()
                     } else if let Some(ref trav) = rp.traversal_anim {
@@ -6564,12 +7116,15 @@ fn sync_remote_players_system(
                         rp.current_locomotion.clone()
                     };
 
-                    if vis_comp.last_lower != desired_lower {
-                        for (lp, mut player, mut trans) in &mut lower_query {
-                            if lp.slot_index == rp.slot_index {
-                                let node = assets.get_or_fallback(&desired_lower, "idle");
-                                let active = trans.play(&mut player, node, Duration::from_millis(120));
-                                if !rp.is_dead && rp.traversal_anim.is_none() {
+                    let is_looping_lower = !rp.is_dead && rp.traversal_anim.is_none();
+                    let lower_node = assets.get_or_fallback(&desired_lower, "idle");
+                    for (lp, mut player, mut trans) in &mut lower_query {
+                        if lp.slot_index == rp.slot_index {
+                            if vis_comp.last_lower != desired_lower
+                                || (is_looping_lower && !player.is_playing_animation(lower_node))
+                            {
+                                let active = trans.play(&mut player, lower_node, Duration::from_millis(120));
+                                if is_looping_lower {
                                     active.repeat();
                                 }
                                 vis_comp.last_lower = desired_lower.clone();
@@ -6577,12 +7132,17 @@ fn sync_remote_players_system(
                         }
                     }
 
-                    if vis_comp.last_upper != desired_upper {
-                        for (up, mut player, mut trans) in &mut upper_query {
-                            if up.slot_index == rp.slot_index {
-                                let node = assets.get_or_fallback(&desired_upper, "idle");
-                                let active = trans.play(&mut player, node, Duration::from_millis(90));
-                                if !rp.is_dead && rp.traversal_anim.is_none() && rp.upper_anim.is_none() {
+                    let is_looping_upper = !rp.is_dead
+                        && rp.traversal_anim.is_none()
+                        && (rp.upper_anim.is_none() || rp.upper_anim.as_deref() == Some("pistol_run"));
+                    let upper_node = assets.get_or_fallback(&desired_upper, "idle");
+                    for (up, mut player, mut trans) in &mut upper_query {
+                        if up.slot_index == rp.slot_index {
+                            if vis_comp.last_upper != desired_upper
+                                || (is_looping_upper && !player.is_playing_animation(upper_node))
+                            {
+                                let active = trans.play(&mut player, upper_node, Duration::from_millis(90));
+                                if is_looping_upper {
                                     active.repeat();
                                 }
                                 vis_comp.last_upper = desired_upper.clone();
@@ -6934,10 +7494,9 @@ struct CreepAssetParams<'w> {
     match_flow: Res<'w, ClientMatchFlow>,
     render_state: Res<'w, ClientRenderState>,
     latest_creeps: Res<'w, LatestCreeps>,
-    creep_gltf_handle: Option<Res<'w, CreepGltfHandle>>,
     gltf_assets: Res<'w, Assets<Gltf>>,
     animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
-    creep_anim_assets: Option<Res<'w, CreepAnimationAssets>>,
+    creep_anim_cache: ResMut<'w, CreepModelAnimCache>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
 }
 
@@ -6947,7 +7506,7 @@ fn sync_lane_creeps_system(
     time: Res<Time>,
     mut res: CreepAssetParams,
     children_query: Query<&Children>,
-    unbound_player_query: Query<Entity, (With<AnimationPlayer>, Without<AnimationGraphHandle>)>,
+    player_check_query: Query<(Option<&CreepAnimPlayer>, Option<&AnimationGraphHandle>), With<AnimationPlayer>>,
     mut anim_player_query: Query<(&CreepAnimPlayer, &mut AnimationPlayer, &mut AnimationTransitions)>,
     mut existing_query: Query<(Entity, &mut CreepVisual, &mut Transform, &mut Visibility)>,
     mut mat_mesh_query: Query<(
@@ -6955,44 +7514,9 @@ fn sync_lane_creeps_system(
         Option<&CreepSavedMaterial>,
     )>,
 ) {
-    // ۱. ساخت گراف انیمیشن سربازان لاین به محض لود شدن GLB
-    if res.creep_anim_assets.is_none() {
-        if let Some(ref c_handle) = res.creep_gltf_handle {
-            if let Some(gltf) = res.gltf_assets.get(&c_handle.0) {
-                let mut graph = AnimationGraph::new();
-                let mut nodes = HashMap::new();
-                for (name, clip_h) in &gltf.named_animations {
-                    let node_idx = graph.add_clip(clip_h.clone(), 1.0, graph.root);
-                    nodes.insert(name.to_string(), node_idx);
-                }
-                let find_node = |target: &str, fallbacks: &[&str]| -> AnimationNodeIndex {
-                    if let Some(&idx) = nodes.get(target) {
-                        return idx;
-                    }
-                    for &fb in fallbacks {
-                        if let Some(&idx) = nodes.get(fb) {
-                            return idx;
-                        }
-                    }
-                    *nodes.values().next().unwrap_or_else(|| {
-                        panic!("فایل GLB سرباز لاین '{}' هیچ انیمیشنی ندارد!", res.config.creeps.model_path)
-                    })
-                };
-                let run_node = find_node(&res.config.creeps.anim_run, &["run_forward", "walk_forward"]);
-                let idle_node = find_node(&res.config.creeps.anim_idle, &["idle"]);
-                let fire_node = find_node(&res.config.creeps.anim_fire, &["firing_rifle"]);
-                let die_node = find_node(&res.config.creeps.anim_die, &["die_1", "die_2"]);
-                let graph_handle = res.animation_graphs.add(graph);
-                commands.insert_resource(CreepAnimationAssets {
-                    graph_handle,
-                    run_node,
-                    idle_node,
-                    fire_node,
-                    die_node,
-                });
-            }
-        }
-    }
+    // ۱. ساخت تدریجی گراف انیمیشن برای هر مدل سرباز (تیم Dawn، تیم Dusk و تمام انواع سربازان کمپ‌های جنگلی)
+    res.creep_anim_cache
+        .build_pending(&res.gltf_assets, &mut res.animation_graphs);
 
     if !res.match_flow.is_in_game() {
         return;
@@ -7034,38 +7558,53 @@ fn sync_lane_creeps_system(
             Visibility::Hidden
         };
 
-        // اتصال گراف انیمیشن به سرباز جدید
-        if let Some(ref assets) = res.creep_anim_assets {
+        // ۲. اتصال و خوداصلاحی گراف انیمیشن برای سربازان لاین و کمپ‌های جنگلی
+        let anim_key: &str = if let Some(ref tid) = cs.creep_type_id {
+            tid.as_str()
+        } else if cs.team == TeamId::Dusk {
+            "lane_dusk"
+        } else {
+            "lane_dawn"
+        };
+
+        if let Some(team_anim) = res.creep_anim_cache.graphs.get(anim_key) {
             for desc in children_query.iter_descendants(root_ent) {
-                if unbound_player_query.contains(desc) {
-                    commands.entity(desc).insert((
-                        AnimationGraphHandle(assets.graph_handle.clone()),
-                        AnimationTransitions::new(),
-                        CreepAnimPlayer { creep_id: cs.id },
-                    ));
+                if let Ok((cp_opt, graph_opt)) = player_check_query.get(desc) {
+                    let needs_bind = cp_opt.is_none()
+                        || graph_opt.map_or(true, |g| g.0 != team_anim.graph_handle);
+                    if needs_bind {
+                        commands.entity(desc).insert((
+                            AnimationGraphHandle(team_anim.graph_handle.clone()),
+                            AnimationTransitions::new(),
+                            CreepAnimPlayer { creep_id: cs.id },
+                        ));
+                    }
                 }
             }
 
-            if vis_comp.last_anim != Some(cs.anim_state) {
-                let target_node = match cs.anim_state {
-                    CreepAnimState::Run => assets.run_node,
-                    CreepAnimState::Idle => assets.idle_node,
-                    CreepAnimState::Fire => assets.fire_node,
-                    CreepAnimState::Die => assets.die_node,
-                };
-                let mut played = false;
-                for (cp, mut player, mut trans) in &mut anim_player_query {
-                    if cp.creep_id == cs.id {
+            let target_node = match cs.anim_state {
+                CreepAnimState::Run => team_anim.run_node,
+                CreepAnimState::Idle => team_anim.idle_node,
+                CreepAnimState::Fire => team_anim.fire_node,
+                CreepAnimState::Die => team_anim.die_node,
+            };
+            let is_looping = cs.anim_state != CreepAnimState::Die;
+            let mut played = false;
+            for (cp, mut player, mut trans) in &mut anim_player_query {
+                if cp.creep_id == cs.id {
+                    let needs_play = vis_comp.last_anim != Some(cs.anim_state)
+                        || (is_looping && !player.is_playing_animation(target_node));
+                    if needs_play {
                         let active = trans.play(&mut player, target_node, Duration::from_millis(100));
-                        if cs.anim_state == CreepAnimState::Run || cs.anim_state == CreepAnimState::Idle {
+                        if is_looping {
                             active.repeat();
                         }
                         played = true;
                     }
                 }
-                if played {
-                    vis_comp.last_anim = Some(cs.anim_state);
-                }
+            }
+            if played {
+                vis_comp.last_anim = Some(cs.anim_state);
             }
         }
 
@@ -7110,7 +7649,12 @@ fn sync_lane_creeps_system(
             .as_deref()
             .and_then(|tid| res.config.neutral_camps.creep_types.get(tid))
             .map(|ct| (ct.model_path.as_str(), ct.scale))
-            .unwrap_or((res.config.creeps.model_path.as_str(), res.config.creeps.scale));
+            .unwrap_or_else(|| {
+                (
+                    res.config.creeps.model_path_for_team(cs.team),
+                    res.config.creeps.scale,
+                )
+            });
         let scene_h = res.asset_server.load(format!("{}#Scene0", c_model));
         commands.spawn((
             CreepVisual {
@@ -9584,6 +10128,9 @@ fn update_pause_overlay_ui_system(
         ),
     >,
 ) {
+    if !pause_state.is_changed() && !match_flow.is_changed() && !match_result.is_changed() {
+        return;
+    }
     let Ok((mut root_node, mut root_bg)) = root_q.single_mut() else {
         return;
     };
@@ -9648,6 +10195,9 @@ fn update_hero_stamina_hud_system(
     mut fill_q: Query<(&mut Node, &mut BackgroundColor), With<HeroStaminaBarFill>>,
     mut txt_q: Query<&mut Text, With<HeroStaminaBarText>>,
 ) {
+    if !hero_state.is_changed() {
+        return;
+    }
     let h = &hero_state.0;
     let pct = ((h.stamina / h.max_stamina.max(1.0)) * 100.0).clamp(0.0, 100.0);
     if let Ok((mut node, mut bg)) = fill_q.single_mut() {
@@ -9663,5 +10213,219 @@ fn update_hero_stamina_hud_system(
             "STAMINA  {:.0} / {:.0} (+{:.1}/s)",
             h.stamina, h.max_stamina, h.stamina_regen_per_sec
         );
+    }
+}
+
+
+fn compensate_upper_body_hips_twist_system(
+    match_flow: Res<ClientMatchFlow>,
+    mut render_state: ResMut<ClientRenderState>,
+    hips_q: Query<&Transform, (With<SoldierHipsBone>, Without<SoldierSpineRootBone>)>,
+    mut spine_q: Query<&mut Transform, (With<SoldierSpineRootBone>, Without<SoldierHipsBone>)>,
+) {
+    if !match_flow.is_in_game() {
+        return;
+    }
+    let Ok(hips_tf) = hips_q.single() else {
+        return;
+    };
+    let Ok(mut spine_tf) = spine_q.single_mut() else {
+        return;
+    };
+
+    let (hips_yaw, _, _) = hips_tf.rotation.to_euler(EulerRot::YXZ);
+    if render_state.current_locomotion == "idle" && render_state.previous_upper_anim == "idle" {
+        render_state.neutral_hips_yaw = Some(hips_yaw);
+        return;
+    }
+
+    if !render_state.traversal_active
+        && render_state.previous_upper_anim != render_state.current_locomotion
+    {
+        let neutral = render_state.neutral_hips_yaw.unwrap_or(0.0);
+        let mut delta_yaw = hips_yaw - neutral;
+        while delta_yaw > std::f32::consts::PI {
+            delta_yaw -= std::f32::consts::TAU;
+        }
+        while delta_yaw < -std::f32::consts::PI {
+            delta_yaw += std::f32::consts::TAU;
+        }
+        spine_tf.rotation = Quat::from_rotation_y(-delta_yaw) * spine_tf.rotation;
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// نمایشگر مینیمال آمار شبکه و فریم‌ریت در بالا سمت راست (FPS / Ping / Packet Loss)
+// -----------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct ClientTelemetryState {
+    fps_smoothed: f32,
+    last_server_tick: Option<u64>,
+    min_tick_step: Option<u64>,
+    in_expected_window: u64,
+    in_lost_window: u64,
+    loss_sample_timer: f32,
+    packet_loss_in_pct: f32,
+    refresh_timer: f32,
+}
+
+impl Default for ClientTelemetryState {
+    fn default() -> Self {
+        Self {
+            fps_smoothed: 60.0,
+            last_server_tick: None,
+            min_tick_step: None,
+            in_expected_window: 0,
+            in_lost_window: 0,
+            loss_sample_timer: 0.0,
+            packet_loss_in_pct: 0.0,
+            refresh_timer: 0.0,
+        }
+    }
+}
+
+#[derive(Component)]
+struct TelemetryTopRowText;
+
+#[derive(Component)]
+struct TelemetryLossRowText;
+
+fn spawn_telemetry_hud_ui(commands: &mut Commands) {
+    commands
+        .spawn((
+            Pickable::IGNORE,
+            GlobalZIndex(210),
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(10.0),
+                right: px(14.0),
+                padding: UiRect::axes(px(10.0), px(5.0)),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexEnd,
+                row_gap: px(2.0),
+                border: UiRect::all(px(1.0)),
+                border_radius: BorderRadius::all(px(6.0)),
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.28, 0.36, 0.48, 0.50)),
+            BackgroundColor(Color::srgba(0.03, 0.05, 0.09, 0.74)),
+        ))
+        .with_children(|box_node| {
+            box_node.spawn((
+                TelemetryTopRowText,
+                Text::new("FPS 60  |  PING 0ms"),
+                TextFont {
+                    font_size: FontSize::Px(11.5),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.86, 0.92, 0.98)),
+            ));
+            box_node.spawn((
+                TelemetryLossRowText,
+                Text::new("IN 0.0%  |  OUT 0.0%"),
+                TextFont {
+                    font_size: FontSize::Px(11.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.74, 0.84, 0.94)),
+            ));
+        });
+}
+
+fn update_telemetry_hud_system(
+    time: Res<Time>,
+    net: Res<ClientNetwork>,
+    mut telemetry: ResMut<ClientTelemetryState>,
+    mut top_q: Query<(&mut Text, &mut TextColor), With<TelemetryTopRowText>>,
+    mut loss_q: Query<
+        (&mut Text, &mut TextColor),
+        (With<TelemetryLossRowText>, Without<TelemetryTopRowText>),
+    >,
+) {
+    let dt = time.delta_secs();
+    if dt > 1e-4 {
+        let inst_fps = (1.0 / dt).clamp(1.0, 999.0);
+        telemetry.fps_smoothed = telemetry.fps_smoothed * 0.92 + inst_fps * 0.08;
+    }
+
+    telemetry.loss_sample_timer += dt;
+    if telemetry.loss_sample_timer >= 2.0 {
+        telemetry.loss_sample_timer = 0.0;
+        if telemetry.in_expected_window > 0 {
+            let raw = (telemetry.in_lost_window as f32 / telemetry.in_expected_window as f32) * 100.0;
+            telemetry.packet_loss_in_pct = (telemetry.packet_loss_in_pct * 0.4 + raw * 0.6).clamp(0.0, 100.0);
+            telemetry.in_expected_window = 0;
+            telemetry.in_lost_window = 0;
+        } else {
+            telemetry.packet_loss_in_pct = 0.0;
+        }
+    }
+
+    telemetry.refresh_timer += dt;
+    if telemetry.refresh_timer < 0.40 {
+        return;
+    }
+    telemetry.refresh_timer = 0.0;
+
+    let ping_ms = (net.client.rtt() * 1000.0).max(0.0) as u32;
+    let loss_out_pct = (net.client.packet_loss() * 100.0).clamp(0.0, 100.0) as f32;
+    let fps = telemetry.fps_smoothed.round() as u32;
+    let loss_in = telemetry.packet_loss_in_pct;
+
+    if let Ok((mut text, mut color)) = top_q.single_mut() {
+        **text = format!("FPS {}  |  PING {}ms", fps, ping_ms);
+        *color = if ping_ms >= 160 || fps < 30 {
+            TextColor(Color::srgb(0.98, 0.40, 0.36))
+        } else if ping_ms >= 95 || fps < 50 {
+            TextColor(Color::srgb(0.96, 0.82, 0.34))
+        } else {
+            TextColor(Color::srgb(0.86, 0.92, 0.98))
+        };
+    }
+
+    if let Ok((mut text, mut color)) = loss_q.single_mut() {
+        **text = format!("IN {:.1}%  |  OUT {:.1}%", loss_in, loss_out_pct);
+        *color = if loss_in >= 5.0 || loss_out_pct >= 5.0 {
+            TextColor(Color::srgb(0.98, 0.40, 0.36))
+        } else if loss_in >= 2.0 || loss_out_pct >= 2.0 {
+            TextColor(Color::srgb(0.96, 0.82, 0.34))
+        } else {
+            TextColor(Color::srgb(0.74, 0.84, 0.94))
+        };
+    }
+}
+
+
+#[derive(Resource, Default)]
+struct FixedSoldierTransformHistory {
+    prev_feet: Vec3,
+    curr_feet: Vec3,
+    initialized: bool,
+}
+
+fn record_soldier_fixed_transform_system(
+    config: Res<GameConfig>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    mut history: ResMut<FixedSoldierTransformHistory>,
+    soldier_phys_q: Query<&Transform, With<PhysicsSoldier>>,
+) {
+    let Ok(phys_tf) = soldier_phys_q.single() else {
+        return;
+    };
+    let hero_scale = hero_hud.0.hero_scale;
+    let feet = Vec3::new(
+        phys_tf.translation.x,
+        phys_tf.translation.y - config.physics.soldier_capsule_center_y * hero_scale,
+        phys_tf.translation.z,
+    );
+    if !history.initialized {
+        history.prev_feet = feet;
+        history.curr_feet = feet;
+        history.initialized = true;
+    } else {
+        history.prev_feet = history.curr_feet;
+        history.curr_feet = feet;
     }
 }

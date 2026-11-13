@@ -132,6 +132,12 @@ impl GameConfig {
             assert!(!hero.model_path.trim().is_empty(), "model_path هیرو '{}' نمی‌تواند خالی باشد", hero.id);
             assert!(!hero.portrait_path.trim().is_empty(), "portrait_path هیرو '{}' نمی‌تواند خالی باشد", hero.id);
             assert!(hero.max_hp > 0.0, "max_hp هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.pistol.magazine_size > 0, "pistol.magazine_size هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.pistol.fire_rate_secs > 0.0, "pistol.fire_rate_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.pistol.reload_duration_secs > 0.0, "pistol.reload_duration_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.pistol.damage > 0.0, "pistol.damage هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.pistol.projectile_speed > 0.0, "pistol.projectile_speed هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.pistol.max_range > 0.0, "pistol.max_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.max_stamina > 0.0, "max_stamina هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.stamina_regen_per_sec > 0.0, "stamina_regen_per_sec هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.slide_stamina_cost > 0.0, "slide_stamina_cost هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -182,7 +188,8 @@ impl GameConfig {
 
     pub fn validate_creeps(&self) {
         let c = &self.creeps;
-        assert!(!c.model_path.trim().is_empty(), "model_path سربازان لاین نمی‌تواند خالی باشد");
+        assert!(!c.dawn_model_path.trim().is_empty(), "dawn_model_path سربازان لاین نمی‌تواند خالی باشد");
+        assert!(!c.dusk_model_path.trim().is_empty(), "dusk_model_path سربازان لاین نمی‌تواند خالی باشد");
         assert!(c.scale > 0.0, "scale سربازان لاین باید بزرگ‌تر از صفر باشد");
         assert!(c.collider_radius > 0.0, "collider_radius سربازان لاین باید بزرگ‌تر از صفر باشد");
         assert!(c.hitbox_height > 0.0, "hitbox_height سربازان لاین باید بزرگ‌تر از صفر باشد");
@@ -649,10 +656,17 @@ pub enum WeaponKind {
     AutomaticRifle,
     Sniper,
     Shotgun,
+    Pistol,
     Throwable,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActiveWeaponSlot {
+    Primary,
+    Pistol,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct HeroWeaponDef {
     pub weapon_kind: WeaponKind,
     pub magazine_size: u32,
@@ -688,6 +702,7 @@ pub struct HeroDef {
     pub vision_range: f32,
     pub high_ground_vision_bonus: f32,
     pub weapon: HeroWeaponDef,
+    pub pistol: HeroWeaponDef,
     pub level_growth: HeroLevelGrowth,
 }
 
@@ -807,7 +822,8 @@ pub struct LaserConfig {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreepConfig {
-    pub model_path: String,
+    pub dawn_model_path: String,
+    pub dusk_model_path: String,
     pub scale: f32,
     pub collider_radius: f32,
     pub hitbox_height: f32,
@@ -838,6 +854,18 @@ pub struct CreepConfig {
     pub die_despawn_delay_secs: f32,
     pub waypoint_reach_dist: f32,
     pub hovered_tint_emissive_rgb: (f32, f32, f32),
+}
+
+impl CreepConfig {
+    pub fn model_path_for_team(&self, team: TeamId) -> &str {
+        match team {
+            TeamId::Dawn => &self.dawn_model_path,
+            TeamId::Dusk => &self.dusk_model_path,
+            TeamId::Neutral => panic!(
+                "خطای بحرانی: برای تیم Neutral نباید از مدل سرباز لاین استفاده شود!"
+            ),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1282,6 +1310,7 @@ pub struct ClientInputCommand {
     pub grenade_just_pressed: bool,
     pub space_just_pressed: bool,
     pub space_held: bool,
+    pub switch_weapon_just_pressed: bool,
     pub kill_toggle_just_pressed: bool,
     pub fire_just_pressed: bool,
     pub fire_held: bool,
@@ -1307,6 +1336,7 @@ impl ClientInputCommand {
         self.grenade_just_pressed |= newer.grenade_just_pressed;
         self.space_just_pressed |= newer.space_just_pressed;
         self.kill_toggle_just_pressed |= newer.kill_toggle_just_pressed;
+        self.switch_weapon_just_pressed |= newer.switch_weapon_just_pressed;
         self.fire_just_pressed |= newer.fire_just_pressed;
     }
 
@@ -1315,6 +1345,7 @@ impl ClientInputCommand {
         self.reload_just_pressed = false;
         self.grenade_just_pressed = false;
         self.space_just_pressed = false;
+        self.switch_weapon_just_pressed = false;
         self.kill_toggle_just_pressed = false;
         self.fire_just_pressed = false;
     }
@@ -1878,6 +1909,7 @@ pub struct HeroSnapshot {
     pub hero_scale: f32,
     pub move_speed: f32,
     pub vision_range: f32,
+    pub active_weapon: ActiveWeaponSlot,
     pub weapon_kind: WeaponKind,
     pub ammo_in_mag: u32,
     pub magazine_size: u32,
@@ -1927,6 +1959,7 @@ pub struct RemotePlayerSnapshot {
     pub max_hp: f32,
     pub stamina: f32,
     pub max_stamina: f32,
+    pub active_weapon: ActiveWeaponSlot,
     pub ammo_in_mag: u32,
     pub magazine_size: u32,
     pub is_visible: bool,
@@ -4388,6 +4421,9 @@ pub struct PlayerSlotState {
     pub hero_deep_water_speed_multiplier: f32,
     pub hero_vision_range: f32,
     pub hero_weapon: HeroWeaponDef,
+    pub hero_pistol: HeroWeaponDef,
+    pub active_weapon: ActiveWeaponSlot,
+    pub other_weapon_ammo_in_mag: u32,
     pub ammo_in_mag: u32,
     pub current_move_speed: f32,
     pub last_hits: u32,
@@ -4458,6 +4494,9 @@ pub struct AuthoritativeWorldState {
     pub hero_deep_water_speed_multiplier: f32,
     pub hero_vision_range: f32,
     pub hero_weapon: HeroWeaponDef,
+    pub hero_pistol: HeroWeaponDef,
+    pub active_weapon: ActiveWeaponSlot,
+    pub other_weapon_ammo_in_mag: u32,
     pub ammo_in_mag: u32,
     pub current_move_speed: f32,
     pub last_hits: u32,
@@ -4591,6 +4630,9 @@ impl AuthoritativeWorldState {
             hero_vision_range: hero.vision_range,
             ammo_in_mag: hero.weapon.magazine_size,
             hero_weapon: hero.weapon,
+            hero_pistol: hero.pistol,
+            active_weapon: ActiveWeaponSlot::Primary,
+            other_weapon_ammo_in_mag: hero.pistol.magazine_size,
             current_move_speed: config.soldier.run_speed * hero.move_speed_multiplier,
             last_hits: 0,
             denies: 0,
@@ -4771,6 +4813,9 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.hero_deep_water_speed_multiplier, &mut p.hero_deep_water_speed_multiplier);
         std::mem::swap(&mut self.hero_vision_range, &mut p.hero_vision_range);
         std::mem::swap(&mut self.hero_weapon, &mut p.hero_weapon);
+        std::mem::swap(&mut self.hero_pistol, &mut p.hero_pistol);
+        std::mem::swap(&mut self.active_weapon, &mut p.active_weapon);
+        std::mem::swap(&mut self.other_weapon_ammo_in_mag, &mut p.other_weapon_ammo_in_mag);
         std::mem::swap(&mut self.ammo_in_mag, &mut p.ammo_in_mag);
         std::mem::swap(&mut self.current_move_speed, &mut p.current_move_speed);
         std::mem::swap(&mut self.last_hits, &mut p.last_hits);
@@ -5182,6 +5227,9 @@ impl AuthoritativeWorldState {
                 hero_vision_range: hero.vision_range,
                 ammo_in_mag: hero.weapon.magazine_size,
                 hero_weapon: hero.weapon,
+                hero_pistol: hero.pistol,
+                active_weapon: ActiveWeaponSlot::Primary,
+                other_weapon_ammo_in_mag: hero.pistol.magazine_size,
                 current_move_speed: config.soldier.run_speed * hero.move_speed_multiplier,
                 last_hits: 0,
                 denies: 0,
@@ -5273,7 +5321,11 @@ impl AuthoritativeWorldState {
                 display_name: p.hero_display_name.clone(),
                 model_path: p.hero_model_path.clone(),
                 hero_scale: p.hero_scale,
-                weapon_kind: p.hero_weapon.weapon_kind,
+                weapon_kind: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                    p.hero_pistol.weapon_kind
+                } else {
+                    p.hero_weapon.weapon_kind
+                },
                 pos: p.soldier_pos,
                 facing_dir: p.soldier_facing_dir,
                 current_locomotion: p.current_locomotion.clone(),
@@ -5285,6 +5337,7 @@ impl AuthoritativeWorldState {
                 max_hp: p.hero_max_hp,
                 stamina: p.hero_stamina,
                 max_stamina: p.hero_max_stamina,
+                active_weapon: p.active_weapon,
                 ammo_in_mag: p.ammo_in_mag,
                 magazine_size: p.hero_weapon.magazine_size,
                 is_visible: true,
@@ -5394,6 +5447,9 @@ impl AuthoritativeWorldState {
         self.hero_vision_range = hero.vision_range;
         self.ammo_in_mag = hero.weapon.magazine_size;
         self.hero_weapon = hero.weapon;
+        self.hero_pistol = hero.pistol;
+        self.active_weapon = ActiveWeaponSlot::Primary;
+        self.other_weapon_ammo_in_mag = hero.pistol.magazine_size;
         self.current_move_speed = config.soldier.run_speed * hero.move_speed_multiplier;
         self.fog_of_war = SharedFogOfWar::from_config(config, hero.team);
     }
@@ -5462,14 +5518,43 @@ impl AuthoritativeWorldState {
                 hero_scale: self.hero_scale,
                 move_speed: self.current_move_speed,
                 vision_range: self.hero_vision_range,
-                weapon_kind: self.hero_weapon.weapon_kind,
+                active_weapon: self.active_weapon,
+                weapon_kind: if self.active_weapon == ActiveWeaponSlot::Pistol {
+                    self.hero_pistol.weapon_kind
+                } else {
+                    self.hero_weapon.weapon_kind
+                },
                 ammo_in_mag: self.ammo_in_mag,
-                magazine_size: self.hero_weapon.magazine_size,
-                fire_rate_secs: self.hero_weapon.fire_rate_secs,
-                reload_duration_secs: self.hero_weapon.reload_duration_secs,
-                weapon_damage: self.hero_weapon.damage,
-                projectile_speed: self.hero_weapon.projectile_speed,
-                weapon_max_range: self.hero_weapon.max_range,
+                magazine_size: if self.active_weapon == ActiveWeaponSlot::Pistol {
+                    self.hero_pistol.magazine_size
+                } else {
+                    self.hero_weapon.magazine_size
+                },
+                fire_rate_secs: if self.active_weapon == ActiveWeaponSlot::Pistol {
+                    self.hero_pistol.fire_rate_secs
+                } else {
+                    self.hero_weapon.fire_rate_secs
+                },
+                reload_duration_secs: if self.active_weapon == ActiveWeaponSlot::Pistol {
+                    self.hero_pistol.reload_duration_secs
+                } else {
+                    self.hero_weapon.reload_duration_secs
+                },
+                weapon_damage: if self.active_weapon == ActiveWeaponSlot::Pistol {
+                    self.hero_pistol.damage
+                } else {
+                    self.hero_weapon.damage
+                },
+                projectile_speed: if self.active_weapon == ActiveWeaponSlot::Pistol {
+                    self.hero_pistol.projectile_speed
+                } else {
+                    self.hero_weapon.projectile_speed
+                },
+                weapon_max_range: if self.active_weapon == ActiveWeaponSlot::Pistol {
+                    self.hero_pistol.max_range
+                } else {
+                    self.hero_weapon.max_range
+                },
                 last_hits: self.last_hits,
                 denies: self.denies,
                 assists: self.assists,
@@ -6190,7 +6275,9 @@ fn shared_drive_single_player(
             world.hero_hp = world.hero_max_hp;
             world.hero_stamina = world.hero_max_stamina;
             world.space_hold_secs = None;
+            world.active_weapon = ActiveWeaponSlot::Primary;
             world.ammo_in_mag = world.hero_weapon.magazine_size;
+            world.other_weapon_ammo_in_mag = world.hero_pistol.magazine_size;
             world.base_stance = Stance::Run;
             let spawn_pos = world.active_spawn_pos;
             world.soldier_pos = spawn_pos;
@@ -6204,11 +6291,32 @@ fn shared_drive_single_player(
         world.hero_hp = (world.hero_hp + effective_hp_regen * dt).min(world.hero_max_hp);
         world.hero_stamina = (world.hero_stamina + world.hero_stamina_regen_per_sec * dt).min(world.hero_max_stamina);
 
+        if input.switch_weapon_just_pressed
+            && !world.traversal.is_active
+            && world.grenade_elapsed_and_duration.is_none()
+        {
+            // ضد تقلب ریلود: با تعویض اسلحه، ریلود نیمه‌تمام لغو می‌شود بدون اینکه خشاب پر شود!
+            world.reload_remaining = None;
+            world.firing_anim_remaining = None;
+            world.fire_cooldown_remaining = 0.0;
+            std::mem::swap(&mut world.ammo_in_mag, &mut world.other_weapon_ammo_in_mag);
+            world.active_weapon = match world.active_weapon {
+                ActiveWeaponSlot::Primary => ActiveWeaponSlot::Pistol,
+                ActiveWeaponSlot::Pistol => ActiveWeaponSlot::Primary,
+            };
+        }
+
+        let active_w = if world.active_weapon == ActiveWeaponSlot::Pistol {
+            world.hero_pistol
+        } else {
+            world.hero_weapon
+        };
+
         if let Some(rem) = &mut world.reload_remaining {
             *rem -= dt;
             if *rem <= 0.0 {
                 world.reload_remaining = None;
-                world.ammo_in_mag = world.hero_weapon.magazine_size;
+                world.ammo_in_mag = active_w.magazine_size;
             }
         }
 
@@ -6232,8 +6340,9 @@ fn shared_drive_single_player(
             && world.reload_remaining.is_none()
             && world.grenade_elapsed_and_duration.is_none()
             && !world.traversal.is_active
+            && world.ammo_in_mag < active_w.magazine_size
         {
-            world.reload_remaining = Some(world.hero_weapon.reload_duration_secs);
+            world.reload_remaining = Some(active_w.reload_duration_secs);
             world.firing_anim_remaining = None;
         }
 
@@ -6803,8 +6912,8 @@ fn step_traversal_custom(
     }
     world.hero_stamina -= stamina_cost;
 
-    let exact_duration = config.exact_anim_duration(anim_name);
-    let distance = speed * exact_duration;
+    let mut exact_duration = config.exact_anim_duration(anim_name);
+    let mut distance = speed * exact_duration;
 
     let clearance_y = if kind == TraversalKind::JumpOver {
         config.soldier.jump_over_clearance_height
@@ -6817,7 +6926,7 @@ fn step_traversal_custom(
         world.soldier_pos.z,
     );
 
-    let safe_dist = physics_world.sweep_capsule_horizontal(
+    let mut safe_dist = physics_world.sweep_capsule_horizontal(
         shape_pos,
         config.physics.soldier_capsule_half_segment,
         config.soldier.player_radius,
@@ -6834,17 +6943,75 @@ fn step_traversal_custom(
         },
     );
 
-    world.traversal.is_active = true;
-    world.traversal.kind = kind;
-    world.traversal.anim_name = anim_name.to_string();
-    world.traversal.elapsed = 0.0;
-    world.traversal.duration = exact_duration;
-    world.traversal.start_pos = world.soldier_pos;
-    world.traversal.target_pos = Vec3::new(
+    let mut target_pos = Vec3::new(
         world.soldier_pos.x + travel_dir.x * safe_dist,
         world.soldier_pos.y,
         world.soldier_pos.z + travel_dir.z * safe_dist,
     );
+
+    let landing_ray_orig = Vec3::new(target_pos.x, target_pos.y + 4.0, target_pos.z);
+    let landing_ground_y = physics_world
+        .cast_ray(
+            landing_ray_orig,
+            Vec3::NEG_Y,
+            12.0,
+            query_groups,
+            |entity| {
+                if let Ok(t) = target_query.get(entity) {
+                    !world.targets[t.index].is_dead
+                } else {
+                    true
+                }
+            },
+        )
+        .map(|(_, hit)| hit.point.y)
+        .unwrap_or(target_pos.y);
+
+    let leads_to_deep_water =
+        if let Some((water_y, _)) = sample_water_surface_at(config, Vec3::new(target_pos.x, landing_ground_y, target_pos.z)) {
+            let extra_depth = sample_waterfall_depth_offset(config, target_pos.x, target_pos.z);
+            let effective_bed_y = (landing_ground_y - extra_depth).max(-1.6);
+            (water_y - effective_bed_y) >= 0.85
+        } else {
+            false
+        };
+
+    let final_anim_name = if leads_to_deep_water {
+        exact_duration = config.exact_anim_duration("run_to_dive");
+        distance = speed * exact_duration;
+        safe_dist = physics_world.sweep_capsule_horizontal(
+            shape_pos,
+            config.physics.soldier_capsule_half_segment,
+            config.soldier.player_radius,
+            travel_dir,
+            distance,
+            config.soldier.free_traversal_wall_padding,
+            query_groups,
+            |entity| {
+                if let Ok(t) = target_query.get(entity) {
+                    !world.targets[t.index].is_dead
+                } else {
+                    true
+                }
+            },
+        );
+        target_pos = Vec3::new(
+            world.soldier_pos.x + travel_dir.x * safe_dist,
+            world.soldier_pos.y,
+            world.soldier_pos.z + travel_dir.z * safe_dist,
+        );
+        "run_to_dive"
+    } else {
+        anim_name
+    };
+
+    world.traversal.is_active = true;
+    world.traversal.kind = kind;
+    world.traversal.anim_name = final_anim_name.to_string();
+    world.traversal.elapsed = 0.0;
+    world.traversal.duration = exact_duration;
+    world.traversal.start_pos = world.soldier_pos;
+    world.traversal.target_pos = target_pos;
     world.traversal.travel_dir = travel_dir;
     world.soldier_facing_dir = travel_dir;
 }
@@ -6906,17 +7073,26 @@ fn step_shooting_and_grenade_spawn(
     let wants_fire =
         (input.fire_just_pressed || input.fire_held) && world.fire_cooldown_remaining <= 0.0;
 
+    let active_w = if world.active_weapon == ActiveWeaponSlot::Pistol {
+        world.hero_pistol
+    } else {
+        world.hero_weapon
+    };
     if wants_fire {
         if world.ammo_in_mag == 0 {
-            world.reload_remaining = Some(world.hero_weapon.reload_duration_secs);
+            world.reload_remaining = Some(active_w.reload_duration_secs);
             world.firing_anim_remaining = None;
             return;
         }
 
         world.ammo_in_mag -= 1;
-        world.fire_cooldown_remaining = world.hero_weapon.fire_rate_secs;
-        let dur = config.exact_anim_duration("firing_rifle");
-        world.firing_anim_remaining = Some(dur);
+        world.fire_cooldown_remaining = active_w.fire_rate_secs;
+        if world.active_weapon == ActiveWeaponSlot::Primary {
+            let dur = config.exact_anim_duration("firing_rifle");
+            world.firing_anim_remaining = Some(dur);
+        } else {
+            world.firing_anim_remaining = None;
+        }
 
         let muzzle_pos = resolve_muzzle_pos(world, input, config);
         let to_aim = world.aim_hit_pos - muzzle_pos;
@@ -6930,16 +7106,16 @@ fn step_shooting_and_grenade_spawn(
             world.aim_world_dir
         };
 
-        let pellets = world.hero_weapon.pellets_per_shot;
+        let pellets = active_w.pellets_per_shot.max(1);
         let crouch_accuracy_mult = if world.effective_stance == Stance::Crouch {
             0.60
         } else {
             1.0
         };
-        let spread_rad = world.hero_weapon.spread_rad * crouch_accuracy_mult;
-        let proj_speed = world.hero_weapon.projectile_speed;
-        let dmg = world.hero_weapon.damage;
-        let max_range = world.hero_weapon.max_range;
+        let spread_rad = active_w.spread_rad * crouch_accuracy_mult;
+        let proj_speed = active_w.projectile_speed;
+        let dmg = active_w.damage / (pellets as f32);
+        let max_range = active_w.max_range;
 
         let mut first_dir = shot_dir;
         for p_idx in 0..pellets {
@@ -7731,7 +7907,7 @@ fn shared_authoritative_react_system(
     }
 }
 
-fn shared_client_drive_system(
+pub fn shared_client_drive_system(
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
     prediction: Option<Res<ClientPhysicsPredictionState>>,
@@ -8439,7 +8615,7 @@ fn step_lane_creeps_system(
         }
 
         world.creeps[idx].anim_state = if fired_or_aiming {
-            if world.creeps[idx].fire_anim_timer > 0.0 {
+            if is_neutral || world.creeps[idx].fire_anim_timer > 0.0 {
                 CreepAnimState::Fire
             } else {
                 CreepAnimState::Idle

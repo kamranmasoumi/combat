@@ -83,6 +83,7 @@ impl GameConfig {
         cfg.validate_chat();
         cfg.validate_ping();
         cfg.validate_pause();
+        cfg.validate_camera();
         cfg.validate_heroes();
         cfg.validate_creeps();
         cfg.validate_neutral_camps();
@@ -119,6 +120,9 @@ impl GameConfig {
             self.combat.min_reload_duration_secs > 0.0,
             "min_reload_duration_secs باید بزرگ‌تر از صفر باشد"
         );
+        assert!(self.soldier.jump_over_speed > 0.0, "soldier.jump_over_speed باید بزرگ‌تر از صفر باشد");
+        assert!(self.soldier.jump_over_clearance_height > 0.0, "soldier.jump_over_clearance_height باید بزرگ‌تر از صفر باشد");
+        assert!(self.soldier.space_hold_threshold_secs > 0.0, "soldier.space_hold_threshold_secs باید بزرگ‌تر از صفر باشد");
         assert!(
             !self.heroes.is_empty(),
             "خطای بحرانی کانفیگ: لیست heroes خالی است! حداقل یک هیرو باید در config.ron تعریف شود."
@@ -128,6 +132,11 @@ impl GameConfig {
             assert!(!hero.model_path.trim().is_empty(), "model_path هیرو '{}' نمی‌تواند خالی باشد", hero.id);
             assert!(!hero.portrait_path.trim().is_empty(), "portrait_path هیرو '{}' نمی‌تواند خالی باشد", hero.id);
             assert!(hero.max_hp > 0.0, "max_hp هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.max_stamina > 0.0, "max_stamina هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.stamina_regen_per_sec > 0.0, "stamina_regen_per_sec هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.slide_stamina_cost > 0.0, "slide_stamina_cost هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.jump_over_stamina_cost > 0.0, "jump_over_stamina_cost هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.level_growth.stamina_regen_per_level >= 0.0, "stamina_regen_per_level هیرو '{}' نمی‌تواند منفی باشد", hero.id);
             assert!(hero.hero_scale > 0.0, "hero_scale هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.xp_gain_radius > 0.0, "xp_gain_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.magazine_size > 0, "magazine_size اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -187,6 +196,16 @@ impl GameConfig {
             (0.0..=1.0).contains(&c.deny_hp_threshold_ratio),
             "deny_hp_threshold_ratio باید بین 0 و 1 باشد"
         );
+    }
+
+    pub fn validate_camera(&self) {
+        assert!(self.camera.cursor_lead_max_distance_x >= 0.0, "cursor_lead_max_distance_x نمی‌تواند منفی باشد");
+        assert!(self.camera.cursor_lead_max_distance_z >= 0.0, "cursor_lead_max_distance_z نمی‌تواند منفی باشد");
+        assert!(
+            (0.0..1.0).contains(&self.camera.cursor_lead_deadzone_ratio),
+            "cursor_lead_deadzone_ratio باید بین [0.0, 1.0) باشد"
+        );
+        assert!(self.camera.cursor_lead_lerp_speed > 0.0, "cursor_lead_lerp_speed باید بزرگ‌تر از صفر باشد");
     }
 
     pub fn validate_pause(&self) {
@@ -541,6 +560,10 @@ pub struct CameraConfig {
     pub trauma_decay_rate: f32,
     pub shake_amplitude: (f32, f32, f32),
     pub look_at_shake_factor: f32,
+    pub cursor_lead_max_distance_x: f32,
+    pub cursor_lead_max_distance_z: f32,
+    pub cursor_lead_deadzone_ratio: f32,
+    pub cursor_lead_lerp_speed: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -653,6 +676,10 @@ pub struct HeroDef {
     pub xp_gain_radius: f32,
     pub max_hp: f32,
     pub hp_regen_per_sec: f32,
+    pub max_stamina: f32,
+    pub stamina_regen_per_sec: f32,
+    pub slide_stamina_cost: f32,
+    pub jump_over_stamina_cost: f32,
     pub armor: f32,
     pub hero_scale: f32,
     pub move_speed_multiplier: f32,
@@ -672,6 +699,7 @@ pub struct HeroLevelGrowth {
     pub max_range_per_level: f32,
     pub max_hp_per_level: f32,
     pub hp_regen_per_level: f32,
+    pub stamina_regen_per_level: f32,
     pub armor_per_level: f32,
 }
 
@@ -686,6 +714,9 @@ pub struct SoldierConfig {
     pub walk_speed: f32,
     pub crouch_speed: f32,
     pub running_slide_speed: f32,
+    pub jump_over_speed: f32,
+    pub jump_over_clearance_height: f32,
+    pub space_hold_threshold_secs: f32,
     pub dive_roll_speed: f32,
     pub quick_roll_speed: f32,
     pub vault_check_distance: f32,
@@ -1236,6 +1267,7 @@ pub enum UpperBodyAction {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TraversalKind {
     RunningJump,
+    JumpOver,
     RunningDiveRoll,
     QuickRollToRun,
     ObstacleVault,
@@ -1249,6 +1281,7 @@ pub struct ClientInputCommand {
     pub reload_just_pressed: bool,
     pub grenade_just_pressed: bool,
     pub space_just_pressed: bool,
+    pub space_held: bool,
     pub kill_toggle_just_pressed: bool,
     pub fire_just_pressed: bool,
     pub fire_held: bool,
@@ -1263,6 +1296,7 @@ impl ClientInputCommand {
         self.move_input = newer.move_input;
         self.shift_held = newer.shift_held;
         self.fire_held = newer.fire_held;
+        self.space_held = newer.space_held;
         self.aim_ray_origin = newer.aim_ray_origin;
         self.aim_ray_dir = newer.aim_ray_dir;
         self.has_aim_ray = newer.has_aim_ray;
@@ -1837,6 +1871,9 @@ pub struct HeroSnapshot {
     pub max_hp: f32,
     pub hp_regen_per_sec: f32,
     pub in_fountain: bool,
+    pub stamina: f32,
+    pub max_stamina: f32,
+    pub stamina_regen_per_sec: f32,
     pub armor: f32,
     pub hero_scale: f32,
     pub move_speed: f32,
@@ -1888,6 +1925,8 @@ pub struct RemotePlayerSnapshot {
     pub is_dead: bool,
     pub hp: f32,
     pub max_hp: f32,
+    pub stamina: f32,
+    pub max_stamina: f32,
     pub ammo_in_mag: u32,
     pub magazine_size: u32,
     pub is_visible: bool,
@@ -1912,6 +1951,7 @@ pub struct ServerWorldSnapshot {
     pub upper_action: UpperBodyAction,
     pub traversal_active: bool,
     pub traversal_anim_name: String,
+    pub traversal_duration: f32,
     pub is_dead: bool,
     pub death_anim_name: String,
     pub in_water: bool,
@@ -4335,6 +4375,12 @@ pub struct PlayerSlotState {
     pub hero_hp: f32,
     pub hero_max_hp: f32,
     pub hero_hp_regen_per_sec: f32,
+    pub hero_stamina: f32,
+    pub hero_max_stamina: f32,
+    pub hero_stamina_regen_per_sec: f32,
+    pub hero_slide_stamina_cost: f32,
+    pub hero_jump_over_stamina_cost: f32,
+    pub space_hold_secs: Option<f32>,
     pub hero_armor: f32,
     pub hero_scale: f32,
     pub hero_move_speed_multiplier: f32,
@@ -4399,6 +4445,12 @@ pub struct AuthoritativeWorldState {
     pub hero_hp: f32,
     pub hero_max_hp: f32,
     pub hero_hp_regen_per_sec: f32,
+    pub hero_stamina: f32,
+    pub hero_max_stamina: f32,
+    pub hero_stamina_regen_per_sec: f32,
+    pub hero_slide_stamina_cost: f32,
+    pub hero_jump_over_stamina_cost: f32,
+    pub space_hold_secs: Option<f32>,
     pub hero_armor: f32,
     pub hero_scale: f32,
     pub hero_move_speed_multiplier: f32,
@@ -4525,6 +4577,12 @@ impl AuthoritativeWorldState {
             hero_hp: hero.max_hp,
             hero_max_hp: hero.max_hp,
             hero_hp_regen_per_sec: hero.hp_regen_per_sec,
+            hero_stamina: hero.max_stamina,
+            hero_max_stamina: hero.max_stamina,
+            hero_stamina_regen_per_sec: hero.stamina_regen_per_sec,
+            hero_slide_stamina_cost: hero.slide_stamina_cost,
+            hero_jump_over_stamina_cost: hero.jump_over_stamina_cost,
+            space_hold_secs: None,
             hero_armor: hero.armor,
             hero_scale: hero.hero_scale,
             hero_move_speed_multiplier: hero.move_speed_multiplier,
@@ -4700,6 +4758,12 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.hero_hp, &mut p.hero_hp);
         std::mem::swap(&mut self.hero_max_hp, &mut p.hero_max_hp);
         std::mem::swap(&mut self.hero_hp_regen_per_sec, &mut p.hero_hp_regen_per_sec);
+        std::mem::swap(&mut self.hero_stamina, &mut p.hero_stamina);
+        std::mem::swap(&mut self.hero_max_stamina, &mut p.hero_max_stamina);
+        std::mem::swap(&mut self.hero_stamina_regen_per_sec, &mut p.hero_stamina_regen_per_sec);
+        std::mem::swap(&mut self.hero_slide_stamina_cost, &mut p.hero_slide_stamina_cost);
+        std::mem::swap(&mut self.hero_jump_over_stamina_cost, &mut p.hero_jump_over_stamina_cost);
+        std::mem::swap(&mut self.space_hold_secs, &mut p.space_hold_secs);
         std::mem::swap(&mut self.hero_armor, &mut p.hero_armor);
         std::mem::swap(&mut self.hero_scale, &mut p.hero_scale);
         std::mem::swap(&mut self.hero_move_speed_multiplier, &mut p.hero_move_speed_multiplier);
@@ -5104,6 +5168,12 @@ impl AuthoritativeWorldState {
                 hero_hp: hero.max_hp,
                 hero_max_hp: hero.max_hp,
                 hero_hp_regen_per_sec: hero.hp_regen_per_sec,
+                hero_stamina: hero.max_stamina,
+                hero_max_stamina: hero.max_stamina,
+                hero_stamina_regen_per_sec: hero.stamina_regen_per_sec,
+                hero_slide_stamina_cost: hero.slide_stamina_cost,
+                hero_jump_over_stamina_cost: hero.jump_over_stamina_cost,
+                space_hold_secs: None,
                 hero_armor: hero.armor,
                 hero_scale: hero.hero_scale,
                 hero_move_speed_multiplier: hero.move_speed_multiplier,
@@ -5213,6 +5283,8 @@ impl AuthoritativeWorldState {
                 is_dead: p.is_dead,
                 hp: p.hero_hp,
                 max_hp: p.hero_max_hp,
+                stamina: p.hero_stamina,
+                max_stamina: p.hero_max_stamina,
                 ammo_in_mag: p.ammo_in_mag,
                 magazine_size: p.hero_weapon.magazine_size,
                 is_visible: true,
@@ -5308,6 +5380,12 @@ impl AuthoritativeWorldState {
         self.hero_hp = hero.max_hp;
         self.hero_max_hp = hero.max_hp;
         self.hero_hp_regen_per_sec = hero.hp_regen_per_sec;
+        self.hero_stamina = hero.max_stamina;
+        self.hero_max_stamina = hero.max_stamina;
+        self.hero_stamina_regen_per_sec = hero.stamina_regen_per_sec;
+        self.hero_slide_stamina_cost = hero.slide_stamina_cost;
+        self.hero_jump_over_stamina_cost = hero.jump_over_stamina_cost;
+        self.space_hold_secs = None;
         self.hero_armor = hero.armor;
         self.hero_scale = hero.hero_scale;
         self.hero_move_speed_multiplier = hero.move_speed_multiplier;
@@ -5340,6 +5418,7 @@ impl AuthoritativeWorldState {
             upper_action: self.upper_body_action(),
             traversal_active: self.traversal.is_active,
             traversal_anim_name: self.traversal.anim_name.clone(),
+            traversal_duration: self.traversal.duration,
             is_dead: self.is_dead,
             death_anim_name: self.death_anim_name.clone(),
             in_water: self.in_water,
@@ -5376,6 +5455,9 @@ impl AuthoritativeWorldState {
                 },
                 in_fountain: !self.is_dead
                     && fountain_regen_bonus_for_pos(config, self.hero_team, self.soldier_pos) > 0.0,
+                stamina: self.hero_stamina,
+                max_stamina: self.hero_max_stamina,
+                stamina_regen_per_sec: self.hero_stamina_regen_per_sec,
                 armor: self.hero_armor,
                 hero_scale: self.hero_scale,
                 move_speed: self.current_move_speed,
@@ -5609,6 +5691,7 @@ pub fn grant_xp_to_player_slot(
             p.hero_max_hp += growth.max_hp_per_level;
             p.hero_hp = (p.hero_hp + growth.max_hp_per_level).min(p.hero_max_hp);
             p.hero_hp_regen_per_sec += growth.hp_regen_per_level;
+            p.hero_stamina_regen_per_sec += growth.stamina_regen_per_level;
             p.hero_armor += growth.armor_per_level;
 
             pending_fx.push(GameplayFxEvent::HeroLeveledUp {
@@ -5638,6 +5721,7 @@ fn trigger_random_death(world: &mut AuthoritativeWorldState, config: &GameConfig
     world.reload_remaining = None;
     world.grenade_elapsed_and_duration = None;
     world.firing_anim_remaining = None;
+    world.space_hold_secs = None;
 }
 
 fn resolve_muzzle_pos(
@@ -6104,6 +6188,8 @@ fn shared_drive_single_player(
         if world.respawn_remaining <= 0.0 {
             world.is_dead = false;
             world.hero_hp = world.hero_max_hp;
+            world.hero_stamina = world.hero_max_stamina;
+            world.space_hold_secs = None;
             world.ammo_in_mag = world.hero_weapon.magazine_size;
             world.base_stance = Stance::Run;
             let spawn_pos = world.active_spawn_pos;
@@ -6116,6 +6202,7 @@ fn shared_drive_single_player(
         let fountain_bonus = fountain_regen_bonus_for_pos(config, world.hero_team, world.soldier_pos);
         let effective_hp_regen = world.hero_hp_regen_per_sec + fountain_bonus;
         world.hero_hp = (world.hero_hp + effective_hp_regen * dt).min(world.hero_max_hp);
+        world.hero_stamina = (world.hero_stamina + world.hero_stamina_regen_per_sec * dt).min(world.hero_max_stamina);
 
         if let Some(rem) = &mut world.reload_remaining {
             *rem -= dt;
@@ -6513,14 +6600,31 @@ fn step_traversal_custom(
             .lerp(world.traversal.target_pos, frac);
         world.soldier_facing_dir = world.traversal.travel_dir;
 
-        if world.traversal.kind == TraversalKind::ObstacleVault {
+        if world.traversal.kind == TraversalKind::ObstacleVault
+            || world.traversal.kind == TraversalKind::JumpOver
+        {
             controller.translation = None;
+            let ground_y = if world.traversal.kind == TraversalKind::JumpOver {
+                let ray_orig = Vec3::new(current_pos.x, current_pos.y + 4.0, current_pos.z);
+                physics_world
+                    .cast_ray(
+                        ray_orig,
+                        Vec3::NEG_Y,
+                        10.0,
+                        soldier_collision_groups(),
+                        |ent| !obstacle_query.contains(ent) && !target_query.contains(ent),
+                    )
+                    .map(|(_, hit)| hit.point.y)
+                    .unwrap_or(current_pos.y)
+            } else {
+                current_pos.y
+            };
             soldier_tf.translation = Vec3::new(
                 current_pos.x,
-                current_pos.y + config.physics.soldier_capsule_center_y,
+                ground_y + config.physics.soldier_capsule_center_y * world.hero_scale,
                 current_pos.z,
             );
-            world.soldier_pos = current_pos;
+            world.soldier_pos = Vec3::new(current_pos.x, ground_y, current_pos.z);
         } else {
             let step_delta = current_pos - world.soldier_pos;
             let grav_y = config.physics.character_gravity_step_y * dt;
@@ -6555,12 +6659,9 @@ fn step_traversal_custom(
         return;
     }
 
-    if !input.space_just_pressed {
-        return;
-    }
-
     if let Some((water_y, _)) = sample_water_surface_at(config, world.soldier_pos) {
         if (water_y - world.soldier_pos.y) >= 0.85 {
+            world.space_hold_secs = None;
             return;
         }
     }
@@ -6574,68 +6675,145 @@ fn step_traversal_custom(
     let ray_origin = world.soldier_pos + Vec3::Y * config.soldier.vault_ray_height;
     let query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
 
-    let crossing_obstacle = physics_world
-        .cast_ray(
-            ray_origin,
-            travel_dir,
-            config.soldier.vault_check_distance,
-            query_groups,
-            |entity| {
-                obstacle_query
-                    .get(entity)
-                    .map(|obs| obs.can_vault)
-                    .unwrap_or(false)
-            },
-        )
-        .is_some();
+    let check_vault = || {
+        physics_world
+            .cast_ray(
+                ray_origin,
+                travel_dir,
+                config.soldier.vault_check_distance,
+                query_groups,
+                |entity| {
+                    obstacle_query
+                        .get(entity)
+                        .map(|obs| obs.can_vault)
+                        .unwrap_or(false)
+                },
+            )
+            .is_some()
+    };
 
-    if crossing_obstacle {
-        let count = config.soldier.vault_animations.len();
-        assert!(count > 0, "لیست vault_animations در کانفیگ خالی است!");
-        let idx = ((world.next_rand() * count as f32) as usize).min(count - 1);
-        let chosen_anim = config.soldier.vault_animations[idx].clone();
-        let exact_duration = config.exact_anim_duration(&chosen_anim);
+    let (kind, anim_name, speed, stamina_cost) = if world.effective_stance == Stance::Run {
+        if input.space_just_pressed && world.space_hold_secs.is_none() {
+            if check_vault() {
+                if world.hero_stamina < world.hero_slide_stamina_cost {
+                    return;
+                }
+                world.hero_stamina -= world.hero_slide_stamina_cost;
+                let count = config.soldier.vault_animations.len();
+                assert!(count > 0, "لیست vault_animations در کانفیگ خالی است!");
+                let idx = ((world.next_rand() * count as f32) as usize).min(count - 1);
+                let chosen_anim = config.soldier.vault_animations[idx].clone();
+                let exact_duration = config.exact_anim_duration(&chosen_anim);
 
-        world.traversal.is_active = true;
-        world.traversal.kind = TraversalKind::ObstacleVault;
-        world.traversal.anim_name = chosen_anim;
-        world.traversal.elapsed = 0.0;
-        world.traversal.duration = exact_duration;
-        world.traversal.start_pos = world.soldier_pos;
-        world.traversal.target_pos = Vec3::new(
-            world.soldier_pos.x + travel_dir.x * config.soldier.vault_travel_distance,
-            world.soldier_pos.y,
-            world.soldier_pos.z + travel_dir.z * config.soldier.vault_travel_distance,
-        );
-        world.traversal.travel_dir = travel_dir;
-        world.soldier_facing_dir = travel_dir;
+                world.traversal.is_active = true;
+                world.traversal.kind = TraversalKind::ObstacleVault;
+                world.traversal.anim_name = chosen_anim;
+                world.traversal.elapsed = 0.0;
+                world.traversal.duration = exact_duration;
+                world.traversal.start_pos = world.soldier_pos;
+                world.traversal.target_pos = Vec3::new(
+                    world.soldier_pos.x + travel_dir.x * config.soldier.vault_travel_distance,
+                    world.soldier_pos.y,
+                    world.soldier_pos.z + travel_dir.z * config.soldier.vault_travel_distance,
+                );
+                world.traversal.travel_dir = travel_dir;
+                world.soldier_facing_dir = travel_dir;
+                return;
+            }
+            world.space_hold_secs = Some(0.0);
+            if input.space_held {
+                return;
+            }
+        }
+
+        if let Some(held) = world.space_hold_secs {
+            if input.space_held {
+                world.space_hold_secs = Some(held + dt);
+                return;
+            }
+            world.space_hold_secs = None;
+            if held >= config.soldier.space_hold_threshold_secs {
+                (
+                    TraversalKind::JumpOver,
+                    "jump_over",
+                    config.soldier.jump_over_speed,
+                    world.hero_jump_over_stamina_cost,
+                )
+            } else {
+                (
+                    TraversalKind::RunningJump,
+                    "running_slide",
+                    config.soldier.running_slide_speed,
+                    world.hero_slide_stamina_cost,
+                )
+            }
+        } else {
+            return;
+        }
+    } else {
+        world.space_hold_secs = None;
+        if !input.space_just_pressed {
+            return;
+        }
+        if check_vault() {
+            if world.hero_stamina < world.hero_slide_stamina_cost {
+                return;
+            }
+            world.hero_stamina -= world.hero_slide_stamina_cost;
+            let count = config.soldier.vault_animations.len();
+            assert!(count > 0, "لیست vault_animations در کانفیگ خالی است!");
+            let idx = ((world.next_rand() * count as f32) as usize).min(count - 1);
+            let chosen_anim = config.soldier.vault_animations[idx].clone();
+            let exact_duration = config.exact_anim_duration(&chosen_anim);
+
+            world.traversal.is_active = true;
+            world.traversal.kind = TraversalKind::ObstacleVault;
+            world.traversal.anim_name = chosen_anim;
+            world.traversal.elapsed = 0.0;
+            world.traversal.duration = exact_duration;
+            world.traversal.start_pos = world.soldier_pos;
+            world.traversal.target_pos = Vec3::new(
+                world.soldier_pos.x + travel_dir.x * config.soldier.vault_travel_distance,
+                world.soldier_pos.y,
+                world.soldier_pos.z + travel_dir.z * config.soldier.vault_travel_distance,
+            );
+            world.traversal.travel_dir = travel_dir;
+            world.soldier_facing_dir = travel_dir;
+            return;
+        }
+        match world.effective_stance {
+            Stance::Walk => (
+                TraversalKind::RunningDiveRoll,
+                "running_dive_roll",
+                config.soldier.dive_roll_speed,
+                world.hero_slide_stamina_cost,
+            ),
+            Stance::Crouch => (
+                TraversalKind::QuickRollToRun,
+                "quick_roll_to_run",
+                config.soldier.quick_roll_speed,
+                world.hero_slide_stamina_cost,
+            ),
+            Stance::Run => unreachable!(),
+        }
+    };
+
+    if world.hero_stamina < stamina_cost {
         return;
     }
-
-    let (kind, anim_name, speed) = match world.effective_stance {
-        Stance::Run => (
-            TraversalKind::RunningJump,
-            "running_slide",
-            config.soldier.running_slide_speed,
-        ),
-        Stance::Walk => (
-            TraversalKind::RunningDiveRoll,
-            "running_dive_roll",
-            config.soldier.dive_roll_speed,
-        ),
-        Stance::Crouch => (
-            TraversalKind::QuickRollToRun,
-            "quick_roll_to_run",
-            config.soldier.quick_roll_speed,
-        ),
-    };
+    world.hero_stamina -= stamina_cost;
 
     let exact_duration = config.exact_anim_duration(anim_name);
     let distance = speed * exact_duration;
 
+    let clearance_y = if kind == TraversalKind::JumpOver {
+        config.soldier.jump_over_clearance_height
+    } else {
+        0.0
+    };
     let shape_pos = Vec3::new(
         world.soldier_pos.x,
-        world.soldier_pos.y + config.physics.soldier_capsule_center_y,
+        world.soldier_pos.y + config.physics.soldier_capsule_center_y + clearance_y,
         world.soldier_pos.z,
     );
 
@@ -6651,7 +6829,7 @@ fn step_traversal_custom(
             if let Ok(t) = target_query.get(entity) {
                 !world.targets[t.index].is_dead
             } else {
-                obstacle_query.contains(entity)
+                true
             }
         },
     );
@@ -6844,7 +7022,10 @@ fn shared_authoritative_react_system(
         if has_slots {
             world.swap_slot_in(slot_idx);
         }
-        if world.traversal.kind != TraversalKind::ObstacleVault || !world.traversal.is_active {
+        if (world.traversal.kind != TraversalKind::ObstacleVault
+            && world.traversal.kind != TraversalKind::JumpOver)
+            || !world.traversal.is_active
+        {
             world.soldier_pos = Vec3::new(
                 soldier_tf.translation.x,
                 soldier_tf.translation.y - config.physics.soldier_capsule_center_y * world.hero_scale,

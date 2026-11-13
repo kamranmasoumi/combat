@@ -75,6 +75,9 @@ fn main() {
             max_hp: h.max_hp,
             hp_regen_per_sec: h.hp_regen_per_sec,
             in_fountain: false,
+            stamina: h.max_stamina,
+            max_stamina: h.max_stamina,
+            stamina_regen_per_sec: h.stamina_regen_per_sec,
             armor: h.armor,
             hero_scale: h.hero_scale,
             move_speed: config.soldier.run_speed * h.move_speed_multiplier,
@@ -138,6 +141,7 @@ fn main() {
         })
         .insert_resource(CameraControlState {
             free_look_target: None,
+            current_cursor_lead: Vec3::ZERO,
             is_pointer_over_minimap: false,
             is_dragging_minimap: false,
         })
@@ -184,6 +188,7 @@ fn main() {
                 waterfall_mist_particle_system,
                 animate_glb_waterfall_materials_system,
                 update_hero_hud_system,
+                update_hero_stamina_hud_system,
                 client_lobby_sync_system,
                 hero_preview_system,
                 match_overlay_ui_system,
@@ -443,6 +448,7 @@ const MINIMAP_TEX_H: u32 = 384;
 #[derive(Resource)]
 struct CameraControlState {
     free_look_target: Option<Vec3>,
+    current_cursor_lead: Vec3,
     is_pointer_over_minimap: bool,
     is_dragging_minimap: bool,
 }
@@ -502,6 +508,12 @@ struct HeroHpBarFill;
 struct HeroHpBarText;
 
 #[derive(Component)]
+struct HeroStaminaBarFill;
+
+#[derive(Component)]
+struct HeroStaminaBarText;
+
+#[derive(Component)]
 struct HeroStatDmgText;
 
 #[derive(Component)]
@@ -554,6 +566,7 @@ struct SoldierGltfHandle(Handle<Gltf>);
 struct SoldierAnimationAssets {
     graph_handle: Handle<AnimationGraph>,
     nodes: HashMap<String, AnimationNodeIndex>,
+    durations: HashMap<String, f32>,
 }
 
 impl SoldierAnimationAssets {
@@ -572,6 +585,10 @@ impl SoldierAnimationAssets {
         } else {
             self.require_node(fallback)
         }
+    }
+
+    fn clip_duration(&self, anim_name: &str) -> Option<f32> {
+        self.durations.get(anim_name).copied()
     }
 }
 
@@ -593,6 +610,7 @@ struct ClientRenderState {
     upper_action: UpperBodyAction,
     traversal_active: bool,
     traversal_anim_name: String,
+    traversal_duration: f32,
     is_dead: bool,
     death_anim_name: String,
     in_water: bool,
@@ -635,6 +653,7 @@ impl ClientRenderState {
             upper_action: UpperBodyAction::None,
             traversal_active: false,
             traversal_anim_name: String::new(),
+            traversal_duration: 0.0,
             is_dead: false,
             death_anim_name: String::new(),
             in_water: false,
@@ -2028,6 +2047,7 @@ fn load_gltf_and_build_graph(
 
     let mut graph = AnimationGraph::new();
     let mut nodes = HashMap::new();
+    let mut durations = HashMap::new();
 
     for (name, clip_handle) in &gltf.named_animations {
         let clip = clip_assets.get(clip_handle).unwrap_or_else(|| {
@@ -2038,6 +2058,7 @@ fn load_gltf_and_build_graph(
         });
         let node_index = graph.add_clip(clip_handle.clone(), 1.0, graph.root);
         nodes.insert(name.to_string(), node_index);
+        durations.insert(name.to_string(), clip.duration());
         println!(
             "انیمیشن بارگذاری شد: '{}' (مدت‌زمان GLB: {:.3}s)",
             name,
@@ -2058,6 +2079,7 @@ fn load_gltf_and_build_graph(
     commands.insert_resource(SoldierAnimationAssets {
         graph_handle,
         nodes,
+        durations,
     });
 
     let spawn_pos = Vec3::new(
@@ -2559,6 +2581,7 @@ fn client_sample_input_system(
             reload_just_pressed: false,
             grenade_just_pressed: false,
             space_just_pressed: false,
+            space_held: false,
             kill_toggle_just_pressed: false,
             fire_just_pressed: false,
             fire_held: false,
@@ -2608,6 +2631,7 @@ fn client_sample_input_system(
         reload_just_pressed: keyboard.just_pressed(KeyCode::KeyR),
         grenade_just_pressed: keyboard.just_pressed(KeyCode::KeyF),
         space_just_pressed: keyboard.just_pressed(KeyCode::Space),
+        space_held: keyboard.pressed(KeyCode::Space),
         kill_toggle_just_pressed: keyboard.just_pressed(KeyCode::KeyX),
         fire_just_pressed: !alt_held
             && !camera_control.is_pointer_over_minimap
@@ -2742,6 +2766,7 @@ fn client_receive_snapshot_and_sync_system(
         render_state.upper_action = snap.upper_action;
         render_state.traversal_active = snap.traversal_active;
         render_state.traversal_anim_name = snap.traversal_anim_name;
+        render_state.traversal_duration = snap.traversal_duration;
         render_state.is_dead = snap.is_dead;
         render_state.death_anim_name = snap.death_anim_name;
         render_state.in_water = snap.in_water;
@@ -3962,13 +3987,17 @@ fn gameplay_fx_system(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn camera_follow_system(
     time: Res<Time>,
     config: Res<GameConfig>,
     match_flow: Res<ClientMatchFlow>,
+    pause_state: Res<LatestPauseState>,
+    chat_state: Res<ChatUiState>,
     mut shake: ResMut<CameraShake>,
     mut render_state: ResMut<ClientRenderState>,
-    camera_control: Res<CameraControlState>,
+    mut camera_control: ResMut<CameraControlState>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
     soldier_query: Query<&Transform, (With<SoldierMarker>, Without<MobaCamera>)>,
     mut camera_query: Query<&mut Transform, With<MobaCamera>>,
 ) {
@@ -3992,6 +4021,40 @@ fn camera_follow_system(
         (rz - 0.5) * amp.2 * shake_power,
     );
 
+    let mut desired_lead = Vec3::ZERO;
+    if camera_control.free_look_target.is_none()
+        && !camera_control.is_pointer_over_minimap
+        && !camera_control.is_dragging_minimap
+        && !chat_state.is_open
+        && pause_state.0.phase == PausePhase::Running
+    {
+        if let Ok(window) = window_query.single() {
+            if let Some(cursor) = window.cursor_position() {
+                let win_w = window.width().max(1.0);
+                let win_h = window.height().max(1.0);
+                let nx = ((cursor.x / win_w) - 0.5) * 2.0;
+                let ny = ((cursor.y / win_h) - 0.5) * 2.0;
+                let vec2 = Vec2::new(nx, ny);
+                let mag = vec2.length().min(1.0);
+                let dz = config.camera.cursor_lead_deadzone_ratio;
+                if mag > dz && mag > 1e-4 {
+                    let t = ((mag - dz) / (1.0 - dz)).clamp(0.0, 1.0);
+                    let smooth = t * t * (3.0 - 2.0 * t);
+                    let dir = vec2 / mag;
+                    desired_lead = Vec3::new(
+                        dir.x * smooth * config.camera.cursor_lead_max_distance_x,
+                        0.0,
+                        dir.y * smooth * config.camera.cursor_lead_max_distance_z,
+                    );
+                }
+            }
+        }
+    }
+
+    let lead_alpha = (config.camera.cursor_lead_lerp_speed * dt).clamp(0.0, 1.0);
+    camera_control.current_cursor_lead =
+        camera_control.current_cursor_lead.lerp(desired_lead, lead_alpha);
+
     let camera_offset = Vec3::new(
         config.camera.offset.0,
         config.camera.offset.1,
@@ -3999,12 +4062,12 @@ fn camera_follow_system(
     );
     let focus_pos = camera_control
         .free_look_target
-        .unwrap_or(soldier_tf.translation);
+        .unwrap_or(soldier_tf.translation + camera_control.current_cursor_lead);
     let target_pos = focus_pos + camera_offset + shake_offset;
 
     camera_tf.translation = camera_tf
         .translation
-        .lerp(target_pos, config.camera.follow_lerp_speed * dt);
+        .lerp(target_pos, (config.camera.follow_lerp_speed * dt).clamp(0.0, 1.0));
     camera_tf.look_at(
         focus_pos + shake_offset * config.camera.look_at_shake_factor,
         Vec3::Y,
@@ -4047,8 +4110,15 @@ fn soldier_animation_player_system(
         if render_state.previous_lower_anim != trav_key {
             let node = anim_assets.require_node(&trav_key);
             let blend = Duration::from_millis(config.animations.traversal_blend_ms);
-            lower_trans.play(&mut lower_player, node, blend).replay();
-            upper_trans.play(&mut upper_player, node, blend).replay();
+            let server_dur = render_state.traversal_duration.max(0.05);
+            let clip_dur = anim_assets.clip_duration(&trav_key).unwrap_or(server_dur);
+            let speed = (clip_dur / server_dur).max(0.1);
+            let l_act = lower_trans.play(&mut lower_player, node, blend);
+            l_act.set_speed(speed);
+            l_act.replay();
+            let u_act = upper_trans.play(&mut upper_player, node, blend);
+            u_act.set_speed(speed);
+            u_act.replay();
             render_state.previous_lower_anim = trav_key.clone();
             render_state.previous_upper_anim = trav_key;
         }
@@ -5609,6 +5679,45 @@ fn spawn_hero_hud_ui(commands: &mut Commands) {
                     ));
                 });
 
+                // ردیف ۲-ب: نوار آبی Stamina زیر نوار سلامتی
+                info.spawn((
+                    Node {
+                        width: percent(100),
+                        height: px(14.0),
+                        border: UiRect::all(px(1.0)),
+                        border_radius: BorderRadius::all(px(4.0)),
+                        overflow: Overflow::clip(),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.18, 0.34, 0.52, 0.9)),
+                    BackgroundColor(Color::srgb(0.07, 0.10, 0.16)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        HeroStaminaBarFill,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(0.0),
+                            top: px(0.0),
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.14, 0.58, 0.96)),
+                    ));
+                    bar.spawn((
+                        HeroStaminaBarText,
+                        Text::new("STAMINA 100 / 100 (+15.0/s)"),
+                        TextFont {
+                            font_size: FontSize::Px(9.5),
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+
                 // ردیف ۳: آمار KDA و مهمات اسلحه
                 info.spawn(Node {
                     width: percent(100),
@@ -6522,6 +6631,11 @@ struct OverheadHpFill {
 }
 
 #[derive(Component)]
+struct OverheadStaminaFill {
+    key_id: usize,
+}
+
+#[derive(Component)]
 struct OverheadBulletPip {
     key_id: usize,
     bullet_index: u32,
@@ -6530,8 +6644,9 @@ struct OverheadBulletPip {
 #[derive(SystemParam)]
 struct OverheadBarQueries<'w, 's> {
     root_q: Query<'w, 's, (Entity, &'static OverheadHeroBarRoot, &'static mut Node)>,
-    hp_q: Query<'w, 's, (&'static OverheadHpFill, &'static mut Node, &'static mut BackgroundColor), Without<OverheadHeroBarRoot>>,
-    pip_q: Query<'w, 's, (&'static OverheadBulletPip, &'static mut BackgroundColor), (Without<OverheadHeroBarRoot>, Without<OverheadHpFill>)>,
+    hp_q: Query<'w, 's, (&'static OverheadHpFill, &'static mut Node, &'static mut BackgroundColor), (Without<OverheadHeroBarRoot>, Without<OverheadStaminaFill>)>,
+    stamina_q: Query<'w, 's, (&'static OverheadStaminaFill, &'static mut Node), (Without<OverheadHeroBarRoot>, Without<OverheadHpFill>)>,
+    pip_q: Query<'w, 's, (&'static OverheadBulletPip, &'static mut BackgroundColor), (Without<OverheadHeroBarRoot>, Without<OverheadHpFill>, Without<OverheadStaminaFill>)>,
 }
 
 fn spawn_overhead_bar(commands: &mut Commands, key_id: usize, ammo_total: u32) {
@@ -6576,6 +6691,31 @@ fn spawn_overhead_bar(commands: &mut Commands, key_id: usize, ammo_total: u32) {
                         ..default()
                     },
                     BackgroundColor(Color::srgb(0.16, 0.82, 0.35)),
+                ));
+            });
+
+            // نوار آبی Stamina زیر نوار سلامتی بالای سر هیرو
+            root.spawn((
+                Node {
+                    width: percent(100),
+                    height: px(4.5),
+                    border: UiRect::all(px(1.0)),
+                    border_radius: BorderRadius::all(px(2.0)),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.05, 0.08, 0.14, 0.85)),
+                BackgroundColor(Color::srgba(0.06, 0.08, 0.14, 0.78)),
+            ))
+            .with_children(|bar| {
+                bar.spawn((
+                    OverheadStaminaFill { key_id },
+                    Node {
+                        width: percent(100),
+                        height: percent(100),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.14, 0.58, 0.96)),
                 ));
             });
 
@@ -6640,6 +6780,8 @@ fn update_overhead_hero_bars_system(
         is_ally: bool,
         hp: f32,
         max_hp: f32,
+        stamina: f32,
+        max_stamina: f32,
         ammo_rem: u32,
         ammo_total: u32,
     }
@@ -6655,6 +6797,8 @@ fn update_overhead_hero_bars_system(
         is_ally: true,
         hp: h.hp,
         max_hp: h.max_hp,
+        stamina: h.stamina,
+        max_stamina: h.max_stamina,
         ammo_rem: h.ammo_in_mag,
         ammo_total: h.magazine_size,
     });
@@ -6668,6 +6812,8 @@ fn update_overhead_hero_bars_system(
             is_ally: rp.team == my_team,
             hp: rp.hp,
             max_hp: rp.max_hp,
+            stamina: rp.stamina,
+            max_stamina: rp.max_stamina,
             ammo_rem: rp.ammo_in_mag,
             ammo_total: rp.magazine_size,
         });
@@ -6728,6 +6874,13 @@ fn update_overhead_hero_bars_system(
             if fill.key_id == tgt.key_id {
                 fnode.width = percent(hp_pct);
                 *fbg = hp_col.into();
+            }
+        }
+
+        let stamina_pct = ((tgt.stamina / tgt.max_stamina.max(1.0)) * 100.0).clamp(0.0, 100.0);
+        for (sfill, mut snode) in &mut bars.stamina_q {
+            if sfill.key_id == tgt.key_id {
+                snode.width = percent(stamina_pct);
             }
         }
 
@@ -9486,5 +9639,29 @@ fn update_pause_overlay_ui_system(
                 **cdt = format!("{}", sec);
             }
         }
+    }
+}
+
+
+fn update_hero_stamina_hud_system(
+    hero_state: Res<LatestHeroSnapshot>,
+    mut fill_q: Query<(&mut Node, &mut BackgroundColor), With<HeroStaminaBarFill>>,
+    mut txt_q: Query<&mut Text, With<HeroStaminaBarText>>,
+) {
+    let h = &hero_state.0;
+    let pct = ((h.stamina / h.max_stamina.max(1.0)) * 100.0).clamp(0.0, 100.0);
+    if let Ok((mut node, mut bg)) = fill_q.single_mut() {
+        node.width = percent(pct);
+        *bg = if pct >= 30.0 {
+            Color::srgb(0.14, 0.58, 0.96).into()
+        } else {
+            Color::srgb(0.10, 0.36, 0.72).into()
+        };
+    }
+    if let Ok(mut t) = txt_q.single_mut() {
+        **t = format!(
+            "STAMINA  {:.0} / {:.0} (+{:.1}/s)",
+            h.stamina, h.max_stamina, h.stamina_regen_per_sec
+        );
     }
 }

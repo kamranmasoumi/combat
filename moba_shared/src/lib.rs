@@ -16,6 +16,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // -----------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PauseConfig {
+    pub max_pauses_per_team: u32,
+    pub team_time_bank_secs: f32,
+    pub player_cooldown_secs: f32,
+    pub manual_unpause_lock_secs: f32,
+    pub disconnect_unpause_lock_secs: f32,
+    pub unpause_countdown_secs: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PingConfig {
     pub duration_secs: f32,
     pub max_active_pings: usize,
@@ -33,6 +43,7 @@ pub struct ChatConfig {
 
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
+    pub pause: PauseConfig,
     pub ping: PingConfig,
     pub chat: ChatConfig,
     pub network: NetworkConfig,
@@ -71,6 +82,7 @@ impl GameConfig {
         cfg.validate_ancients();
         cfg.validate_chat();
         cfg.validate_ping();
+        cfg.validate_pause();
         cfg.validate_heroes();
         cfg.validate_creeps();
         cfg.validate_neutral_camps();
@@ -175,6 +187,15 @@ impl GameConfig {
             (0.0..=1.0).contains(&c.deny_hp_threshold_ratio),
             "deny_hp_threshold_ratio باید بین 0 و 1 باشد"
         );
+    }
+
+    pub fn validate_pause(&self) {
+        assert!(self.pause.max_pauses_per_team > 0, "pause.max_pauses_per_team باید بزرگ‌تر از صفر باشد");
+        assert!(self.pause.team_time_bank_secs > 0.0, "pause.team_time_bank_secs باید بزرگ‌تر از صفر باشد");
+        assert!(self.pause.player_cooldown_secs >= 0.0, "pause.player_cooldown_secs نمی‌تواند منفی باشد");
+        assert!(self.pause.manual_unpause_lock_secs >= 0.0, "pause.manual_unpause_lock_secs نمی‌تواند منفی باشد");
+        assert!(self.pause.disconnect_unpause_lock_secs >= 0.0, "pause.disconnect_unpause_lock_secs نمی‌تواند منفی باشد");
+        assert!(self.pause.unpause_countdown_secs > 0.0, "pause.unpause_countdown_secs باید بزرگ‌تر از صفر باشد");
     }
 
     pub fn validate_ping(&self) {
@@ -1450,6 +1471,27 @@ pub struct ChatMessageEntry {
     pub text: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PausePhase {
+    Running,
+    Paused,
+    UnpauseCountdown,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PauseSnapshot {
+    pub phase: PausePhase,
+    pub paused_by_team: Option<TeamId>,
+    pub paused_by_name: String,
+    pub is_disconnect_pause: bool,
+    pub lock_remaining_secs: f32,
+    pub countdown_remaining_secs: f32,
+    pub your_team_pauses_left: u32,
+    pub your_team_time_left_secs: f32,
+    pub your_player_cooldown_secs: f32,
+    pub can_you_unpause: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PingEntry {
     pub id: u64,
@@ -1464,6 +1506,7 @@ pub enum ClientLobbyMessage {
     ReportMapLoaded,
     SendChat { all_chat: bool, text: String },
     SendPing { world_pos: Vec3 },
+    TogglePause,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1885,6 +1928,7 @@ pub struct ServerWorldSnapshot {
     pub ancients: Vec<AncientSnapshot>,
     pub recent_chat: Vec<ChatMessageEntry>,
     pub recent_pings: Vec<PingEntry>,
+    pub pause: PauseSnapshot,
     pub fx_events: Vec<GameplayFxEvent>,
 }
 
@@ -4232,6 +4276,7 @@ pub struct ClientPhysicsPredictionState {
     pub effective_stance: Stance,
     pub is_dead: bool,
     pub match_ended: bool,
+    pub is_paused: bool,
 }
 
 impl ClientPhysicsPredictionState {
@@ -4242,6 +4287,7 @@ impl ClientPhysicsPredictionState {
             effective_stance: Stance::Run,
             is_dead: false,
             match_ended: false,
+            is_paused: false,
         }
     }
 }
@@ -4251,6 +4297,7 @@ pub struct PlayerSlotState {
     pub slot_index: usize,
     pub client_id: Option<u64>,
     pub is_disconnected: bool,
+    pub pause_cooldown_remaining: f32,
     pub active_input: Option<ClientInputCommand>,
     pub soldier_pos: Vec3,
     pub soldier_facing_dir: Vec3,
@@ -4380,6 +4427,16 @@ pub struct AuthoritativeWorldState {
     pub next_chat_id: u64,
     pub ping_history: Vec<PingEntry>,
     pub next_ping_id: u64,
+    pub pause_phase: PausePhase,
+    pub paused_by_team: Option<TeamId>,
+    pub paused_by_name: String,
+    pub pause_is_disconnect: bool,
+    pub pause_lock_remaining: f32,
+    pub unpause_countdown_remaining: f32,
+    pub dawn_pauses_remaining: u32,
+    pub dusk_pauses_remaining: u32,
+    pub dawn_time_bank_secs: f32,
+    pub dusk_time_bank_secs: f32,
     pub winning_team: Option<TeamId>,
     pub match_elapsed_secs: f32,
     pub next_wave_time_secs: f32,
@@ -4563,6 +4620,16 @@ impl AuthoritativeWorldState {
             next_chat_id: 1,
             ping_history: Vec::new(),
             next_ping_id: 1,
+            pause_phase: PausePhase::Running,
+            paused_by_team: None,
+            paused_by_name: String::new(),
+            pause_is_disconnect: false,
+            pause_lock_remaining: 0.0,
+            unpause_countdown_remaining: 0.0,
+            dawn_pauses_remaining: config.pause.max_pauses_per_team,
+            dusk_pauses_remaining: config.pause.max_pauses_per_team,
+            dawn_time_bank_secs: config.pause.team_time_bank_secs,
+            dusk_time_bank_secs: config.pause.team_time_bank_secs,
             winning_team: None,
             match_elapsed_secs: 0.0,
             next_wave_time_secs: config.creeps.first_wave_delay_secs,
@@ -4652,6 +4719,156 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.water_splash_cooldown, &mut p.water_splash_cooldown);
         std::mem::swap(&mut self.traversal, &mut p.traversal);
         self.active_slot = idx;
+    }
+
+    pub fn can_slot_unpause(&self, slot_index: usize) -> bool {
+        if self.pause_phase != PausePhase::Paused {
+            return false;
+        }
+        let viewer_team = self
+            .players
+            .get(slot_index)
+            .map(|p| p.hero_team)
+            .unwrap_or(self.hero_team);
+        if self.pause_is_disconnect {
+            let team_has_dc = self
+                .players
+                .iter()
+                .any(|p| p.is_disconnected && p.hero_team == viewer_team);
+            if team_has_dc {
+                return true;
+            }
+            self.pause_lock_remaining <= 0.0
+        } else {
+            if self.paused_by_team == Some(viewer_team) {
+                return true;
+            }
+            self.pause_lock_remaining <= 0.0
+        }
+    }
+
+    pub fn toggle_pause(&mut self, slot_index: usize, config: &GameConfig) {
+        if self.winning_team.is_some() {
+            return;
+        }
+        match self.pause_phase {
+            PausePhase::Running => {
+                let any_disconnected = self.players.iter().any(|p| p.is_disconnected);
+                let (team, name, player_cd) = if let Some(p) = self.players.get(slot_index) {
+                    (p.hero_team, p.hero_display_name.clone(), p.pause_cooldown_remaining)
+                } else {
+                    (self.hero_team, self.hero_display_name.clone(), 0.0)
+                };
+
+                let (pauses_left, time_left) = match team {
+                    TeamId::Dawn => (self.dawn_pauses_remaining, self.dawn_time_bank_secs),
+                    TeamId::Dusk => (self.dusk_pauses_remaining, self.dusk_time_bank_secs),
+                    TeamId::Neutral => return,
+                };
+
+                if pauses_left == 0 || time_left <= 0.0 {
+                    return;
+                }
+                if !any_disconnected && player_cd > 0.0 {
+                    return;
+                }
+
+                match team {
+                    TeamId::Dawn => self.dawn_pauses_remaining -= 1,
+                    TeamId::Dusk => self.dusk_pauses_remaining -= 1,
+                    TeamId::Neutral => return,
+                }
+                if let Some(p) = self.players.get_mut(slot_index) {
+                    p.pause_cooldown_remaining = config.pause.player_cooldown_secs;
+                }
+
+                self.pause_phase = PausePhase::Paused;
+                self.paused_by_team = Some(team);
+                self.paused_by_name = name.clone();
+                self.pause_is_disconnect = any_disconnected;
+                self.pause_lock_remaining = if any_disconnected {
+                    config.pause.disconnect_unpause_lock_secs
+                } else {
+                    config.pause.manual_unpause_lock_secs
+                };
+                self.unpause_countdown_remaining = 0.0;
+
+                let id = self.next_chat_id;
+                self.next_chat_id += 1;
+                self.chat_history.push(ChatMessageEntry {
+                    id,
+                    sender_name: name.clone(),
+                    sender_team: team,
+                    kind: ChatMessageKind::PlayerAll,
+                    all_chat: true,
+                    text: format!("{} paused the game.", name),
+                });
+            }
+            PausePhase::Paused => {
+                if !self.can_slot_unpause(slot_index) {
+                    return;
+                }
+                self.pause_phase = PausePhase::UnpauseCountdown;
+                self.unpause_countdown_remaining = config.pause.unpause_countdown_secs;
+            }
+            PausePhase::UnpauseCountdown => {}
+        }
+    }
+
+    pub fn step_pause_system(&mut self, dt: f32, config: &GameConfig) {
+        if self.winning_team.is_some() {
+            return;
+        }
+        for p in &mut self.players {
+            if p.pause_cooldown_remaining > 0.0 {
+                p.pause_cooldown_remaining = (p.pause_cooldown_remaining - dt).max(0.0);
+            }
+        }
+        match self.pause_phase {
+            PausePhase::Running => {}
+            PausePhase::Paused => {
+                if self.pause_lock_remaining > 0.0 {
+                    self.pause_lock_remaining = (self.pause_lock_remaining - dt).max(0.0);
+                }
+                let time_exhausted = match self.paused_by_team {
+                    Some(TeamId::Dawn) => {
+                        self.dawn_time_bank_secs = (self.dawn_time_bank_secs - dt).max(0.0);
+                        self.dawn_time_bank_secs <= 0.0
+                    }
+                    Some(TeamId::Dusk) => {
+                        self.dusk_time_bank_secs = (self.dusk_time_bank_secs - dt).max(0.0);
+                        self.dusk_time_bank_secs <= 0.0
+                    }
+                    _ => false,
+                };
+                if time_exhausted {
+                    self.pause_phase = PausePhase::UnpauseCountdown;
+                    self.unpause_countdown_remaining = config.pause.unpause_countdown_secs;
+                }
+            }
+            PausePhase::UnpauseCountdown => {
+                self.unpause_countdown_remaining -= dt;
+                if self.unpause_countdown_remaining <= 0.0 {
+                    self.pause_phase = PausePhase::Running;
+                    self.paused_by_team = None;
+                    self.paused_by_name.clear();
+                    self.pause_is_disconnect = false;
+                    self.pause_lock_remaining = 0.0;
+                    self.unpause_countdown_remaining = 0.0;
+
+                    let id = self.next_chat_id;
+                    self.next_chat_id += 1;
+                    self.chat_history.push(ChatMessageEntry {
+                        id,
+                        sender_name: "System".to_string(),
+                        sender_team: TeamId::Neutral,
+                        kind: ChatMessageKind::SystemReconnect,
+                        all_chat: true,
+                        text: "Game resumed.".to_string(),
+                    });
+                }
+            }
+        }
     }
 
     pub fn push_ping(
@@ -4849,6 +5066,7 @@ impl AuthoritativeWorldState {
                 slot_index: lp.slot_index,
                 client_id: lp.client_id,
                 is_disconnected: !lp.connected,
+                pause_cooldown_remaining: 0.0,
                 active_input: None,
                 soldier_pos: spawn_pos,
                 soldier_facing_dir: facing_dir,
@@ -5020,6 +5238,28 @@ impl AuthoritativeWorldState {
             .collect();
         let ping_start = filtered_pings.len().saturating_sub(max_pings);
         snap.recent_pings = filtered_pings[ping_start..].to_vec();
+        let (team_pauses_left, team_time_left) = match viewer_team {
+            TeamId::Dawn => (self.dawn_pauses_remaining, self.dawn_time_bank_secs),
+            TeamId::Dusk => (self.dusk_pauses_remaining, self.dusk_time_bank_secs),
+            TeamId::Neutral => (0, 0.0),
+        };
+        let player_cd = self
+            .players
+            .get(slot_index)
+            .map(|p| p.pause_cooldown_remaining)
+            .unwrap_or(0.0);
+        snap.pause = PauseSnapshot {
+            phase: self.pause_phase,
+            paused_by_team: self.paused_by_team,
+            paused_by_name: self.paused_by_name.clone(),
+            is_disconnect_pause: self.pause_is_disconnect,
+            lock_remaining_secs: self.pause_lock_remaining.max(0.0),
+            countdown_remaining_secs: self.unpause_countdown_remaining.max(0.0),
+            your_team_pauses_left: team_pauses_left,
+            your_team_time_left_secs: team_time_left.max(0.0),
+            your_player_cooldown_secs: player_cd.max(0.0),
+            can_you_unpause: self.can_slot_unpause(slot_index),
+        };
         snap.creeps = self
             .creeps
             .iter()
@@ -5202,6 +5442,18 @@ impl AuthoritativeWorldState {
                 .collect(),
             recent_chat: Vec::new(),
             recent_pings: Vec::new(),
+            pause: PauseSnapshot {
+                phase: self.pause_phase,
+                paused_by_team: self.paused_by_team,
+                paused_by_name: self.paused_by_name.clone(),
+                is_disconnect_pause: self.pause_is_disconnect,
+                lock_remaining_secs: self.pause_lock_remaining.max(0.0),
+                countdown_remaining_secs: self.unpause_countdown_remaining.max(0.0),
+                your_team_pauses_left: 0,
+                your_team_time_left_secs: 0.0,
+                your_player_cooldown_secs: 0.0,
+                can_you_unpause: false,
+            },
             targets: self
                 .targets
                 .iter()
@@ -5672,13 +5924,14 @@ fn shared_authoritative_drive_system(
     {
         return;
     }
-    if world.winning_team.is_some() {
+    let dt = time.delta_secs();
+    world.step_pause_system(dt, &config);
+    if world.winning_team.is_some() || world.pause_phase != PausePhase::Running {
         for (_, _, mut controller) in &mut soldier_query {
             controller.translation = None;
         }
         return;
     }
-    let dt = time.delta_secs();
     let hero_aim_targets: Vec<(usize, TeamId, Vec3, f32, Stance, bool)> = world
         .players
         .iter()
@@ -6569,6 +6822,9 @@ fn shared_authoritative_react_system(
     {
         return;
     }
+    if world.pause_phase != PausePhase::Running {
+        return;
+    }
     if world.winning_team.is_some() {
         for (entity, _, _) in &bullet_query {
             commands.entity(entity).despawn();
@@ -7305,7 +7561,7 @@ fn shared_client_drive_system(
         return;
     };
 
-    if prediction.match_ended || prediction.is_dead || prediction.traversal_active {
+    if prediction.match_ended || prediction.is_paused || prediction.is_dead || prediction.traversal_active {
         controller.translation = None;
         return;
     }

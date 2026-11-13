@@ -147,6 +147,13 @@ fn server_network_receive_system(
                             }
                         }
                     }
+                    ClientLobbyMessage::TogglePause => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                world.toggle_pause(slot_idx, &config);
+                            }
+                        }
+                    }
                 }
             }
         }

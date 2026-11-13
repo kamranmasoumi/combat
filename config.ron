@@ -18,6 +18,14 @@ GameConfig(
             25, 26, 27, 28, 29, 30, 31, 32,
         )
     ),
+    pause: PauseConfig(
+        max_pauses_per_team: 3,
+        team_time_bank_secs: 300.0,
+        player_cooldown_secs: 300.0,
+        manual_unpause_lock_secs: 5.0,
+        disconnect_unpause_lock_secs: 60.0,
+        unpause_countdown_secs: 3.0,
+    ),
     ping: PingConfig(
         duration_secs: 3.5,
         max_active_pings: 8,

@@ -23,7 +23,7 @@ use moba_shared::{
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
-    AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
@@ -127,6 +127,7 @@ fn main() {
         .insert_resource(LatestMatchResult::default())
         .insert_resource(ChatUiState::default())
         .insert_resource(ClientPingState::default())
+        .insert_resource(LatestPauseState::default())
         .insert_resource(ClientMatchFlow {
             your_slot: None,
             snapshot: None,
@@ -193,7 +194,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system, client_chat_input_system, update_chat_ui_system, client_ping_input_system, update_ping_visuals_system)
+            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system, client_chat_input_system, update_chat_ui_system, client_ping_input_system, update_ping_visuals_system, client_pause_input_system, update_pause_overlay_ui_system)
                 .chain()
                 .after(sync_remote_players_system),
         )
@@ -1851,6 +1852,7 @@ fn setup_scene(
     spawn_death_screen_overlay(&mut commands);
     spawn_end_of_match_overlay(&mut commands);
     spawn_chat_ui(&mut commands);
+    spawn_pause_overlay_ui(&mut commands);
     spawn_match_overlay_ui(&mut commands, &config);
     spawn_laser_and_reticle_visuals(
         &mut commands,
@@ -2536,6 +2538,7 @@ fn weapon_live_calibration_system(
 fn client_sample_input_system(
     match_flow: Res<ClientMatchFlow>,
     match_result: Res<LatestMatchResult>,
+    pause_state: Res<LatestPauseState>,
     chat_state: Res<ChatUiState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
@@ -2548,7 +2551,7 @@ fn client_sample_input_system(
     if !match_flow.is_in_game() || match_result.0.is_some() {
         return;
     }
-    if chat_state.is_open {
+    if chat_state.is_open || pause_state.0.phase != PausePhase::Running {
         prediction.latest_input = Some(ClientInputCommand {
             move_input: Vec3::ZERO,
             shift_held: false,
@@ -2786,6 +2789,8 @@ fn client_receive_snapshot_and_sync_system(
         prediction.traversal_active = snap.traversal_active;
         prediction.is_dead = snap.is_dead;
         prediction.match_ended = snap.winning_team.is_some();
+        prediction.is_paused = snap.pause.phase != PausePhase::Running;
+        hud_sync.pause_state.0 = snap.pause.clone();
 
         if let Ok(mut soldier_phys_tf) = soldier_physics_query.single_mut() {
             reconcile_soldier_physics_pos(
@@ -5891,6 +5896,7 @@ struct SnapshotHudSyncParams<'w, 's> {
     chat_state: ResMut<'w, ChatUiState>,
     ping_state: ResMut<'w, ClientPingState>,
     minimap_root_q: Query<'w, 's, Entity, With<MinimapRoot>>,
+    pause_state: ResMut<'w, LatestPauseState>,
 }
 
 fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
@@ -9267,5 +9273,218 @@ fn update_ping_visuals_system(
         node.height = px(size);
         node.left = px(dot.uv.x * MINIMAP_WIDTH_PX - size * 0.5);
         node.top = px(dot.uv.y * MINIMAP_HEIGHT_PX - size * 0.5);
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم توقف بازی (Pause / Unpause با F9 — طراحی مینیمال)
+// -----------------------------------------------------------------------------
+
+#[derive(Resource)]
+struct LatestPauseState(PauseSnapshot);
+
+impl Default for LatestPauseState {
+    fn default() -> Self {
+        Self(PauseSnapshot {
+            phase: PausePhase::Running,
+            paused_by_team: None,
+            paused_by_name: String::new(),
+            is_disconnect_pause: false,
+            lock_remaining_secs: 0.0,
+            countdown_remaining_secs: 0.0,
+            your_team_pauses_left: 0,
+            your_team_time_left_secs: 0.0,
+            your_player_cooldown_secs: 0.0,
+            can_you_unpause: false,
+        })
+    }
+}
+
+#[derive(Component)]
+struct PauseOverlayRoot;
+
+#[derive(Component)]
+struct PauseBannerBox;
+
+#[derive(Component)]
+struct PauseTitleText;
+
+#[derive(Component)]
+struct PauseMetaText;
+
+#[derive(Component)]
+struct PauseCountdownText;
+
+fn spawn_pause_overlay_ui(commands: &mut Commands) {
+    commands
+        .spawn((
+            PauseOverlayRoot,
+            Pickable::IGNORE,
+            GlobalZIndex(235),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: percent(100),
+                height: percent(100),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::FlexStart,
+                padding: UiRect::top(px(74.0)),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.02, 0.03, 0.05, 0.38)),
+        ))
+        .with_children(|root| {
+            root.spawn((
+                PauseBannerBox,
+                Pickable::IGNORE,
+                Node {
+                    padding: UiRect::axes(px(22.0), px(10.0)),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: px(4.0),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(10.0)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.95, 0.78, 0.24, 0.90)),
+                BackgroundColor(Color::srgba(0.04, 0.06, 0.10, 0.92)),
+            ))
+            .with_children(|card| {
+                card.spawn((
+                    PauseTitleText,
+                    Text::new("PAUSED"),
+                    TextFont {
+                        font_size: FontSize::Px(22.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.98, 0.84, 0.30)),
+                ));
+                card.spawn((
+                    PauseMetaText,
+                    Text::new(""),
+                    TextFont {
+                        font_size: FontSize::Px(13.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.86, 0.90, 0.96)),
+                ));
+            });
+
+            root.spawn((
+                PauseCountdownText,
+                Text::new(""),
+                TextFont {
+                    font_size: FontSize::Px(68.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.98, 0.88, 0.32)),
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(170.0),
+                    display: Display::None,
+                    ..default()
+                },
+            ));
+        });
+}
+
+fn client_pause_input_system(
+    match_flow: Res<ClientMatchFlow>,
+    match_result: Res<LatestMatchResult>,
+    chat_state: Res<ChatUiState>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut net: ResMut<ClientNetwork>,
+) {
+    if !match_flow.is_in_game() || match_result.0.is_some() || chat_state.is_open {
+        return;
+    }
+    if keyboard.just_pressed(KeyCode::F9) {
+        if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::TogglePause) {
+            net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn update_pause_overlay_ui_system(
+    match_flow: Res<ClientMatchFlow>,
+    match_result: Res<LatestMatchResult>,
+    pause_state: Res<LatestPauseState>,
+    mut root_q: Query<(&mut Node, &mut BackgroundColor), With<PauseOverlayRoot>>,
+    mut banner_q: Query<
+        &mut Node,
+        (With<PauseBannerBox>, Without<PauseOverlayRoot>, Without<PauseCountdownText>),
+    >,
+    mut title_q: Query<&mut Text, With<PauseTitleText>>,
+    mut meta_q: Query<&mut Text, (With<PauseMetaText>, Without<PauseTitleText>)>,
+    mut cd_q: Query<
+        (&mut Node, &mut Text),
+        (
+            With<PauseCountdownText>,
+            Without<PauseOverlayRoot>,
+            Without<PauseBannerBox>,
+            Without<PauseTitleText>,
+            Without<PauseMetaText>,
+        ),
+    >,
+) {
+    let Ok((mut root_node, mut root_bg)) = root_q.single_mut() else {
+        return;
+    };
+    let ps = &pause_state.0;
+    if !match_flow.is_in_game() || match_result.0.is_some() || ps.phase == PausePhase::Running {
+        root_node.display = Display::None;
+        return;
+    }
+
+    root_node.display = Display::Flex;
+    match ps.phase {
+        PausePhase::Running => {}
+        PausePhase::Paused => {
+            *root_bg = BackgroundColor(Color::srgba(0.02, 0.03, 0.05, 0.42));
+            if let Ok(mut bn) = banner_q.single_mut() {
+                bn.display = Display::Flex;
+            }
+            if let Ok((mut cdn, _)) = cd_q.single_mut() {
+                cdn.display = Display::None;
+            }
+            if let Ok(mut t) = title_q.single_mut() {
+                **t = if ps.is_disconnect_pause {
+                    "PAUSED (DISCONNECT)".to_string()
+                } else {
+                    "PAUSED".to_string()
+                };
+            }
+            if let Ok(mut m) = meta_q.single_mut() {
+                let bank_s = ps.your_team_time_left_secs.ceil() as u32;
+                let action_hint = if ps.can_you_unpause {
+                    "[F9] Unpause".to_string()
+                } else {
+                    format!("Locked {}s", ps.lock_remaining_secs.ceil() as u32)
+                };
+                **m = format!(
+                    "{}  •  Pauses: {}  •  Bank: {:02}:{:02}  •  {}",
+                    ps.paused_by_name,
+                    ps.your_team_pauses_left,
+                    bank_s / 60,
+                    bank_s % 60,
+                    action_hint
+                );
+            }
+        }
+        PausePhase::UnpauseCountdown => {
+            *root_bg = BackgroundColor(Color::srgba(0.02, 0.03, 0.05, 0.22));
+            if let Ok(mut bn) = banner_q.single_mut() {
+                bn.display = Display::None;
+            }
+            if let Ok((mut cdn, mut cdt)) = cd_q.single_mut() {
+                cdn.display = Display::Flex;
+                let sec = ps.countdown_remaining_secs.ceil().max(1.0) as u32;
+                **cdt = format!("{}", sec);
+            }
+        }
     }
 }

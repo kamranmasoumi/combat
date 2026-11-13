@@ -11,6 +11,9 @@ use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub mod shop_shared;
+pub use shop_shared::*;
+
 // -----------------------------------------------------------------------------
 // ۱. ساختارهای کانفیگ (بدون هیچ Default یا serde(default))
 // -----------------------------------------------------------------------------
@@ -1572,6 +1575,11 @@ pub enum ClientLobbyMessage {
     SendChat { all_chat: bool, text: String },
     SendPing { world_pos: Vec3 },
     TogglePause,
+    BuyItem { item_id: String },
+    BuyCart { item_ids: Vec<String> },
+    SellItem { inv_index: usize },
+    CycleItemMode { inv_index: usize },
+    SwapInventorySlots { from_slot: usize, to_slot: usize },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1924,6 +1932,7 @@ pub struct HeroSnapshot {
     pub kills: u32,
     pub deaths: u32,
     pub respawn_remaining: f32,
+    pub inventory: Vec<InventoryItemState>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -4353,6 +4362,7 @@ pub struct ClientPhysicsPredictionState {
     pub is_paused: bool,
     pub hero_index: usize,
     pub latest_hero_scale: f32,
+    pub latest_move_speed_multiplier: Option<f32>,
     pub latest_authoritative_feet_pos: Option<Vec3>,
 }
 
@@ -4368,6 +4378,7 @@ impl ClientPhysicsPredictionState {
             is_paused: false,
             hero_index: 0,
             latest_hero_scale: 1.0,
+            latest_move_speed_multiplier: None,
             latest_authoritative_feet_pos: None,
         }
     }
@@ -4439,6 +4450,7 @@ pub struct PlayerSlotState {
     pub assists: u32,
     pub kills: u32,
     pub deaths: u32,
+    pub inventory: Vec<InventoryItemState>,
     pub fog_of_war: SharedFogOfWar,
     pub in_water: bool,
     pub water_splash_cooldown: f32,
@@ -4512,6 +4524,7 @@ pub struct AuthoritativeWorldState {
     pub assists: u32,
     pub kills: u32,
     pub deaths: u32,
+    pub inventory: Vec<InventoryItemState>,
     pub fog_of_war: SharedFogOfWar,
     pub in_water: bool,
     pub water_splash_cooldown: f32,
@@ -4647,6 +4660,7 @@ impl AuthoritativeWorldState {
             assists: 0,
             kills: 0,
             deaths: 0,
+            inventory: Vec::new(),
             fog_of_war,
             in_water: false,
             water_splash_cooldown: 0.0,
@@ -4831,6 +4845,7 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.assists, &mut p.assists);
         std::mem::swap(&mut self.kills, &mut p.kills);
         std::mem::swap(&mut self.deaths, &mut p.deaths);
+        std::mem::swap(&mut self.inventory, &mut p.inventory);
         std::mem::swap(&mut self.fog_of_war, &mut p.fog_of_war);
         std::mem::swap(&mut self.in_water, &mut p.in_water);
         std::mem::swap(&mut self.water_splash_cooldown, &mut p.water_splash_cooldown);
@@ -5244,6 +5259,7 @@ impl AuthoritativeWorldState {
                 assists: 0,
                 kills: 0,
                 deaths: 0,
+                inventory: Vec::new(),
                 fog_of_war: SharedFogOfWar::from_config(config, lp.team),
                 in_water: false,
                 water_splash_cooldown: 0.0,
@@ -5569,6 +5585,7 @@ impl AuthoritativeWorldState {
                 kills: self.kills,
                 deaths: self.deaths,
                 respawn_remaining: if self.is_dead { self.respawn_remaining.max(0.0) } else { 0.0 },
+                inventory: self.inventory.clone(),
             },
             other_players: Vec::new(),
             top_bar_heroes: Vec::new(),
@@ -6618,7 +6635,7 @@ fn shared_drive_single_player(
             let is_deep_water = water_depth >= 0.85;
 
             let hero_cfg = config.active_hero(world.hero_index);
-            let hero_move_mult = hero_cfg.move_speed_multiplier;
+            let hero_move_mult = world.hero_move_speed_multiplier;
             let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
             let deep_mult = hero_cfg.deep_water_speed_multiplier;
 
@@ -6677,7 +6694,7 @@ fn shared_drive_single_player(
         } else if !world.traversal.is_active {
             let grav_y = config.physics.character_gravity_step_y * dt;
             if world.is_moving {
-                let hero_move_mult = config.active_hero(world.hero_index).move_speed_multiplier;
+                let hero_move_mult = world.hero_move_speed_multiplier;
                 let speed = match world.effective_stance {
                     Stance::Run => config.soldier.run_speed,
                     Stance::Walk => config.soldier.walk_speed,
@@ -7941,7 +7958,7 @@ pub fn shared_client_drive_system(
         soldier_tf.translation.z,
     );
     let water_sample = sample_water_surface_at(&config, feet_pos);
-    let hero_move_mult = hero_cfg.move_speed_multiplier;
+    let hero_move_mult = prediction.latest_move_speed_multiplier.unwrap_or(hero_cfg.move_speed_multiplier);
     let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
     let deep_mult = hero_cfg.deep_water_speed_multiplier;
     let speed_mult = if let Some((water_y, _)) = water_sample {

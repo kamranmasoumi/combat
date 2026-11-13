@@ -25,7 +25,7 @@ use moba_shared::{
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
     ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
-    GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
+    GameplayFxEvent, ItemsConfig, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
     CHANNEL_UNRELIABLE_STATE,
 };
@@ -36,8 +36,12 @@ use std::f32::consts::PI;
 use std::path::Path;
 use std::time::Duration;
 
+mod shop_client;
+use shop_client::{SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
+
 fn main() {
     let mut config = GameConfig::load_from_file("config.ron");
+    let items_config = ItemsConfig::load_from_file("items.ron");
     apply_client_cli_overrides(&mut config.network);
     let tick_hz = config.network.server_tick_rate_hz;
     let substeps = config.physics.substeps;
@@ -97,6 +101,7 @@ fn main() {
             kills: 0,
             deaths: 0,
             respawn_remaining: 0.0,
+            inventory: Vec::new(),
         }
     };
 
@@ -112,6 +117,8 @@ fn main() {
         }))
         .insert_resource(DirectionalLightShadowMap { size: 2048 })
         .insert_resource(config)
+        .insert_resource(items_config)
+        .add_plugins(ShopPlugin)
         .insert_resource(ClientNetwork { client, transport })
         .insert_resource(render_state)
         .insert_resource(ClientPhysicsPredictionState::new())
@@ -219,10 +226,11 @@ fn main() {
         )
         .add_systems(
             Update,
-            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system, client_chat_input_system, update_chat_ui_system, client_ping_input_system, update_ping_visuals_system, client_pause_input_system, update_pause_overlay_ui_system, update_telemetry_hud_system)
+            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system, client_chat_input_system, update_chat_ui_system, client_ping_input_system, update_ping_visuals_system, client_pause_input_system, update_pause_overlay_ui_system, update_telemetry_hud_system, sync_shop_context_and_network_system)
                 .chain()
                 .after(sync_remote_players_system),
         )
+        .add_systems(Update, adaptive_ui_performance_mode_system)
         .add_systems(
             PostUpdate,
             align_weapon_horizontally_system.before(TransformSystems::Propagate),
@@ -2799,6 +2807,8 @@ fn client_sample_input_system(
     match_result: Res<LatestMatchResult>,
     pause_state: Res<LatestPauseState>,
     chat_state: Res<ChatUiState>,
+    shop_ui: Res<ShopUiState>,
+    settings_ui: Res<SettingsUiState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     camera_control: Res<CameraControlState>,
@@ -2873,10 +2883,14 @@ fn client_sample_input_system(
         switch_weapon_just_pressed: keyboard.just_pressed(KeyCode::KeyE),
         kill_toggle_just_pressed: keyboard.just_pressed(KeyCode::KeyX),
         fire_just_pressed: !alt_held
+            && !shop_ui.is_open
+            && !settings_ui.is_open
             && !camera_control.is_pointer_over_minimap
             && !camera_control.is_dragging_minimap
             && mouse_button.just_pressed(MouseButton::Left),
         fire_held: !alt_held
+            && !shop_ui.is_open
+            && !settings_ui.is_open
             && !camera_control.is_pointer_over_minimap
             && !camera_control.is_dragging_minimap
             && mouse_button.pressed(MouseButton::Left),
@@ -3071,6 +3085,7 @@ fn client_receive_snapshot_and_sync_system(
             prediction.hero_index = h_idx;
         }
         prediction.latest_hero_scale = snap.hero.hero_scale;
+        prediction.latest_move_speed_multiplier = Some(snap.hero.move_speed / config.soldier.run_speed.max(0.1));
         prediction.latest_authoritative_feet_pos = Some(snap.soldier_pos);
         hud_sync.pause_state.0 = snap.pause.clone();
         if let Some(prev_tick) = hud_sync.telemetry.last_server_tick {
@@ -4154,6 +4169,8 @@ fn cursor_reticle_system(
     match_flow: Res<ClientMatchFlow>,
     render_state: Res<ClientRenderState>,
     shake: Res<CameraShake>,
+    shop_ui: Res<ShopUiState>,
+    settings_ui: Res<SettingsUiState>,
     mut window_query: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
     mut root_query: Query<(&mut ReticleRoot, &mut Node, &mut Visibility)>,
     mut outer_query: Query<
@@ -4200,24 +4217,33 @@ fn cursor_reticle_system(
     let in_game = match_flow.is_in_game();
 
     if config.cursor_reticle.hide_os_cursor_in_game {
-        cursor_options.visible = !in_game;
+        let desired_visible = !in_game || shop_ui.is_open || settings_ui.is_open;
+        if cursor_options.visible != desired_visible {
+            cursor_options.visible = desired_visible;
+        }
     }
 
     let Ok((mut reticle, mut root_node, mut root_vis)) = root_query.single_mut() else {
         return;
     };
 
-    if !in_game {
-        *root_vis = Visibility::Hidden;
+    if !in_game || shop_ui.is_open || settings_ui.is_open {
+        if *root_vis != Visibility::Hidden {
+            *root_vis = Visibility::Hidden;
+        }
         return;
     }
 
     let Some(cursor_pos) = window.cursor_position() else {
-        *root_vis = Visibility::Hidden;
+        if *root_vis != Visibility::Hidden {
+            *root_vis = Visibility::Hidden;
+        }
         return;
     };
 
-    *root_vis = Visibility::Visible;
+    if *root_vis != Visibility::Visible {
+        *root_vis = Visibility::Visible;
+    }
     let rc = &config.cursor_reticle;
     let container_size = rc.outer_diameter_px + rc.fire_expand_px + rc.tick_length_px * 2.0 + 16.0;
     root_node.left = px(cursor_pos.x - container_size * 0.5);
@@ -5766,16 +5792,31 @@ fn animate_glb_waterfall_materials_system(
 
 const XP_RING_SEGMENTS: usize = 24;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeroStatKind {
+    Dmg,
+    Rate,
+    Range,
+    Armor,
+    Speed,
+    Vision,
+    Ammo,
+}
+
+#[derive(Component)]
+struct HeroStatBonusText(HeroStatKind);
+
 fn spawn_stat_chip(
     row: &mut ChildSpawnerCommands,
     icon_label: &str,
     icon_color: Color,
     marker: impl Component,
+    kind: HeroStatKind,
 ) {
     row.spawn((
         Node {
             padding: UiRect::axes(px(7.0), px(4.0)),
-            column_gap: px(5.0),
+            column_gap: px(4.0),
             align_items: AlignItems::Center,
             border: UiRect::all(px(1.0)),
             border_radius: BorderRadius::all(px(5.0)),
@@ -5811,10 +5852,20 @@ fn spawn_stat_chip(
             marker,
             Text::new("--"),
             TextFont {
-                font_size: FontSize::Px(11.5),
+                font_size: FontSize::Px(11.0),
                 ..default()
             },
             TextColor(Color::srgb(0.92, 0.95, 0.99)),
+        ));
+
+        chip.spawn((
+            HeroStatBonusText(kind),
+            Text::new(""),
+            TextFont {
+                font_size: FontSize::Px(11.0),
+                ..default()
+            },
+            TextColor(Color::srgb(0.28, 0.95, 0.52)),
         ));
     });
 }
@@ -5925,7 +5976,7 @@ fn spawn_hero_hud_ui(commands: &mut Commands) {
             root.spawn(Node {
                 flex_direction: FlexDirection::Column,
                 row_gap: px(7.0),
-                width: px(375.0),
+                width: px(425.0),
                 ..default()
             })
             .with_children(|info| {
@@ -6077,10 +6128,10 @@ fn spawn_hero_hud_ui(commands: &mut Commands) {
                         TextColor(Color::srgb(0.76, 0.84, 0.92)),
                     ));
 
-                    spawn_stat_chip(mid, "A", Color::srgb(0.98, 0.80, 0.22), HeroStatAmmoText);
+                    spawn_stat_chip(mid, "A", Color::srgb(0.98, 0.80, 0.22), HeroStatAmmoText, HeroStatKind::Ammo);
                 });
 
-                // ردیف ۴: ۶ کارت آمار با آیکون رنگی مفهومی (بدون Scale)
+                // ردیف ۴: ۶ کارت آمار با آیکون رنگی مفهومی + نمایش +-number باف/دیباف آیتم‌ها
                 info.spawn(Node {
                     width: percent(100),
                     flex_direction: FlexDirection::Row,
@@ -6090,20 +6141,35 @@ fn spawn_hero_hud_ui(commands: &mut Commands) {
                     ..default()
                 })
                 .with_children(|grid| {
-                    spawn_stat_chip(grid, "D", Color::srgb(0.95, 0.30, 0.28), HeroStatDmgText);
-                    spawn_stat_chip(grid, "F", Color::srgb(0.98, 0.58, 0.18), HeroStatRateText);
-                    spawn_stat_chip(grid, "R", Color::srgb(0.24, 0.86, 0.94), HeroStatRangeText);
-                    spawn_stat_chip(grid, "S", Color::srgb(0.36, 0.64, 0.98), HeroStatArmorText);
-                    spawn_stat_chip(grid, "M", Color::srgb(0.26, 0.88, 0.52), HeroStatSpeedText);
-                    spawn_stat_chip(grid, "V", Color::srgb(0.76, 0.48, 0.98), HeroStatVisionText);
+                    spawn_stat_chip(grid, "D", Color::srgb(0.95, 0.30, 0.28), HeroStatDmgText, HeroStatKind::Dmg);
+                    spawn_stat_chip(grid, "F", Color::srgb(0.98, 0.58, 0.18), HeroStatRateText, HeroStatKind::Rate);
+                    spawn_stat_chip(grid, "R", Color::srgb(0.24, 0.86, 0.94), HeroStatRangeText, HeroStatKind::Range);
+                    spawn_stat_chip(grid, "S", Color::srgb(0.36, 0.64, 0.98), HeroStatArmorText, HeroStatKind::Armor);
+                    spawn_stat_chip(grid, "M", Color::srgb(0.26, 0.88, 0.52), HeroStatSpeedText, HeroStatKind::Speed);
+                    spawn_stat_chip(grid, "V", Color::srgb(0.76, 0.48, 0.98), HeroStatVisionText, HeroStatKind::Vision);
                 });
             });
         });
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[derive(SystemParam)]
+struct HeroHudExtraStatQueries<'w, 's> {
+    dmg_q: Query<'w, 's, &'static mut Text, (With<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    rate_q: Query<'w, 's, &'static mut Text, (With<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    range_q: Query<'w, 's, &'static mut Text, (With<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    armor_q: Query<'w, 's, &'static mut Text, (With<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    speed_q: Query<'w, 's, &'static mut Text, (With<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    vision_q: Query<'w, 's, &'static mut Text, (With<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    ammo_q: Query<'w, 's, &'static mut Text, (With<HeroStatAmmoText>, Without<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    bonus_q: Query<'w, 's, (&'static HeroStatBonusText, &'static mut Text, &'static mut TextColor), (Without<HeroStatAmmoText>, Without<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+}
+
 fn update_hero_hud_system(
+    config: Res<GameConfig>,
+    items_cfg: Res<ItemsConfig>,
     hero_state: Res<LatestHeroSnapshot>,
+    mut extra_stats: HeroHudExtraStatQueries,
     mut hp_bar_query: Query<(&mut Node, &mut BackgroundColor), With<HeroHpBarFill>>,
     mut xp_seg_query: Query<(&HeroHudXpSegment, &mut BackgroundColor), Without<HeroHpBarFill>>,
     mut header_q: Query<&mut Text, With<HeroHudHeaderText>>,
@@ -6112,13 +6178,6 @@ fn update_hero_hud_system(
     mut lvl_q: Query<&mut Text, (With<HeroHudLevelText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>)>,
     mut xp_lbl_q: Query<&mut Text, (With<HeroHudXpLabelText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>)>,
     mut hp_txt_q: Query<&mut Text, (With<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
-    mut dmg_q: Query<&mut Text, (With<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
-    mut rate_q: Query<&mut Text, (With<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
-    mut range_q: Query<&mut Text, (With<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
-    mut armor_q: Query<&mut Text, (With<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
-    mut speed_q: Query<&mut Text, (With<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
-    mut vision_q: Query<&mut Text, (With<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
-    mut ammo_q: Query<&mut Text, (With<HeroStatAmmoText>, Without<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
 ) {
     let h = &hero_state.0;
     let hp_pct = ((h.hp / h.max_hp.max(1.0)) * 100.0).clamp(0.0, 100.0);
@@ -6178,31 +6237,119 @@ fn update_hero_hud_system(
             **t = format!("{:.0} / {:.0} (+{:.1}/s)", h.hp, h.max_hp, h.hp_regen_per_sec);
         }
     }
-    if let Ok(mut t) = dmg_q.single_mut() {
-        **t = format!("DMG {:.0}", h.weapon_damage);
+    let mods = items_cfg.sum_inventory_modifiers(&h.inventory);
+    let is_pistol = h.active_weapon == ActiveWeaponSlot::Pistol;
+    let item_dmg = if is_pistol { mods.pistol_damage_bonus } else { mods.primary_damage_bonus };
+    let item_rate_pct = if is_pistol { mods.pistol_fire_rate_pct } else { mods.primary_fire_rate_pct };
+    let item_rng = if is_pistol { mods.pistol_range_bonus } else { mods.primary_range_bonus };
+    let item_arm = mods.armor_bonus;
+    let item_spd = config.soldier.run_speed * mods.move_speed_pct;
+    let item_mag = if is_pistol { mods.pistol_magazine_bonus } else { mods.primary_magazine_bonus };
+
+    let base_dmg = h.weapon_damage - item_dmg;
+    let base_rng = h.weapon_max_range - item_rng;
+    let base_arm = h.armor - item_arm;
+    let base_spd = h.move_speed - item_spd;
+    let base_mag = ((h.magazine_size as i32) - item_mag).max(1);
+
+    if let Ok(mut t) = extra_stats.dmg_q.single_mut() {
+        **t = format!("DMG {:.0}", base_dmg);
     }
-    if let Ok(mut t) = rate_q.single_mut() {
+    if let Ok(mut t) = extra_stats.rate_q.single_mut() {
         **t = format!("Rate {:.2}s | Rld {:.2}s", h.fire_rate_secs, h.reload_duration_secs);
     }
-    if let Ok(mut t) = range_q.single_mut() {
-        **t = format!("Rng {:.0}m", h.weapon_max_range);
+    if let Ok(mut t) = extra_stats.range_q.single_mut() {
+        **t = format!("Rng {:.0}m", base_rng);
     }
-    if let Ok(mut t) = armor_q.single_mut() {
-        **t = format!("Arm {:.1}", h.armor);
+    if let Ok(mut t) = extra_stats.armor_q.single_mut() {
+        **t = format!("Arm {:.1}", base_arm);
     }
-    if let Ok(mut t) = speed_q.single_mut() {
-        **t = format!("Spd {:.1}", h.move_speed);
+    if let Ok(mut t) = extra_stats.speed_q.single_mut() {
+        **t = format!("Spd {:.1}", base_spd);
     }
-    if let Ok(mut t) = vision_q.single_mut() {
+    if let Ok(mut t) = extra_stats.vision_q.single_mut() {
         **t = format!("Vis {:.0}m", h.vision_range);
     }
-    if let Ok(mut t) = ammo_q.single_mut() {
-        let tag = if h.active_weapon == ActiveWeaponSlot::Pistol {
-            "PISTOL"
-        } else {
-            "RIFLE"
-        };
-        **t = format!("[E] {} {}/{}", tag, h.ammo_in_mag, h.magazine_size);
+    if let Ok(mut t) = extra_stats.ammo_q.single_mut() {
+        let tag = if is_pistol { "PISTOL" } else { "RIFLE" };
+        **t = format!("[E] {} {}/{}", tag, h.ammo_in_mag, base_mag);
+    }
+
+    let green = Color::srgb(0.26, 0.96, 0.50);
+    let red = Color::srgb(0.98, 0.34, 0.34);
+    for (bkind, mut bt, mut bc) in &mut extra_stats.bonus_q {
+        match bkind.0 {
+            HeroStatKind::Dmg => {
+                if item_dmg > 0.01 {
+                    **bt = format!("+{:.0}", item_dmg);
+                    *bc = TextColor(green);
+                } else if item_dmg < -0.01 {
+                    **bt = format!("{:.0}", item_dmg);
+                    *bc = TextColor(red);
+                } else {
+                    bt.clear();
+                }
+            }
+            HeroStatKind::Rate => {
+                let pct = item_rate_pct * 100.0;
+                if pct > 0.1 {
+                    **bt = format!("+{:.0}%", pct);
+                    *bc = TextColor(green);
+                } else if pct < -0.1 {
+                    **bt = format!("{:.0}%", pct);
+                    *bc = TextColor(red);
+                } else {
+                    bt.clear();
+                }
+            }
+            HeroStatKind::Range => {
+                if item_rng > 0.05 {
+                    **bt = format!("+{:.0}m", item_rng);
+                    *bc = TextColor(green);
+                } else if item_rng < -0.05 {
+                    **bt = format!("{:.0}m", item_rng);
+                    *bc = TextColor(red);
+                } else {
+                    bt.clear();
+                }
+            }
+            HeroStatKind::Armor => {
+                if item_arm > 0.05 {
+                    **bt = format!("+{:.1}", item_arm);
+                    *bc = TextColor(green);
+                } else if item_arm < -0.05 {
+                    **bt = format!("{:.1}", item_arm);
+                    *bc = TextColor(red);
+                } else {
+                    bt.clear();
+                }
+            }
+            HeroStatKind::Speed => {
+                if item_spd > 0.05 {
+                    **bt = format!("+{:.1}", item_spd);
+                    *bc = TextColor(green);
+                } else if item_spd < -0.05 {
+                    **bt = format!("{:.1}", item_spd);
+                    *bc = TextColor(red);
+                } else {
+                    bt.clear();
+                }
+            }
+            HeroStatKind::Ammo => {
+                if item_mag > 0 {
+                    **bt = format!("+{}", item_mag);
+                    *bc = TextColor(green);
+                } else if item_mag < 0 {
+                    **bt = format!("{}", item_mag);
+                    *bc = TextColor(red);
+                } else {
+                    bt.clear();
+                }
+            }
+            HeroStatKind::Vision => {
+                bt.clear();
+            }
+        }
     }
 }
 
@@ -6762,22 +6909,32 @@ fn match_overlay_ui_system(
 
     if let Ok((mut root_node, mut root_bg)) = overlay_query.single_mut() {
         if phase == MatchPhase::InGame {
-            root_node.display = Display::None;
+            if root_node.display != Display::None {
+                root_node.display = Display::None;
+            }
             return;
         }
-        root_node.display = Display::Flex;
-        *root_bg = match phase {
-            MatchPhase::HeroSelect => BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.35)),
-            _ => BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.92)),
+        if root_node.display != Display::Flex {
+            root_node.display = Display::Flex;
+        }
+        let target_bg = match phase {
+            MatchPhase::HeroSelect => Color::srgba(0.03, 0.05, 0.08, 0.35),
+            _ => Color::srgba(0.03, 0.05, 0.08, 0.92),
         };
+        if root_bg.0 != target_bg {
+            *root_bg = BackgroundColor(target_bg);
+        }
     }
 
     if let Ok(mut row_node) = pick_row_query.single_mut() {
-        row_node.display = if phase == MatchPhase::HeroSelect {
+        let desired_row = if phase == MatchPhase::HeroSelect {
             Display::Flex
         } else {
             Display::None
         };
+        if row_node.display != desired_row {
+            row_node.display = desired_row;
+        }
     }
 
     for (interaction, btn, mut bg, mut border) in &mut hero_btn_query {
@@ -6804,7 +6961,7 @@ fn match_overlay_ui_system(
     };
 
     if let Ok(mut header) = header_query.single_mut() {
-        **header = match snap.phase {
+        let next_header = match snap.phase {
             MatchPhase::WaitingForPlayers => format!(
                 "PHASE 1: WAITING FOR PLAYERS ({} / {})",
                 snap.connected_count, snap.required_players
@@ -6828,6 +6985,9 @@ fn match_overlay_ui_system(
             }
             MatchPhase::InGame => String::new(),
         };
+        if **header != next_header {
+            **header = next_header;
+        }
     }
 
     if let Ok(mut body) = body_query.single_mut() {
@@ -6913,8 +7073,49 @@ fn match_overlay_ui_system(
             }
             MatchPhase::InGame => {}
         }
-        **body = lines.join("
+        let next_body = lines.join("
 ");
+        if **body != next_body {
+            **body = next_body;
+        }
+    }
+}
+
+fn adaptive_ui_performance_mode_system(
+    match_flow: Res<ClientMatchFlow>,
+    shop_ui: Res<ShopUiState>,
+    settings_ui: Res<SettingsUiState>,
+    mut winit_settings: ResMut<bevy::winit::WinitSettings>,
+    mut window_query: Query<&mut Window, With<PrimaryWindow>>,
+    mut last_ui_mode: Local<Option<bool>>,
+) {
+    let ui_page_active = !match_flow.is_in_game() || shop_ui.is_open || settings_ui.is_open;
+    if *last_ui_mode == Some(ui_page_active) {
+        return;
+    }
+    *last_ui_mode = Some(ui_page_active);
+
+    if ui_page_active {
+        *winit_settings = bevy::winit::WinitSettings {
+            focused_mode: bevy::winit::UpdateMode::reactive_low_power(
+                std::time::Duration::from_secs_f64(1.0 / 60.0),
+            ),
+            unfocused_mode: bevy::winit::UpdateMode::reactive_low_power(
+                std::time::Duration::from_secs_f64(1.0 / 30.0),
+            ),
+        };
+        if let Ok(mut window) = window_query.single_mut() {
+            if window.present_mode != PresentMode::AutoVsync {
+                window.present_mode = PresentMode::AutoVsync;
+            }
+        }
+    } else {
+        *winit_settings = bevy::winit::WinitSettings::game();
+        if let Ok(mut window) = window_query.single_mut() {
+            if window.present_mode != PresentMode::AutoNoVsync {
+                window.present_mode = PresentMode::AutoNoVsync;
+            }
+        }
     }
 }
 
@@ -10454,5 +10655,39 @@ fn record_soldier_fixed_transform_system(
     } else {
         history.prev_feet = history.curr_feet;
         history.curr_feet = feet;
+    }
+}
+
+fn sync_shop_context_and_network_system(
+    match_flow: Res<ClientMatchFlow>,
+    chat_state: Res<ChatUiState>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    render_state: Res<ClientRenderState>,
+    mut ctx: ResMut<ShopContextSnapshot>,
+    mut outgoing: ResMut<ShopOutgoingQueue>,
+    mut net: ResMut<ClientNetwork>,
+) {
+    let in_game = match_flow.is_in_game();
+    if ctx.in_game != in_game
+        || ctx.chat_open != chat_state.is_open
+        || ctx.in_fountain != hero_hud.0.in_fountain
+        || ctx.is_dead != render_state.is_dead
+        || ctx.gold != hero_hud.0.gold
+        || ctx.inventory != hero_hud.0.inventory
+    {
+        ctx.in_game = in_game;
+        ctx.chat_open = chat_state.is_open;
+        ctx.in_fountain = hero_hud.0.in_fountain;
+        ctx.is_dead = render_state.is_dead;
+        ctx.gold = hero_hud.0.gold;
+        ctx.inventory = hero_hud.0.inventory.clone();
+    }
+
+    if net.client.is_connected() && !outgoing.0.is_empty() {
+        for msg in outgoing.0.drain(..) {
+            if let Ok(bytes) = bincode::serialize(&msg) {
+                net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
+            }
+        }
     }
 }

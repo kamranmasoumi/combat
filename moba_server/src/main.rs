@@ -1,10 +1,11 @@
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use moba_shared::{
-    create_shared_renet_server, parse_server_cli_args, AuthoritativeMatchState,
-    AuthoritativeWorldState, ClientInputCommand, ClientLobbyMessage, GameConfig, GameplayFxEvent,
-    MatchPhase, MobaPhysicsSet, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
-    ServerMatchMessage, CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
+    create_shared_renet_server, parse_server_cli_args, try_buy_cart, try_buy_item,
+    try_cycle_item_mode, try_sell_item, try_swap_inventory_slots, AuthoritativeMatchState, AuthoritativeWorldState,
+    ClientInputCommand, ClientLobbyMessage, GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase,
+    MobaPhysicsSet, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier, ServerMatchMessage,
+    CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
 };
 use renet::{RenetServer, ServerEvent};
 use renet_netcode::NetcodeServerTransport;
@@ -23,6 +24,7 @@ fn main() {
     let (cli_port, required_players) = parse_server_cli_args();
 
     let mut config = GameConfig::load_from_file("config.ron");
+    let items_config = ItemsConfig::load_from_file("items.ron");
     let ip = config
         .network
         .server_bind_addr
@@ -54,6 +56,7 @@ fn main() {
             substeps,
         })
         .insert_resource(config)
+        .insert_resource(items_config)
         .insert_resource(world_state)
         .insert_resource(match_state)
         .insert_resource(LobbyBroadcastTimer(Timer::from_seconds(
@@ -75,6 +78,7 @@ fn main() {
 fn server_network_receive_system(
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
+    items_config: Res<ItemsConfig>,
     mut net: ResMut<ServerNetwork>,
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
@@ -151,6 +155,53 @@ fn server_network_receive_system(
                         if match_state.phase == MatchPhase::InGame {
                             if let Some(slot_idx) = match_state.slot_for_client(client_id) {
                                 world.toggle_pause(slot_idx, &config);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::BuyItem { item_id } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_buy_item(&mut world, slot_idx, &item_id, &config, &items_config);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::BuyCart { item_ids } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_buy_cart(&mut world, slot_idx, &item_ids, &config, &items_config);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::SellItem { inv_index } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_sell_item(&mut world, slot_idx, inv_index, &config, &items_config);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::CycleItemMode { inv_index } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_cycle_item_mode(
+                                    &mut world,
+                                    slot_idx,
+                                    inv_index,
+                                    &config,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::SwapInventorySlots { from_slot, to_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_swap_inventory_slots(
+                                    &mut world,
+                                    slot_idx,
+                                    from_slot,
+                                    to_slot,
+                                    &items_config,
+                                );
                             }
                         }
                     }

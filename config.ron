@@ -187,7 +187,7 @@ GameConfig(
             model_path: "hero_2.glb",
             portrait_path: "portraits/frost.png",
             team: Dawn,
-            starting_gold: 600,
+            starting_gold: 60000,
             xp_gain_radius: 28.0,
             max_hp: 540.0,
             hp_regen_per_sec: 1.8,
@@ -713,7 +713,7 @@ GameConfig(
     ),
     map: MapConfig(
             map_dimensions: (340.0, 240.0),
-            show_object_labels: true,
+            show_object_labels: false,
             base_vision_range: 38.0,
             high_ground_vision_bonus: 14.0,
             high_ground_occlusion_min_diff: 1.2,

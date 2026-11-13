@@ -4346,10 +4346,14 @@ pub struct SharedTraversalState {
 pub struct ClientPhysicsPredictionState {
     pub latest_input: Option<ClientInputCommand>,
     pub traversal_active: bool,
+    pub base_stance: Stance,
     pub effective_stance: Stance,
     pub is_dead: bool,
     pub match_ended: bool,
     pub is_paused: bool,
+    pub hero_index: usize,
+    pub latest_hero_scale: f32,
+    pub latest_authoritative_feet_pos: Option<Vec3>,
 }
 
 impl ClientPhysicsPredictionState {
@@ -4357,10 +4361,14 @@ impl ClientPhysicsPredictionState {
         Self {
             latest_input: None,
             traversal_active: false,
+            base_stance: Stance::Run,
             effective_stance: Stance::Run,
             is_dead: false,
             match_ended: false,
             is_paused: false,
+            hero_index: 0,
+            latest_hero_scale: 1.0,
+            latest_authoritative_feet_pos: None,
         }
     }
 }
@@ -7926,13 +7934,13 @@ pub fn shared_client_drive_system(
     let dt = time.delta_secs();
     let grav_y = config.physics.character_gravity_step_y * dt;
 
+    let hero_cfg = config.active_hero(prediction.hero_index);
     let feet_pos = Vec3::new(
         soldier_tf.translation.x,
-        soldier_tf.translation.y - config.physics.soldier_capsule_center_y,
+        soldier_tf.translation.y - config.physics.soldier_capsule_center_y * hero_cfg.hero_scale,
         soldier_tf.translation.z,
     );
     let water_sample = sample_water_surface_at(&config, feet_pos);
-    let hero_cfg = config.active_hero(0);
     let hero_move_mult = hero_cfg.move_speed_multiplier;
     let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
     let deep_mult = hero_cfg.deep_water_speed_multiplier;

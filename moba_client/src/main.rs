@@ -26,7 +26,7 @@ use moba_shared::{
     ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
-    ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
+    ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
     CHANNEL_UNRELIABLE_STATE,
 };
 use renet::RenetClient;
@@ -163,7 +163,8 @@ fn main() {
             FixedUpdate,
             (
                 client_flush_input_to_server_system,
-                record_soldier_fixed_transform_system.after(moba_shared::shared_client_drive_system),
+                client_reconcile_fixed_system.after(moba_shared::MobaPhysicsSet::Simulate),
+                record_soldier_fixed_transform_system.after(client_reconcile_fixed_system),
             ),
         )
         .add_systems(
@@ -2885,6 +2886,19 @@ fn client_sample_input_system(
         client_muzzle_world_pos,
     };
 
+    if cmd.toggle_crouch_just_pressed {
+        prediction.base_stance = if prediction.base_stance == Stance::Crouch {
+            Stance::Run
+        } else {
+            Stance::Crouch
+        };
+    }
+    prediction.effective_stance = if cmd.shift_held {
+        Stance::Walk
+    } else {
+        prediction.base_stance
+    };
+
     if let Some(ref mut existing) = prediction.latest_input {
         existing.accumulate_from(cmd);
     } else {
@@ -3053,6 +3067,11 @@ fn client_receive_snapshot_and_sync_system(
         prediction.is_dead = snap.is_dead;
         prediction.match_ended = snap.winning_team.is_some();
         prediction.is_paused = snap.pause.phase != PausePhase::Running;
+        if let Some(h_idx) = config.heroes.iter().position(|h| h.id == snap.hero.hero_id) {
+            prediction.hero_index = h_idx;
+        }
+        prediction.latest_hero_scale = snap.hero.hero_scale;
+        prediction.latest_authoritative_feet_pos = Some(snap.soldier_pos);
         hud_sync.pause_state.0 = snap.pause.clone();
         if let Some(prev_tick) = hud_sync.telemetry.last_server_tick {
             if snap.tick > prev_tick {
@@ -3070,14 +3089,7 @@ fn client_receive_snapshot_and_sync_system(
         }
         hud_sync.telemetry.last_server_tick = Some(snap.tick);
 
-        if let Ok(mut soldier_phys_tf) = soldier_physics_query.single_mut() {
-            reconcile_soldier_physics_pos(
-                &mut soldier_phys_tf,
-                snap.soldier_pos,
-                snap.hero.hero_scale,
-                &config,
-            );
-        }
+        // آشتی‌سازی فیزیکی در FixedUpdate (client_reconcile_fixed_system) انجام می‌شود تا نوسان 60Hz/128Hz رخ ندهد
 
         for (entity, mut v_target) in &mut target_query {
             let s_target = &snap.targets[v_target.index];
@@ -3255,10 +3267,8 @@ fn client_receive_snapshot_and_sync_system(
         } else {
             target_feet_pos
         };
-        let smooth_y = soldier_vis_tf
-            .translation
-            .y
-            .lerp(interp_pos.y, config.physics.position_reconcile_lerp_factor);
+        let y_alpha = (1.0 - (-22.0 * time.delta_secs()).exp()).clamp(0.0, 1.0);
+        let smooth_y = soldier_vis_tf.translation.y.lerp(interp_pos.y, y_alpha);
         let smoothed_pos = Vec3::new(interp_pos.x, smooth_y, interp_pos.z);
         render_state.soldier_pos = smoothed_pos;
         soldier_vis_tf.translation = smoothed_pos;
@@ -4357,7 +4367,7 @@ fn camera_follow_system(
         }
     }
 
-    let lead_alpha = (config.camera.cursor_lead_lerp_speed * dt).clamp(0.0, 1.0);
+    let lead_alpha = (1.0 - (-config.camera.cursor_lead_lerp_speed * dt).exp()).clamp(0.0, 1.0);
     camera_control.current_cursor_lead =
         camera_control.current_cursor_lead.lerp(desired_lead, lead_alpha);
 
@@ -4371,9 +4381,8 @@ fn camera_follow_system(
         .unwrap_or(soldier_tf.translation + camera_control.current_cursor_lead);
     let target_pos = focus_pos + camera_offset + shake_offset;
 
-    camera_tf.translation = camera_tf
-        .translation
-        .lerp(target_pos, (config.camera.follow_lerp_speed * dt).clamp(0.0, 1.0));
+    let cam_alpha = (1.0 - (-config.camera.follow_lerp_speed * dt).exp()).clamp(0.0, 1.0);
+    camera_tf.translation = camera_tf.translation.lerp(target_pos, cam_alpha);
     camera_tf.look_at(
         focus_pos + shake_offset * config.camera.look_at_shake_factor,
         Vec3::Y,
@@ -10403,6 +10412,24 @@ struct FixedSoldierTransformHistory {
     prev_feet: Vec3,
     curr_feet: Vec3,
     initialized: bool,
+}
+
+fn client_reconcile_fixed_system(
+    config: Res<GameConfig>,
+    prediction: Res<ClientPhysicsPredictionState>,
+    mut soldier_phys_q: Query<&mut Transform, With<PhysicsSoldier>>,
+) {
+    let Some(auth_feet) = prediction.latest_authoritative_feet_pos else {
+        return;
+    };
+    if let Ok(mut phys_tf) = soldier_phys_q.single_mut() {
+        reconcile_soldier_physics_pos(
+            &mut phys_tf,
+            auth_feet,
+            prediction.latest_hero_scale,
+            &config,
+        );
+    }
 }
 
 fn record_soldier_fixed_transform_system(

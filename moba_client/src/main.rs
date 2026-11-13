@@ -13,7 +13,7 @@ use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use bevy::window::{CursorOptions, PresentMode, PrimaryWindow, WindowResolution};
 use moba_shared::{
-    ancient_physics_bundle, center_bridge_physics_bundle, create_shared_renet_client,
+    ancient_physics_bundle, barracks_physics_bundle, center_bridge_physics_bundle, create_shared_renet_client,
     grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
     mountain_physics_bundle, obstacle_physics_bundle, orient_soldier_towards,
     particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
@@ -21,7 +21,7 @@ use moba_shared::{
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
-    ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    AncientSnapshot, BarracksKind, BarracksSnapshot, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
@@ -72,6 +72,7 @@ fn main() {
             hp: h.max_hp,
             max_hp: h.max_hp,
             hp_regen_per_sec: h.hp_regen_per_sec,
+            in_fountain: false,
             armor: h.armor,
             hero_scale: h.hero_scale,
             move_speed: config.soldier.run_speed * h.move_speed_multiplier,
@@ -119,6 +120,9 @@ fn main() {
         .insert_resource(LatestCreeps::default())
         .insert_resource(LatestTopBarState::default())
         .insert_resource(LatestTurrets::default())
+        .insert_resource(LatestBarracks::default())
+        .insert_resource(LatestAncients::default())
+        .insert_resource(LatestMatchResult::default())
         .insert_resource(ClientMatchFlow {
             your_slot: None,
             snapshot: None,
@@ -185,7 +189,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system)
+            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system)
                 .chain()
                 .after(sync_remote_players_system),
         )
@@ -576,6 +580,8 @@ struct ClientRenderState {
     aim_locked_on_enemy: bool,
     hovered_creep_id: Option<u64>,
     hovered_turret_index: Option<usize>,
+    hovered_barracks_index: Option<usize>,
+    hovered_ancient_index: Option<usize>,
     current_locomotion: String,
     previous_lower_anim: String,
     previous_upper_anim: String,
@@ -616,6 +622,8 @@ impl ClientRenderState {
             aim_locked_on_enemy: false,
             hovered_creep_id: None,
             hovered_turret_index: None,
+            hovered_barracks_index: None,
+            hovered_ancient_index: None,
             current_locomotion: "idle".to_string(),
             previous_lower_anim: String::new(),
             previous_upper_anim: String::new(),
@@ -1262,7 +1270,7 @@ fn setup_scene(
     }
 
     // ۹. کریستال‌های باستانی هر دو تیم (Ancients: زمردی در غرب، یاقوتی در شرق)
-    for anc in &config.map.ancients {
+    for (anc_idx, anc) in config.map.ancients.iter().enumerate() {
         let bs = Vec3::new(anc.base_size.0, anc.base_size.1, anc.base_size.2);
         let c = anc.color_rgb;
         let ce = anc.core_emissive_rgb;
@@ -1273,7 +1281,12 @@ fn setup_scene(
         };
 
         let mut anc_cmds = commands.spawn((
-            ancient_physics_bundle(&config, anc),
+            ancient_physics_bundle(&config, anc_idx, anc),
+            AncientVisualRoot {
+                index: anc_idx,
+                is_dead: false,
+                is_highlighted: false,
+            },
             Visibility::Visible,
         ));
 
@@ -1281,11 +1294,13 @@ fn setup_scene(
         let anc_ent = anc_cmds.id();
         if custom_glb_exists(&anc.model_path) {
             anc_cmds.with_children(|parent| {
-                parent.spawn(glb_model_bundle(
+                let mut glb = glb_model_bundle(
                     &asset_server,
                     &anc.model_path,
                     &anc.model_transform,
-                ));
+                );
+                glb.1.translation.y = -anc.core_height * 0.5;
+                parent.spawn(glb);
             });
         } else {
             anc_cmds
@@ -1452,6 +1467,82 @@ fn setup_scene(
                 });
         }
         spawn_map_object_label(&mut commands, config.map.show_object_labels, tur_ent, &tur.id, tur.height * 0.5 + tur.head_radius * 2.0 + 1.0);
+    }
+
+    // ۱۰-ب. ۱۲ باراکس (۲ ساختمان پشت هر تاور Tier 3 در هر لاین)
+    for (b_idx, bar) in config.map.barracks.iter().enumerate() {
+        let bs = Vec3::new(bar.size.0, bar.size.1, bar.size.2);
+        let bc = bar.color_rgb;
+        let ae = bar.accent_emissive_rgb;
+        let mut bar_cmds = commands.spawn((
+            barracks_physics_bundle(&config, b_idx, bar),
+            BarracksVisualRoot {
+                index: b_idx,
+                is_dead: false,
+                is_highlighted: false,
+            },
+            Visibility::Visible,
+        ));
+        bar_cmds.insert(VisionOccludable {
+            is_faded: false,
+            half_extents: bs * 0.5,
+        });
+        let bar_ent = bar_cmds.id();
+        if custom_glb_exists(&bar.model_path) {
+            bar_cmds.with_children(|parent| {
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &bar.model_path,
+                    &bar.model_transform,
+                ));
+            });
+        } else {
+            let accent_col = if bar.team == TeamId::Dawn {
+                Color::srgb(0.20, 0.92, 0.72)
+            } else {
+                Color::srgb(0.98, 0.30, 0.24)
+            };
+            bar_cmds
+                .insert((
+                    Mesh3d(meshes.add(Cuboid::new(bs.x, bs.y, bs.z))),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::srgb(bc.0, bc.1, bc.2),
+                        metallic: 0.25,
+                        perceptual_roughness: 0.65,
+                        ..default()
+                    })),
+                ))
+                .with_children(|parent| {
+                    // سقف/تاج متمایز برای باراکس Melee (زره/سلامت) و Ranged (قدرت آتش)
+                    if bar.kind == BarracksKind::Melee {
+                        parent.spawn((
+                            Mesh3d(meshes.add(Cuboid::new(bs.x * 0.72, bs.y * 0.32, bs.z * 0.72))),
+                            MeshMaterial3d(materials.add(StandardMaterial {
+                                base_color: accent_col,
+                                emissive: LinearRgba::new(ae.0, ae.1, ae.2, 1.0),
+                                perceptual_roughness: 0.35,
+                                ..default()
+                            })),
+                            Transform::from_xyz(0.0, bs.y * 0.62, 0.0),
+                        ));
+                    } else {
+                        parent.spawn((
+                            Mesh3d(meshes.add(Cone {
+                                radius: bs.x * 0.38,
+                                height: bs.y * 0.55,
+                            })),
+                            MeshMaterial3d(materials.add(StandardMaterial {
+                                base_color: accent_col,
+                                emissive: LinearRgba::new(ae.0, ae.1, ae.2, 1.0),
+                                perceptual_roughness: 0.30,
+                                ..default()
+                            })),
+                            Transform::from_xyz(0.0, bs.y * 0.72, 0.0),
+                        ));
+                    }
+                });
+        }
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, bar_ent, &bar.id, bs.y * 0.5 + 1.2);
     }
 
     // ۱۱. کوه‌ها، صخره‌های چندلایه خزه‌دار و باروهای سنگی دور نقشه
@@ -1754,6 +1845,7 @@ fn setup_scene(
     spawn_hero_hud_ui(&mut commands);
     spawn_top_match_hud_ui(&mut commands);
     spawn_death_screen_overlay(&mut commands);
+    spawn_end_of_match_overlay(&mut commands);
     spawn_match_overlay_ui(&mut commands, &config);
     spawn_laser_and_reticle_visuals(
         &mut commands,
@@ -2434,6 +2526,7 @@ fn weapon_live_calibration_system(
 
 fn client_sample_input_system(
     match_flow: Res<ClientMatchFlow>,
+    match_result: Res<LatestMatchResult>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     camera_control: Res<CameraControlState>,
@@ -2442,7 +2535,7 @@ fn client_sample_input_system(
     muzzle_query: Query<&GlobalTransform, With<MuzzlePoint>>,
     mut prediction: ResMut<ClientPhysicsPredictionState>,
 ) {
-    if !match_flow.is_in_game() {
+    if !match_flow.is_in_game() || match_result.0.is_some() {
         return;
     }
     let mut move_vec = Vec3::ZERO;
@@ -2609,6 +2702,8 @@ fn client_receive_snapshot_and_sync_system(
         render_state.aim_locked_on_enemy = snap.aim_locked_on_enemy;
         render_state.hovered_creep_id = snap.hovered_creep_id;
         render_state.hovered_turret_index = snap.hovered_turret_index;
+        render_state.hovered_barracks_index = snap.hovered_barracks_index;
+        render_state.hovered_ancient_index = snap.hovered_ancient_index;
         render_state.current_locomotion = snap.current_locomotion;
         render_state.upper_action = snap.upper_action;
         render_state.traversal_active = snap.traversal_active;
@@ -2622,12 +2717,16 @@ fn client_receive_snapshot_and_sync_system(
         hud_sync.top_bar.match_elapsed_secs = snap.match_elapsed_secs;
         hud_sync.top_bar.heroes = snap.top_bar_heroes.clone();
         hud_sync.turrets.0 = snap.turrets.clone();
+        hud_sync.barracks.0 = snap.barracks.clone();
+        hud_sync.ancients.0 = snap.ancients.clone();
+        hud_sync.match_result.0 = snap.winning_team;
         if let Some(ref mut fow_state) = fow {
             fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
         }
 
         prediction.traversal_active = snap.traversal_active;
         prediction.is_dead = snap.is_dead;
+        prediction.match_ended = snap.winning_team.is_some();
 
         if let Ok(mut soldier_phys_tf) = soldier_physics_query.single_mut() {
             reconcile_soldier_physics_pos(
@@ -4663,6 +4762,18 @@ fn bake_minimap_image(config: &GameConfig) -> Image {
         draw_circle(&mut pixels, loc.0, loc.2, fr, col);
     }
 
+    // ۱۰-ب. باراکس‌ها (Barracks)
+    for bar in &config.map.barracks {
+        let loc = bar.model_transform.location;
+        let col = if bar.team == TeamId::Dawn {
+            [40, 210, 165, 255]
+        } else {
+            [235, 70, 60, 255]
+        };
+        draw_rotated_rect(&mut pixels, loc.0, loc.2, bar.size.0 + 1.4, bar.size.2 + 1.4, 0.0, [15, 18, 22, 255]);
+        draw_rotated_rect(&mut pixels, loc.0, loc.2, bar.size.0, bar.size.2, 0.0, col);
+    }
+
     // ۱۱. برج‌های دفاعی (Turrets)
     for tur in &config.map.turrets {
         let loc = tur.model_transform.location;
@@ -5544,6 +5655,8 @@ fn update_hero_hud_system(
     if let Ok(mut t) = hp_txt_q.single_mut() {
         if h.respawn_remaining > 0.0 {
             **t = format!("DEAD - RESPAWN IN {}s", h.respawn_remaining.ceil() as u32);
+        } else if h.in_fountain {
+            **t = format!("{:.0} / {:.0} (+{:.1}/s) [FOUNTAIN]", h.hp, h.max_hp, h.hp_regen_per_sec);
         } else {
             **t = format!("{:.0} / {:.0} (+{:.1}/s)", h.hp, h.max_hp, h.hp_regen_per_sec);
         }
@@ -5693,6 +5806,15 @@ struct LatestTopBarState {
 #[derive(Resource, Default)]
 struct LatestTurrets(Vec<TurretSnapshot>);
 
+#[derive(Resource, Default)]
+struct LatestBarracks(Vec<BarracksSnapshot>);
+
+#[derive(Resource, Default)]
+struct LatestAncients(Vec<AncientSnapshot>);
+
+#[derive(Resource, Default)]
+struct LatestMatchResult(Option<TeamId>);
+
 #[derive(SystemParam)]
 struct SnapshotHudSyncParams<'w> {
     hero_hud: ResMut<'w, LatestHeroSnapshot>,
@@ -5700,6 +5822,9 @@ struct SnapshotHudSyncParams<'w> {
     creeps: ResMut<'w, LatestCreeps>,
     top_bar: ResMut<'w, LatestTopBarState>,
     turrets: ResMut<'w, LatestTurrets>,
+    barracks: ResMut<'w, LatestBarracks>,
+    ancients: ResMut<'w, LatestAncients>,
+    match_result: ResMut<'w, LatestMatchResult>,
 }
 
 fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
@@ -6666,7 +6791,8 @@ fn sync_lane_creeps_system(
             .as_deref()
             .and_then(|tid| res.config.neutral_camps.creep_types.get(tid))
             .map(|ct| ct.scale)
-            .unwrap_or(res.config.creeps.scale);
+            .unwrap_or(res.config.creeps.scale)
+            * cs.scale_multiplier;
         tf.scale = Vec3::splat(c_scale);
 
         let flat_dir = Vec3::new(cs.facing_dir.x, 0.0, cs.facing_dir.z);
@@ -6768,7 +6894,7 @@ fn sync_lane_creeps_system(
                 is_highlighted: false,
             },
             WorldAssetRoot(scene_h),
-            Transform::from_translation(cs.pos).with_scale(Vec3::splat(c_scale)),
+            Transform::from_translation(cs.pos).with_scale(Vec3::splat(c_scale * cs.scale_multiplier)),
             if cs.is_visible {
                 Visibility::Visible
             } else {
@@ -7798,5 +7924,541 @@ fn update_overhead_turret_bars_system(
                 Color::srgb(0.92, 0.22, 0.20).into()
             };
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// سیستم باراکس‌ها (هایلایت دشمن + حذف پس از تخریب + نوار سلامتی بالای ساختمان)
+// -----------------------------------------------------------------------------
+
+#[derive(Component)]
+struct BarracksVisualRoot {
+    index: usize,
+    is_dead: bool,
+    is_highlighted: bool,
+}
+
+#[derive(Component)]
+struct BarracksSavedMaterial(Handle<StandardMaterial>);
+
+#[derive(Component)]
+struct OverheadBarracksBarRoot {
+    barracks_index: usize,
+}
+
+#[derive(Component)]
+struct OverheadBarracksHpFill {
+    barracks_index: usize,
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn sync_barracks_system(
+    mut commands: Commands,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    latest_barracks: Res<LatestBarracks>,
+    children_query: Query<&Children>,
+    mut root_q: Query<(Entity, &mut BarracksVisualRoot)>,
+    mut mat_mesh_q: Query<(&mut MeshMaterial3d<StandardMaterial>, Option<&BarracksSavedMaterial>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if !match_flow.is_in_game() {
+        return;
+    }
+
+    for (root_ent, mut root_comp) in &mut root_q {
+        let Some(bs) = latest_barracks.0.get(root_comp.index) else {
+            continue;
+        };
+        if bs.is_dead {
+            root_comp.is_dead = true;
+            commands.entity(root_ent).despawn();
+            continue;
+        }
+
+        let should_highlight = !bs.is_dead && render_state.hovered_barracks_index == Some(root_comp.index);
+        if root_comp.is_highlighted != should_highlight {
+            let tint = config.fx.turret_hovered_tint_emissive_rgb;
+            let mut apply_tint = |ent: Entity| {
+                let Ok((mut mat_comp, saved_opt)) = mat_mesh_q.get_mut(ent) else {
+                    return;
+                };
+                if should_highlight {
+                    if saved_opt.is_none() {
+                        let orig_h = mat_comp.0.clone();
+                        if let Some(mut cloned) = materials.get(&orig_h).cloned() {
+                            cloned.emissive = LinearRgba::new(tint.0, tint.1, tint.2, 1.0);
+                            cloned.base_color = cloned.base_color.mix(&Color::srgb(1.0, 0.35, 0.30), 0.30);
+                            mat_comp.0 = materials.add(cloned);
+                            commands.entity(ent).insert(BarracksSavedMaterial(orig_h));
+                        }
+                    }
+                } else if let Some(saved) = saved_opt {
+                    mat_comp.0 = saved.0.clone();
+                    commands.entity(ent).remove::<BarracksSavedMaterial>();
+                }
+            };
+            apply_tint(root_ent);
+            for desc in children_query.iter_descendants(root_ent) {
+                apply_tint(desc);
+            }
+            root_comp.is_highlighted = should_highlight;
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn update_overhead_barracks_bars_system(
+    mut commands: Commands,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    latest_barracks: Res<LatestBarracks>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut bar_root_q: Query<(Entity, &OverheadBarracksBarRoot, &mut Node, &mut BorderColor)>,
+    mut bar_fill_q: Query<
+        (&OverheadBarracksHpFill, &mut Node, &mut BackgroundColor),
+        Without<OverheadBarracksBarRoot>,
+    >,
+) {
+    if !match_flow.is_in_game() {
+        for (_, _, mut node, _) in &mut bar_root_q {
+            node.display = Display::None;
+        }
+        return;
+    }
+
+    let Ok((camera, cam_gtf)) = camera_query.single() else {
+        return;
+    };
+    let my_team = hero_hud.0.team;
+
+    for bs in &latest_barracks.0 {
+        let mut found_ent = None;
+        for (ent, root, _, _) in &bar_root_q {
+            if root.barracks_index == bs.index {
+                found_ent = Some(ent);
+                break;
+            }
+        }
+        if found_ent.is_none() && !bs.is_dead {
+            let bidx = bs.index;
+            commands
+                .spawn((
+                    OverheadBarracksBarRoot { barracks_index: bidx },
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        width: px(92.0),
+                        height: px(9.0),
+                        border: UiRect::all(px(1.5)),
+                        border_radius: BorderRadius::all(px(3.0)),
+                        overflow: Overflow::clip(),
+                        display: Display::None,
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.10, 0.12, 0.16, 0.9)),
+                    BackgroundColor(Color::srgba(0.06, 0.07, 0.10, 0.85)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        OverheadBarracksHpFill { barracks_index: bidx },
+                        Pickable::IGNORE,
+                        Node {
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.16, 0.82, 0.36)),
+                    ));
+                });
+        }
+    }
+
+    for (_, root, mut node, mut border) in &mut bar_root_q {
+        let Some(bs) = latest_barracks.0.get(root.barracks_index) else {
+            node.display = Display::None;
+            continue;
+        };
+        if bs.is_dead {
+            node.display = Display::None;
+            continue;
+        }
+        let b_def = &config.map.barracks[bs.index];
+        let scaled_h = b_def.size.1 * b_def.model_transform.scale_vec().y;
+        let world_head = b_def.model_transform.location_vec() + Vec3::Y * (scaled_h + 1.4);
+        if let Ok(sp) = camera.world_to_viewport(cam_gtf, world_head) {
+            node.display = Display::Flex;
+            node.left = px(sp.x - 46.0);
+            node.top = px(sp.y - 16.0);
+            *border = if bs.is_invulnerable {
+                BorderColor::all(Color::srgb(0.45, 0.78, 1.0))
+            } else {
+                BorderColor::all(Color::srgba(0.08, 0.10, 0.14, 0.92))
+            };
+        } else {
+            node.display = Display::None;
+        }
+    }
+
+    for (fill, mut fnode, mut fbg) in &mut bar_fill_q {
+        if let Some(bs) = latest_barracks.0.get(fill.barracks_index) {
+            let pct = ((bs.hp / bs.max_hp.max(1.0)) * 100.0).clamp(0.0, 100.0);
+            fnode.width = percent(pct);
+            *fbg = if bs.team == my_team {
+                Color::srgb(0.16, 0.82, 0.36).into()
+            } else {
+                Color::srgb(0.92, 0.22, 0.20).into()
+            };
+        }
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// سیستم ساختمان اصلی (Ancient) و صفحه افکت‌پرداز پایان بازی (Victory / Defeat)
+// -----------------------------------------------------------------------------
+
+#[derive(Component)]
+struct AncientVisualRoot {
+    index: usize,
+    is_dead: bool,
+    is_highlighted: bool,
+}
+
+#[derive(Component)]
+struct AncientSavedMaterial(Handle<StandardMaterial>);
+
+#[derive(Component)]
+struct OverheadAncientBarRoot {
+    ancient_index: usize,
+}
+
+#[derive(Component)]
+struct OverheadAncientHpFill {
+    ancient_index: usize,
+}
+
+#[derive(Component)]
+struct EndOfMatchOverlayRoot;
+
+#[derive(Component)]
+struct EndOfMatchBannerCard;
+
+#[derive(Component)]
+struct EndOfMatchTitleText;
+
+#[derive(Component)]
+struct EndOfMatchSubtitleText;
+
+#[derive(Component)]
+struct EndOfMatchStatsText;
+
+fn spawn_end_of_match_overlay(commands: &mut Commands) {
+    commands
+        .spawn((
+            EndOfMatchOverlayRoot,
+            Pickable::IGNORE,
+            GlobalZIndex(250),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: percent(100),
+                height: percent(100),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.02, 0.03, 0.05, 0.72)),
+        ))
+        .with_children(|root| {
+            root.spawn((
+                EndOfMatchBannerCard,
+                Pickable::IGNORE,
+                Node {
+                    width: px(540.0),
+                    padding: UiRect::all(px(32.0)),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: px(14.0),
+                    border: UiRect::all(px(3.0)),
+                    border_radius: BorderRadius::all(px(16.0)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgb(0.95, 0.80, 0.25)),
+                BackgroundColor(Color::srgba(0.05, 0.08, 0.12, 0.94)),
+            ))
+            .with_children(|card| {
+                card.spawn((
+                    EndOfMatchTitleText,
+                    Text::new("VICTORY"),
+                    TextFont {
+                        font_size: FontSize::Px(54.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.25, 0.98, 0.65)),
+                ));
+                card.spawn((
+                    EndOfMatchSubtitleText,
+                    Text::new("TEAM DAWN VICTORY"),
+                    TextFont {
+                        font_size: FontSize::Px(20.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.92, 0.95, 1.0)),
+                ));
+                card.spawn((
+                    EndOfMatchStatsText,
+                    Text::new(""),
+                    TextFont {
+                        font_size: FontSize::Px(15.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.80, 0.86, 0.92)),
+                ));
+            });
+        });
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn sync_ancients_system(
+    mut commands: Commands,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    latest_ancients: Res<LatestAncients>,
+    children_query: Query<&Children>,
+    mut root_q: Query<(Entity, &mut AncientVisualRoot)>,
+    mut mat_mesh_q: Query<(&mut MeshMaterial3d<StandardMaterial>, Option<&AncientSavedMaterial>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if !match_flow.is_in_game() {
+        return;
+    }
+
+    for (root_ent, mut root_comp) in &mut root_q {
+        let Some(asnap) = latest_ancients.0.get(root_comp.index) else {
+            continue;
+        };
+        if asnap.is_dead {
+            root_comp.is_dead = true;
+            commands.entity(root_ent).despawn();
+            continue;
+        }
+
+        let should_highlight = !asnap.is_dead && render_state.hovered_ancient_index == Some(root_comp.index);
+        if root_comp.is_highlighted != should_highlight {
+            let tint = config.fx.turret_hovered_tint_emissive_rgb;
+            let mut apply_tint = |ent: Entity| {
+                let Ok((mut mat_comp, saved_opt)) = mat_mesh_q.get_mut(ent) else {
+                    return;
+                };
+                if should_highlight {
+                    if saved_opt.is_none() {
+                        let orig_h = mat_comp.0.clone();
+                        if let Some(mut cloned) = materials.get(&orig_h).cloned() {
+                            cloned.emissive = LinearRgba::new(tint.0, tint.1, tint.2, 1.0);
+                            cloned.base_color = cloned.base_color.mix(&Color::srgb(1.0, 0.35, 0.30), 0.30);
+                            mat_comp.0 = materials.add(cloned);
+                            commands.entity(ent).insert(AncientSavedMaterial(orig_h));
+                        }
+                    }
+                } else if let Some(saved) = saved_opt {
+                    mat_comp.0 = saved.0.clone();
+                    commands.entity(ent).remove::<AncientSavedMaterial>();
+                }
+            };
+            apply_tint(root_ent);
+            for desc in children_query.iter_descendants(root_ent) {
+                apply_tint(desc);
+            }
+            root_comp.is_highlighted = should_highlight;
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn update_overhead_ancients_bars_system(
+    mut commands: Commands,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    latest_ancients: Res<LatestAncients>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut bar_root_q: Query<(Entity, &OverheadAncientBarRoot, &mut Node, &mut BorderColor)>,
+    mut bar_fill_q: Query<
+        (&OverheadAncientHpFill, &mut Node, &mut BackgroundColor),
+        Without<OverheadAncientBarRoot>,
+    >,
+) {
+    if !match_flow.is_in_game() {
+        for (_, _, mut node, _) in &mut bar_root_q {
+            node.display = Display::None;
+        }
+        return;
+    }
+
+    let Ok((camera, cam_gtf)) = camera_query.single() else {
+        return;
+    };
+    let my_team = hero_hud.0.team;
+
+    for asnap in &latest_ancients.0 {
+        let mut found_ent = None;
+        for (ent, root, _, _) in &bar_root_q {
+            if root.ancient_index == asnap.index {
+                found_ent = Some(ent);
+                break;
+            }
+        }
+        if found_ent.is_none() && !asnap.is_dead {
+            let aidx = asnap.index;
+            commands
+                .spawn((
+                    OverheadAncientBarRoot { ancient_index: aidx },
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        width: px(136.0),
+                        height: px(12.0),
+                        border: UiRect::all(px(2.0)),
+                        border_radius: BorderRadius::all(px(4.0)),
+                        overflow: Overflow::clip(),
+                        display: Display::None,
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.10, 0.12, 0.16, 0.95)),
+                    BackgroundColor(Color::srgba(0.06, 0.07, 0.10, 0.88)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        OverheadAncientHpFill { ancient_index: aidx },
+                        Pickable::IGNORE,
+                        Node {
+                            width: percent(100),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.16, 0.82, 0.36)),
+                    ));
+                });
+        }
+    }
+
+    for (_, root, mut node, mut border) in &mut bar_root_q {
+        let Some(asnap) = latest_ancients.0.get(root.ancient_index) else {
+            node.display = Display::None;
+            continue;
+        };
+        if asnap.is_dead {
+            node.display = Display::None;
+            continue;
+        }
+        let a_def = &config.map.ancients[asnap.index];
+        let scaled_h = (a_def.base_size.1 + a_def.core_height * 0.30) * a_def.model_transform.scale_vec().y;
+        let world_head = a_def.model_transform.location_vec() + Vec3::Y * scaled_h;
+        if let Ok(sp) = camera.world_to_viewport(cam_gtf, world_head) {
+            node.display = Display::Flex;
+            node.left = px(sp.x - 68.0);
+            node.top = px(sp.y - 18.0);
+            *border = if asnap.is_invulnerable {
+                BorderColor::all(Color::srgb(0.45, 0.78, 1.0))
+            } else {
+                BorderColor::all(Color::srgba(0.95, 0.82, 0.30, 0.95))
+            };
+        } else {
+            node.display = Display::None;
+        }
+    }
+
+    for (fill, mut fnode, mut fbg) in &mut bar_fill_q {
+        if let Some(asnap) = latest_ancients.0.get(fill.ancient_index) {
+            let pct = ((asnap.hp / asnap.max_hp.max(1.0)) * 100.0).clamp(0.0, 100.0);
+            fnode.width = percent(pct);
+            *fbg = if asnap.team == my_team {
+                Color::srgb(0.16, 0.82, 0.36).into()
+            } else {
+                Color::srgb(0.92, 0.22, 0.20).into()
+            };
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn end_of_match_overlay_system(
+    time: Res<Time>,
+    match_flow: Res<ClientMatchFlow>,
+    match_result: Res<LatestMatchResult>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    top_bar: Res<LatestTopBarState>,
+    mut root_q: Query<(&mut Node, &mut BackgroundColor), With<EndOfMatchOverlayRoot>>,
+    mut card_q: Query<(&mut BorderColor, &mut BackgroundColor), (With<EndOfMatchBannerCard>, Without<EndOfMatchOverlayRoot>)>,
+    mut title_q: Query<(&mut Text, &mut TextColor), With<EndOfMatchTitleText>>,
+    mut sub_q: Query<&mut Text, (With<EndOfMatchSubtitleText>, Without<EndOfMatchTitleText>)>,
+    mut stats_q: Query<&mut Text, (With<EndOfMatchStatsText>, Without<EndOfMatchTitleText>, Without<EndOfMatchSubtitleText>)>,
+) {
+    let Ok((mut root_node, mut root_bg)) = root_q.single_mut() else {
+        return;
+    };
+    let Some(winner) = match_result.0 else {
+        root_node.display = Display::None;
+        return;
+    };
+    if !match_flow.is_in_game() {
+        root_node.display = Display::None;
+        return;
+    }
+
+    root_node.display = Display::Flex;
+    let is_victory = winner == hero_hud.0.team;
+    let pulse = (time.elapsed_secs() * 3.2).sin() * 0.5 + 0.5;
+    *root_bg = BackgroundColor(Color::srgba(0.02, 0.03, 0.05, 0.68 + pulse * 0.10));
+
+    if let Ok((mut border, mut card_bg)) = card_q.single_mut() {
+        if is_victory {
+            *border = BorderColor::all(Color::srgb(0.25 + pulse * 0.45, 0.95, 0.55));
+            *card_bg = BackgroundColor(Color::srgba(0.04, 0.14, 0.10, 0.95));
+        } else {
+            *border = BorderColor::all(Color::srgb(0.95, 0.20 + pulse * 0.25, 0.20));
+            *card_bg = BackgroundColor(Color::srgba(0.16, 0.04, 0.05, 0.95));
+        }
+    }
+
+    if let Ok((mut t, mut col)) = title_q.single_mut() {
+        if is_victory {
+            **t = "VICTORY".to_string();
+            *col = TextColor(Color::srgb(0.30, 0.98, 0.65));
+        } else {
+            **t = "DEFEAT".to_string();
+            *col = TextColor(Color::srgb(1.0, 0.30, 0.28));
+        }
+    }
+
+    if let Ok(mut sub) = sub_q.single_mut() {
+        **sub = format!("{:?} TEAM WINS — ENEMY ANCIENT DESTROYED", winner);
+    }
+
+    if let Ok(mut stats) = stats_q.single_mut() {
+        let total_secs = top_bar.match_elapsed_secs.max(0.0) as u32;
+        let h = &hero_hud.0;
+        **stats = format!(
+            "Time {:02}:{:02}  |  LVL {}  |  K {} / D {} / A {}  |  LH {}  DN {}  |  Gold {}",
+            total_secs / 60,
+            total_secs % 60,
+            h.level,
+            h.kills,
+            h.deaths,
+            h.assists,
+            h.last_hits,
+            h.denies,
+            h.gold
+        );
     }
 }

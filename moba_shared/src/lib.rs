@@ -48,6 +48,9 @@ impl GameConfig {
             )
         });
         cfg.validate_unique_map_ids();
+        cfg.validate_fountains();
+        cfg.validate_barracks();
+        cfg.validate_ancients();
         cfg.validate_heroes();
         cfg.validate_creeps();
         cfg.validate_neutral_camps();
@@ -154,6 +157,71 @@ impl GameConfig {
         );
     }
 
+    pub fn validate_ancients(&self) {
+        assert!(
+            self.map.ancients.len() == 2,
+            "خطای بحرانی کانفیگ: map.ancients باید دقیقاً شامل ۲ ساختمان اصلی (Dawn و Dusk) باشد!"
+        );
+        let mut has_dawn = false;
+        let mut has_dusk = false;
+        for a in &self.map.ancients {
+            assert!(a.team != TeamId::Neutral, "تیم Ancient '{}' نمی‌تواند Neutral باشد!", a.id);
+            assert!(a.max_hp > 0.0, "max_hp ساختمان اصلی '{}' باید بزرگ‌تر از صفر باشد!", a.id);
+            assert!(a.armor >= 0.0, "armor ساختمان اصلی '{}' نمی‌تواند منفی باشد!", a.id);
+            if a.team == TeamId::Dawn {
+                has_dawn = true;
+            } else if a.team == TeamId::Dusk {
+                has_dusk = true;
+            }
+        }
+        assert!(has_dawn && has_dusk, "هر دو تیم Dawn و Dusk باید Ancient داشته باشند!");
+    }
+
+    pub fn validate_barracks(&self) {
+        assert!(
+            !self.map.barracks.is_empty(),
+            "خطای بحرانی کانفیگ: لیست map.barracks خالی است!"
+        );
+        let bb = &self.map.barracks_buffs;
+        assert!(bb.melee_destroyed_hp_multiplier >= 1.0, "melee_destroyed_hp_multiplier باید >= 1.0 باشد");
+        assert!(bb.melee_destroyed_scale_multiplier >= 1.0, "melee_destroyed_scale_multiplier باید >= 1.0 باشد");
+        assert!(bb.melee_destroyed_armor_bonus >= 0.0, "melee_destroyed_armor_bonus باید >= 0.0 باشد");
+        assert!(bb.ranged_destroyed_damage_multiplier >= 1.0, "ranged_destroyed_damage_multiplier باید >= 1.0 باشد");
+        assert!(
+            bb.ranged_destroyed_fire_rate_multiplier > 0.0 && bb.ranged_destroyed_fire_rate_multiplier <= 1.0,
+            "ranged_destroyed_fire_rate_multiplier باید بین (0.0, 1.0] باشد"
+        );
+        for b in &self.map.barracks {
+            assert!(b.team != TeamId::Neutral, "تیم باراکس '{}' نمی‌تواند Neutral باشد!", b.id);
+            assert!(b.size.0 > 0.0 && b.size.1 > 0.0 && b.size.2 > 0.0, "اندازه باراکس '{}' نامعتبر است!", b.id);
+            assert!(b.max_hp > 0.0, "max_hp باراکس '{}' باید بزرگ‌تر از صفر باشد!", b.id);
+        }
+    }
+
+    pub fn validate_fountains(&self) {
+        assert!(
+            !self.map.fountains.is_empty(),
+            "خطای بحرانی کانفیگ: لیست map.fountains خالی است!"
+        );
+        for ftn in &self.map.fountains {
+            assert!(
+                ftn.team != TeamId::Neutral,
+                "خطای بحرانی کانفیگ: تیم چشمه '{}' نمی‌تواند Neutral باشد!",
+                ftn.id
+            );
+            assert!(
+                ftn.heal_radius > 0.0,
+                "خطای بحرانی کانفیگ: heal_radius چشمه '{}' باید بزرگ‌تر از صفر باشد!",
+                ftn.id
+            );
+            assert!(
+                ftn.heal_per_sec > 0.0,
+                "خطای بحرانی کانفیگ: heal_per_sec چشمه '{}' باید بزرگ‌تر از صفر باشد!",
+                ftn.id
+            );
+        }
+    }
+
     pub fn active_hero(&self, index: usize) -> &HeroDef {
         self.heroes.get(index).unwrap_or_else(|| {
             panic!(
@@ -200,6 +268,9 @@ impl GameConfig {
         }
         for item in &self.map.turrets {
             check_id(&item.id, "map.turrets");
+        }
+        for item in &self.map.barracks {
+            check_id(&item.id, "map.barracks");
         }
         for item in &self.map.mountains {
             check_id(&item.id, "map.mountains");
@@ -873,6 +944,8 @@ pub struct MapConfig {
     pub fountains: Vec<FountainDef>,
     pub ancients: Vec<AncientDef>,
     pub turrets: Vec<TurretDef>,
+    pub barracks_buffs: BarracksBuffConfig,
+    pub barracks: Vec<BarracksDef>,
     pub mountains: Vec<MountainDef>,
     pub trees: Vec<TreeDef>,
     pub lanes: Vec<LanePathDef>,
@@ -961,8 +1034,43 @@ pub struct AncientDef {
     pub core_radius: f32,
     pub core_height: f32,
     pub max_hp: f32,
+    pub armor: f32,
+    pub backdoor_protection_requires_creeps: bool,
     pub color_rgb: (f32, f32, f32),
     pub core_emissive_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BarracksKind {
+    Melee,
+    Ranged,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BarracksBuffConfig {
+    pub melee_destroyed_hp_multiplier: f32,
+    pub melee_destroyed_scale_multiplier: f32,
+    pub melee_destroyed_armor_bonus: f32,
+    pub ranged_destroyed_damage_multiplier: f32,
+    pub ranged_destroyed_fire_rate_multiplier: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BarracksDef {
+    pub id: String,
+    pub model_path: String,
+    pub model_transform: ModelTransformConfig,
+    pub team: TeamId,
+    pub lane: LaneId,
+    pub kind: BarracksKind,
+    pub size: (f32, f32, f32),
+    pub max_hp: f32,
+    pub armor: f32,
+    pub gold_bounty: u32,
+    pub xp_bounty: u32,
+    pub backdoor_protection_requires_creeps: bool,
+    pub color_rgb: (f32, f32, f32),
+    pub accent_emissive_rgb: (f32, f32, f32),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1207,9 +1315,32 @@ pub struct CreepSnapshot {
     pub hp: f32,
     pub max_hp: f32,
     pub anim_state: CreepAnimState,
+    pub scale_multiplier: f32,
     pub is_dead: bool,
     pub is_deniable: bool,
     pub is_visible: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AncientSnapshot {
+    pub index: usize,
+    pub team: TeamId,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub is_dead: bool,
+    pub is_invulnerable: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BarracksSnapshot {
+    pub index: usize,
+    pub team: TeamId,
+    pub lane: LaneId,
+    pub kind: BarracksKind,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub is_dead: bool,
+    pub is_invulnerable: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1577,6 +1708,7 @@ pub struct HeroSnapshot {
     pub hp: f32,
     pub max_hp: f32,
     pub hp_regen_per_sec: f32,
+    pub in_fountain: bool,
     pub armor: f32,
     pub hero_scale: f32,
     pub move_speed: f32,
@@ -1644,6 +1776,9 @@ pub struct ServerWorldSnapshot {
     pub aim_locked_on_enemy: bool,
     pub hovered_creep_id: Option<u64>,
     pub hovered_turret_index: Option<usize>,
+    pub hovered_barracks_index: Option<usize>,
+    pub hovered_ancient_index: Option<usize>,
+    pub winning_team: Option<TeamId>,
     pub current_locomotion: String,
     pub upper_action: UpperBodyAction,
     pub traversal_active: bool,
@@ -1660,6 +1795,8 @@ pub struct ServerWorldSnapshot {
     pub targets: Vec<TargetSnapshot>,
     pub creeps: Vec<CreepSnapshot>,
     pub turrets: Vec<TurretSnapshot>,
+    pub barracks: Vec<BarracksSnapshot>,
+    pub ancients: Vec<AncientSnapshot>,
     pub fx_events: Vec<GameplayFxEvent>,
 }
 
@@ -2876,8 +3013,18 @@ pub struct PhysicsTurret {
 }
 
 #[derive(Component)]
+pub struct PhysicsBarracks {
+    pub id: String,
+    pub index: usize,
+    pub team: TeamId,
+    pub lane: LaneId,
+    pub kind: BarracksKind,
+}
+
+#[derive(Component)]
 pub struct PhysicsAncient {
     pub id: String,
+    pub index: usize,
     pub team: TeamId,
 }
 
@@ -3200,8 +3347,50 @@ pub fn turret_physics_bundle(
     )
 }
 
+pub fn barracks_physics_bundle(
+    config: &GameConfig,
+    index: usize,
+    barrack: &BarracksDef,
+) -> (
+    MapObjectId,
+    PhysicsBarracks,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
+    CollisionGroups,
+    Transform,
+) {
+    let mut tf = barrack.model_transform.to_transform();
+    let s = tf.scale;
+    let half = Vec3::new(
+        barrack.size.0 * 0.5 * s.x,
+        barrack.size.1 * 0.5 * s.y,
+        barrack.size.2 * 0.5 * s.z,
+    );
+    tf.translation.y += half.y;
+    (
+        MapObjectId(barrack.id.clone()),
+        PhysicsBarracks {
+            id: barrack.id.clone(),
+            index,
+            team: barrack.team,
+            lane: barrack.lane,
+            kind: barrack.kind,
+        },
+        CustomRigidBody::Fixed,
+        CustomCollider::cuboid(half.x, half.y, half.z),
+        SurfaceMaterial {
+            friction: config.physics.obstacle_friction,
+            restitution: config.physics.obstacle_restitution,
+        },
+        world_collision_groups(),
+        tf,
+    )
+}
+
 pub fn ancient_physics_bundle(
     config: &GameConfig,
+    index: usize,
     ancient: &AncientDef,
 ) -> (
     MapObjectId,
@@ -3216,7 +3405,7 @@ pub fn ancient_physics_bundle(
     let s = tf.scale;
     let half = Vec3::new(
         ancient.base_size.0 * 0.5 * s.x,
-        ancient.base_size.1 * 0.5 * s.y,
+        (ancient.base_size.1 + ancient.core_height) * 0.5 * s.y,
         ancient.base_size.2 * 0.5 * s.z,
     );
     tf.translation.y += half.y;
@@ -3224,6 +3413,7 @@ pub fn ancient_physics_bundle(
         MapObjectId(ancient.id.clone()),
         PhysicsAncient {
             id: ancient.id.clone(),
+            index,
             team: ancient.team,
         },
         CustomRigidBody::Fixed,
@@ -3708,6 +3898,12 @@ impl SharedFogOfWar {
                 allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), tur.attack_range + 4.0));
             }
         }
+        for bar in &config.map.barracks {
+            if bar.team == hero_team {
+                let loc = bar.model_transform.location;
+                allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), 20.0));
+            }
+        }
 
         Self {
             terrain_y,
@@ -3871,6 +4067,36 @@ pub struct LaneCreepState {
 }
 
 #[derive(Clone, Debug)]
+pub struct AncientState {
+    pub index: usize,
+    pub id: String,
+    pub team: TeamId,
+    pub pos: Vec3,
+    pub height: f32,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub armor: f32,
+    pub is_dead: bool,
+    pub is_invulnerable: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct BarracksState {
+    pub index: usize,
+    pub id: String,
+    pub team: TeamId,
+    pub lane: LaneId,
+    pub kind: BarracksKind,
+    pub pos: Vec3,
+    pub height: f32,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub armor: f32,
+    pub is_dead: bool,
+    pub is_invulnerable: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct TurretState {
     pub index: usize,
     pub id: String,
@@ -3917,6 +4143,7 @@ pub struct ClientPhysicsPredictionState {
     pub traversal_active: bool,
     pub effective_stance: Stance,
     pub is_dead: bool,
+    pub match_ended: bool,
 }
 
 impl ClientPhysicsPredictionState {
@@ -3926,6 +4153,7 @@ impl ClientPhysicsPredictionState {
             traversal_active: false,
             effective_stance: Stance::Run,
             is_dead: false,
+            match_ended: false,
         }
     }
 }
@@ -3947,6 +4175,8 @@ pub struct PlayerSlotState {
     pub aim_locked_on_enemy: bool,
     pub hovered_creep_id: Option<u64>,
     pub hovered_turret_index: Option<usize>,
+    pub hovered_barracks_index: Option<usize>,
+    pub hovered_ancient_index: Option<usize>,
     pub is_moving: bool,
     pub move_input: Vec3,
     pub fire_cooldown_remaining: f32,
@@ -4010,6 +4240,8 @@ pub struct AuthoritativeWorldState {
     pub aim_locked_on_enemy: bool,
     pub hovered_creep_id: Option<u64>,
     pub hovered_turret_index: Option<usize>,
+    pub hovered_barracks_index: Option<usize>,
+    pub hovered_ancient_index: Option<usize>,
     pub is_moving: bool,
     pub move_input: Vec3,
     pub fire_cooldown_remaining: f32,
@@ -4053,6 +4285,9 @@ pub struct AuthoritativeWorldState {
     pub targets_visible: Vec<bool>,
     pub creeps: Vec<LaneCreepState>,
     pub turrets: Vec<TurretState>,
+    pub barracks: Vec<BarracksState>,
+    pub ancients: Vec<AncientState>,
+    pub winning_team: Option<TeamId>,
     pub match_elapsed_secs: f32,
     pub next_wave_time_secs: f32,
     pub next_camp_spawn_time_secs: f32,
@@ -4113,6 +4348,8 @@ impl AuthoritativeWorldState {
             aim_locked_on_enemy: false,
             hovered_creep_id: None,
             hovered_turret_index: None,
+            hovered_barracks_index: None,
+            hovered_ancient_index: None,
             is_moving: false,
             move_input: Vec3::ZERO,
             fire_cooldown_remaining: 0.0,
@@ -4191,6 +4428,45 @@ impl AuthoritativeWorldState {
                     aim_target_pos: None,
                 })
                 .collect(),
+            barracks: config
+                .map
+                .barracks
+                .iter()
+                .enumerate()
+                .map(|(index, b)| BarracksState {
+                    index,
+                    id: b.id.clone(),
+                    team: b.team,
+                    lane: b.lane,
+                    kind: b.kind,
+                    pos: b.model_transform.location_vec(),
+                    height: b.size.1 * b.model_transform.scale_vec().y,
+                    hp: b.max_hp,
+                    max_hp: b.max_hp,
+                    armor: b.armor,
+                    is_dead: false,
+                    is_invulnerable: true,
+                })
+                .collect(),
+            ancients: config
+                .map
+                .ancients
+                .iter()
+                .enumerate()
+                .map(|(index, a)| AncientState {
+                    index,
+                    id: a.id.clone(),
+                    team: a.team,
+                    pos: a.model_transform.location_vec(),
+                    height: (a.base_size.1 + a.core_height) * a.model_transform.scale_vec().y,
+                    hp: a.max_hp,
+                    max_hp: a.max_hp,
+                    armor: a.armor,
+                    is_dead: false,
+                    is_invulnerable: true,
+                })
+                .collect(),
+            winning_team: None,
             match_elapsed_secs: 0.0,
             next_wave_time_secs: config.creeps.first_wave_delay_secs,
             next_camp_spawn_time_secs: config.neutral_camps.first_spawn_delay_secs,
@@ -4236,6 +4512,8 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.aim_locked_on_enemy, &mut p.aim_locked_on_enemy);
         std::mem::swap(&mut self.hovered_creep_id, &mut p.hovered_creep_id);
         std::mem::swap(&mut self.hovered_turret_index, &mut p.hovered_turret_index);
+        std::mem::swap(&mut self.hovered_barracks_index, &mut p.hovered_barracks_index);
+        std::mem::swap(&mut self.hovered_ancient_index, &mut p.hovered_ancient_index);
         std::mem::swap(&mut self.is_moving, &mut p.is_moving);
         std::mem::swap(&mut self.move_input, &mut p.move_input);
         std::mem::swap(&mut self.fire_cooldown_remaining, &mut p.fire_cooldown_remaining);
@@ -4362,6 +4640,8 @@ impl AuthoritativeWorldState {
                 aim_locked_on_enemy: false,
                 hovered_creep_id: None,
                 hovered_turret_index: None,
+            hovered_barracks_index: None,
+            hovered_ancient_index: None,
                 is_moving: false,
                 move_input: Vec3::ZERO,
                 fire_cooldown_remaining: 0.0,
@@ -4517,6 +4797,13 @@ impl AuthoritativeWorldState {
                     hp: c.hp,
                     max_hp: c.max_hp,
                     anim_state: c.anim_state,
+                    scale_multiplier: lane_creep_buffs(
+                        config,
+                        &self.barracks,
+                        c.team,
+                        c.lane,
+                        c.camp_index.is_none(),
+                    ).1,
                     is_dead: c.is_dead,
                     is_deniable: !c.is_dead
                         && c.team == self.hero_team
@@ -4565,6 +4852,9 @@ impl AuthoritativeWorldState {
             aim_locked_on_enemy: self.aim_locked_on_enemy,
             hovered_creep_id: self.hovered_creep_id,
             hovered_turret_index: self.hovered_turret_index,
+            hovered_barracks_index: self.hovered_barracks_index,
+            hovered_ancient_index: self.hovered_ancient_index,
+            winning_team: self.winning_team,
             current_locomotion: self.current_locomotion.clone(),
             upper_action: self.upper_body_action(),
             traversal_active: self.traversal.is_active,
@@ -4595,7 +4885,16 @@ impl AuthoritativeWorldState {
                 xp_gain_radius: self.hero_xp_gain_radius,
                 hp: self.hero_hp,
                 max_hp: self.hero_max_hp,
-                hp_regen_per_sec: self.hero_hp_regen_per_sec,
+                hp_regen_per_sec: {
+                    let fountain_bonus = if self.is_dead {
+                        0.0
+                    } else {
+                        fountain_regen_bonus_for_pos(config, self.hero_team, self.soldier_pos)
+                    };
+                    self.hero_hp_regen_per_sec + fountain_bonus
+                },
+                in_fountain: !self.is_dead
+                    && fountain_regen_bonus_for_pos(config, self.hero_team, self.soldier_pos) > 0.0,
                 armor: self.hero_armor,
                 hero_scale: self.hero_scale,
                 move_speed: self.current_move_speed,
@@ -4632,6 +4931,32 @@ impl AuthoritativeWorldState {
                     is_dead: t.is_dead,
                     is_invulnerable: t.is_invulnerable,
                     aim_target_pos: t.aim_target_pos,
+                })
+                .collect(),
+            barracks: self
+                .barracks
+                .iter()
+                .map(|b| BarracksSnapshot {
+                    index: b.index,
+                    team: b.team,
+                    lane: b.lane,
+                    kind: b.kind,
+                    hp: b.hp,
+                    max_hp: b.max_hp,
+                    is_dead: b.is_dead,
+                    is_invulnerable: b.is_invulnerable,
+                })
+                .collect(),
+            ancients: self
+                .ancients
+                .iter()
+                .map(|a| AncientSnapshot {
+                    index: a.index,
+                    team: a.team,
+                    hp: a.hp,
+                    max_hp: a.max_hp,
+                    is_dead: a.is_dead,
+                    is_invulnerable: a.is_invulnerable,
                 })
                 .collect(),
             targets: self
@@ -4743,6 +5068,24 @@ pub fn reconcile_soldier_physics_pos(
     }
 }
 
+
+/// محاسبه بونوس بازسازی سلامتی در چشمه پایگاه تیم خودی بر اساس config.ron
+pub fn fountain_regen_bonus_for_pos(config: &GameConfig, team: TeamId, pos: Vec3) -> f32 {
+    if team == TeamId::Neutral {
+        return 0.0;
+    }
+    let mut best_bonus = 0.0_f32;
+    for ftn in &config.map.fountains {
+        if ftn.team != team {
+            continue;
+        }
+        let ftn_pos = ftn.model_transform.location_vec();
+        if pos.distance(ftn_pos) <= ftn.heal_radius {
+            best_bonus = best_bonus.max(ftn.heal_per_sec);
+        }
+    }
+    best_bonus
+}
 
 pub fn grant_xp_to_player_slot(
     p: &mut PlayerSlotState,
@@ -4867,8 +5210,12 @@ fn spawn_server_environment_colliders_system(mut commands: Commands, config: Res
         commands.spawn(turret_physics_bundle(&config, index, turret));
     }
 
-    for ancient in &config.map.ancients {
-        commands.spawn(ancient_physics_bundle(&config, ancient));
+    for (index, barrack) in config.map.barracks.iter().enumerate() {
+        commands.spawn(barracks_physics_bundle(&config, index, barrack));
+    }
+
+    for (index, ancient) in config.map.ancients.iter().enumerate() {
+        commands.spawn(ancient_physics_bundle(&config, index, ancient));
     }
 
     for obs in &config.obstacles {
@@ -5073,11 +5420,19 @@ fn shared_authoritative_drive_system(
     obstacle_query: Query<&PhysicsObstacle>,
     target_query: Query<&PhysicsTarget>,
     turret_query: Query<&PhysicsTurret>,
+    barracks_query: Query<&PhysicsBarracks>,
+    ancient_query: Query<&PhysicsAncient>,
 ) {
     if match_state
         .as_ref()
         .is_some_and(|m| m.phase != MatchPhase::InGame)
     {
+        return;
+    }
+    if world.winning_team.is_some() {
+        for (_, _, mut controller) in &mut soldier_query {
+            controller.translation = None;
+        }
         return;
     }
     let dt = time.delta_secs();
@@ -5115,6 +5470,8 @@ fn shared_authoritative_drive_system(
                 &obstacle_query,
                 &target_query,
                 &turret_query,
+                &barracks_query,
+                &ancient_query,
                 &hero_aim_targets,
             );
         }
@@ -5140,6 +5497,9 @@ fn shared_authoritative_drive_system(
         &physics_world,
         &mut world,
     );
+
+    step_barracks_system(&config, &mut world);
+    step_ancients_system(&config, &mut world);
 
     // حل برخورد فیزیکی هیروها با یکدیگر (هیچ دو هیرویی نمی‌توانند از داخل هم عبور کنند)
     if world.players.len() > 1 {
@@ -5226,6 +5586,8 @@ fn shared_drive_single_player(
     obstacle_query: &Query<&PhysicsObstacle>,
     target_query: &Query<&PhysicsTarget>,
     turret_query: &Query<&PhysicsTurret>,
+    barracks_query: &Query<&PhysicsBarracks>,
+    ancient_query: &Query<&PhysicsAncient>,
     hero_aim_targets: &[(usize, TeamId, Vec3, f32, Stance, bool)],
 ) {
 
@@ -5254,8 +5616,10 @@ fn shared_drive_single_player(
                 spawn_pos + Vec3::Y * config.physics.soldier_capsule_center_y;
         }
     } else {
-        // ۲. بازسازی سلامتی در ثانیه (HP Regen) و آپدیت تایمرهای بالاتنه
-        world.hero_hp = (world.hero_hp + world.hero_hp_regen_per_sec * dt).min(world.hero_max_hp);
+        // ۲. بازسازی سلامتی در ثانیه (HP Regen پایه + بونوس چشمه تیم خودی) و آپدیت تایمرهای بالاتنه
+        let fountain_bonus = fountain_regen_bonus_for_pos(config, world.hero_team, world.soldier_pos);
+        let effective_hp_regen = world.hero_hp_regen_per_sec + fountain_bonus;
+        world.hero_hp = (world.hero_hp + effective_hp_regen * dt).min(world.hero_max_hp);
 
         if let Some(rem) = &mut world.reload_remaining {
             *rem -= dt;
@@ -5417,6 +5781,8 @@ fn shared_drive_single_player(
             let mut locked_enemy = false;
             let mut hovered_creep: Option<u64> = None;
             let mut hovered_turret: Option<usize> = None;
+            let mut hovered_barracks: Option<usize> = None;
+            let mut hovered_ancient: Option<usize> = None;
 
             let hero_wins_aim = match (best_enemy_hit, best_creep_hit) {
                 (Some((h_t, _)), Some((_, c_t, _))) => h_t <= c_t,
@@ -5437,6 +5803,22 @@ fn shared_drive_single_player(
                         resolved_hit = Some(hit.point);
                         locked_enemy = true;
                         hovered_turret = Some(pt.index);
+                    } else {
+                        resolved_hit = Some(hit.point);
+                    }
+                } else if let Ok(pb) = barracks_query.get(hit_ent) {
+                    if pb.team != world.hero_team && !world.barracks[pb.index].is_dead {
+                        resolved_hit = Some(hit.point);
+                        locked_enemy = true;
+                        hovered_barracks = Some(pb.index);
+                    } else {
+                        resolved_hit = Some(hit.point);
+                    }
+                } else if let Ok(pa) = ancient_query.get(hit_ent) {
+                    if pa.team != world.hero_team && !world.ancients[pa.index].is_dead {
+                        resolved_hit = Some(hit.point);
+                        locked_enemy = true;
+                        hovered_ancient = Some(pa.index);
                     } else {
                         resolved_hit = Some(hit.point);
                     }
@@ -5469,6 +5851,8 @@ fn shared_drive_single_player(
             world.aim_locked_on_enemy = locked_enemy;
             world.hovered_creep_id = hovered_creep;
             world.hovered_turret_index = hovered_turret;
+            world.hovered_barracks_index = hovered_barracks;
+            world.hovered_ancient_index = hovered_ancient;
 
             if let Some(hit) = resolved_hit {
                 world.aim_hit_pos = hit;
@@ -5933,11 +6317,24 @@ fn shared_authoritative_react_system(
     >,
     target_query: Query<(Entity, &PhysicsTarget)>,
     turret_query: Query<(Entity, &PhysicsTurret)>,
+    barracks_query: Query<(Entity, &PhysicsBarracks)>,
+    ancient_query: Query<(Entity, &PhysicsAncient)>,
 ) {
     if match_state
         .as_ref()
         .is_some_and(|m| m.phase != MatchPhase::InGame)
     {
+        return;
+    }
+    if world.winning_team.is_some() {
+        for (entity, _, _) in &bullet_query {
+            commands.entity(entity).despawn();
+        }
+        for (entity, _, _, _) in &grenade_query {
+            commands.entity(entity).despawn();
+        }
+        world.bullets_snapshot.clear();
+        world.grenades_snapshot.clear();
         return;
     }
     let dt = time.delta_secs();
@@ -5969,6 +6366,14 @@ fn shared_authoritative_react_system(
     let mut turret_idx_by_entity = HashMap::new();
     for (entity, p_turret) in &turret_query {
         turret_idx_by_entity.insert(entity, p_turret.index);
+    }
+    let mut barracks_idx_by_entity = HashMap::new();
+    for (entity, p_barrack) in &barracks_query {
+        barracks_idx_by_entity.insert(entity, p_barrack.index);
+    }
+    let mut ancient_idx_by_entity = HashMap::new();
+    for (entity, p_anc) in &ancient_query {
+        ancient_idx_by_entity.insert(entity, p_anc.index);
     }
 
     let mut exploded_positions = Vec::new();
@@ -6178,7 +6583,14 @@ fn shared_authoritative_react_system(
             let (c_idx, c_toi) = best_creep_hit.unwrap();
             let impact_pos = old_pos + step_dir * c_toi;
             let c_stats = resolve_creep_stats(&config, world.creeps[c_idx].creep_type_id.as_deref());
-            let dmg_mult = dota2_armor_multiplier(c_stats.armor);
+            let (_, _, armor_bonus, _, _) = lane_creep_buffs(
+                &config,
+                &world.barracks,
+                world.creeps[c_idx].team,
+                world.creeps[c_idx].lane,
+                world.creeps[c_idx].camp_index.is_none(),
+            );
+            let dmg_mult = dota2_armor_multiplier(c_stats.armor + armor_bonus);
             let effective_dmg = (bullet.damage * dmg_mult).max(1.0);
             world.creeps[c_idx].hp = (world.creeps[c_idx].hp - effective_dmg).max(0.0);
             if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
@@ -6330,6 +6742,86 @@ fn shared_authoritative_react_system(
                                 grant_xp_to_player_slot(&mut world_inner.players[idx], share, &config, &mut world_inner.pending_fx);
                             }
                         }
+                    }
+                }
+            } else if let Some(&bar_idx) = barracks_idx_by_entity.get(&hit_entity) {
+                let bar_team = world.barracks[bar_idx].team;
+                let bar_lane = world.barracks[bar_idx].lane;
+                let bar_kind = world.barracks[bar_idx].kind;
+                let bar_invuln = world.barracks[bar_idx].is_invulnerable;
+                let bar_dead = world.barracks[bar_idx].is_dead;
+                if bullet.owner_team != bar_team && !bar_invuln && !bar_dead {
+                    let dmg_mult = dota2_armor_multiplier(world.barracks[bar_idx].armor);
+                    let eff_dmg = (bullet.damage * dmg_mult).max(1.0);
+                    world.barracks[bar_idx].hp = (world.barracks[bar_idx].hp - eff_dmg).max(0.0);
+                    if world.barracks[bar_idx].hp <= 0.0 && !world.barracks[bar_idx].is_dead {
+                        world.barracks[bar_idx].is_dead = true;
+                        target_destroyed = true;
+                        commands.entity(hit_entity).insert(ColliderDisabled);
+                        let bar_pos = world.barracks[bar_idx].pos;
+                        let gold_b = config.map.barracks[bar_idx].gold_bounty;
+                        let xp_b = config.map.barracks[bar_idx].xp_bounty;
+                        if bar_kind == BarracksKind::Melee {
+                            let hp_mult = config.map.barracks_buffs.melee_destroyed_hp_multiplier;
+                            for c in &mut world.creeps {
+                                if !c.is_dead && c.camp_index.is_none() && c.team != bar_team && c.lane == bar_lane {
+                                    c.max_hp *= hp_mult;
+                                    c.hp = (c.hp * hp_mult).min(c.max_hp);
+                                }
+                            }
+                        }
+                        if let Some(owner_slot) = bullet.owner_slot {
+                            let world_inner = &mut *world;
+                            if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                                killer.last_hits += 1;
+                                killer.hero_gold += gold_b;
+                                world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
+                                    pos: bar_pos + Vec3::Y * 2.5,
+                                    gold: gold_b,
+                                });
+                            }
+                        }
+                        let killer_team = bullet.owner_team;
+                        let eligible: Vec<usize> = world
+                            .players
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, p)| !p.is_dead && p.hero_team == killer_team && p.soldier_pos.distance(bar_pos) <= p.hero_xp_gain_radius)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if !eligible.is_empty() && xp_b > 0 {
+                            let share = xp_b / (eligible.len() as u32);
+                            let world_inner = &mut *world;
+                            for idx in eligible {
+                                grant_xp_to_player_slot(&mut world_inner.players[idx], share, &config, &mut world_inner.pending_fx);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(&anc_idx) = ancient_idx_by_entity.get(&hit_entity) {
+                let anc_team = world.ancients[anc_idx].team;
+                let anc_invuln = world.ancients[anc_idx].is_invulnerable;
+                let anc_dead = world.ancients[anc_idx].is_dead;
+                if bullet.owner_team != anc_team && !anc_invuln && !anc_dead {
+                    let dmg_mult = dota2_armor_multiplier(world.ancients[anc_idx].armor);
+                    let eff_dmg = (bullet.damage * dmg_mult).max(1.0);
+                    world.ancients[anc_idx].hp = (world.ancients[anc_idx].hp - eff_dmg).max(0.0);
+                    if world.ancients[anc_idx].hp <= 0.0 && !world.ancients[anc_idx].is_dead {
+                        world.ancients[anc_idx].is_dead = true;
+                        target_destroyed = true;
+                        commands.entity(hit_entity).insert(ColliderDisabled);
+                        let anc_pos = world.ancients[anc_idx].pos;
+                        let winner = if anc_team == TeamId::Dawn {
+                            TeamId::Dusk
+                        } else {
+                            TeamId::Dawn
+                        };
+                        world.winning_team = Some(winner);
+                        world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
+                            pos: anc_pos + Vec3::Y * 3.0,
+                            trauma_add: config.combat.grenade_explosion_trauma_add,
+                            trauma_max: config.combat.grenade_explosion_trauma_max,
+                        });
                     }
                 }
             } else if let Some(&t_idx) = target_idx_by_entity.get(&hit_entity) {
@@ -6570,7 +7062,7 @@ fn shared_client_drive_system(
         return;
     };
 
-    if prediction.is_dead || prediction.traversal_active {
+    if prediction.match_ended || prediction.is_dead || prediction.traversal_active {
         controller.translation = None;
         return;
     }
@@ -6715,6 +7207,32 @@ fn resolve_creep_stats<'a>(config: &'a GameConfig, creep_type_id: Option<&str>) 
     }
 }
 
+/// محاسبه باف‌های سربازان یک لاین بر اساس باراکس‌های نابودشده حریف
+pub fn lane_creep_buffs(
+    config: &GameConfig,
+    barracks: &[BarracksState],
+    creep_team: TeamId,
+    lane: LaneId,
+    is_lane_creep: bool,
+) -> (f32, f32, f32, f32, f32) {
+    if !is_lane_creep || creep_team == TeamId::Neutral {
+        return (1.0, 1.0, 0.0, 1.0, 1.0);
+    }
+    let melee_dead = barracks.iter().any(|b| {
+        b.is_dead && b.team != creep_team && b.lane == lane && b.kind == BarracksKind::Melee
+    });
+    let ranged_dead = barracks.iter().any(|b| {
+        b.is_dead && b.team != creep_team && b.lane == lane && b.kind == BarracksKind::Ranged
+    });
+    let bb = &config.map.barracks_buffs;
+    let hp_mult = if melee_dead { bb.melee_destroyed_hp_multiplier } else { 1.0 };
+    let scale_mult = if melee_dead { bb.melee_destroyed_scale_multiplier } else { 1.0 };
+    let armor_bonus = if melee_dead { bb.melee_destroyed_armor_bonus } else { 0.0 };
+    let dmg_mult = if ranged_dead { bb.ranged_destroyed_damage_multiplier } else { 1.0 };
+    let fire_rate_mult = if ranged_dead { bb.ranged_destroyed_fire_rate_multiplier } else { 1.0 };
+    (hp_mult, scale_mult, armor_bonus, dmg_mult, fire_rate_mult)
+}
+
 fn step_lane_creeps_system(
     commands: &mut Commands,
     dt: f32,
@@ -6754,6 +7272,14 @@ fn step_lane_creeps_system(
                         + side * (col * config.creeps.wave_spawn_spacing);
                     let id = world.next_creep_id;
                     world.next_creep_id += 1;
+                    let (hp_mult, _, _, _, _) = lane_creep_buffs(
+                        config,
+                        &world.barracks,
+                        team,
+                        lane_def.lane,
+                        true,
+                    );
+                    let buffed_hp = config.creeps.max_hp * hp_mult;
                     world.creeps.push(LaneCreepState {
                         id,
                         team,
@@ -6765,8 +7291,8 @@ fn step_lane_creeps_system(
                         waypoint_index: next_wp_idx,
                         pos: spawn_pos,
                         facing_dir: dir,
-                        hp: config.creeps.max_hp,
-                        max_hp: config.creeps.max_hp,
+                        hp: buffed_hp,
+                        max_hp: buffed_hp,
                         fire_cooldown: 0.0,
                         fire_anim_timer: 0.0,
                         anim_state: CreepAnimState::Run,
@@ -6865,6 +7391,28 @@ fn step_lane_creeps_system(
             (t.team, t.pos, world_r, t.height, t.is_dead)
         })
         .collect();
+    let barracks_snap: Vec<(TeamId, Vec3, f32, f32, bool, bool)> = world
+        .barracks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let bd = &config.map.barracks[i];
+            let s = bd.model_transform.scale_vec();
+            let half_r = (bd.size.0 * s.x).max(bd.size.2 * s.z) * 0.5;
+            (b.team, b.pos, half_r, b.height, b.is_dead, b.is_invulnerable)
+        })
+        .collect();
+    let ancient_snap: Vec<(TeamId, Vec3, f32, f32, bool, bool)> = world
+        .ancients
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let ad = &config.map.ancients[i];
+            let s = ad.model_transform.scale_vec();
+            let half_r = (ad.base_size.0 * s.x).max(ad.base_size.2 * s.z) * 0.5;
+            (a.team, a.pos, half_r, a.height, a.is_dead, a.is_invulnerable)
+        })
+        .collect();
 
     let query_groups = soldier_collision_groups();
     let c_len = world.creeps.len();
@@ -6915,7 +7463,7 @@ fn step_lane_creeps_system(
                         0.0,
                     )
                 {
-                    best_target = Some((other_pos, d));
+                    best_target = Some((other_pos + Vec3::Y * c_stats.aim_chest_height, d));
                 }
             }
             for &(h_team, h_pos, h_dead) in &hero_snap {
@@ -6935,7 +7483,7 @@ fn step_lane_creeps_system(
                         0.0,
                     )
                 {
-                    best_target = Some((h_pos, d));
+                    best_target = Some((h_pos + Vec3::Y * c_stats.aim_chest_height, d));
                 }
             }
             if !is_neutral {
@@ -6958,12 +7506,62 @@ fn step_lane_creeps_system(
                             c_stats.vision_range,
                             0.0,
                         ) {
-                            best_target = Some((Vec3::new(t_pos.x, my_pos.y.max(t_pos.y) + t_height * 0.45, t_pos.z), edge_dist));
+                            best_target = Some((Vec3::new(t_pos.x, t_pos.y + t_height * 0.5, t_pos.z), edge_dist));
                         }
                     }
                 }
             }
         }
+            if !is_neutral {
+                for &(b_team, b_pos, b_rad, b_height, b_dead, b_invuln) in &barracks_snap {
+                    if b_team == my_team || b_dead || b_invuln {
+                        continue;
+                    }
+                    let edge_dist = (my_pos.distance(b_pos) - b_rad).max(0.0);
+                    if edge_dist <= c_stats.vision_range
+                        && best_target.map_or(true, |(_, bd)| edge_dist < bd)
+                    {
+                        let to_bar = Vec3::new(my_pos.x - b_pos.x, 0.0, my_pos.z - b_pos.z).normalize_or_zero();
+                        let bar_edge_pos = Vec3::new(b_pos.x, my_pos.y, b_pos.z) + to_bar * (b_rad * 1.45 + 0.6);
+                        if can_observer_see_point_with_range(
+                            physics_world,
+                            config,
+                            my_pos,
+                            bar_edge_pos,
+                            c_stats.aim_chest_height,
+                            c_stats.vision_range,
+                            0.0,
+                        ) {
+                            best_target = Some((Vec3::new(b_pos.x, b_pos.y + b_height * 0.5, b_pos.z), edge_dist));
+                        }
+                    }
+                }
+            }
+            if !is_neutral {
+                for &(a_team, a_pos, a_rad, a_height, a_dead, a_invuln) in &ancient_snap {
+                    if a_team == my_team || a_dead || a_invuln {
+                        continue;
+                    }
+                    let edge_dist = (my_pos.distance(a_pos) - a_rad).max(0.0);
+                    if edge_dist <= c_stats.vision_range
+                        && best_target.map_or(true, |(_, bd)| edge_dist < bd)
+                    {
+                        let to_anc = Vec3::new(my_pos.x - a_pos.x, 0.0, my_pos.z - a_pos.z).normalize_or_zero();
+                        let anc_edge_pos = Vec3::new(a_pos.x, my_pos.y, a_pos.z) + to_anc * (a_rad * 1.45 + 0.6);
+                        if can_observer_see_point_with_range(
+                            physics_world,
+                            config,
+                            my_pos,
+                            anc_edge_pos,
+                            c_stats.aim_chest_height,
+                            c_stats.vision_range,
+                            0.0,
+                        ) {
+                            best_target = Some((Vec3::new(a_pos.x, a_pos.y + 1.5, a_pos.z), edge_dist));
+                        }
+                    }
+                }
+            }
         if is_neutral && best_target.is_none() && my_pos.distance(my_home) <= 0.5 {
             world.creeps[idx].is_aggroed = false;
         }
@@ -6980,14 +7578,22 @@ fn step_lane_creeps_system(
             if dist <= c_stats.attack_range {
                 fired_or_aiming = true;
                 if world.creeps[idx].fire_cooldown <= 0.0 {
-                    world.creeps[idx].fire_cooldown = c_stats.fire_rate_secs;
+                    let (_, _, _, dmg_mult, fire_rate_mult) = lane_creep_buffs(
+                        config,
+                        &world.barracks,
+                        my_team,
+                        my_lane,
+                        !is_neutral,
+                    );
+                    let eff_fire_rate = c_stats.fire_rate_secs * fire_rate_mult;
+                    world.creeps[idx].fire_cooldown = eff_fire_rate;
                     world.creeps[idx].fire_anim_timer =
-                        (c_stats.fire_rate_secs * 0.45).min(0.35);
+                        (eff_fire_rate * 0.45).min(0.35);
 
                     let muzzle_pos = my_pos
                         + Vec3::Y * c_stats.muzzle_offset_y
                         + world.creeps[idx].facing_dir * c_stats.muzzle_forward;
-                    let aim_target = target_pos + Vec3::Y * c_stats.aim_chest_height;
+                    let aim_target = target_pos;
                     let shot_dir = (aim_target - muzzle_pos).normalize_or_zero();
                     let b_id = world.next_entity_id;
                     world.next_entity_id += 1;
@@ -6998,7 +7604,7 @@ fn step_lane_creeps_system(
                             owner_slot: None,
                             owner_team: my_team,
                             velocity: shot_dir * c_stats.projectile_speed,
-                            damage: c_stats.bullet_damage,
+                            damage: c_stats.bullet_damage * dmg_mult,
                             remaining_range: c_stats.bullet_max_range,
                         },
                         Transform::from_translation(muzzle_pos),
@@ -7028,8 +7634,20 @@ fn step_lane_creeps_system(
                 moved = true;
             }
         } else {
-            // ب) حرکت در امتداد Waypointهای لاین مربوطه به سمت پایگاه دشمن
-            if let Some(lane_def) = config.map.lanes.iter().find(|l| l.lane == my_lane) {
+            // ب) حرکت در امتداد Waypointهای لاین و پس از آن پیشروی مستقیم به سمت ساختمان اصلی (Ancient) دشمن
+            let mut move_target_opt: Option<(Vec3, f32)> = None;
+            if world.creeps[idx].waypoint_index == usize::MAX {
+                if let Some(&(_a_team, a_pos, a_rad, _a_h, a_dead, _a_invuln)) = ancient_snap
+                    .iter()
+                    .find(|&&(a_team, _, _, _, a_dead, _)| a_team != my_team && !a_dead)
+                {
+                    let to_anc = Vec3::new(a_pos.x - my_pos.x, 0.0, a_pos.z - my_pos.z);
+                    let stop_dist = a_rad * 1.45 + c_stats.collider_radius + 1.0;
+                    if to_anc.length() > stop_dist {
+                        move_target_opt = Some((to_anc, to_anc.length()));
+                    }
+                }
+            } else if let Some(lane_def) = config.map.lanes.iter().find(|l| l.lane == my_lane) {
                 let wp_idx = world.creeps[idx]
                     .waypoint_index
                     .min(lane_def.waypoints.len().saturating_sub(1));
@@ -7051,16 +7669,26 @@ fn step_lane_creeps_system(
                         TeamId::Dawn => {
                             if wp_idx + 1 < lane_def.waypoints.len() {
                                 world.creeps[idx].waypoint_index = wp_idx + 1;
+                            } else {
+                                world.creeps[idx].waypoint_index = usize::MAX;
                             }
                         }
                         TeamId::Dusk => {
                             if wp_idx > 0 {
                                 world.creeps[idx].waypoint_index = wp_idx - 1;
+                            } else {
+                                world.creeps[idx].waypoint_index = usize::MAX;
                             }
                         }
                         TeamId::Neutral => {}
                     }
-                } else if dist_wp > 0.01 {
+                } else {
+                    move_target_opt = Some((to_wp, dist_wp));
+                }
+            }
+
+            if let Some((to_wp, dist_wp)) = move_target_opt {
+                if dist_wp > 0.01 {
                     let mut dir = to_wp / dist_wp;
                     // هدایت نرم به طرفین هنگام نزدیک شدن به بدنه تاور
                     for &(_t_team, t_pos, t_rad, _t_h, t_dead) in &turret_snap {
@@ -7327,5 +7955,102 @@ fn step_turrets_system(
                 });
             }
         }
+    }
+}
+
+fn step_barracks_system(
+    config: &GameConfig,
+    world: &mut AuthoritativeWorldState,
+) {
+    let turret_t3_dead: Vec<(TeamId, LaneId, bool)> = world
+        .turrets
+        .iter()
+        .filter(|t| t.tier == 3)
+        .map(|t| (t.team, t.lane, t.is_dead))
+        .collect();
+
+    let creep_snap: Vec<(TeamId, Vec3, bool, bool)> = world
+        .creeps
+        .iter()
+        .map(|c| (c.team, c.pos, c.is_dead, c.camp_index.is_none()))
+        .collect();
+
+    let backdoor_r = config.combat.turret_backdoor_creep_radius;
+
+    for idx in 0..world.barracks.len() {
+        if world.barracks[idx].is_dead {
+            world.barracks[idx].is_invulnerable = true;
+            continue;
+        }
+        let my_team = world.barracks[idx].team;
+        let my_lane = world.barracks[idx].lane;
+        let my_pos = world.barracks[idx].pos;
+        let b_def = &config.map.barracks[idx];
+
+        let t3_alive = turret_t3_dead
+            .iter()
+            .any(|&(tm, ln, dead)| tm == my_team && ln == my_lane && !dead);
+
+        let has_enemy_lane_creeps = if b_def.backdoor_protection_requires_creeps {
+            creep_snap.iter().any(|&(c_team, c_pos, c_dead, is_lane_creep)| {
+                !c_dead
+                    && is_lane_creep
+                    && c_team != my_team
+                    && c_team != TeamId::Neutral
+                    && c_pos.distance(my_pos) <= backdoor_r
+            })
+        } else {
+            true
+        };
+
+        world.barracks[idx].is_invulnerable = t3_alive || !has_enemy_lane_creeps;
+    }
+}
+
+fn step_ancients_system(
+    config: &GameConfig,
+    world: &mut AuthoritativeWorldState,
+) {
+    let turret_t3_status: Vec<(TeamId, bool)> = world
+        .turrets
+        .iter()
+        .filter(|t| t.tier == 3)
+        .map(|t| (t.team, t.is_dead))
+        .collect();
+
+    let creep_snap: Vec<(TeamId, Vec3, bool, bool)> = world
+        .creeps
+        .iter()
+        .map(|c| (c.team, c.pos, c.is_dead, c.camp_index.is_none()))
+        .collect();
+
+    let backdoor_r = config.combat.turret_backdoor_creep_radius;
+
+    for idx in 0..world.ancients.len() {
+        if world.ancients[idx].is_dead {
+            world.ancients[idx].is_invulnerable = true;
+            continue;
+        }
+        let my_team = world.ancients[idx].team;
+        let my_pos = world.ancients[idx].pos;
+        let a_def = &config.map.ancients[idx];
+
+        let any_t3_dead = turret_t3_status
+            .iter()
+            .any(|&(tm, dead)| tm == my_team && dead);
+
+        let has_enemy_lane_creeps = if a_def.backdoor_protection_requires_creeps {
+            creep_snap.iter().any(|&(c_team, c_pos, c_dead, is_lane_creep)| {
+                !c_dead
+                    && is_lane_creep
+                    && c_team != my_team
+                    && c_team != TeamId::Neutral
+                    && c_pos.distance(my_pos) <= backdoor_r
+            })
+        } else {
+            true
+        };
+
+        world.ancients[idx].is_invulnerable = !any_t3_dead || !has_enemy_lane_creeps;
     }
 }

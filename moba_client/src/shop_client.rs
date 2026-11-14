@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use bevy::ui::RelativeCursorPosition;
 use bevy::window::PrimaryWindow;
 use moba_shared::{
-    ClientLobbyMessage, InventoryItemState, ItemCategory, ItemDef, ItemsConfig,
+    ClientLobbyMessage, CourierOrder, InventoryItemState, ItemCategory, ItemDef, ItemsConfig,
 };
 use std::path::Path;
 
@@ -56,6 +56,11 @@ impl ShopCategoryFilter {
 }
 
 #[derive(Resource, Default)]
+pub struct CourierControlState {
+    pub selected: bool,
+}
+
+#[derive(Resource, Default)]
 pub struct ShopContextSnapshot {
     pub in_game: bool,
     pub chat_open: bool,
@@ -63,6 +68,15 @@ pub struct ShopContextSnapshot {
     pub is_dead: bool,
     pub gold: u32,
     pub inventory: Vec<InventoryItemState>,
+    pub courier_hp: f32,
+    pub courier_max_hp: f32,
+    pub courier_is_dead: bool,
+    pub courier_respawn_remaining: f32,
+    pub courier_order: CourierOrder,
+    pub courier_in_fountain: bool,
+    pub courier_inventory: Vec<InventoryItemState>,
+    pub inspected_inventory: Option<Vec<InventoryItemState>>,
+    pub inspected_is_read_only: bool,
 }
 
 #[derive(Resource, Default)]
@@ -192,6 +206,7 @@ impl Plugin for ShopPlugin {
             .init_resource::<InventoryShortcutsState>()
             .init_resource::<SettingsUiState>()
             .init_resource::<InventoryDragState>()
+            .init_resource::<CourierControlState>()
             .init_resource::<ItemIconCache>()
             .add_systems(Startup, spawn_shop_and_inventory_ui)
             .add_systems(
@@ -213,6 +228,8 @@ impl Plugin for ShopPlugin {
                     rebuild_settings_modal_system,
                     inventory_shortcut_trigger_system,
                     hud_inventory_drag_and_drop_system,
+                    courier_hud_and_hotkey_system,
+                    rebuild_hud_courier_bar_system,
                 )
                     .chain(),
             );
@@ -400,6 +417,42 @@ struct DragGhostRoot;
 #[derive(Component)]
 struct DragGhostLabelText;
 
+#[derive(Component)]
+struct HudCourierRoot;
+
+#[derive(Component)]
+struct HudCourierStatusText;
+
+#[derive(Component)]
+struct HudCourierHpFill;
+
+#[derive(Component)]
+struct HudCourierSlotsRow;
+
+#[derive(Component)]
+struct HudCourierDeliverBtn;
+
+#[derive(Component)]
+struct HudCourierReturnBtn;
+
+#[derive(Component)]
+struct HudCourierDeadBanner;
+
+#[derive(Component)]
+struct HudCourierDeadText;
+
+#[derive(Component)]
+struct HudCourierSelectBtn;
+
+#[derive(Component)]
+struct HudCourierSelectBtnText;
+
+#[derive(Component)]
+struct ShopSellCourierBtn(usize);
+
+#[derive(Component)]
+struct ShopDeliverCourierBtn;
+
 fn spawn_shop_and_inventory_ui(mut commands: Commands) {
     // ۱. نوار ۶ اسلاته اینونتوری + دکمه [B] SHOP در پایین صفحه
     commands
@@ -458,6 +511,155 @@ fn spawn_shop_and_inventory_ui(mut commands: Commands) {
                     TextColor(Color::srgb(1.0, 0.88, 0.36)),
                 ));
             });
+
+            // دکمه‌های سریع Courier کنار دکمه SHOP (بدون تداخل با مینی‌مپ)
+            root.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: px(4.0),
+                ..default()
+            })
+            .with_children(|col| {
+                col.spawn((
+                    Interaction::default(),
+                    HudCourierDeliverBtn,
+                    Node {
+                        padding: UiRect::axes(px(8.0), px(4.0)),
+                        border: UiRect::all(px(1.0)),
+                        border_radius: BorderRadius::all(px(5.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgb(0.95, 0.78, 0.25)),
+                    BackgroundColor(Color::srgba(0.24, 0.18, 0.05, 0.94)),
+                ))
+                .with_children(|b| {
+                    b.spawn((
+                        Pickable::IGNORE,
+                        Text::new("[F3] DELIVER"),
+                        TextFont {
+                            font_size: FontSize::Px(10.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(1.0, 0.88, 0.36)),
+                    ));
+                });
+
+                col.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(4.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Interaction::default(),
+                        HudCourierReturnBtn,
+                        Node {
+                            padding: UiRect::axes(px(6.0), px(3.0)),
+                            border: UiRect::all(px(1.0)),
+                            border_radius: BorderRadius::all(px(4.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgb(0.45, 0.62, 0.80)),
+                        BackgroundColor(Color::srgba(0.10, 0.15, 0.22, 0.94)),
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Pickable::IGNORE,
+                            Text::new("[F4] HOME"),
+                            TextFont {
+                                font_size: FontSize::Px(9.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.82, 0.90, 1.0)),
+                        ));
+                    });
+
+                    row.spawn((
+                        Interaction::default(),
+                        HudCourierSelectBtn,
+                        Node {
+                            padding: UiRect::axes(px(6.0), px(3.0)),
+                            border: UiRect::all(px(1.0)),
+                            border_radius: BorderRadius::all(px(4.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgb(0.35, 0.75, 0.92)),
+                        BackgroundColor(Color::srgba(0.08, 0.16, 0.24, 0.94)),
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            HudCourierSelectBtnText,
+                            Pickable::IGNORE,
+                            Text::new("[F2] DRONE"),
+                            TextFont {
+                                font_size: FontSize::Px(9.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.60, 0.92, 1.0)),
+                        ));
+                    });
+                });
+            });
+        });
+
+    // ۱.۵ بنر قرمز Cooldown مرگ Courier دقیقاً بالای نوار اینونتوری بازیکن
+    commands
+        .spawn((
+            HudCourierDeadBanner,
+            GlobalZIndex(195),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(565.0),
+                bottom: px(92.0),
+                padding: UiRect::axes(px(12.0), px(6.0)),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(8.0),
+                border: UiRect::all(px(1.5)),
+                border_radius: BorderRadius::all(px(8.0)),
+                display: Display::None,
+                ..default()
+            },
+            BorderColor::all(Color::srgb(0.95, 0.25, 0.25)),
+            BackgroundColor(Color::srgba(0.32, 0.05, 0.05, 0.94)),
+        ))
+        .with_children(|banner| {
+            // آیکون پهپاد قرمز
+            banner
+                .spawn((
+                    Node {
+                        width: px(22.0),
+                        height: px(16.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(px(1.5)),
+                        border_radius: BorderRadius::all(px(4.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgb(1.0, 0.45, 0.45)),
+                    BackgroundColor(Color::srgba(0.55, 0.10, 0.10, 0.95)),
+                ))
+                .with_children(|icon| {
+                    icon.spawn((
+                        Text::new("DRN"),
+                        TextFont {
+                            font_size: FontSize::Px(8.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(1.0, 0.85, 0.85)),
+                    ));
+                });
+
+            banner.spawn((
+                HudCourierDeadText,
+                Text::new("COURIER DEAD - RESPAWNS IN 0s"),
+                TextFont {
+                    font_size: FontSize::Px(12.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(1.0, 0.42, 0.42)),
+            ));
         });
 
     // ۲. پنجره جامع شاپ در وسط صفحه
@@ -991,6 +1193,7 @@ fn spawn_shop_and_inventory_ui(mut commands: Commands) {
                 TextColor(Color::WHITE),
             ));
         });
+
 }
 
 #[derive(SystemParam)]
@@ -1406,15 +1609,12 @@ fn rebuild_shop_modal_system(
         }
     }
     if let Ok((mut f_txt, mut f_col)) = ftn_txt_q.single_mut() {
-        if ctx.is_dead {
-            **f_txt = "DEAD - BROWSE / QUEUE ONLY".to_string();
-            *f_col = TextColor(Color::srgb(0.98, 0.35, 0.32));
-        } else if ctx.in_fountain {
-            **f_txt = "IN FOUNTAIN - READY TO BUY & SELL".to_string();
+        if ctx.in_fountain && !ctx.is_dead {
+            **f_txt = "IN FOUNTAIN - BUY TO HERO & SELL".to_string();
             *f_col = TextColor(Color::srgb(0.35, 0.98, 0.60));
         } else {
-            **f_txt = "OUTSIDE FOUNTAIN - BROWSE & CART ONLY".to_string();
-            *f_col = TextColor(Color::srgb(0.98, 0.78, 0.28));
+            **f_txt = "REMOTE BUY - ITEMS SENT TO COURIER".to_string();
+            *f_col = TextColor(Color::srgb(0.45, 0.90, 1.0));
         }
     }
 
@@ -1586,10 +1786,15 @@ fn rebuild_shop_modal_system(
             let (eff_cost, consumed) = items_cfg
                 .effective_purchase_cost(&item.id, &ctx.inventory)
                 .unwrap_or((item.cost, Vec::new()));
-            let can_buy = ctx.in_fountain
+            let hero_can_fit = ctx.in_fountain
                 && !ctx.is_dead
-                && ctx.gold >= eff_cost
                 && (ctx.inventory.len() - consumed.len() + 1) <= items_cfg.max_inventory_slots;
+            let (c_eff_cost, c_consumed) = items_cfg
+                .effective_purchase_cost(&item.id, &ctx.courier_inventory)
+                .unwrap_or((item.cost, Vec::new()));
+            let courier_can_fit = (ctx.courier_inventory.len() - c_consumed.len() + 1) <= 6;
+            let active_cost = if hero_can_fit { eff_cost } else { c_eff_cost };
+            let can_buy = ctx.gold >= active_cost && (hero_can_fit || courier_can_fit);
 
             commands.entity(insp_ent).with_children(|col| {
                 // هدر آیتم انتخاب‌شده
@@ -2011,11 +2216,7 @@ fn rebuild_shop_modal_system(
                 }
             }
 
-            let can_buy_cart = ctx.in_fountain
-                && !ctx.is_dead
-                && !ui_state.cart.is_empty()
-                && ctx.gold >= total_cart_cost
-                && sim_inv.len() <= items_cfg.max_inventory_slots;
+            let can_buy_cart = !ui_state.cart.is_empty() && ctx.gold >= total_cart_cost;
 
             col.spawn((
                 Text::new(format!("Cart Total: {}g", total_cart_cost)),
@@ -2089,6 +2290,115 @@ fn rebuild_shop_modal_system(
                     ));
                 });
             });
+
+            // بخش آیتم‌های داخل Courier
+            col.spawn(Node {
+                width: percent(100),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|chdr| {
+                chdr.spawn((
+                    Text::new(format!("COURIER STASH ({}/6)", ctx.courier_inventory.len())),
+                    TextFont {
+                        font_size: FontSize::Px(12.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.45, 0.90, 1.0)),
+                ));
+                if !ctx.courier_inventory.is_empty() && !ctx.courier_is_dead {
+                    chdr.spawn((
+                        Interaction::default(),
+                        ShopDeliverCourierBtn,
+                        Node {
+                            padding: UiRect::axes(px(7.0), px(3.0)),
+                            border: UiRect::all(px(1.0)),
+                            border_radius: BorderRadius::all(px(4.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgb(0.95, 0.78, 0.25)),
+                        BackgroundColor(Color::srgba(0.24, 0.18, 0.05, 0.95)),
+                    ))
+                    .with_children(|db| {
+                        db.spawn((
+                            Pickable::IGNORE,
+                            Text::new("DELIVER"),
+                            TextFont {
+                                font_size: FontSize::Px(10.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(1.0, 0.88, 0.35)),
+                        ));
+                    });
+                }
+            });
+
+            let mut sorted_cour: Vec<&InventoryItemState> = ctx.courier_inventory.iter().collect();
+            sorted_cour.sort_by_key(|it| it.slot);
+            for c_item in sorted_cour {
+                if let Some(item) = items_cfg.get_item(&c_item.item_id) {
+                    let refund = items_cfg.sell_price(&item.id);
+                    col.spawn((
+                        Node {
+                            width: percent(100),
+                            padding: UiRect::all(px(5.0)),
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::SpaceBetween,
+                            align_items: AlignItems::Center,
+                            column_gap: px(5.0),
+                            border: UiRect::all(px(1.0)),
+                            border_radius: BorderRadius::all(px(5.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.25, 0.55, 0.75, 0.75)),
+                        BackgroundColor(Color::srgba(0.06, 0.10, 0.15, 0.90)),
+                    ))
+                    .with_children(|row| {
+                        row.spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: px(5.0),
+                            ..default()
+                        })
+                        .with_children(|lbl| {
+                            spawn_item_icon_badge(lbl, &asset_server, &mut icon_cache, item, 20.0, 8.0);
+                            lbl.spawn((
+                                Text::new(&item.name),
+                                TextFont {
+                                    font_size: FontSize::Px(10.5),
+                                    ..default()
+                                },
+                                TextColor(Color::WHITE),
+                            ));
+                        });
+                        if ctx.courier_in_fountain && !ctx.courier_is_dead {
+                            row.spawn((
+                                Interaction::default(),
+                                ShopSellCourierBtn(c_item.slot),
+                                Node {
+                                    padding: UiRect::axes(px(5.0), px(2.0)),
+                                    border_radius: BorderRadius::all(px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.32, 0.18, 0.06, 0.92)),
+                            ))
+                            .with_children(|sb| {
+                                sb.spawn((
+                                    Pickable::IGNORE,
+                                    Text::new(format!("SELL +{}g", refund)),
+                                    TextFont {
+                                        font_size: FontSize::Px(9.5),
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(1.0, 0.85, 0.35)),
+                                ));
+                            });
+                        }
+                    });
+                }
+            }
 
             // بخش اینونتوری و فروش آیتم‌ها
             col.spawn((
@@ -2211,24 +2521,44 @@ fn rebuild_hud_inventory_bar_system(
     ctx: Res<ShopContextSnapshot>,
     ui_state: Res<ShopUiState>,
     shortcuts: Res<InventoryShortcutsState>,
+    courier_ctrl: Res<CourierControlState>,
     slots_q: Query<(Entity, Option<&Children>), With<HudInventorySlotsRow>>,
     mut toggle_txt_q: Query<&mut Text, With<HudShopToggleText>>,
+    mut root_border_q: Query<&mut BorderColor, With<HudInventoryRoot>>,
     mut last_inv: Local<Option<Vec<InventoryItemState>>>,
     mut last_cart_len: Local<usize>,
     mut last_bindings: Local<Option<[Option<ShortcutInput>; 6]>>,
+    mut last_cour_sel: Local<Option<bool>>,
 ) {
     if !ctx.in_game {
         return;
     }
+    let active_inv = if let Some(ref insp_inv) = ctx.inspected_inventory {
+        insp_inv
+    } else if courier_ctrl.selected {
+        &ctx.courier_inventory
+    } else {
+        &ctx.inventory
+    };
     let cart_changed = *last_cart_len != ui_state.cart.len();
-    let inv_changed = last_inv.as_ref() != Some(&ctx.inventory);
+    let inv_changed = last_inv.as_ref() != Some(active_inv);
     let bind_changed = last_bindings.as_ref() != Some(&shortcuts.bindings);
-    if !cart_changed && !inv_changed && !bind_changed {
+    let sel_changed = *last_cour_sel != Some(courier_ctrl.selected);
+    if !cart_changed && !inv_changed && !bind_changed && !sel_changed {
         return;
     }
     *last_cart_len = ui_state.cart.len();
-    *last_inv = Some(ctx.inventory.clone());
+    *last_inv = Some(active_inv.clone());
     *last_bindings = Some(shortcuts.bindings);
+    *last_cour_sel = Some(courier_ctrl.selected);
+
+    if let Ok(mut bc) = root_border_q.single_mut() {
+        *bc = if courier_ctrl.selected {
+            BorderColor::all(Color::srgb(0.28, 0.88, 1.0))
+        } else {
+            BorderColor::all(Color::srgba(0.42, 0.58, 0.72, 0.78))
+        };
+    }
 
     if let Ok(mut t) = toggle_txt_q.single_mut() {
         if ui_state.cart.is_empty() {
@@ -2247,7 +2577,7 @@ fn rebuild_hud_inventory_bar_system(
                     .get(idx)
                     .and_then(|b| *b)
                     .map(|b| b.label());
-                if let Some(inv_item) = ctx.inventory.iter().find(|it| it.slot == idx) {
+                if let Some(inv_item) = active_inv.iter().find(|it| it.slot == idx) {
                     if let Some(item) = items_cfg.get_item(&inv_item.item_id) {
                         row.spawn((
                             Interaction::default(),
@@ -2855,7 +3185,7 @@ fn hud_inventory_drag_and_drop_system(
     mut ghost_q: Query<(&mut Node, &mut Visibility), With<DragGhostRoot>>,
     mut ghost_txt_q: Query<&mut Text, With<DragGhostLabelText>>,
 ) {
-    if !ctx.in_game {
+    if !ctx.in_game || ctx.inspected_is_read_only {
         drag_state.pressed_slot = None;
         drag_state.dragging_slot = None;
         if let Ok((mut gn, _)) = ghost_q.single_mut() {
@@ -2943,3 +3273,107 @@ fn hud_inventory_drag_and_drop_system(
         }
     }
 }
+
+
+#[derive(SystemParam)]
+struct CourierHudParams<'w, 's> {
+    deliver_btn_q: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<HudCourierDeliverBtn>)>,
+    return_btn_q: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<HudCourierReturnBtn>)>,
+    select_btn_q: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<HudCourierSelectBtn>)>,
+    shop_deliver_q: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<ShopDeliverCourierBtn>)>,
+    shop_sell_cour_q: Query<'w, 's, (&'static Interaction, &'static ShopSellCourierBtn), Changed<Interaction>>,
+    select_txt_q: Query<'w, 's, &'static mut Text, With<HudCourierSelectBtnText>>,
+    dead_banner_q: Query<'w, 's, &'static mut Node, With<HudCourierDeadBanner>>,
+    dead_txt_q: Query<'w, 's, &'static mut Text, (With<HudCourierDeadText>, Without<HudCourierSelectBtnText>)>,
+}
+
+fn courier_hud_and_hotkey_system(
+    ctx: Res<ShopContextSnapshot>,
+    ui_state: Res<ShopUiState>,
+    settings_ui: Res<SettingsUiState>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut courier_ctrl: ResMut<CourierControlState>,
+    mut outgoing: ResMut<ShopOutgoingQueue>,
+    mut p: CourierHudParams,
+) {
+    if !ctx.in_game {
+        courier_ctrl.selected = false;
+        return;
+    }
+
+    for inter in &p.deliver_btn_q {
+        if *inter == Interaction::Pressed {
+            outgoing.0.push(ClientLobbyMessage::CourierDeliver);
+        }
+    }
+    for inter in &p.shop_deliver_q {
+        if *inter == Interaction::Pressed {
+            outgoing.0.push(ClientLobbyMessage::CourierDeliver);
+        }
+    }
+    for inter in &p.return_btn_q {
+        if *inter == Interaction::Pressed {
+            outgoing.0.push(ClientLobbyMessage::CourierReturnToFountain);
+        }
+    }
+    for inter in &p.select_btn_q {
+        if *inter == Interaction::Pressed {
+            courier_ctrl.selected = true;
+        }
+    }
+    for (inter, btn) in &p.shop_sell_cour_q {
+        if *inter == Interaction::Pressed {
+            outgoing.0.push(ClientLobbyMessage::SellCourierItem { inv_index: btn.0 });
+        }
+    }
+
+    if !ui_state.is_open && !settings_ui.is_open && !ctx.chat_open {
+        if keys.just_pressed(KeyCode::F3) {
+            outgoing.0.push(ClientLobbyMessage::CourierDeliver);
+        }
+        if keys.just_pressed(KeyCode::F4) {
+            outgoing.0.push(ClientLobbyMessage::CourierReturnToFountain);
+        }
+        if keys.just_pressed(KeyCode::F2) {
+            courier_ctrl.selected = true;
+        }
+        if keys.just_pressed(KeyCode::F1) {
+            courier_ctrl.selected = false;
+        }
+    }
+
+    if let Ok(mut st) = p.select_txt_q.single_mut() {
+        let desired = if courier_ctrl.selected {
+            "[F2] HERO"
+        } else {
+            "[F2] DRONE"
+        };
+        if **st != desired {
+            **st = desired.to_string();
+        }
+    }
+
+    if let Ok(mut db_node) = p.dead_banner_q.single_mut() {
+        let desired_disp = if ctx.in_game && ctx.courier_is_dead {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if db_node.display != desired_disp {
+            db_node.display = desired_disp;
+        }
+    }
+    if ctx.courier_is_dead {
+        if let Ok(mut dt) = p.dead_txt_q.single_mut() {
+            let txt = format!(
+                "COURIER DEAD  |  RESPAWNS IN {:.0}s",
+                ctx.courier_respawn_remaining.ceil()
+            );
+            if **dt != txt {
+                **dt = txt;
+            }
+        }
+    }
+}
+
+fn rebuild_hud_courier_bar_system() {}

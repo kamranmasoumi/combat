@@ -2,7 +2,7 @@ use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use moba_shared::{
     create_shared_renet_server, parse_server_cli_args, try_buy_cart, try_buy_item,
-    try_cycle_item_mode, try_sell_item, try_swap_inventory_slots, AuthoritativeMatchState, AuthoritativeWorldState,
+    step_couriers_system, try_courier_deliver, try_courier_move_to, try_courier_return_to_fountain, try_cycle_item_mode, try_sell_courier_item, try_sell_item, try_swap_inventory_slots, AuthoritativeMatchState, AuthoritativeWorldState,
     ClientInputCommand, ClientLobbyMessage, GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase,
     MobaPhysicsSet, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier, ServerMatchMessage,
     CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
@@ -69,6 +69,9 @@ fn main() {
             (
                 server_network_receive_system.before(MobaPhysicsSet::Drive),
                 server_match_tick_system.before(MobaPhysicsSet::Drive),
+                step_couriers_system
+                    .after(MobaPhysicsSet::Drive)
+                    .before(server_send_snapshot_system),
                 server_send_snapshot_system.after(MobaPhysicsSet::React),
             ),
         )
@@ -202,6 +205,40 @@ fn server_network_receive_system(
                                     to_slot,
                                     &items_config,
                                 );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::SellCourierItem { inv_index } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_sell_courier_item(
+                                    &mut world,
+                                    slot_idx,
+                                    inv_index,
+                                    &config,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::CourierDeliver => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_courier_deliver(&mut world, slot_idx);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::CourierReturnToFountain => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_courier_return_to_fountain(&mut world, slot_idx);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::CourierMoveTo { world_pos } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_courier_move_to(&mut world, slot_idx, world_pos, &config);
                             }
                         }
                     }

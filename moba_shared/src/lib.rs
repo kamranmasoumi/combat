@@ -138,6 +138,17 @@ impl GameConfig {
             assert!(hero.pistol.magazine_size > 0, "pistol.magazine_size هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.pistol.fire_rate_secs > 0.0, "pistol.fire_rate_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.pistol.reload_duration_secs > 0.0, "pistol.reload_duration_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(!hero.courier.model_path.trim().is_empty(), "courier.model_path هیرو '{}' نمی‌تواند خالی باشد", hero.id);
+            assert!(hero.courier.scale > 0.0, "courier.scale هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.fly_height > 0.0, "courier.fly_height هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.move_speed > 0.0, "courier.move_speed هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.inventory_slots > 0, "courier.inventory_slots هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.max_hp > 0.0, "courier.max_hp هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.respawn_secs > 0.0, "courier.respawn_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.deliver_radius > 0.0, "courier.deliver_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.fountain_radius > 0.0, "courier.fountain_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.hit_radius > 0.0, "courier.hit_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.vision_range > 0.0, "courier.vision_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.pistol.damage > 0.0, "pistol.damage هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.pistol.projectile_speed > 0.0, "pistol.projectile_speed هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.pistol.max_range > 0.0, "pistol.max_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -683,6 +694,22 @@ pub struct HeroWeaponDef {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CourierConfig {
+    pub model_path: String,
+    pub scale: f32,
+    pub fly_height: f32,
+    pub move_speed: f32,
+    pub inventory_slots: usize,
+    pub max_hp: f32,
+    pub respawn_secs: f32,
+    pub deliver_radius: f32,
+    pub fountain_radius: f32,
+    pub hit_radius: f32,
+    pub bounty_gold: u32,
+    pub vision_range: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HeroDef {
     pub id: String,
     pub display_name: String,
@@ -707,6 +734,7 @@ pub struct HeroDef {
     pub weapon: HeroWeaponDef,
     pub pistol: HeroWeaponDef,
     pub level_growth: HeroLevelGrowth,
+    pub courier: CourierConfig,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1314,7 +1342,6 @@ pub struct ClientInputCommand {
     pub space_just_pressed: bool,
     pub space_held: bool,
     pub switch_weapon_just_pressed: bool,
-    pub kill_toggle_just_pressed: bool,
     pub fire_just_pressed: bool,
     pub fire_held: bool,
     pub aim_ray_origin: Vec3,
@@ -1338,7 +1365,6 @@ impl ClientInputCommand {
         self.reload_just_pressed |= newer.reload_just_pressed;
         self.grenade_just_pressed |= newer.grenade_just_pressed;
         self.space_just_pressed |= newer.space_just_pressed;
-        self.kill_toggle_just_pressed |= newer.kill_toggle_just_pressed;
         self.switch_weapon_just_pressed |= newer.switch_weapon_just_pressed;
         self.fire_just_pressed |= newer.fire_just_pressed;
     }
@@ -1349,7 +1375,6 @@ impl ClientInputCommand {
         self.grenade_just_pressed = false;
         self.space_just_pressed = false;
         self.switch_weapon_just_pressed = false;
-        self.kill_toggle_just_pressed = false;
         self.fire_just_pressed = false;
     }
 }
@@ -1441,6 +1466,11 @@ pub struct CreepSnapshot {
     pub scale_multiplier: f32,
     pub is_dead: bool,
     pub is_deniable: bool,
+    pub move_speed: f32,
+    pub armor: f32,
+    pub damage: f32,
+    pub attack_range: f32,
+    pub fire_rate_secs: f32,
     pub is_visible: bool,
 }
 
@@ -1580,6 +1610,10 @@ pub enum ClientLobbyMessage {
     SellItem { inv_index: usize },
     CycleItemMode { inv_index: usize },
     SwapInventorySlots { from_slot: usize, to_slot: usize },
+    SellCourierItem { inv_index: usize },
+    CourierDeliver,
+    CourierReturnToFountain,
+    CourierMoveTo { world_pos: Vec3 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1895,6 +1929,32 @@ impl AuthoritativeMatchState {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CourierOrder {
+    #[default]
+    Idle,
+    ReturnToFountain,
+    MoveTo,
+    DeliverToHero,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CourierSnapshot {
+    pub owner_slot: usize,
+    pub team: TeamId,
+    pub model_path: String,
+    pub scale: f32,
+    pub pos: Vec3,
+    pub facing_dir: Vec3,
+    pub hp: f32,
+    pub max_hp: f32,
+    pub is_dead: bool,
+    pub respawn_remaining: f32,
+    pub order: CourierOrder,
+    pub inventory: Vec<InventoryItemState>,
+    pub is_visible: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HeroSnapshot {
     pub hero_id: String,
@@ -1933,6 +1993,13 @@ pub struct HeroSnapshot {
     pub deaths: u32,
     pub respawn_remaining: f32,
     pub inventory: Vec<InventoryItemState>,
+    pub courier_hp: f32,
+    pub courier_max_hp: f32,
+    pub courier_is_dead: bool,
+    pub courier_respawn_remaining: f32,
+    pub courier_order: CourierOrder,
+    pub courier_in_fountain: bool,
+    pub courier_inventory: Vec<InventoryItemState>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1971,6 +2038,13 @@ pub struct RemotePlayerSnapshot {
     pub active_weapon: ActiveWeaponSlot,
     pub ammo_in_mag: u32,
     pub magazine_size: u32,
+    pub level: u32,
+    pub armor: f32,
+    pub move_speed: f32,
+    pub weapon_damage: f32,
+    pub fire_rate_secs: f32,
+    pub weapon_max_range: f32,
+    pub inventory: Vec<InventoryItemState>,
     pub is_visible: bool,
 }
 
@@ -2005,6 +2079,7 @@ pub struct ServerWorldSnapshot {
     pub grenades: Vec<GrenadeSnapshot>,
     pub targets: Vec<TargetSnapshot>,
     pub creeps: Vec<CreepSnapshot>,
+    pub couriers: Vec<CourierSnapshot>,
     pub turrets: Vec<TurretSnapshot>,
     pub barracks: Vec<BarracksSnapshot>,
     pub ancients: Vec<AncientSnapshot>,
@@ -4451,6 +4526,15 @@ pub struct PlayerSlotState {
     pub kills: u32,
     pub deaths: u32,
     pub inventory: Vec<InventoryItemState>,
+    pub courier_pos: Vec3,
+    pub courier_facing_dir: Vec3,
+    pub courier_hp: f32,
+    pub courier_max_hp: f32,
+    pub courier_is_dead: bool,
+    pub courier_respawn_remaining: f32,
+    pub courier_order: CourierOrder,
+    pub courier_target_pos: Vec3,
+    pub courier_inventory: Vec<InventoryItemState>,
     pub fog_of_war: SharedFogOfWar,
     pub in_water: bool,
     pub water_splash_cooldown: f32,
@@ -5260,6 +5344,15 @@ impl AuthoritativeWorldState {
                 kills: 0,
                 deaths: 0,
                 inventory: Vec::new(),
+                courier_pos: Vec3::new(spawn_pos.x, hero.courier.fly_height, spawn_pos.z),
+                courier_facing_dir: facing_dir,
+                courier_hp: hero.courier.max_hp,
+                courier_max_hp: hero.courier.max_hp,
+                courier_is_dead: false,
+                courier_respawn_remaining: 0.0,
+                courier_order: CourierOrder::Idle,
+                courier_target_pos: Vec3::new(spawn_pos.x, hero.courier.fly_height, spawn_pos.z),
+                courier_inventory: Vec::new(),
                 fog_of_war: SharedFogOfWar::from_config(config, lp.team),
                 in_water: false,
                 water_splash_cooldown: 0.0,
@@ -5312,6 +5405,38 @@ impl AuthoritativeWorldState {
 
         self.swap_slot_in(slot_index);
         let mut snap = self.build_snapshot(config);
+        if let Some(me) = self.players.get(slot_index) {
+            snap.hero.courier_hp = me.courier_hp;
+            snap.hero.courier_max_hp = me.courier_max_hp;
+            snap.hero.courier_is_dead = me.courier_is_dead;
+            snap.hero.courier_respawn_remaining = me.courier_respawn_remaining.max(0.0);
+            snap.hero.courier_order = me.courier_order;
+            snap.hero.courier_in_fountain = fountain_regen_bonus_for_pos(config, me.hero_team, me.courier_pos) > 0.0;
+            snap.hero.courier_inventory = me.courier_inventory.clone();
+        }
+        for p in &self.players {
+            let hero_cfg = config.active_hero(p.hero_index);
+            let is_vis = p.hero_team == viewer_team
+                || self.fog_of_war.is_world_point_visible(config, p.courier_pos.x, p.courier_pos.z);
+            if !is_vis {
+                continue;
+            }
+            snap.couriers.push(CourierSnapshot {
+                owner_slot: p.slot_index,
+                team: p.hero_team,
+                model_path: hero_cfg.courier.model_path.clone(),
+                scale: hero_cfg.courier.scale,
+                pos: p.courier_pos,
+                facing_dir: p.courier_facing_dir,
+                hp: p.courier_hp,
+                max_hp: p.courier_max_hp,
+                is_dead: p.courier_is_dead,
+                respawn_remaining: p.courier_respawn_remaining.max(0.0),
+                order: p.courier_order,
+                inventory: p.courier_inventory.clone(),
+                is_visible: is_vis,
+            });
+        }
         let mut others = Vec::with_capacity(self.players.len().saturating_sub(1));
         for p in &self.players {
 
@@ -5363,7 +5488,30 @@ impl AuthoritativeWorldState {
                 max_stamina: p.hero_max_stamina,
                 active_weapon: p.active_weapon,
                 ammo_in_mag: p.ammo_in_mag,
-                magazine_size: p.hero_weapon.magazine_size,
+                magazine_size: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                    p.hero_pistol.magazine_size
+                } else {
+                    p.hero_weapon.magazine_size
+                },
+                level: p.hero_level,
+                armor: p.hero_armor,
+                move_speed: p.current_move_speed,
+                weapon_damage: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                    p.hero_pistol.damage
+                } else {
+                    p.hero_weapon.damage
+                },
+                fire_rate_secs: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                    p.hero_pistol.fire_rate_secs
+                } else {
+                    p.hero_weapon.fire_rate_secs
+                },
+                weapon_max_range: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                    p.hero_pistol.max_range
+                } else {
+                    p.hero_weapon.max_range
+                },
+                inventory: p.inventory.clone(),
                 is_visible: true,
             });
         }
@@ -5438,6 +5586,12 @@ impl AuthoritativeWorldState {
                     is_deniable: !c.is_dead
                         && c.team == self.hero_team
                         && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio,
+                    move_speed: resolve_creep_stats(config, c.creep_type_id.as_deref()).move_speed,
+                    armor: resolve_creep_stats(config, c.creep_type_id.as_deref()).armor
+                        + lane_creep_buffs(config, &self.barracks, c.team, c.lane, c.camp_index.is_none()).2,
+                    damage: resolve_creep_stats(config, c.creep_type_id.as_deref()).bullet_damage,
+                    attack_range: resolve_creep_stats(config, c.creep_type_id.as_deref()).attack_range,
+                    fire_rate_secs: resolve_creep_stats(config, c.creep_type_id.as_deref()).fire_rate_secs,
                     is_visible: true,
                 })
             })
@@ -5586,6 +5740,13 @@ impl AuthoritativeWorldState {
                 deaths: self.deaths,
                 respawn_remaining: if self.is_dead { self.respawn_remaining.max(0.0) } else { 0.0 },
                 inventory: self.inventory.clone(),
+                courier_hp: 0.0,
+                courier_max_hp: 1.0,
+                courier_is_dead: false,
+                courier_respawn_remaining: 0.0,
+                courier_order: CourierOrder::Idle,
+                courier_in_fountain: false,
+                courier_inventory: Vec::new(),
             },
             other_players: Vec::new(),
             top_bar_heroes: Vec::new(),
@@ -5593,6 +5754,7 @@ impl AuthoritativeWorldState {
             bullets: self.bullets_snapshot.clone(),
             grenades: self.grenades_snapshot.clone(),
             creeps: Vec::new(),
+            couriers: Vec::new(),
             turrets: self
                 .turrets
                 .iter()
@@ -6281,16 +6443,7 @@ fn shared_drive_single_player(
     hero_aim_targets: &[(usize, TeamId, Vec3, f32, Stance, bool)],
 ) {
 
-    // ۱. بررسی کلید X (تست مرگ) و تایمر زنده شدن مجدد در چشمه پایگاه
-    if input.kill_toggle_just_pressed {
-        if world.is_dead {
-            world.is_dead = false;
-            world.base_stance = Stance::Run;
-        } else {
-            world.traversal.is_active = false;
-            trigger_random_death(world, config);
-        }
-    }
+    // تایمر زنده شدن مجدد در چشمه پایگاه
 
     if world.is_dead {
         controller.translation = None;
@@ -6501,6 +6654,33 @@ fn shared_drive_single_player(
             let mut hovered_barracks: Option<usize> = None;
             let mut hovered_ancient: Option<usize> = None;
 
+            let mut best_courier_hit: Option<(f32, Vec3)> = None;
+            for p in &world.players {
+                if p.hero_team == world.hero_team || p.courier_is_dead {
+                    continue;
+                }
+                if !world.fog_of_war.is_world_point_visible(config, p.courier_pos.x, p.courier_pos.z) {
+                    continue;
+                }
+                let h_cfg = config.active_hero(p.hero_index);
+                let c_rad = h_cfg.courier.hit_radius * config.combat.aim_lock_radius_multiplier;
+                if let Some(toi) = segment_hits_hero_capsule(
+                    input.aim_ray_origin,
+                    ray_dir,
+                    max_aim_dist,
+                    p.courier_pos - Vec3::Y * c_rad,
+                    c_rad,
+                    c_rad * 2.0,
+                    0.2,
+                    0.2,
+                ) {
+                    let prev_best = best_courier_hit.map(|(t, _)| t).unwrap_or(world_toi + 0.05);
+                    if toi <= world_toi + 0.05 && toi < prev_best {
+                        best_courier_hit = Some((toi, p.courier_pos));
+                    }
+                }
+            }
+
             let hero_wins_aim = match (best_enemy_hit, best_creep_hit) {
                 (Some((h_t, _)), Some((_, c_t, _))) => h_t <= c_t,
                 (Some(_), None) => true,
@@ -6510,10 +6690,24 @@ fn shared_drive_single_player(
             if hero_wins_aim {
                 resolved_hit = Some(best_enemy_hit.unwrap().1);
                 locked_enemy = true;
-            } else if let Some((c_id, _, c_chest_pos)) = best_creep_hit {
-                resolved_hit = Some(c_chest_pos);
+            } else if let Some((c_id, c_toi, c_chest_pos)) = best_creep_hit {
+                if let Some((cour_toi, cour_pos)) = best_courier_hit {
+                    if cour_toi < c_toi {
+                        resolved_hit = Some(cour_pos);
+                        locked_enemy = true;
+                    } else {
+                        resolved_hit = Some(c_chest_pos);
+                        locked_enemy = true;
+                        hovered_creep = Some(c_id);
+                    }
+                } else {
+                    resolved_hit = Some(c_chest_pos);
+                    locked_enemy = true;
+                    hovered_creep = Some(c_id);
+                }
+            } else if let Some((_, cour_pos)) = best_courier_hit {
+                resolved_hit = Some(cour_pos);
                 locked_enemy = true;
-                hovered_creep = Some(c_id);
             } else if let Some((hit_ent, hit)) = world_hit_opt {
                 if let Ok(pt) = turret_query.get(hit_ent) {
                     if pt.team != world.hero_team && !world.turrets[pt.index].is_dead {
@@ -7330,6 +7524,30 @@ fn shared_authoritative_react_system(
 
         let mut best_hero_hit: Option<(usize, f32)> = None;
         let mut best_creep_hit: Option<(usize, f32)> = None;
+        let mut best_courier_hit: Option<(usize, f32)> = None;
+        if step_dist > f32::EPSILON {
+            for (p_idx, p) in world.players.iter().enumerate() {
+                if p.hero_team == bullet.owner_team || p.courier_is_dead {
+                    continue;
+                }
+                let h_cfg = config.active_hero(p.hero_index);
+                let c_rad = h_cfg.courier.hit_radius + config.combat.bullet_hit_forgiveness_radius;
+                if let Some(toi) = segment_hits_hero_capsule(
+                    old_pos,
+                    step_dir,
+                    step_dist,
+                    p.courier_pos - Vec3::Y * c_rad,
+                    c_rad,
+                    c_rad * 2.0,
+                    0.2,
+                    0.2,
+                ) {
+                    if best_courier_hit.map_or(true, |(_, prev_toi)| toi < prev_toi) {
+                        best_courier_hit = Some((p_idx, toi));
+                    }
+                }
+            }
+        }
         if step_dist > f32::EPSILON {
             for (p_idx, p) in world.players.iter().enumerate() {
                 if Some(p.slot_index) == bullet.owner_slot || p.hero_team == bullet.owner_team || p.is_dead {
@@ -7447,6 +7665,57 @@ fn shared_authoritative_react_system(
                 impact_pos,
                 bullet_dir: step_dir,
                 target_destroyed: enemy_killed,
+                trauma_add: config.combat.shot_fire_trauma_add,
+                trauma_max: config.combat.shot_fire_trauma_max,
+            });
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        let courier_wins = match (best_courier_hit, ray_hit.as_ref()) {
+            (Some((_, cour_toi)), Some((_, _, s_toi))) => cour_toi <= *s_toi,
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        if courier_wins {
+            let (cour_p_idx, cour_toi) = best_courier_hit.unwrap();
+            let impact_pos = old_pos + step_dir * cour_toi;
+            let h_cfg = config.active_hero(world.players[cour_p_idx].hero_index).clone();
+            world.players[cour_p_idx].courier_hp =
+                (world.players[cour_p_idx].courier_hp - bullet.damage).max(0.0);
+            let cour_killed = world.players[cour_p_idx].courier_hp <= 0.0
+                && !world.players[cour_p_idx].courier_is_dead;
+            if cour_killed {
+                world.players[cour_p_idx].courier_is_dead = true;
+                world.players[cour_p_idx].courier_respawn_remaining = h_cfg.courier.respawn_secs;
+                world.players[cour_p_idx].courier_order = CourierOrder::Idle;
+                let cour_pos = world.players[cour_p_idx].courier_pos;
+                if let Some(owner_slot) = bullet.owner_slot {
+                    let world_inner = &mut *world;
+                    if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        killer.last_hits += 1;
+                        killer.hero_gold = killer.hero_gold.saturating_add(h_cfg.courier.bounty_gold);
+                        world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
+                            pos: cour_pos,
+                            gold: h_cfg.courier.bounty_gold,
+                        });
+                    }
+                }
+                world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
+                    pos: cour_pos,
+                    trauma_add: config.combat.shot_fire_trauma_add,
+                    trauma_max: config.combat.shot_fire_trauma_max,
+                });
+            }
+            world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
+                start: old_pos,
+                end: impact_pos,
+            });
+            world.pending_fx.push(GameplayFxEvent::BulletImpact {
+                impact_pos,
+                bullet_dir: step_dir,
+                target_destroyed: cour_killed,
                 trauma_add: config.combat.shot_fire_trauma_add,
                 trauma_max: config.combat.shot_fire_trauma_max,
             });
@@ -7905,9 +8174,18 @@ fn shared_authoritative_react_system(
                 .filter(|c| !c.is_dead && c.team == my_team)
                 .map(|c| c.pos)
                 .collect();
+            let allied_courier_vision: Vec<(Vec3, f32)> = world
+                .players
+                .iter()
+                .filter(|p| !p.courier_is_dead && p.hero_team == my_team)
+                .map(|p| (p.courier_pos, config.active_hero(p.hero_index).courier.vision_range))
+                .collect();
             world
                 .fog_of_war
                 .update_for_hero(&config, hero_pos, hero, &allied_creep_positions);
+            for (c_pos, c_range) in allied_courier_vision {
+                world.fog_of_war.reveal_from_source(&config, c_pos, c_range, 48);
+            }
         }
         if let Some(ref mut active_input) = world.active_input {
             active_input.consume_just_pressed();
@@ -8261,6 +8539,11 @@ fn step_lane_creeps_system(
         .iter()
         .map(|p| (p.hero_team, p.soldier_pos, p.is_dead))
         .collect();
+    let courier_snap: Vec<(TeamId, Vec3, bool)> = world
+        .players
+        .iter()
+        .map(|p| (p.hero_team, p.courier_pos, p.courier_is_dead))
+        .collect();
     let turret_snap: Vec<(TeamId, Vec3, f32, f32, bool)> = world
         .turrets
         .iter()
@@ -8415,6 +8698,17 @@ fn step_lane_creeps_system(
                         ) {
                             best_target = Some((Vec3::new(b_pos.x, b_pos.y + b_height * 0.5, b_pos.z), edge_dist));
                         }
+                    }
+                }
+            }
+            if !is_neutral {
+                for &(cour_team, cour_pos, cour_dead) in &courier_snap {
+                    if cour_team == my_team || cour_dead {
+                        continue;
+                    }
+                    let d_xz = Vec2::new(my_pos.x, my_pos.z).distance(Vec2::new(cour_pos.x, cour_pos.z));
+                    if d_xz <= c_stats.vision_range && best_target.map_or(true, |(_, bd)| d_xz < bd) {
+                        best_target = Some((cour_pos, d_xz));
                     }
                 }
             }
@@ -8712,6 +9006,11 @@ fn step_turrets_system(
         .map(|p| (p.hero_team, p.soldier_pos, p.is_dead))
         .collect();
 
+    let courier_snap: Vec<(TeamId, Vec3, bool)> = world
+        .players
+        .iter()
+        .map(|p| (p.hero_team, p.courier_pos, p.courier_is_dead))
+        .collect();
     let backdoor_r = config.combat.turret_backdoor_creep_radius;
     let spread_rad = config.combat.turret_bullet_spread_rad;
 
@@ -8798,7 +9097,19 @@ fn step_turrets_system(
             }
         }
 
-        let chosen_target = best_creep.or(best_hero).map(|(p, _)| p);
+        let mut best_courier: Option<(Vec3, f32)> = None;
+        if best_creep.is_none() && best_hero.is_none() {
+            for &(c_team, c_pos, c_dead) in &courier_snap {
+                if c_team == my_team || c_dead {
+                    continue;
+                }
+                let d_xz = Vec2::new(my_pos.x, my_pos.z).distance(Vec2::new(c_pos.x, c_pos.z));
+                if d_xz <= t_def.attack_range && best_courier.map_or(true, |(_, bd)| d_xz < bd) {
+                    best_courier = Some((c_pos, d_xz));
+                }
+            }
+        }
+        let chosen_target = best_creep.or(best_hero).or(best_courier).map(|(p, _)| p);
         world.turrets[idx].aim_target_pos = chosen_target;
 
         // ۴. شلیک رگباری متناوب دولول

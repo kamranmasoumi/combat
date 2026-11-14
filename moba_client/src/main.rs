@@ -13,7 +13,7 @@ use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalA
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
-use bevy::window::{CursorOptions, PresentMode, PrimaryWindow, WindowResolution};
+use bevy::window::{CursorOptions, MonitorSelection, PresentMode, PrimaryWindow, WindowMode, WindowResolution};
 use moba_shared::{
     ancient_physics_bundle, barracks_physics_bundle, center_bridge_physics_bundle, create_shared_renet_client,
     grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
@@ -21,7 +21,7 @@ use moba_shared::{
     particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
     shell_casing_physics_bundle, target_physics_bundle,
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
-    apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CreepAnimState, CreepSnapshot,
+    apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CourierOrder, CourierSnapshot, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
     ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
@@ -37,7 +37,7 @@ use std::path::Path;
 use std::time::Duration;
 
 mod shop_client;
-use shop_client::{SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
+use shop_client::{CourierControlState, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
 
 fn main() {
     let mut config = GameConfig::load_from_file("config.ron");
@@ -102,6 +102,13 @@ fn main() {
             deaths: 0,
             respawn_remaining: 0.0,
             inventory: Vec::new(),
+            courier_hp: h.courier.max_hp,
+            courier_max_hp: h.courier.max_hp,
+            courier_is_dead: false,
+            courier_respawn_remaining: 0.0,
+            courier_order: CourierOrder::Idle,
+            courier_in_fountain: true,
+            courier_inventory: Vec::new(),
         }
     };
 
@@ -111,6 +118,7 @@ fn main() {
                 title: config.window.title.clone(),
                 resolution: WindowResolution::new(config.window.width, config.window.height),
                 present_mode: PresentMode::AutoNoVsync,
+                mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
                 ..default()
             }),
             ..default()
@@ -131,6 +139,9 @@ fn main() {
         .insert_resource(LatestHeroSnapshot(initial_hero_snapshot))
         .insert_resource(LatestRemotePlayers::default())
         .insert_resource(LatestCreeps::default())
+        .insert_resource(LatestCouriers::default())
+        .insert_resource(InspectedUnit::default())
+        .insert_resource(HeroClickMoveTarget::default())
         .insert_resource(LatestTopBarState::default())
         .insert_resource(LatestTurrets::default())
         .insert_resource(LatestBarracks::default())
@@ -152,6 +163,7 @@ fn main() {
         })
         .insert_resource(CameraControlState {
             free_look_target: None,
+            camera_unlocked: false,
             current_cursor_lead: Vec3::ZERO,
             is_pointer_over_minimap: false,
             is_dragging_minimap: false,
@@ -230,7 +242,7 @@ fn main() {
                 .chain()
                 .after(sync_remote_players_system),
         )
-        .add_systems(Update, adaptive_ui_performance_mode_system)
+        .add_systems(Update, (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system))
         .add_systems(
             PostUpdate,
             align_weapon_horizontally_system.before(TransformSystems::Propagate),
@@ -497,6 +509,7 @@ const MINIMAP_TEX_H: u32 = 384;
 #[derive(Resource)]
 struct CameraControlState {
     free_look_target: Option<Vec3>,
+    camera_unlocked: bool,
     current_cursor_lead: Vec3,
     is_pointer_over_minimap: bool,
     is_dragging_minimap: bool,
@@ -2750,6 +2763,7 @@ fn weapon_live_calibration_system(
         return;
     }
     let dt = time.delta_secs();
+
     let move_speed = config.weapon_tuner.calibration_move_speed * dt;
     let rot_speed = config.weapon_tuner.calibration_rot_speed_deg * dt;
 
@@ -2802,6 +2816,15 @@ fn weapon_live_calibration_system(
 // ارسال ورودی به سرور و دریافت وضعیت Authoritative از سرور
 // -----------------------------------------------------------------------------
 
+#[derive(SystemParam)]
+struct SampleInputExtraParams<'w> {
+    render_state: Res<'w, ClientRenderState>,
+    courier_ctrl: ResMut<'w, CourierControlState>,
+    inspected: ResMut<'w, InspectedUnit>,
+    hero_move_target: ResMut<'w, HeroClickMoveTarget>,
+    prediction: ResMut<'w, ClientPhysicsPredictionState>,
+}
+
 fn client_sample_input_system(
     match_flow: Res<ClientMatchFlow>,
     match_result: Res<LatestMatchResult>,
@@ -2815,13 +2838,13 @@ fn client_sample_input_system(
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
     muzzle_query: Query<&GlobalTransform, With<MuzzlePoint>>,
-    mut prediction: ResMut<ClientPhysicsPredictionState>,
+    mut ex: SampleInputExtraParams,
 ) {
     if !match_flow.is_in_game() || match_result.0.is_some() {
         return;
     }
     if chat_state.is_open || pause_state.0.phase != PausePhase::Running {
-        prediction.latest_input = Some(ClientInputCommand {
+        ex.prediction.latest_input = Some(ClientInputCommand {
             move_input: Vec3::ZERO,
             shift_held: false,
             toggle_crouch_just_pressed: false,
@@ -2830,7 +2853,6 @@ fn client_sample_input_system(
             space_just_pressed: false,
             space_held: false,
             switch_weapon_just_pressed: false,
-            kill_toggle_just_pressed: false,
             fire_just_pressed: false,
             fire_held: false,
             aim_ray_origin: Vec3::ZERO,
@@ -2853,6 +2875,20 @@ fn client_sample_input_system(
     if keyboard.pressed(KeyCode::KeyD) {
         move_vec.x += 1.0;
     }
+    if move_vec.length_squared() > 0.01 {
+        ex.hero_move_target.0 = None;
+    } else if let Some(target) = ex.hero_move_target.0 {
+        let delta = Vec3::new(
+            target.x - ex.render_state.soldier_pos.x,
+            0.0,
+            target.z - ex.render_state.soldier_pos.z,
+        );
+        if delta.length() <= 0.45 {
+            ex.hero_move_target.0 = None;
+        } else {
+            move_vec = delta.normalize();
+        }
+    }
 
     let mut aim_ray_origin = Vec3::ZERO;
     let mut aim_ray_dir = Vec3::NEG_Z;
@@ -2871,6 +2907,23 @@ fn client_sample_input_system(
     let client_muzzle_world_pos = muzzle_query.single().ok().map(|gtf| gtf.translation());
 
     let alt_held = keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight);
+    let hero_action_taken = move_vec.length_squared() > 0.01
+        || keyboard.just_pressed(KeyCode::Space)
+        || keyboard.just_pressed(KeyCode::KeyR)
+        || keyboard.just_pressed(KeyCode::KeyE)
+        || keyboard.just_pressed(KeyCode::KeyF)
+        || (!alt_held
+            && !shop_ui.is_open
+            && !settings_ui.is_open
+            && !camera_control.is_pointer_over_minimap
+            && !camera_control.is_dragging_minimap
+            && mouse_button.just_pressed(MouseButton::Left));
+    if hero_action_taken && !shop_ui.is_open && !settings_ui.is_open {
+        ex.courier_ctrl.selected = false;
+        if *ex.inspected == InspectedUnit::OwnCourier {
+            *ex.inspected = InspectedUnit::OwnHero;
+        }
+    }
     let cmd = ClientInputCommand {
         move_input: move_vec,
         shift_held: keyboard.pressed(KeyCode::ShiftLeft) || keyboard.pressed(KeyCode::ShiftRight),
@@ -2881,7 +2934,6 @@ fn client_sample_input_system(
         space_just_pressed: keyboard.just_pressed(KeyCode::Space),
         space_held: keyboard.pressed(KeyCode::Space),
         switch_weapon_just_pressed: keyboard.just_pressed(KeyCode::KeyE),
-        kill_toggle_just_pressed: keyboard.just_pressed(KeyCode::KeyX),
         fire_just_pressed: !alt_held
             && !shop_ui.is_open
             && !settings_ui.is_open
@@ -2901,22 +2953,22 @@ fn client_sample_input_system(
     };
 
     if cmd.toggle_crouch_just_pressed {
-        prediction.base_stance = if prediction.base_stance == Stance::Crouch {
+        ex.prediction.base_stance = if ex.prediction.base_stance == Stance::Crouch {
             Stance::Run
         } else {
             Stance::Crouch
         };
     }
-    prediction.effective_stance = if cmd.shift_held {
+    ex.prediction.effective_stance = if cmd.shift_held {
         Stance::Walk
     } else {
-        prediction.base_stance
+        ex.prediction.base_stance
     };
 
-    if let Some(ref mut existing) = prediction.latest_input {
+    if let Some(ref mut existing) = ex.prediction.latest_input {
         existing.accumulate_from(cmd);
     } else {
-        prediction.latest_input = Some(cmd);
+        ex.prediction.latest_input = Some(cmd);
     }
 }
 
@@ -3039,6 +3091,7 @@ fn client_receive_snapshot_and_sync_system(
         hud_sync.hero_hud.0 = snap.hero.clone();
         hud_sync.remote_players.0 = snap.other_players.clone();
         hud_sync.creeps.0 = snap.creeps.clone();
+        hud_sync.couriers.0 = snap.couriers.clone();
         hud_sync.top_bar.match_elapsed_secs = snap.match_elapsed_secs;
         hud_sync.top_bar.heroes = snap.top_bar_heroes.clone();
         hud_sync.turrets.0 = snap.turrets.clone();
@@ -4338,16 +4391,55 @@ fn camera_follow_system(
     chat_state: Res<ChatUiState>,
     mut shake: ResMut<CameraShake>,
     mut render_state: ResMut<ClientRenderState>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    shop_ui: Res<ShopUiState>,
     mut camera_control: ResMut<CameraControlState>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     soldier_query: Query<&Transform, (With<SoldierMarker>, Without<MobaCamera>)>,
     mut camera_query: Query<&mut Transform, With<MobaCamera>>,
+    mut last_mid_cursor: Local<Option<Vec2>>,
 ) {
     if !match_flow.is_in_game() {
         return;
     }
     let Ok(soldier_tf) = soldier_query.single() else { return };
     let Ok(mut camera_tf) = camera_query.single_mut() else { return };
+
+    if !chat_state.is_open && !shop_ui.is_open && keyboard.just_pressed(KeyCode::KeyC) {
+        camera_control.camera_unlocked = !camera_control.camera_unlocked;
+        if camera_control.camera_unlocked {
+            if camera_control.free_look_target.is_none() {
+                camera_control.free_look_target = Some(soldier_tf.translation);
+            }
+        } else {
+            camera_control.free_look_target = None;
+        }
+    }
+
+    if !chat_state.is_open && !shop_ui.is_open && mouse_button.pressed(MouseButton::Middle) {
+        if let Ok(window) = window_query.single() {
+            if let Some(cursor) = window.cursor_position() {
+                if let Some(prev) = *last_mid_cursor {
+                    let delta = cursor - prev;
+                    if delta.length_squared() > 0.01 {
+                        let base = camera_control
+                            .free_look_target
+                            .unwrap_or(soldier_tf.translation);
+                        let pan_speed = 0.065;
+                        let half_x = config.map.map_dimensions.0 * 0.5;
+                        let half_z = config.map.map_dimensions.1 * 0.5;
+                        let next_x = (base.x - delta.x * pan_speed).clamp(-half_x, half_x);
+                        let next_z = (base.z - delta.y * pan_speed).clamp(-half_z, half_z);
+                        camera_control.free_look_target = Some(Vec3::new(next_x, base.y, next_z));
+                    }
+                }
+                *last_mid_cursor = Some(cursor);
+            }
+        }
+    } else {
+        *last_mid_cursor = None;
+    }
 
     let dt = time.delta_secs();
     shake.trauma = (shake.trauma - config.camera.trauma_decay_rate * dt).max(0.0);
@@ -4751,12 +4843,19 @@ fn spawn_minimap_ui(commands: &mut Commands, config: &GameConfig, minimap_handle
 }
 
 fn minimap_interaction_system(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     config: Res<GameConfig>,
     chat_state: Res<ChatUiState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     render_state: Res<ClientRenderState>,
+    courier_ctrl: Res<CourierControlState>,
+    mut inspected: ResMut<InspectedUnit>,
+    mut hero_move_target: ResMut<HeroClickMoveTarget>,
+    mut outgoing: ResMut<ShopOutgoingQueue>,
     mut camera_control: ResMut<CameraControlState>,
 ) {
     if !chat_state.is_open {
@@ -4765,10 +4864,10 @@ fn minimap_interaction_system(
             || keyboard.pressed(KeyCode::KeyS)
             || keyboard.pressed(KeyCode::KeyD);
 
-        if keyboard.just_pressed(KeyCode::KeyY)
-            || keyboard.just_pressed(KeyCode::Home)
-            || (wasd_pressed && !camera_control.is_dragging_minimap)
-        {
+        if keyboard.just_pressed(KeyCode::KeyY) || keyboard.just_pressed(KeyCode::Home) {
+            camera_control.camera_unlocked = false;
+            camera_control.free_look_target = None;
+        } else if !camera_control.camera_unlocked && wasd_pressed && !camera_control.is_dragging_minimap {
             camera_control.free_look_target = None;
         }
     }
@@ -4810,6 +4909,21 @@ fn minimap_interaction_system(
         let world_z = (v - 0.5) * config.map.map_dimensions.1;
         camera_control.free_look_target = Some(Vec3::new(world_x, render_state.soldier_pos.y, world_z));
     }
+
+    if inside && !chat_state.is_open && mouse_button.just_pressed(MouseButton::Right) {
+        let u = ((cursor.x - min_x) / MINIMAP_WIDTH_PX).clamp(0.0, 1.0);
+        let v = ((cursor.y - min_y) / MINIMAP_HEIGHT_PX).clamp(0.0, 1.0);
+        let world_x = (u - 0.5) * config.map.map_dimensions.0;
+        let world_z = (v - 0.5) * config.map.map_dimensions.1;
+        let target_pos = Vec3::new(world_x, 0.0, world_z);
+        spawn_green_move_arrows(&mut commands, &mut meshes, &mut materials, target_pos);
+        if courier_ctrl.selected {
+            outgoing.0.push(ClientLobbyMessage::CourierMoveTo { world_pos: target_pos });
+        } else {
+            *inspected = InspectedUnit::OwnHero;
+            hero_move_target.0 = Some(target_pos);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -4819,6 +4933,8 @@ fn minimap_overlay_update_system(
     render_state: Res<ClientRenderState>,
     hero_hud: Res<LatestHeroSnapshot>,
     latest_creeps: Res<LatestCreeps>,
+    latest_couriers: Res<LatestCouriers>,
+    match_flow: Res<ClientMatchFlow>,
     camera_control: Res<CameraControlState>,
     soldier_query: Query<&Transform, With<SoldierMarker>>,
     target_query: Query<&VisualTarget>,
@@ -4830,6 +4946,7 @@ fn minimap_overlay_update_system(
             Without<MinimapTargetDot>,
             Without<MinimapCameraBox>,
             Without<MinimapCreepDot>,
+            Without<MinimapCourierDot>,
         ),
     >,
     mut target_dot_query: Query<
@@ -4838,6 +4955,7 @@ fn minimap_overlay_update_system(
             Without<MinimapSoldierDot>,
             Without<MinimapCameraBox>,
             Without<MinimapCreepDot>,
+            Without<MinimapCourierDot>,
         ),
     >,
     mut cam_box_query: Query<
@@ -4847,6 +4965,7 @@ fn minimap_overlay_update_system(
             Without<MinimapSoldierDot>,
             Without<MinimapTargetDot>,
             Without<MinimapCreepDot>,
+            Without<MinimapCourierDot>,
         ),
     >,
     mut creep_dot_query: Query<
@@ -4855,6 +4974,16 @@ fn minimap_overlay_update_system(
             Without<MinimapSoldierDot>,
             Without<MinimapTargetDot>,
             Without<MinimapCameraBox>,
+            Without<MinimapCourierDot>,
+        ),
+    >,
+    mut courier_dot_query: Query<
+        (Entity, &MinimapCourierDot, &mut Node, &mut BackgroundColor),
+        (
+            Without<MinimapSoldierDot>,
+            Without<MinimapTargetDot>,
+            Without<MinimapCameraBox>,
+            Without<MinimapCreepDot>,
         ),
     >,
 ) {
@@ -4950,7 +5079,67 @@ fn minimap_overlay_update_system(
             });
         }
     }
+
+    // نمایش Courierهای زنده و قابل‌مشاهده روی مینی‌مپ
+    let my_slot = match_flow.your_slot;
+    let alive_couriers: HashMap<usize, &CourierSnapshot> = latest_couriers
+        .0
+        .iter()
+        .filter(|c| !c.is_dead && c.is_visible)
+        .map(|c| (c.owner_slot, c))
+        .collect();
+    let mut existing_cour_dots = HashSet::new();
+    for (ent, cdot, mut node, mut bg) in &mut courier_dot_query {
+        let Some(&cs) = alive_couriers.get(&cdot.owner_slot) else {
+            commands.entity(ent).despawn();
+            continue;
+        };
+        existing_cour_dots.insert(cdot.owner_slot);
+        let uv = world_to_minimap_uv(&config, cs.pos.x, cs.pos.z);
+        node.left = px(uv.x * MINIMAP_WIDTH_PX - 3.5);
+        node.top = px(uv.y * MINIMAP_HEIGHT_PX - 3.5);
+        bg.0 = if Some(cs.owner_slot) == my_slot {
+            Color::srgb(0.20, 0.92, 1.0)
+        } else if cs.team == my_team {
+            Color::srgb(0.25, 0.92, 0.45)
+        } else {
+            Color::srgb(0.98, 0.25, 0.25)
+        };
+    }
+    if let Ok(root_ent) = minimap_root_q.single() {
+        for (&owner_slot, &cs) in &alive_couriers {
+            if existing_cour_dots.contains(&owner_slot) {
+                continue;
+            }
+            let uv = world_to_minimap_uv(&config, cs.pos.x, cs.pos.z);
+            let col = if Some(owner_slot) == my_slot {
+                Color::srgb(0.20, 0.92, 1.0)
+            } else if cs.team == my_team {
+                Color::srgb(0.25, 0.92, 0.45)
+            } else {
+                Color::srgb(0.98, 0.25, 0.25)
+            };
+            commands.entity(root_ent).with_children(|p| {
+                p.spawn((
+                    MinimapCourierDot { owner_slot },
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(uv.x * MINIMAP_WIDTH_PX - 3.5),
+                        top: px(uv.y * MINIMAP_HEIGHT_PX - 3.5),
+                        width: px(7.0),
+                        height: px(7.0),
+                        border: UiRect::all(px(1.0)),
+                        border_radius: BorderRadius::all(px(2.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::BLACK),
+                    BackgroundColor(col),
+                ));
+            });
+        }
+    }
 }
+
 
 fn bake_minimap_image(config: &GameConfig) -> Image {
     let w = MINIMAP_TEX_W as usize;
@@ -6169,6 +6358,7 @@ fn update_hero_hud_system(
     config: Res<GameConfig>,
     items_cfg: Res<ItemsConfig>,
     hero_state: Res<LatestHeroSnapshot>,
+    inspect_p: HudInspectParams,
     mut extra_stats: HeroHudExtraStatQueries,
     mut hp_bar_query: Query<(&mut Node, &mut BackgroundColor), With<HeroHpBarFill>>,
     mut xp_seg_query: Query<(&HeroHudXpSegment, &mut BackgroundColor), Without<HeroHpBarFill>>,
@@ -6180,6 +6370,204 @@ fn update_hero_hud_system(
     mut hp_txt_q: Query<&mut Text, (With<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
 ) {
     let h = &hero_state.0;
+    let clear_bonuses = |extra: &mut HeroHudExtraStatQueries| {
+        for (_, mut bt, _) in &mut extra.bonus_q {
+            **bt = String::new();
+        }
+    };
+    let set_unit_extra_stats = |extra: &mut HeroHudExtraStatQueries,
+                                lvl_q: &mut Query<&mut Text, (With<HeroHudLevelText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>)>,
+                                xp_q: &mut Query<&mut Text, (With<HeroHudXpLabelText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>)>,
+                                lvl_str: &str,
+                                xp_str: &str,
+                                dmg: f32,
+                                rate: f32,
+                                rng: f32,
+                                arm: f32,
+                                spd: f32,
+                                vis: f32,
+                                ammo: &str| {
+        if let Ok(mut t) = lvl_q.single_mut() { **t = lvl_str.to_string(); }
+        if let Ok(mut t) = xp_q.single_mut() { **t = xp_str.to_string(); }
+        if let Ok(mut t) = extra.dmg_q.single_mut() { **t = format!("DMG {:.0}", dmg); }
+        if let Ok(mut t) = extra.rate_q.single_mut() { **t = format!("RATE {:.2}s", rate); }
+        if let Ok(mut t) = extra.range_q.single_mut() { **t = format!("RNG {:.0}m", rng); }
+        if let Ok(mut t) = extra.armor_q.single_mut() { **t = format!("ARM {:.1}", arm); }
+        if let Ok(mut t) = extra.speed_q.single_mut() { **t = format!("SPD {:.1}", spd); }
+        if let Ok(mut t) = extra.vision_q.single_mut() { **t = format!("VIS {:.0}m", vis); }
+        if let Ok(mut t) = extra.ammo_q.single_mut() { **t = ammo.to_string(); }
+    };
+
+    let show_own_courier = inspect_p.courier_ctrl.selected || *inspect_p.inspected == InspectedUnit::OwnCourier;
+    if show_own_courier {
+        let my_hero_cfg = config.heroes.iter().find(|hd| hd.id == h.hero_id).unwrap_or(config.active_hero(0));
+        let pct = if h.courier_is_dead || h.courier_max_hp <= 0.0 {
+            0.0
+        } else {
+            ((h.courier_hp / h.courier_max_hp) * 100.0).clamp(0.0, 100.0)
+        };
+        if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
+            bar_node.width = percent(pct);
+            *bar_col = Color::srgb(0.28, 0.86, 1.0).into();
+        }
+        if let Ok(mut t) = header_q.single_mut() {
+            **t = format!("DRONE COURIER [{:?}]", h.team);
+        }
+        if let Ok(mut t) = hp_txt_q.single_mut() {
+            **t = if h.courier_is_dead {
+                format!("DEAD - RESPAWN IN {:.0}s", h.courier_respawn_remaining.ceil())
+            } else {
+                format!("{:.0} / {:.0} [{:?}]", h.courier_hp, h.courier_max_hp, h.courier_order)
+            };
+        }
+        if let Ok(mut t) = kda_q.single_mut() {
+            **t = format!("STASH {}/6  |  RMB: Fly  |  [F3] Deliver  |  [F1] Hero", h.courier_inventory.len());
+        }
+        clear_bonuses(&mut extra_stats);
+        set_unit_extra_stats(
+            &mut extra_stats,
+            &mut lvl_q,
+            &mut xp_lbl_q,
+            "DRN",
+            "FLYING",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            my_hero_cfg.courier.move_speed,
+            my_hero_cfg.courier.vision_range,
+            "N/A",
+        );
+        return;
+    }
+
+    match *inspect_p.inspected {
+        InspectedUnit::EnemyCourier(owner_slot) => {
+            if let Some(c) = inspect_p.latest_couriers.0.iter().find(|c| c.owner_slot == owner_slot) {
+                let pct = if c.is_dead || c.max_hp <= 0.0 { 0.0 } else { ((c.hp / c.max_hp) * 100.0).clamp(0.0, 100.0) };
+                if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
+                    bar_node.width = percent(pct);
+                    *bar_col = Color::srgb(0.95, 0.30, 0.30).into();
+                }
+                if let Ok(mut t) = header_q.single_mut() { **t = format!("ENEMY COURIER [{:?}]", c.team); }
+                if let Ok(mut t) = hp_txt_q.single_mut() { **t = format!("{:.0} / {:.0}", c.hp, c.max_hp); }
+                if let Ok(mut t) = kda_q.single_mut() { **t = "Enemy Flying Courier".to_string(); }
+                clear_bonuses(&mut extra_stats);
+                set_unit_extra_stats(&mut extra_stats, &mut lvl_q, &mut xp_lbl_q, "DRN", "ENEMY", 0.0, 0.0, 0.0, 0.0, 14.0, 6.0, "N/A");
+                return;
+            }
+        }
+        InspectedUnit::RemoteHero(slot) => {
+            if let Some(rp) = inspect_p.latest_remotes.0.iter().find(|r| r.slot_index == slot) {
+                let pct = if rp.is_dead || rp.max_hp <= 0.0 { 0.0 } else { ((rp.hp / rp.max_hp) * 100.0).clamp(0.0, 100.0) };
+                if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
+                    bar_node.width = percent(pct);
+                    *bar_col = if rp.team == h.team { Color::srgb(0.16, 0.78, 0.38).into() } else { Color::srgb(0.95, 0.30, 0.30).into() };
+                }
+                if let Ok(mut t) = header_q.single_mut() { **t = format!("{} [{:?}]", rp.display_name, rp.team); }
+                if let Ok(mut t) = hp_txt_q.single_mut() { **t = format!("{:.0} / {:.0}", rp.hp, rp.max_hp); }
+                if let Ok(mut t) = kda_q.single_mut() { **t = format!("Weapon: {:?}", rp.weapon_kind); }
+                clear_bonuses(&mut extra_stats);
+                let vis_r = config.heroes.iter().find(|hd| hd.id == rp.hero_id).map(|hd| hd.vision_range).unwrap_or(36.0);
+                set_unit_extra_stats(
+                    &mut extra_stats,
+                    &mut lvl_q,
+                    &mut xp_lbl_q,
+                    &format!("{}", rp.level),
+                    "HERO",
+                    rp.weapon_damage,
+                    rp.fire_rate_secs,
+                    rp.weapon_max_range,
+                    rp.armor,
+                    rp.move_speed,
+                    vis_r,
+                    &format!("{}/{}", rp.ammo_in_mag, rp.magazine_size),
+                );
+                return;
+            }
+        }
+        InspectedUnit::Creep(cid) => {
+            if let Some(cr) = inspect_p.latest_creeps.0.iter().find(|c| c.id == cid) {
+                let pct = if cr.is_dead || cr.max_hp <= 0.0 { 0.0 } else { ((cr.hp / cr.max_hp) * 100.0).clamp(0.0, 100.0) };
+                if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
+                    bar_node.width = percent(pct);
+                    *bar_col = if cr.team == h.team { Color::srgb(0.16, 0.78, 0.38).into() } else { Color::srgb(0.95, 0.30, 0.30).into() };
+                }
+                if let Ok(mut t) = header_q.single_mut() { **t = format!("CREEP [{:?}]", cr.team); }
+                if let Ok(mut t) = hp_txt_q.single_mut() { **t = format!("{:.0} / {:.0}", cr.hp, cr.max_hp); }
+                if let Ok(mut t) = kda_q.single_mut() { **t = cr.creep_type_id.clone().unwrap_or_else(|| "Lane Creep".to_string()); }
+                clear_bonuses(&mut extra_stats);
+                set_unit_extra_stats(
+                    &mut extra_stats,
+                    &mut lvl_q,
+                    &mut xp_lbl_q,
+                    "CRP",
+                    "UNIT",
+                    cr.damage,
+                    cr.fire_rate_secs,
+                    cr.attack_range,
+                    cr.armor,
+                    cr.move_speed,
+                    config.creeps.vision_range,
+                    "INF",
+                );
+                return;
+            }
+        }
+        InspectedUnit::Turret(t_idx) => {
+            if let (Some(ts), Some(td)) = (inspect_p.latest_turrets.0.get(t_idx), config.map.turrets.get(t_idx)) {
+                let pct = if ts.is_dead || ts.max_hp <= 0.0 { 0.0 } else { ((ts.hp / ts.max_hp) * 100.0).clamp(0.0, 100.0) };
+                if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
+                    bar_node.width = percent(pct);
+                    *bar_col = if ts.team == h.team { Color::srgb(0.16, 0.78, 0.38).into() } else { Color::srgb(0.95, 0.30, 0.30).into() };
+                }
+                if let Ok(mut t) = header_q.single_mut() { **t = format!("TIER {} TURRET [{:?}]", td.tier, ts.team); }
+                if let Ok(mut t) = hp_txt_q.single_mut() {
+                    **t = if ts.is_invulnerable { format!("{:.0} / {:.0} [INVULNERABLE]", ts.hp, ts.max_hp) } else { format!("{:.0} / {:.0}", ts.hp, ts.max_hp) };
+                }
+                if let Ok(mut t) = kda_q.single_mut() { **t = format!("Lane: {:?}  |  Tower Structure", td.lane); }
+                clear_bonuses(&mut extra_stats);
+                set_unit_extra_stats(&mut extra_stats, &mut lvl_q, &mut xp_lbl_q, &format!("T{}", td.tier), "TOWER", td.bullet_damage, td.fire_rate_secs, td.attack_range, td.armor, 0.0, td.vision_range, "INF");
+                return;
+            }
+        }
+        InspectedUnit::Barracks(b_idx) => {
+            if let (Some(bs), Some(bd)) = (inspect_p.latest_barracks.0.get(b_idx), config.map.barracks.get(b_idx)) {
+                let pct = if bs.is_dead || bs.max_hp <= 0.0 { 0.0 } else { ((bs.hp / bs.max_hp) * 100.0).clamp(0.0, 100.0) };
+                if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
+                    bar_node.width = percent(pct);
+                    *bar_col = if bs.team == h.team { Color::srgb(0.16, 0.78, 0.38).into() } else { Color::srgb(0.95, 0.30, 0.30).into() };
+                }
+                if let Ok(mut t) = header_q.single_mut() { **t = format!("{:?} BARRACKS [{:?}]", bd.kind, bs.team); }
+                if let Ok(mut t) = hp_txt_q.single_mut() {
+                    **t = if bs.is_invulnerable { format!("{:.0} / {:.0} [INVULNERABLE]", bs.hp, bs.max_hp) } else { format!("{:.0} / {:.0}", bs.hp, bs.max_hp) };
+                }
+                if let Ok(mut t) = kda_q.single_mut() { **t = format!("Lane: {:?}  |  Barracks Structure", bd.lane); }
+                clear_bonuses(&mut extra_stats);
+                set_unit_extra_stats(&mut extra_stats, &mut lvl_q, &mut xp_lbl_q, "BRK", "BLDG", 0.0, 0.0, 0.0, bd.armor, 0.0, config.map.base_vision_range, "N/A");
+                return;
+            }
+        }
+        InspectedUnit::Ancient(a_idx) => {
+            if let (Some(ans), Some(ad)) = (inspect_p.latest_ancients.0.get(a_idx), config.map.ancients.get(a_idx)) {
+                let pct = if ans.is_dead || ans.max_hp <= 0.0 { 0.0 } else { ((ans.hp / ans.max_hp) * 100.0).clamp(0.0, 100.0) };
+                if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
+                    bar_node.width = percent(pct);
+                    *bar_col = if ans.team == h.team { Color::srgb(0.16, 0.78, 0.38).into() } else { Color::srgb(0.95, 0.30, 0.30).into() };
+                }
+                if let Ok(mut t) = header_q.single_mut() { **t = format!("ANCIENT CORE [{:?}]", ans.team); }
+                if let Ok(mut t) = hp_txt_q.single_mut() {
+                    **t = if ans.is_invulnerable { format!("{:.0} / {:.0} [INVULNERABLE]", ans.hp, ans.max_hp) } else { format!("{:.0} / {:.0}", ans.hp, ans.max_hp) };
+                }
+                if let Ok(mut t) = kda_q.single_mut() { **t = "Main Base Objective".to_string(); }
+                clear_bonuses(&mut extra_stats);
+                set_unit_extra_stats(&mut extra_stats, &mut lvl_q, &mut xp_lbl_q, "ANC", "CORE", 0.0, 0.0, 0.0, ad.armor, 0.0, config.map.base_vision_range, "N/A");
+                return;
+            }
+        }
+        InspectedUnit::OwnHero | InspectedUnit::OwnCourier => {}
+    }
+
     let hp_pct = ((h.hp / h.max_hp.max(1.0)) * 100.0).clamp(0.0, 100.0);
 
     if let Ok((mut bar_node, mut bar_col)) = hp_bar_query.single_mut() {
@@ -6454,6 +6842,9 @@ struct LatestRemotePlayers(Vec<RemotePlayerSnapshot>);
 #[derive(Resource, Default)]
 struct LatestCreeps(Vec<CreepSnapshot>);
 
+#[derive(Resource, Default)]
+struct LatestCouriers(Vec<CourierSnapshot>);
+
 struct CachedHeroAnimGraph {
     graph_handle: Handle<AnimationGraph>,
     nodes: HashMap<String, AnimationNodeIndex>,
@@ -6636,6 +7027,7 @@ struct SnapshotHudSyncParams<'w, 's> {
     hero_hud: ResMut<'w, LatestHeroSnapshot>,
     remote_players: ResMut<'w, LatestRemotePlayers>,
     creeps: ResMut<'w, LatestCreeps>,
+    couriers: ResMut<'w, LatestCouriers>,
     top_bar: ResMut<'w, LatestTopBarState>,
     turrets: ResMut<'w, LatestTurrets>,
     barracks: ResMut<'w, LatestBarracks>,
@@ -10663,17 +11055,43 @@ fn sync_shop_context_and_network_system(
     chat_state: Res<ChatUiState>,
     hero_hud: Res<LatestHeroSnapshot>,
     render_state: Res<ClientRenderState>,
+    inspected: Res<InspectedUnit>,
+    latest_remotes: Res<LatestRemotePlayers>,
+    latest_couriers: Res<LatestCouriers>,
     mut ctx: ResMut<ShopContextSnapshot>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
     mut net: ResMut<ClientNetwork>,
 ) {
     let in_game = match_flow.is_in_game();
+    let (insp_inv, insp_ro) = match *inspected {
+        InspectedUnit::OwnHero | InspectedUnit::OwnCourier => (None, false),
+        InspectedUnit::RemoteHero(slot) => (
+            latest_remotes.0.iter().find(|r| r.slot_index == slot).map(|r| r.inventory.clone()),
+            true,
+        ),
+        InspectedUnit::EnemyCourier(slot) => (
+            latest_couriers.0.iter().find(|c| c.owner_slot == slot).map(|c| c.inventory.clone()),
+            true,
+        ),
+        InspectedUnit::Creep(_) | InspectedUnit::Turret(_) | InspectedUnit::Barracks(_) | InspectedUnit::Ancient(_) => {
+            (Some(Vec::new()), true)
+        }
+    };
     if ctx.in_game != in_game
         || ctx.chat_open != chat_state.is_open
         || ctx.in_fountain != hero_hud.0.in_fountain
         || ctx.is_dead != render_state.is_dead
         || ctx.gold != hero_hud.0.gold
         || ctx.inventory != hero_hud.0.inventory
+        || (ctx.courier_hp - hero_hud.0.courier_hp).abs() > 0.1
+        || (ctx.courier_max_hp - hero_hud.0.courier_max_hp).abs() > 0.1
+        || ctx.courier_is_dead != hero_hud.0.courier_is_dead
+        || (ctx.courier_respawn_remaining - hero_hud.0.courier_respawn_remaining).abs() > 0.2
+        || ctx.courier_order != hero_hud.0.courier_order
+        || ctx.courier_in_fountain != hero_hud.0.courier_in_fountain
+        || ctx.courier_inventory != hero_hud.0.courier_inventory
+        || ctx.inspected_inventory != insp_inv
+        || ctx.inspected_is_read_only != insp_ro
     {
         ctx.in_game = in_game;
         ctx.chat_open = chat_state.is_open;
@@ -10681,6 +11099,15 @@ fn sync_shop_context_and_network_system(
         ctx.is_dead = render_state.is_dead;
         ctx.gold = hero_hud.0.gold;
         ctx.inventory = hero_hud.0.inventory.clone();
+        ctx.courier_hp = hero_hud.0.courier_hp;
+        ctx.courier_max_hp = hero_hud.0.courier_max_hp;
+        ctx.courier_is_dead = hero_hud.0.courier_is_dead;
+        ctx.courier_respawn_remaining = hero_hud.0.courier_respawn_remaining;
+        ctx.courier_order = hero_hud.0.courier_order;
+        ctx.courier_in_fountain = hero_hud.0.courier_in_fountain;
+        ctx.courier_inventory = hero_hud.0.courier_inventory.clone();
+        ctx.inspected_inventory = insp_inv;
+        ctx.inspected_is_read_only = insp_ro;
     }
 
     if net.client.is_connected() && !outgoing.0.is_empty() {
@@ -10688,6 +11115,534 @@ fn sync_shop_context_and_network_system(
             if let Ok(bytes) = bincode::serialize(&msg) {
                 net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
             }
+        }
+    }
+}
+
+
+#[derive(Component)]
+struct CourierVisualEntity {
+    owner_slot: usize,
+    model_path: String,
+}
+
+#[derive(Component)]
+struct CourierOverheadBar {
+    owner_slot: usize,
+}
+
+#[derive(Component)]
+struct CourierOverheadFill {
+    owner_slot: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_couriers_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    latest_couriers: Res<LatestCouriers>,
+    mut existing_q: Query<(Entity, &CourierVisualEntity, &mut Transform, &mut Visibility)>,
+) {
+    let t_secs = time.elapsed_secs();
+    let mut seen = std::collections::HashSet::new();
+
+    for c in &latest_couriers.0 {
+        seen.insert(c.owner_slot);
+        let mut found = false;
+        for (ent, vis_comp, mut tf, mut vis) in &mut existing_q {
+            if vis_comp.owner_slot == c.owner_slot {
+                if vis_comp.model_path != c.model_path {
+                    commands.entity(ent).despawn();
+                    continue;
+                }
+                found = true;
+                let desired_vis = if c.is_visible && !c.is_dead {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
+                if *vis != desired_vis {
+                    *vis = desired_vis;
+                }
+                let hover_offset = (t_secs * 4.2 + c.owner_slot as f32).sin() * 0.18;
+                let target_pos = c.pos + Vec3::Y * hover_offset;
+                let alpha = 1.0 - (-18.0 * time.delta_secs()).exp();
+                tf.translation = tf.translation.lerp(target_pos, alpha);
+                if c.facing_dir.length_squared() > 0.01 {
+                    let look_target = tf.translation + Vec3::new(c.facing_dir.x, 0.0, c.facing_dir.z);
+                    tf.look_at(look_target, Vec3::Y);
+                }
+                break;
+            }
+        }
+
+        if !found {
+            let team_color = if c.team == TeamId::Dawn {
+                Color::srgb(0.25, 0.85, 1.0)
+            } else {
+                Color::srgb(1.0, 0.42, 0.25)
+            };
+            let _ = (&mut meshes, &mut materials, team_color);
+            commands.spawn((
+                CourierVisualEntity {
+                    owner_slot: c.owner_slot,
+                    model_path: c.model_path.clone(),
+                },
+                WorldAssetRoot(
+                    asset_server.load(GltfAssetLabel::Scene(0).from_asset(c.model_path.clone())),
+                ),
+                Transform::from_translation(c.pos).with_scale(Vec3::splat(c.scale)),
+                if c.is_visible && !c.is_dead {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                },
+            ));
+        }
+    }
+
+    for (ent, vis_comp, _, _) in &existing_q {
+        if !seen.contains(&vis_comp.owner_slot) {
+            commands.entity(ent).despawn();
+        }
+    }
+}
+
+fn update_overhead_courier_bars_system(
+    mut commands: Commands,
+    match_flow: Res<ClientMatchFlow>,
+    latest_couriers: Res<LatestCouriers>,
+    cam_q: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut bar_q: Query<(Entity, &CourierOverheadBar, &mut Node)>,
+    mut fill_q: Query<(&CourierOverheadFill, &mut Node, &mut BackgroundColor), Without<CourierOverheadBar>>,
+) {
+    let Ok((camera, cam_gt)) = cam_q.single() else {
+        return;
+    };
+    let my_slot = match_flow.your_slot;
+    let my_team = match_flow
+        .your_slot
+        .and_then(|s| match_flow.snapshot.as_ref().and_then(|sn| sn.players.get(s)))
+        .map(|p| p.team);
+
+    let mut active_slots = std::collections::HashSet::new();
+
+    for c in &latest_couriers.0 {
+        if !c.is_visible || c.is_dead {
+            continue;
+        }
+        let world_pos = c.pos + Vec3::Y * 1.25;
+        let Ok(screen_pos) = camera.world_to_viewport(cam_gt, world_pos) else {
+            continue;
+        };
+        active_slots.insert(c.owner_slot);
+
+        let bar_w = 54.0;
+        let ratio = (c.hp / c.max_hp.max(1.0)).clamp(0.0, 1.0);
+        let fill_color = if Some(c.owner_slot) == my_slot {
+            Color::srgb(0.30, 0.92, 1.0)
+        } else if Some(c.team) == my_team {
+            Color::srgb(0.28, 0.90, 0.45)
+        } else {
+            Color::srgb(0.96, 0.30, 0.30)
+        };
+
+        let mut exists = false;
+        for (_, bar, mut node) in &mut bar_q {
+            if bar.owner_slot == c.owner_slot {
+                exists = true;
+                node.left = px(screen_pos.x - bar_w * 0.5);
+                node.top = px(screen_pos.y - 10.0);
+                break;
+            }
+        }
+        for (fill, mut fnode, mut fbg) in &mut fill_q {
+            if fill.owner_slot == c.owner_slot {
+                fnode.width = percent(ratio * 100.0);
+                fbg.0 = fill_color;
+            }
+        }
+
+        if !exists {
+            commands
+                .spawn((
+                    CourierOverheadBar { owner_slot: c.owner_slot },
+                    Pickable::IGNORE,
+                    GlobalZIndex(120),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(screen_pos.x - bar_w * 0.5),
+                        top: px(screen_pos.y - 10.0),
+                        width: px(bar_w),
+                        height: px(7.0),
+                        border: UiRect::all(px(1.0)),
+                        border_radius: BorderRadius::all(px(2.0)),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.05, 0.08, 0.12, 0.95)),
+                    BackgroundColor(Color::srgba(0.05, 0.07, 0.10, 0.85)),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        CourierOverheadFill { owner_slot: c.owner_slot },
+                        Pickable::IGNORE,
+                        Node {
+                            width: percent(ratio * 100.0),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(fill_color),
+                    ));
+                });
+        }
+    }
+
+    for (ent, bar, _) in &bar_q {
+        if !active_slots.contains(&bar.owner_slot) {
+            commands.entity(ent).despawn();
+        }
+    }
+}
+
+#[derive(Component)]
+struct MinimapCourierDot {
+    owner_slot: usize,
+}
+
+#[derive(Resource, Clone, PartialEq, Eq, Debug, Default)]
+enum InspectedUnit {
+    #[default]
+    OwnHero,
+    OwnCourier,
+    RemoteHero(usize),
+    EnemyCourier(usize),
+    Creep(u64),
+    Turret(usize),
+    Barracks(usize),
+    Ancient(usize),
+}
+
+#[derive(Resource, Default)]
+struct HeroClickMoveTarget(Option<Vec3>);
+
+#[derive(SystemParam)]
+struct HudInspectParams<'w> {
+    courier_ctrl: Res<'w, CourierControlState>,
+    inspected: Res<'w, InspectedUnit>,
+    latest_couriers: Res<'w, LatestCouriers>,
+    latest_remotes: Res<'w, LatestRemotePlayers>,
+    latest_creeps: Res<'w, LatestCreeps>,
+    latest_turrets: Res<'w, LatestTurrets>,
+    latest_barracks: Res<'w, LatestBarracks>,
+    latest_ancients: Res<'w, LatestAncients>,
+}
+
+fn ray_point_distance(ray_origin: Vec3, ray_dir: Vec3, point: Vec3) -> (f32, f32) {
+    let to_p = point - ray_origin;
+    let t = to_p.dot(ray_dir).max(0.0);
+    let closest = ray_origin + ray_dir * t;
+    (closest.distance(point), t)
+}
+
+#[derive(Component)]
+struct MoveClickArrow {
+    center: Vec3,
+    dir: Vec3,
+    elapsed: f32,
+    duration: f32,
+}
+
+fn spawn_green_move_arrows(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    center: Vec3,
+) {
+    let arrow_mesh = meshes.add(Cuboid::new(0.22, 0.08, 0.55));
+    let arrow_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.20, 1.0, 0.42),
+        emissive: LinearRgba::rgb(0.30, 3.2, 0.85),
+        unlit: true,
+        ..default()
+    });
+    for i in 0..3 {
+        let angle = (i as f32) * (std::f32::consts::TAU / 3.0);
+        let dir = Vec3::new(angle.cos(), 0.0, angle.sin());
+        let start_pos = center + dir * 1.15 + Vec3::Y * 0.16;
+        let mut tf = Transform::from_translation(start_pos);
+        tf.look_at(center + Vec3::Y * 0.16, Vec3::Y);
+        commands.spawn((
+            MoveClickArrow {
+                center: center + Vec3::Y * 0.16,
+                dir,
+                elapsed: 0.0,
+                duration: 0.42,
+            },
+            Mesh3d(arrow_mesh.clone()),
+            MeshMaterial3d(arrow_mat.clone()),
+            tf,
+        ));
+    }
+}
+
+fn animate_move_click_arrows_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut MoveClickArrow, &mut Transform)>,
+) {
+    let dt = time.delta_secs();
+    for (ent, mut arrow, mut tf) in &mut q {
+        arrow.elapsed += dt;
+        let p = (arrow.elapsed / arrow.duration).clamp(0.0, 1.0);
+        if p >= 1.0 {
+            commands.entity(ent).despawn();
+            continue;
+        }
+        let dist = 1.15 * (1.0 - p);
+        tf.translation = arrow.center + arrow.dir * dist;
+        tf.scale = Vec3::splat(1.0 - p * 0.65);
+    }
+}
+
+#[derive(Component)]
+struct AllyHoverRing;
+
+#[allow(clippy::too_many_arguments)]
+fn hover_ally_highlight_system(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    latest_couriers: Res<LatestCouriers>,
+    latest_remotes: Res<LatestRemotePlayers>,
+    latest_creeps: Res<LatestCreeps>,
+    window_q: Query<&Window, With<PrimaryWindow>>,
+    cam_q: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut ring_q: Query<(&mut Transform, &mut Visibility), With<AllyHoverRing>>,
+) {
+    if !match_flow.is_in_game() {
+        for (_, mut v) in &mut ring_q {
+            *v = Visibility::Hidden;
+        }
+        return;
+    }
+    let my_team = hero_hud.0.team;
+    let hovered_pos: Option<(Vec3, f32)> = (|| {
+        let window = window_q.single().ok()?;
+        let cursor_pos = window.cursor_position()?;
+        let (camera, cam_gt) = cam_q.single().ok()?;
+        let ray = camera.viewport_to_world(cam_gt, cursor_pos).ok()?;
+        let rd = *ray.direction;
+
+        for c in &latest_couriers.0 {
+            if c.is_visible && !c.is_dead && c.team == my_team && ray_point_distance(ray.origin, rd, c.pos).0 <= 2.2 {
+                return Some((Vec3::new(c.pos.x, c.pos.y - 0.3, c.pos.z), 1.3));
+            }
+        }
+        for rp in &latest_remotes.0 {
+            if rp.is_visible && !rp.is_dead && rp.team == my_team && ray_point_distance(ray.origin, rd, rp.pos + Vec3::Y * 1.0).0 <= 1.25 {
+                return Some((rp.pos + Vec3::Y * 0.12, 1.1));
+            }
+        }
+        for cr in &latest_creeps.0 {
+            if cr.is_visible && !cr.is_dead && cr.team == my_team && ray_point_distance(ray.origin, rd, cr.pos + Vec3::Y * 0.8).0 <= 1.15 {
+                return Some((cr.pos + Vec3::Y * 0.10, 0.9));
+            }
+        }
+        for td in &config.map.turrets {
+            if td.team == my_team && ray_point_distance(ray.origin, rd, td.model_transform.location_vec() + Vec3::Y * 2.5).0 <= 3.2 {
+                return Some((td.model_transform.location_vec() + Vec3::Y * 0.15, 2.8));
+            }
+        }
+        for bd in &config.map.barracks {
+            if bd.team == my_team && ray_point_distance(ray.origin, rd, bd.model_transform.location_vec() + Vec3::Y * 1.8).0 <= 3.5 {
+                return Some((bd.model_transform.location_vec() + Vec3::Y * 0.15, 3.2));
+            }
+        }
+        for ad in &config.map.ancients {
+            if ad.team == my_team && ray_point_distance(ray.origin, rd, ad.model_transform.location_vec() + Vec3::Y * 2.5).0 <= 4.5 {
+                return Some((ad.model_transform.location_vec() + Vec3::Y * 0.15, 4.2));
+            }
+        }
+        None
+    })();
+
+    if let Ok((mut tf, mut vis)) = ring_q.single_mut() {
+        if let Some((pos, scale)) = hovered_pos {
+            tf.translation = pos;
+            tf.scale = Vec3::new(scale, 1.0, scale);
+            *vis = Visibility::Visible;
+        } else {
+            *vis = Visibility::Hidden;
+        }
+    } else {
+        let mesh = meshes.add(Torus::new(0.85, 1.0));
+        let mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.25, 0.95, 0.72),
+            emissive: LinearRgba::rgb(0.35, 2.4, 1.6),
+            unlit: true,
+            ..default()
+        });
+        commands.spawn((
+            AllyHoverRing,
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            Visibility::Hidden,
+        ));
+    }
+}
+
+#[derive(SystemParam)]
+struct ManualMoveQueries<'w> {
+    latest_couriers: Res<'w, LatestCouriers>,
+    latest_remotes: Res<'w, LatestRemotePlayers>,
+    latest_creeps: Res<'w, LatestCreeps>,
+    latest_turrets: Res<'w, LatestTurrets>,
+    latest_barracks: Res<'w, LatestBarracks>,
+    latest_ancients: Res<'w, LatestAncients>,
+}
+
+#[derive(SystemParam)]
+struct ManualMoveUiGuards<'w> {
+    shop_ui: Res<'w, ShopUiState>,
+    settings_ui: Res<'w, SettingsUiState>,
+    chat_state: Res<'w, ChatUiState>,
+    camera_control: Res<'w, CameraControlState>,
+    render_state: Res<'w, ClientRenderState>,
+    physics_world: Res<'w, CustomPhysicsWorld>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn courier_manual_move_input_system(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    guards: ManualMoveUiGuards,
+    q: ManualMoveQueries,
+    mut courier_ctrl: ResMut<CourierControlState>,
+    mut inspected: ResMut<InspectedUnit>,
+    mut hero_move_target: ResMut<HeroClickMoveTarget>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    window_q: Query<&Window, With<PrimaryWindow>>,
+    cam_q: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    mut outgoing: ResMut<ShopOutgoingQueue>,
+) {
+    if !match_flow.is_in_game()
+        || guards.shop_ui.is_open
+        || guards.settings_ui.is_open
+        || guards.chat_state.is_open
+        || guards.camera_control.is_pointer_over_minimap
+        || guards.camera_control.is_dragging_minimap
+    {
+        return;
+    }
+    if !mouse.just_pressed(MouseButton::Right) {
+        return;
+    }
+    let Ok(window) = window_q.single() else {
+        return;
+    };
+    let Some(cursor_pos) = window.cursor_position() else {
+        return;
+    };
+    let Ok((camera, cam_gt)) = cam_q.single() else {
+        return;
+    };
+    let Ok(ray) = camera.viewport_to_world(cam_gt, cursor_pos) else {
+        return;
+    };
+    let ray_dir = *ray.direction;
+    let my_slot = match_flow.your_slot;
+
+    for c in &q.latest_couriers.0 {
+        if !c.is_visible || c.is_dead {
+            continue;
+        }
+        if ray_point_distance(ray.origin, ray_dir, c.pos).0 <= 2.2 {
+            if Some(c.owner_slot) == my_slot {
+                courier_ctrl.selected = true;
+                *inspected = InspectedUnit::OwnCourier;
+            } else {
+                *inspected = InspectedUnit::EnemyCourier(c.owner_slot);
+            }
+            return;
+        }
+    }
+
+    if !courier_ctrl.selected {
+        for rp in &q.latest_remotes.0 {
+            if rp.is_visible && ray_point_distance(ray.origin, ray_dir, rp.pos + Vec3::Y * 1.0).0 <= 1.25 {
+                *inspected = InspectedUnit::RemoteHero(rp.slot_index);
+                return;
+            }
+        }
+        for cr in &q.latest_creeps.0 {
+            if cr.is_visible && !cr.is_dead && ray_point_distance(ray.origin, ray_dir, cr.pos + Vec3::Y * 0.8).0 <= 1.15 {
+                *inspected = InspectedUnit::Creep(cr.id);
+                return;
+            }
+        }
+        for (idx, td) in config.map.turrets.iter().enumerate() {
+            if q.latest_turrets.0.get(idx).is_some_and(|t| !t.is_dead)
+                && ray_point_distance(ray.origin, ray_dir, td.model_transform.location_vec() + Vec3::Y * 2.5).0 <= 3.2
+            {
+                *inspected = InspectedUnit::Turret(idx);
+                return;
+            }
+        }
+        for (idx, bd) in config.map.barracks.iter().enumerate() {
+            if q.latest_barracks.0.get(idx).is_some_and(|b| !b.is_dead)
+                && ray_point_distance(ray.origin, ray_dir, bd.model_transform.location_vec() + Vec3::Y * 1.8).0 <= 3.5
+            {
+                *inspected = InspectedUnit::Barracks(idx);
+                return;
+            }
+        }
+        for (idx, ad) in config.map.ancients.iter().enumerate() {
+            if q.latest_ancients.0.get(idx).is_some_and(|a| !a.is_dead)
+                && ray_point_distance(ray.origin, ray_dir, ad.model_transform.location_vec() + Vec3::Y * 2.5).0 <= 4.5
+            {
+                *inspected = InspectedUnit::Ancient(idx);
+                return;
+            }
+        }
+    }
+
+    let terrain_hit = guards
+        .physics_world
+        .cast_ray(
+            ray.origin,
+            ray_dir,
+            400.0,
+            soldier_collision_groups(),
+            |_| true,
+        )
+        .map(|(_, hit)| hit.point)
+        .or_else(|| {
+            if ray_dir.y.abs() > 1e-4 {
+                let t = (guards.render_state.soldier_pos.y - ray.origin.y) / ray_dir.y;
+                (t > 0.0).then(|| ray.origin + ray_dir * t)
+            } else {
+                None
+            }
+        });
+
+    if let Some(hit_world) = terrain_hit {
+        spawn_green_move_arrows(&mut commands, &mut meshes, &mut materials, hit_world);
+        if courier_ctrl.selected {
+            outgoing.0.push(ClientLobbyMessage::CourierMoveTo { world_pos: hit_world });
+        } else {
+            *inspected = InspectedUnit::OwnHero;
+            hero_move_target.0 = Some(hit_world);
         }
     }
 }

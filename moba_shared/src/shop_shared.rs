@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use crate::{
-    fountain_regen_bonus_for_pos, ActiveWeaponSlot, AuthoritativeWorldState, GameConfig,
+    fountain_regen_bonus_for_pos, ActiveWeaponSlot, AuthoritativeWorldState, CourierOrder, GameConfig,
     PlayerSlotState,
 };
 
@@ -440,7 +440,7 @@ pub fn recompute_player_slot_stats(
     }
 }
 
-/// خرید آیتم به صورت کاملاً Server-Authoritative (فقط در محدوده چشمه تیم خودی و در حالت زنده)
+/// خرید آیتم به صورت کاملاً Server-Authoritative (در چشمه به اینونتوری هیرو و خارج از چشمه به Courier)
 pub fn try_buy_item(
     world: &mut AuthoritativeWorldState,
     slot_index: usize,
@@ -451,36 +451,62 @@ pub fn try_buy_item(
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
-    if p.is_dead || fountain_regen_bonus_for_pos(config, p.hero_team, p.soldier_pos) <= 0.0 {
-        return false;
+    let hero_cfg = config.active_hero(p.hero_index);
+    let in_fountain = !p.is_dead && fountain_regen_bonus_for_pos(config, p.hero_team, p.soldier_pos) > 0.0;
+
+    if in_fountain {
+        if let Some((cost_to_pay, mut consumed_indices)) =
+            items_cfg.effective_purchase_cost(item_id, &p.inventory)
+        {
+            let final_slot_count = p.inventory.len() - consumed_indices.len() + 1;
+            if p.hero_gold >= cost_to_pay && final_slot_count <= items_cfg.max_inventory_slots {
+                p.hero_gold -= cost_to_pay;
+                consumed_indices.sort_unstable_by(|a, b| b.cmp(a));
+                for idx in consumed_indices {
+                    p.inventory.remove(idx);
+                }
+                let free_slot = (0..items_cfg.max_inventory_slots)
+                    .find(|s| !p.inventory.iter().any(|it| it.slot == *s))
+                    .unwrap_or(0);
+                p.inventory.push(InventoryItemState {
+                    item_id: item_id.to_string(),
+                    active_mode: 0,
+                    slot: free_slot,
+                });
+                recompute_player_slot_stats(p, config, items_cfg);
+                return true;
+            }
+        }
     }
+
+    // خرید از راه دور یا زمانی که اینونتوری هیرو پر است -> قرارگیری در اینونتوری Courier
+    let courier_max_slots = hero_cfg.courier.inventory_slots;
     let Some((cost_to_pay, mut consumed_indices)) =
-        items_cfg.effective_purchase_cost(item_id, &p.inventory)
+        items_cfg.effective_purchase_cost(item_id, &p.courier_inventory)
     else {
         return false;
     };
     if p.hero_gold < cost_to_pay {
         return false;
     }
-    let final_slot_count = p.inventory.len() - consumed_indices.len() + 1;
-    if final_slot_count > items_cfg.max_inventory_slots {
+    let final_courier_count = p.courier_inventory.len() - consumed_indices.len() + 1;
+    if final_courier_count > courier_max_slots {
         return false;
     }
 
     p.hero_gold -= cost_to_pay;
     consumed_indices.sort_unstable_by(|a, b| b.cmp(a));
     for idx in consumed_indices {
-        p.inventory.remove(idx);
+        p.courier_inventory.remove(idx);
     }
-    let free_slot = (0..items_cfg.max_inventory_slots)
-        .find(|s| !p.inventory.iter().any(|it| it.slot == *s))
+    let free_slot = (0..courier_max_slots)
+        .find(|s| !p.courier_inventory.iter().any(|it| it.slot == *s))
         .unwrap_or(0);
-    p.inventory.push(InventoryItemState {
+    p.courier_inventory.push(InventoryItemState {
         item_id: item_id.to_string(),
         active_mode: 0,
         slot: free_slot,
     });
-    recompute_player_slot_stats(p, config, items_cfg);
     true
 }
 
@@ -588,4 +614,170 @@ pub fn try_swap_inventory_slots(
         }
     }
     true
+}
+
+
+/// فروش آیتم از اینونتوری Courier (وقتی Courier زنده و داخل چشمه است)
+pub fn try_sell_courier_item(
+    world: &mut AuthoritativeWorldState,
+    slot_index: usize,
+    inv_index: usize,
+    config: &GameConfig,
+    items_cfg: &ItemsConfig,
+) -> bool {
+    let Some(p) = world.players.get_mut(slot_index) else {
+        return false;
+    };
+    if p.courier_is_dead
+        || fountain_regen_bonus_for_pos(config, p.hero_team, p.courier_pos) <= 0.0
+    {
+        return false;
+    }
+    let Some(pos) = p.courier_inventory.iter().position(|it| it.slot == inv_index) else {
+        return false;
+    };
+    let removed = p.courier_inventory.remove(pos);
+    let refund = items_cfg.sell_price(&removed.item_id);
+    p.hero_gold = p.hero_gold.saturating_add(refund);
+    true
+}
+
+pub fn try_courier_deliver(world: &mut AuthoritativeWorldState, slot_index: usize) -> bool {
+    let Some(p) = world.players.get_mut(slot_index) else {
+        return false;
+    };
+    if p.courier_is_dead {
+        return false;
+    }
+    p.courier_order = CourierOrder::DeliverToHero;
+    true
+}
+
+pub fn try_courier_return_to_fountain(world: &mut AuthoritativeWorldState, slot_index: usize) -> bool {
+    let Some(p) = world.players.get_mut(slot_index) else {
+        return false;
+    };
+    if p.courier_is_dead {
+        return false;
+    }
+    p.courier_order = CourierOrder::ReturnToFountain;
+    true
+}
+
+pub fn try_courier_move_to(
+    world: &mut AuthoritativeWorldState,
+    slot_index: usize,
+    world_pos: Vec3,
+    config: &GameConfig,
+) -> bool {
+    let Some(p) = world.players.get_mut(slot_index) else {
+        return false;
+    };
+    if p.courier_is_dead {
+        return false;
+    }
+    let h_cfg = config.active_hero(p.hero_index);
+    let half_x = config.map.map_dimensions.0 * 0.5;
+    let half_z = config.map.map_dimensions.1 * 0.5;
+    let clamped_x = world_pos.x.clamp(-half_x, half_x);
+    let clamped_z = world_pos.z.clamp(-half_z, half_z);
+    p.courier_target_pos = Vec3::new(clamped_x, h_cfg.courier.fly_height, clamped_z);
+    p.courier_order = CourierOrder::MoveTo;
+    true
+}
+
+/// شبیه‌سازی حرکت، تحویل آیتم و ریسپاون Courierها (پرواز در ارتفاع بالا بدون برخورد با موانع)
+pub fn step_couriers_system(
+    time: Res<Time<Fixed>>,
+    config: Res<GameConfig>,
+    items_cfg: Res<ItemsConfig>,
+    mut world: ResMut<AuthoritativeWorldState>,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+
+    for p in &mut world.players {
+        let h_cfg = config.active_hero(p.hero_index);
+        let fly_y = h_cfg.courier.fly_height;
+
+        if p.courier_is_dead {
+            p.courier_respawn_remaining -= dt;
+            if p.courier_respawn_remaining <= 0.0 {
+                p.courier_is_dead = false;
+                p.courier_respawn_remaining = 0.0;
+                p.courier_hp = p.courier_max_hp;
+                p.courier_pos = Vec3::new(p.spawn_pos.x, fly_y, p.spawn_pos.z);
+                p.courier_order = CourierOrder::Idle;
+            }
+            continue;
+        }
+
+        let target_xz = match p.courier_order {
+            CourierOrder::Idle => None,
+            CourierOrder::ReturnToFountain => Some(Vec3::new(p.spawn_pos.x, fly_y, p.spawn_pos.z)),
+            CourierOrder::MoveTo => Some(Vec3::new(p.courier_target_pos.x, fly_y, p.courier_target_pos.z)),
+            CourierOrder::DeliverToHero => {
+                if p.is_dead {
+                    p.courier_order = CourierOrder::ReturnToFountain;
+                    Some(Vec3::new(p.spawn_pos.x, fly_y, p.spawn_pos.z))
+                } else {
+                    Some(Vec3::new(p.soldier_pos.x, fly_y, p.soldier_pos.z))
+                }
+            }
+        };
+
+        if let Some(target) = target_xz {
+            let delta = Vec3::new(target.x - p.courier_pos.x, 0.0, target.z - p.courier_pos.z);
+            let dist = delta.length();
+            let step = h_cfg.courier.move_speed * dt;
+
+            if dist > 0.05 {
+                let dir = delta / dist;
+                p.courier_facing_dir = dir;
+                if dist <= step {
+                    p.courier_pos.x = target.x;
+                    p.courier_pos.z = target.z;
+                } else {
+                    p.courier_pos.x += dir.x * step;
+                    p.courier_pos.z += dir.z * step;
+                }
+            }
+            p.courier_pos.y = fly_y;
+
+            let new_dist = Vec3::new(target.x - p.courier_pos.x, 0.0, target.z - p.courier_pos.z).length();
+            match p.courier_order {
+                CourierOrder::DeliverToHero if !p.is_dead && new_dist <= h_cfg.courier.deliver_radius => {
+                    let mut transferred_any = false;
+                    let mut remaining = Vec::new();
+                    for mut c_item in p.courier_inventory.drain(..) {
+                        if let Some(free_slot) = (0..items_cfg.max_inventory_slots)
+                            .find(|s| !p.inventory.iter().any(|it| it.slot == *s))
+                        {
+                            c_item.slot = free_slot;
+                            p.inventory.push(c_item);
+                            transferred_any = true;
+                        } else {
+                            remaining.push(c_item);
+                        }
+                    }
+                    p.courier_inventory = remaining;
+                    if transferred_any {
+                        recompute_player_slot_stats(p, &config, &items_cfg);
+                    }
+                    p.courier_order = CourierOrder::ReturnToFountain;
+                }
+                CourierOrder::ReturnToFountain if new_dist <= h_cfg.courier.fountain_radius => {
+                    p.courier_order = CourierOrder::Idle;
+                }
+                CourierOrder::MoveTo if new_dist <= 0.6 => {
+                    p.courier_order = CourierOrder::Idle;
+                }
+                _ => {}
+            }
+        } else {
+            p.courier_pos.y = fly_y;
+        }
+    }
 }

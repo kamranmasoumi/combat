@@ -13,7 +13,7 @@ use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalA
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
-use bevy::window::{CursorOptions, PresentMode, PrimaryWindow, WindowResolution};
+use bevy::window::{CursorOptions, MonitorSelection, PresentMode, PrimaryWindow, WindowMode, WindowResolution};
 use moba_shared::{
     ancient_physics_bundle, barracks_physics_bundle, center_bridge_physics_bundle, create_shared_renet_client,
     grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
@@ -26,7 +26,7 @@ use moba_shared::{
     ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerLobbyPacket, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, ItemsConfig, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
-    ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
+    ScoreboardHeroInfo, ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
     CHANNEL_UNRELIABLE_STATE,
 };
 use renet::RenetClient;
@@ -37,17 +37,62 @@ use std::path::Path;
 use std::time::Duration;
 
 mod shop_client;
-use shop_client::{CourierControlState, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
+use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
+
+
+#[cfg(not(debug_assertions))]
+fn load_client_config() -> (GameConfig, bool) {
+    if Path::new("config.ron").is_file() {
+        (GameConfig::load_from_file("config.ron"), true)
+    } else if Path::new("../../config.ron").is_file() {
+        (GameConfig::load_from_file("../../config.ron"), true)
+    } else {
+        (
+            GameConfig::load_from_str(include_str!("../../config.ron"), "embedded:config.ron"),
+            false,
+        )
+    }
+}
+
+#[cfg(debug_assertions)]
+fn load_client_config() -> (GameConfig, bool) {
+    if Path::new("config.ron").is_file() {
+        (GameConfig::load_from_file("config.ron"), true)
+    } else if Path::new("../../config.ron").is_file() {
+        (GameConfig::load_from_file("../../config.ron"), true)
+    } else {
+        panic!("خطای بحرانی: فایل config.ron در مسیر لوکال پیدا نشد!");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn load_client_items_config() -> (ItemsConfig, bool) {
+    if Path::new("items.ron").is_file() {
+        (ItemsConfig::load_from_file("items.ron"), true)
+    } else if Path::new("../../items.ron").is_file() {
+        (ItemsConfig::load_from_file("../../items.ron"), true)
+    } else {
+        (
+            ItemsConfig::load_from_str(include_str!("../../items.ron"), "embedded:items.ron"),
+            false,
+        )
+    }
+}
+
+#[cfg(debug_assertions)]
+fn load_client_items_config() -> (ItemsConfig, bool) {
+    if Path::new("items.ron").is_file() {
+        (ItemsConfig::load_from_file("items.ron"), true)
+    } else if Path::new("../../items.ron").is_file() {
+        (ItemsConfig::load_from_file("../../items.ron"), true)
+    } else {
+        panic!("خطای بحرانی: فایل items.ron در مسیر لوکال پیدا نشد!");
+    }
+}
 
 fn main() {
-    let mut config = GameConfig::load_from_str(
-        include_str!("../../config.ron"),
-        "embedded:config.ron",
-    );
-    let items_config = ItemsConfig::load_from_str(
-        include_str!("../../items.ron"),
-        "embedded:items.ron",
-    );
+    let (mut config, has_local_config) = load_client_config();
+    let (items_config, has_local_items) = load_client_items_config();
     if let Some(build_addr) = option_env!("MOBA_SERVER_ADDR") {
         if !build_addr.trim().is_empty() {
             config.network.server_public_addr = build_addr.trim().to_string();
@@ -114,6 +159,10 @@ fn main() {
             weapon_damage: h.weapon.damage,
             projectile_speed: h.weapon.projectile_speed,
             weapon_max_range: h.weapon.max_range,
+            grenade_charges: h.grenade.max_charges,
+            grenade_max_charges: h.grenade.max_charges,
+            grenade_recharge_remaining: 0.0,
+            grenade_throw_duration_secs: h.grenade.throw_duration_secs,
             last_hits: 0,
             denies: 0,
             assists: 0,
@@ -137,6 +186,7 @@ fn main() {
                 title: config.window.title.clone(),
                 resolution: WindowResolution::new(config.window.width, config.window.height),
                 present_mode: PresentMode::AutoNoVsync,
+                mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
                 ..default()
             }),
             ..default()
@@ -144,6 +194,10 @@ fn main() {
         .insert_resource(DirectionalLightShadowMap { size: 2048 })
         .insert_resource(config)
         .insert_resource(items_config)
+        .insert_resource(LocalConfigOverride {
+            has_local_config,
+            has_local_items,
+        })
         .add_plugins(ShopPlugin)
         .insert_resource(ClientNetwork { client, transport })
         .insert_resource(render_state)
@@ -161,6 +215,7 @@ fn main() {
         .insert_resource(InspectedUnit::default())
         .insert_resource(HeroClickMoveTarget::default())
         .insert_resource(LatestTopBarState::default())
+        .insert_resource(LatestScoreboard::default())
         .insert_resource(LatestTurrets::default())
         .insert_resource(LatestBarracks::default())
         .insert_resource(LatestAncients::default())
@@ -260,12 +315,18 @@ fn main() {
                 .chain()
                 .after(sync_remote_players_system),
         )
-        .add_systems(Update, (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system))
+        .add_systems(Update, (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system))
         .add_systems(
             PostUpdate,
             align_weapon_horizontally_system.before(TransformSystems::Propagate),
         )
         .run();
+}
+
+#[derive(Resource)]
+struct LocalConfigOverride {
+    has_local_config: bool,
+    has_local_items: bool,
 }
 
 #[derive(Resource)]
@@ -390,6 +451,20 @@ struct NetworkBulletVisual {
 #[derive(Component)]
 struct NetworkGrenadeVisual {
     server_id: u64,
+    spawn_time: f32,
+}
+
+#[derive(Component)]
+struct GrenadeBlinkLed {
+    mat: Handle<StandardMaterial>,
+}
+
+#[derive(Component)]
+struct ExplosionSmokeParticle {
+    vel: Vec3,
+    timer: Timer,
+    start_scale: f32,
+    end_scale: f32,
 }
 
 #[derive(Component)]
@@ -613,6 +688,9 @@ struct HeroStatVisionText;
 
 #[derive(Component)]
 struct HeroStatAmmoText;
+
+#[derive(Component)]
+struct HeroStatGrenadeText;
 
 #[derive(Component)]
 struct TreeVisualMarker {
@@ -1954,6 +2032,7 @@ fn setup_scene(
     spawn_minimap_ui(&mut commands, &config, minimap_handle, fog_handle);
     spawn_hero_hud_ui(&mut commands);
     spawn_top_match_hud_ui(&mut commands);
+    spawn_scoreboard_ui(&mut commands, &config);
     spawn_death_screen_overlay(&mut commands);
     spawn_end_of_match_overlay(&mut commands);
     spawn_chat_ui(&mut commands);
@@ -3111,7 +3190,10 @@ fn client_receive_snapshot_and_sync_system(
         hud_sync.creeps.0 = snap.creeps.clone();
         hud_sync.couriers.0 = snap.couriers.clone();
         hud_sync.top_bar.match_elapsed_secs = snap.match_elapsed_secs;
+        hud_sync.top_bar.dawn_total_kills = snap.dawn_total_kills;
+        hud_sync.top_bar.dusk_total_kills = snap.dusk_total_kills;
         hud_sync.top_bar.heroes = snap.top_bar_heroes.clone();
+        hud_sync.scoreboard.0 = snap.scoreboard_heroes.clone();
         hud_sync.turrets.0 = snap.turrets.clone();
         hud_sync.barracks.0 = snap.barracks.clone();
         hud_sync.ancients.0 = snap.ancients.clone();
@@ -3286,26 +3368,55 @@ fn client_receive_snapshot_and_sync_system(
 
         for g_snap in &snap.grenades {
             if !seen_grenades.contains(&g_snap.id) {
-                commands.spawn((
-                    Mesh3d(fx_res.meshes.add(Sphere::new(config.physics.grenade_collider_radius))),
-                    MeshMaterial3d(fx_res.materials.add(StandardMaterial {
-                        base_color: Color::srgb(0.2, 0.38, 0.18),
-                        metallic: 0.6,
-                        perceptual_roughness: 0.4,
-                        ..default()
-                    })),
-                    NetworkGrenadeVisual {
-                        server_id: g_snap.id,
-                    },
-                    grenade_physics_bundle(
-                        &config,
-                        g_snap.id,
-                        g_snap.translation,
-                        g_snap.rotation,
-                        g_snap.linear_velocity,
-                        g_snap.angular_velocity,
-                    ),
-                ));
+                let led_mat = fx_res.materials.add(StandardMaterial {
+                    base_color: Color::srgb(1.0, 0.12, 0.08),
+                    emissive: LinearRgba::new(14.0, 0.6, 0.4, 1.0),
+                    unlit: true,
+                    ..default()
+                });
+                commands
+                    .spawn((
+                        Mesh3d(fx_res.meshes.add(Sphere::new(config.physics.grenade_collider_radius))),
+                        MeshMaterial3d(fx_res.materials.add(StandardMaterial {
+                            base_color: Color::srgb(0.2, 0.38, 0.18),
+                            metallic: 0.6,
+                            perceptual_roughness: 0.4,
+                            ..default()
+                        })),
+                        NetworkGrenadeVisual {
+                            server_id: g_snap.id,
+                            spawn_time: time.elapsed_secs(),
+                        },
+                        grenade_physics_bundle(
+                            &config,
+                            g_snap.id,
+                            0,
+                            TeamId::Dawn,
+                            1.5,
+                            0.0,
+                            1.0,
+                            g_snap.translation,
+                            g_snap.rotation,
+                            g_snap.linear_velocity,
+                            g_snap.angular_velocity,
+                        ),
+                    ))
+                    .with_children(|g| {
+                        g.spawn((
+                            GrenadeBlinkLed { mat: led_mat.clone() },
+                            Mesh3d(fx_res.meshes.add(Sphere::new(config.physics.grenade_collider_radius * 0.45))),
+                            MeshMaterial3d(led_mat),
+                            Transform::from_xyz(0.0, config.physics.grenade_collider_radius * 0.9, 0.0),
+                            PointLight {
+                                color: Color::srgb(1.0, 0.10, 0.08),
+                                intensity: 95_000.0,
+                                range: 5.5,
+                                shadow_maps_enabled: false,
+                                ..default()
+                            },
+                            NotShadowCaster,
+                        ));
+                    });
             }
         }
     }
@@ -3503,6 +3614,7 @@ fn spawn_fx_from_server_event(
         }
         GameplayFxEvent::GrenadeExploded {
             pos,
+            aoe_radius,
             trauma_add,
             trauma_max,
         } => {
@@ -3512,6 +3624,40 @@ fn spawn_fx_from_server_event(
                 unlit: true,
                 ..default()
             });
+            let smoke_mat = materials.add(StandardMaterial {
+                base_color: Color::srgba(0.32, 0.30, 0.28, 0.62),
+                alpha_mode: AlphaMode::Blend,
+                perceptual_roughness: 0.95,
+                ..default()
+            });
+            let dust_mat = materials.add(StandardMaterial {
+                base_color: Color::srgba(0.52, 0.46, 0.38, 0.52),
+                alpha_mode: AlphaMode::Blend,
+                perceptual_roughness: 0.98,
+                ..default()
+            });
+            let smoke_mesh = meshes.add(Sphere::new(0.45));
+            let cloud_count = ((aoe_radius * 3.0) as u32).clamp(12, 26);
+            for c_i in 0..cloud_count {
+                let rx = render_state.next_fx_rand() - 0.5;
+                let rz = render_state.next_fx_rand() - 0.5;
+                let ry = render_state.next_fx_rand();
+                let spread_r = aoe_radius * 0.55;
+                let spawn_p = pos + Vec3::new(rx * spread_r, 0.25 + ry * 0.45, rz * spread_r);
+                let is_dust = c_i % 3 == 0;
+                commands.spawn((
+                    Mesh3d(smoke_mesh.clone()),
+                    MeshMaterial3d(if is_dust { dust_mat.clone() } else { smoke_mat.clone() }),
+                    Transform::from_translation(spawn_p).with_scale(Vec3::splat(0.7)),
+                    ExplosionSmokeParticle {
+                        vel: Vec3::new(rx * 2.4, 1.8 + ry * 2.2, rz * 2.4),
+                        timer: Timer::from_seconds(1.5 + ry * 0.7, TimerMode::Once),
+                        start_scale: 0.65,
+                        end_scale: (aoe_radius * 0.42).clamp(1.6, 3.4),
+                    },
+                    NotShadowCaster,
+                ));
+            }
 
             for _ in 0..config.fx.explosion_particle_count {
                 let rx = render_state.next_fx_rand();
@@ -4382,9 +4528,36 @@ fn cursor_reticle_system(
 fn gameplay_fx_system(
     mut commands: Commands,
     time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut flash_query: Query<(Entity, &mut MuzzleFlash)>,
     mut trail_query: Query<(Entity, &mut BulletTrail)>,
+    mut smoke_query: Query<(Entity, &mut Transform, &mut ExplosionSmokeParticle)>,
+    mut led_query: Query<(&GrenadeBlinkLed, &mut PointLight)>,
 ) {
+    let t_secs = time.elapsed_secs();
+    let dt = time.delta_secs();
+    let blink_on = (t_secs * 16.0).sin() > 0.0;
+    for (led, mut light) in &mut led_query {
+        light.intensity = if blink_on { 120_000.0 } else { 0.0 };
+        if let Some(mut mat) = materials.get_mut(&led.mat) {
+            mat.emissive = if blink_on {
+                LinearRgba::new(16.0, 0.8, 0.4, 1.0)
+            } else {
+                LinearRgba::new(0.8, 0.05, 0.05, 1.0)
+            };
+        }
+    }
+    for (entity, mut tf, mut sp) in &mut smoke_query {
+        sp.timer.tick(time.delta());
+        tf.translation += sp.vel * dt;
+        sp.vel *= (1.0 - 1.4 * dt).max(0.1);
+        let frac = sp.timer.fraction();
+        let s = sp.start_scale.lerp(sp.end_scale, frac) * (1.0 - (frac - 0.70).max(0.0) * 3.0).max(0.05);
+        tf.scale = Vec3::splat(s);
+        if sp.timer.is_finished() {
+            commands.entity(entity).despawn();
+        }
+    }
     for (entity, mut flash) in &mut flash_query {
         flash.timer.tick(time.delta());
         if flash.timer.is_finished() {
@@ -4597,13 +4770,16 @@ fn soldier_animation_player_system(
         UpperBodyAction::TossGrenade => {
             if render_state.previous_upper_anim != "toss_grenade" {
                 let node = anim_assets.require_node("toss_grenade");
-                upper_trans
-                    .play(
-                        &mut upper_player,
-                        node,
-                        Duration::from_millis(config.animations.grenade_blend_ms),
-                    )
-                    .replay();
+                let throw_dur = hero_hud.0.grenade_throw_duration_secs.max(0.05);
+                let clip_dur = anim_assets.clip_duration("toss_grenade").unwrap_or(throw_dur);
+                let speed = (clip_dur / throw_dur).max(0.1);
+                let active = upper_trans.play(
+                    &mut upper_player,
+                    node,
+                    Duration::from_millis(config.animations.grenade_blend_ms),
+                );
+                active.set_speed(speed);
+                active.replay();
                 render_state.previous_upper_anim = "toss_grenade".to_string();
             }
         }
@@ -6008,6 +6184,7 @@ enum HeroStatKind {
     Speed,
     Vision,
     Ammo,
+    Grenade,
 }
 
 #[derive(Component)]
@@ -6335,7 +6512,16 @@ fn spawn_hero_hud_ui(commands: &mut Commands) {
                         TextColor(Color::srgb(0.76, 0.84, 0.92)),
                     ));
 
-                    spawn_stat_chip(mid, "A", Color::srgb(0.98, 0.80, 0.22), HeroStatAmmoText, HeroStatKind::Ammo);
+                    mid.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        column_gap: px(6.0),
+                        align_items: AlignItems::Center,
+                        ..default()
+                    })
+                    .with_children(|chips| {
+                        spawn_stat_chip(chips, "A", Color::srgb(0.98, 0.80, 0.22), HeroStatAmmoText, HeroStatKind::Ammo);
+                        spawn_stat_chip(chips, "G", Color::srgb(1.0, 0.45, 0.14), HeroStatGrenadeText, HeroStatKind::Grenade);
+                    });
                 });
 
                 // ردیف ۴: ۶ کارت آمار با آیکون رنگی مفهومی + نمایش +-number باف/دیباف آیتم‌ها
@@ -6368,8 +6554,9 @@ struct HeroHudExtraStatQueries<'w, 's> {
     armor_q: Query<'w, 's, &'static mut Text, (With<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
     speed_q: Query<'w, 's, &'static mut Text, (With<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
     vision_q: Query<'w, 's, &'static mut Text, (With<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
-    ammo_q: Query<'w, 's, &'static mut Text, (With<HeroStatAmmoText>, Without<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
-    bonus_q: Query<'w, 's, (&'static HeroStatBonusText, &'static mut Text, &'static mut TextColor), (Without<HeroStatAmmoText>, Without<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    ammo_q: Query<'w, 's, &'static mut Text, (With<HeroStatAmmoText>, Without<HeroStatGrenadeText>, Without<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    grenade_q: Query<'w, 's, &'static mut Text, (With<HeroStatGrenadeText>, Without<HeroStatAmmoText>, Without<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
+    bonus_q: Query<'w, 's, (&'static HeroStatBonusText, &'static mut Text, &'static mut TextColor), (Without<HeroStatGrenadeText>, Without<HeroStatAmmoText>, Without<HeroStatVisionText>, Without<HeroStatSpeedText>, Without<HeroStatArmorText>, Without<HeroStatRangeText>, Without<HeroStatRateText>, Without<HeroStatDmgText>, Without<HeroHpBarText>, Without<HeroHudHeaderText>, Without<HeroHudGoldText>, Without<HeroHudKdaText>, Without<HeroHudLevelText>, Without<HeroHudXpLabelText>)>,
 }
 
 fn update_hero_hud_system(
@@ -6414,6 +6601,7 @@ fn update_hero_hud_system(
         if let Ok(mut t) = extra.speed_q.single_mut() { **t = format!("SPD {:.1}", spd); }
         if let Ok(mut t) = extra.vision_q.single_mut() { **t = format!("VIS {:.0}m", vis); }
         if let Ok(mut t) = extra.ammo_q.single_mut() { **t = ammo.to_string(); }
+        if let Ok(mut t) = extra.grenade_q.single_mut() { **t = "N/A".to_string(); }
     };
 
     let show_own_courier = inspect_p.courier_ctrl.selected || *inspect_p.inspected == InspectedUnit::OwnCourier;
@@ -6680,6 +6868,18 @@ fn update_hero_hud_system(
         let tag = if is_pistol { "PISTOL" } else { "RIFLE" };
         **t = format!("[E] {} {}/{}", tag, h.ammo_in_mag, base_mag);
     }
+    if let Ok(mut t) = extra_stats.grenade_q.single_mut() {
+        if h.grenade_charges < h.grenade_max_charges && h.grenade_recharge_remaining > 0.0 {
+            **t = format!(
+                "[F] GRN {}/{} ({}s)",
+                h.grenade_charges,
+                h.grenade_max_charges,
+                h.grenade_recharge_remaining.ceil() as u32
+            );
+        } else {
+            **t = format!("[F] GRN {}/{}", h.grenade_charges, h.grenade_max_charges);
+        }
+    }
 
     let green = Color::srgb(0.26, 0.96, 0.50);
     let red = Color::srgb(0.98, 0.34, 0.34);
@@ -6752,7 +6952,7 @@ fn update_hero_hud_system(
                     bt.clear();
                 }
             }
-            HeroStatKind::Vision => {
+            HeroStatKind::Vision | HeroStatKind::Grenade => {
                 bt.clear();
             }
         }
@@ -6866,6 +7066,7 @@ struct LatestCouriers(Vec<CourierSnapshot>);
 struct CachedHeroAnimGraph {
     graph_handle: Handle<AnimationGraph>,
     nodes: HashMap<String, AnimationNodeIndex>,
+    durations: HashMap<String, f32>,
 }
 
 impl CachedHeroAnimGraph {
@@ -6894,6 +7095,7 @@ impl HeroModelAnimCache {
         model_path: &str,
         asset_server: &AssetServer,
         gltf_assets: &Assets<Gltf>,
+        clip_assets: &Assets<AnimationClip>,
         animation_graphs: &mut Assets<AnimationGraph>,
     ) -> Option<&'a CachedHeroAnimGraph> {
         if !self.graphs.contains_key(model_path) {
@@ -6905,9 +7107,14 @@ impl HeroModelAnimCache {
             if let Some(gltf) = gltf_assets.get(&handle) {
                 let mut graph = AnimationGraph::new();
                 let mut nodes = HashMap::new();
+                let mut durations = HashMap::new();
                 for (name, clip_h) in &gltf.named_animations {
+                    let Some(clip) = clip_assets.get(clip_h) else {
+                        return None;
+                    };
                     let idx = graph.add_clip(clip_h.clone(), 1.0, graph.root);
                     nodes.insert(name.to_string(), idx);
+                    durations.insert(name.to_string(), clip.duration());
                 }
                 let graph_handle = animation_graphs.add(graph);
                 self.graphs.insert(
@@ -6915,6 +7122,7 @@ impl HeroModelAnimCache {
                     CachedHeroAnimGraph {
                         graph_handle,
                         nodes,
+                        durations,
                     },
                 );
             }
@@ -7025,6 +7233,8 @@ impl CreepModelAnimCache {
 #[derive(Resource, Default)]
 struct LatestTopBarState {
     match_elapsed_secs: f32,
+    dawn_total_kills: u32,
+    dusk_total_kills: u32,
     heroes: Vec<TopBarHeroInfo>,
 }
 
@@ -7047,6 +7257,7 @@ struct SnapshotHudSyncParams<'w, 's> {
     creeps: ResMut<'w, LatestCreeps>,
     couriers: ResMut<'w, LatestCouriers>,
     top_bar: ResMut<'w, LatestTopBarState>,
+    scoreboard: ResMut<'w, LatestScoreboard>,
     turrets: ResMut<'w, LatestTurrets>,
     barracks: ResMut<'w, LatestBarracks>,
     ancients: ResMut<'w, LatestAncients>,
@@ -7198,6 +7409,7 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
 fn client_lobby_sync_system(
     mut config: ResMut<GameConfig>,
     mut items_config: ResMut<ItemsConfig>,
+    local_override: Res<LocalConfigOverride>,
     mut shop_ui: ResMut<ShopUiState>,
     hero_hud: Res<LatestHeroSnapshot>,
     mut net: ResMut<ClientNetwork>,
@@ -7216,14 +7428,18 @@ fn client_lobby_sync_system(
                     game_config: mut srv_cfg,
                     items_config: srv_items,
                 } => {
-                    srv_cfg.network.server_bind_addr = config.network.server_bind_addr.clone();
-                    srv_cfg.network.server_public_addr = config.network.server_public_addr.clone();
-                    srv_cfg.network.client_bind_addr = config.network.client_bind_addr.clone();
-                    srv_cfg.network.client_id = config.network.client_id;
-                    srv_cfg.network.private_key = config.network.private_key;
-                    *config = srv_cfg;
-                    *items_config = srv_items;
-                    shop_ui.dirty = true;
+                    if !local_override.has_local_config {
+                        srv_cfg.network.server_bind_addr = config.network.server_bind_addr.clone();
+                        srv_cfg.network.server_public_addr = config.network.server_public_addr.clone();
+                        srv_cfg.network.client_bind_addr = config.network.client_bind_addr.clone();
+                        srv_cfg.network.client_id = config.network.client_id;
+                        srv_cfg.network.private_key = config.network.private_key;
+                        *config = srv_cfg;
+                    }
+                    if !local_override.has_local_items {
+                        *items_config = srv_items;
+                        shop_ui.dirty = true;
+                    }
                 }
             }
         }
@@ -7254,6 +7470,7 @@ fn hero_preview_system(
     config: Res<GameConfig>,
     asset_server: Res<AssetServer>,
     gltf_assets: Res<Assets<Gltf>>,
+    clip_assets: Res<Assets<AnimationClip>>,
     mut animation_graphs: ResMut<Assets<AnimationGraph>>,
     mut hero_anim_cache: ResMut<HeroModelAnimCache>,
     mut match_flow: ResMut<ClientMatchFlow>,
@@ -7297,6 +7514,7 @@ fn hero_preview_system(
         &hero.model_path,
         &asset_server,
         &gltf_assets,
+        &clip_assets,
         &mut animation_graphs,
     );
 
@@ -7558,6 +7776,7 @@ struct RemoteAssetsParams<'w> {
     config: Res<'w, GameConfig>,
     asset_server: Res<'w, AssetServer>,
     gltf_assets: Res<'w, Assets<Gltf>>,
+    clip_assets: Res<'w, Assets<AnimationClip>>,
     animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
     hero_anim_cache: ResMut<'w, HeroModelAnimCache>,
     match_flow: Res<'w, ClientMatchFlow>,
@@ -7632,6 +7851,7 @@ fn sync_remote_players_system(
                     &rp.model_path,
                     &res.asset_server,
                     &res.gltf_assets,
+                    &res.clip_assets,
                     &mut res.animation_graphs,
                 );
                 if let Some(assets) = cached_opt {
@@ -7781,6 +8001,12 @@ fn sync_remote_players_system(
                                 || (is_looping_upper && !player.is_playing_animation(upper_node))
                             {
                                 let active = trans.play(&mut player, upper_node, Duration::from_millis(90));
+                                if desired_upper == "toss_grenade" {
+                                    let throw_dur = rp.grenade_throw_duration_secs.max(0.05);
+                                    let clip_dur = assets.durations.get("toss_grenade").copied().unwrap_or(throw_dur);
+                                    let speed = (clip_dur / throw_dur).max(0.1);
+                                    active.set_speed(speed);
+                                }
                                 if is_looping_upper {
                                     active.repeat();
                                 }
@@ -7822,6 +8048,7 @@ fn sync_remote_players_system(
 struct OverheadHeroBarRoot {
     key_id: usize,
     ammo_total: u32,
+    grenade_total: u32,
 }
 
 #[derive(Component)]
@@ -7840,21 +8067,29 @@ struct OverheadBulletPip {
     bullet_index: u32,
 }
 
+#[derive(Component)]
+struct OverheadGrenadePip {
+    key_id: usize,
+    grenade_index: u32,
+}
+
 #[derive(SystemParam)]
 struct OverheadBarQueries<'w, 's> {
     root_q: Query<'w, 's, (Entity, &'static OverheadHeroBarRoot, &'static mut Node)>,
     hp_q: Query<'w, 's, (&'static OverheadHpFill, &'static mut Node, &'static mut BackgroundColor), (Without<OverheadHeroBarRoot>, Without<OverheadStaminaFill>)>,
     stamina_q: Query<'w, 's, (&'static OverheadStaminaFill, &'static mut Node), (Without<OverheadHeroBarRoot>, Without<OverheadHpFill>)>,
-    pip_q: Query<'w, 's, (&'static OverheadBulletPip, &'static mut BackgroundColor), (Without<OverheadHeroBarRoot>, Without<OverheadHpFill>, Without<OverheadStaminaFill>)>,
+    pip_q: Query<'w, 's, (&'static OverheadBulletPip, &'static mut BackgroundColor), (Without<OverheadHeroBarRoot>, Without<OverheadHpFill>, Without<OverheadStaminaFill>, Without<OverheadGrenadePip>)>,
+    gpip_q: Query<'w, 's, (&'static OverheadGrenadePip, &'static mut BackgroundColor), (Without<OverheadHeroBarRoot>, Without<OverheadHpFill>, Without<OverheadStaminaFill>, Without<OverheadBulletPip>)>,
 }
 
-fn spawn_overhead_bar(commands: &mut Commands, key_id: usize, ammo_total: u32) {
+fn spawn_overhead_bar(commands: &mut Commands, key_id: usize, ammo_total: u32, grenade_total: u32) {
     let total = ammo_total.max(1);
+    let g_total = grenade_total.max(1);
     let pip_w = ((136.0 / total as f32) - 1.5).clamp(2.5, 10.0);
 
     commands
         .spawn((
-            OverheadHeroBarRoot { key_id, ammo_total: total },
+            OverheadHeroBarRoot { key_id, ammo_total: total, grenade_total: g_total },
             Node {
                 position_type: PositionType::Absolute,
                 left: px(0.0),
@@ -7947,6 +8182,34 @@ fn spawn_overhead_bar(commands: &mut Commands, key_id: usize, ammo_total: u32) {
                     ));
                 }
             });
+
+            // ردیف آیکون نارنجک‌ها زیر نوار فشنگ‌ها (نارنجی = آماده، مشکی = در حال شارژ)
+            root.spawn((
+                Node {
+                    width: percent(100),
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(3.0),
+                    ..default()
+                },
+                BackgroundColor(Color::NONE),
+            ))
+            .with_children(|grow| {
+                for g_idx in 0..g_total {
+                    grow.spawn((
+                        OverheadGrenadePip {
+                            key_id,
+                            grenade_index: g_idx,
+                        },
+                        Node {
+                            width: px(12.0),
+                            height: px(7.0),
+                            border_radius: BorderRadius::all(px(3.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(1.0, 0.48, 0.14)),
+                    ));
+                }
+            });
         });
 }
 
@@ -7983,6 +8246,8 @@ fn update_overhead_hero_bars_system(
         max_stamina: f32,
         ammo_rem: u32,
         ammo_total: u32,
+        grenade_rem: u32,
+        grenade_total: u32,
     }
 
     let mut targets: Vec<BarTarget> = Vec::with_capacity(1 + remote_players.0.len());
@@ -8000,6 +8265,8 @@ fn update_overhead_hero_bars_system(
         max_stamina: h.max_stamina,
         ammo_rem: h.ammo_in_mag,
         ammo_total: h.magazine_size,
+        grenade_rem: h.grenade_charges,
+        grenade_total: h.grenade_max_charges,
     });
 
     // ۲. سایر هیروهای بازی (هم‌تیمی‌ها سبز، دشمنان قرمز)
@@ -8015,6 +8282,8 @@ fn update_overhead_hero_bars_system(
             max_stamina: rp.max_stamina,
             ammo_rem: rp.ammo_in_mag,
             ammo_total: rp.magazine_size,
+            grenade_rem: rp.grenade_charges,
+            grenade_total: rp.grenade_max_charges,
         });
     }
 
@@ -8025,21 +8294,21 @@ fn update_overhead_hero_bars_system(
     }
 
     for tgt in &targets {
-        let mut existing_ent: Option<(Entity, u32)> = None;
+        let mut existing_ent: Option<(Entity, u32, u32)> = None;
         for (ent, root, _) in &bars.root_q {
             if root.key_id == tgt.key_id {
-                existing_ent = Some((ent, root.ammo_total));
+                existing_ent = Some((ent, root.ammo_total, root.grenade_total));
                 break;
             }
         }
         match existing_ent {
             None => {
-                spawn_overhead_bar(&mut commands, tgt.key_id, tgt.ammo_total);
+                spawn_overhead_bar(&mut commands, tgt.key_id, tgt.ammo_total, tgt.grenade_total);
                 continue;
             }
-            Some((ent, cur_total)) if cur_total != tgt.ammo_total.max(1) => {
+            Some((ent, cur_total, cur_gtotal)) if cur_total != tgt.ammo_total.max(1) || cur_gtotal != tgt.grenade_total.max(1) => {
                 commands.entity(ent).despawn();
-                spawn_overhead_bar(&mut commands, tgt.key_id, tgt.ammo_total);
+                spawn_overhead_bar(&mut commands, tgt.key_id, tgt.ammo_total, tgt.grenade_total);
                 continue;
             }
             _ => {}
@@ -8089,6 +8358,17 @@ fn update_overhead_hero_bars_system(
             if pip.key_id == tgt.key_id {
                 *pbg = if pip.bullet_index < tgt.ammo_rem {
                     yellow_bullet.into()
+                } else {
+                    used_black.into()
+                };
+            }
+        }
+
+        let orange_grenade = Color::srgb(1.0, 0.48, 0.14);
+        for (gpip, mut gbg) in &mut bars.gpip_q {
+            if gpip.key_id == tgt.key_id {
+                *gbg = if gpip.grenade_index < tgt.grenade_rem {
+                    orange_grenade.into()
                 } else {
                     used_black.into()
                 };
@@ -8438,6 +8718,12 @@ struct TopMatchHudRoot;
 struct TopMatchClockText;
 
 #[derive(Component)]
+struct TopDawnKillsText;
+
+#[derive(Component)]
+struct TopDuskKillsText;
+
+#[derive(Component)]
 struct TopDawnPortraitsRow;
 
 #[derive(Component)]
@@ -8477,6 +8763,32 @@ fn spawn_top_match_hud_ui(commands: &mut Commands) {
                 },
             ));
 
+            // تعداد کل کیل‌های تیم Dawn (چپ زمان بازی)
+            root.spawn((
+                Pickable::IGNORE,
+                Node {
+                    padding: UiRect::axes(px(11.0), px(7.0)),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(8.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BorderColor::all(Color::srgb(0.20, 0.85, 0.56)),
+                BackgroundColor(Color::srgba(0.05, 0.16, 0.12, 0.92)),
+            ))
+            .with_children(|k| {
+                k.spawn((
+                    TopDawnKillsText,
+                    Text::new("0"),
+                    TextFont {
+                        font_size: FontSize::Px(18.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.32, 0.98, 0.65)),
+                ));
+            });
+
             // ساعت مرکزی بازی (MM:SS)
             root.spawn((
                 Pickable::IGNORE,
@@ -8500,6 +8812,32 @@ fn spawn_top_match_hud_ui(commands: &mut Commands) {
                         ..default()
                     },
                     TextColor(Color::srgb(0.98, 0.94, 0.76)),
+                ));
+            });
+
+            // تعداد کل کیل‌های تیم Dusk (راست زمان بازی)
+            root.spawn((
+                Pickable::IGNORE,
+                Node {
+                    padding: UiRect::axes(px(11.0), px(7.0)),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(8.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BorderColor::all(Color::srgb(0.92, 0.28, 0.24)),
+                BackgroundColor(Color::srgba(0.20, 0.06, 0.07, 0.92)),
+            ))
+            .with_children(|k| {
+                k.spawn((
+                    TopDuskKillsText,
+                    Text::new("0"),
+                    TextFont {
+                        font_size: FontSize::Px(18.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.36, 0.32)),
                 ));
             });
 
@@ -8698,7 +9036,9 @@ fn update_top_match_hud_system(
     top_bar: Res<LatestTopBarState>,
     mut sig_cache: ResMut<TopBarPopulatedSignature>,
     mut root_q: Query<&mut Node, With<TopMatchHudRoot>>,
-    mut clock_q: Query<&mut Text, With<TopMatchClockText>>,
+    mut clock_q: Query<&mut Text, (With<TopMatchClockText>, Without<TopDawnKillsText>, Without<TopDuskKillsText>)>,
+    mut dawn_kills_q: Query<&mut Text, (With<TopDawnKillsText>, Without<TopMatchClockText>, Without<TopDuskKillsText>)>,
+    mut dusk_kills_q: Query<&mut Text, (With<TopDuskKillsText>, Without<TopMatchClockText>, Without<TopDawnKillsText>)>,
     dawn_row_q: Query<(Entity, Option<&Children>), With<TopDawnPortraitsRow>>,
     dusk_row_q: Query<(Entity, Option<&Children>), With<TopDuskPortraitsRow>>,
 ) {
@@ -8716,6 +9056,12 @@ fn update_top_match_hud_system(
     let secs = total_secs % 60;
     if let Ok(mut clock_txt) = clock_q.single_mut() {
         **clock_txt = format!("{:02}:{:02}", mins, secs);
+    }
+    if let Ok(mut dk_txt) = dawn_kills_q.single_mut() {
+        **dk_txt = format!("{}", top_bar.dawn_total_kills);
+    }
+    if let Ok(mut ek_txt) = dusk_kills_q.single_mut() {
+        **ek_txt = format!("{}", top_bar.dusk_total_kills);
     }
 
     let new_sig: Vec<(usize, String, bool)> = top_bar
@@ -11681,5 +12027,795 @@ fn courier_manual_move_input_system(
             *inspected = InspectedUnit::OwnHero;
             hero_move_target.0 = Some(hit_world);
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// پنل جدول امتیازات (Scoreboard با نگه داشتن کلید ` در سمت چپ صفحه)
+// -----------------------------------------------------------------------------
+
+#[derive(Resource, Default)]
+struct LatestScoreboard(Vec<ScoreboardHeroInfo>);
+
+#[derive(Component)]
+struct ScoreboardRoot;
+
+#[derive(Component)]
+struct ScoreboardClockText;
+
+#[derive(Component)]
+struct ScoreboardTablesContainer;
+
+#[derive(Resource, Default)]
+struct ScoreboardRenderCache {
+    was_open: bool,
+    last_snapshot: Vec<ScoreboardHeroInfo>,
+}
+
+fn spawn_scoreboard_ui(commands: &mut Commands, config: &GameConfig) {
+    commands.init_resource::<ScoreboardRenderCache>();
+    let sb = &config.scoreboard;
+
+    commands
+        .spawn((
+            ScoreboardRoot,
+            Pickable::IGNORE,
+            GlobalZIndex(220),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(sb.panel_left_px),
+                top: px(sb.panel_top_px),
+                width: px(sb.panel_width_px),
+                padding: UiRect::all(px(12.0)),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(10.0),
+                border: UiRect::all(px(1.5)),
+                border_radius: BorderRadius::all(px(10.0)),
+                display: Display::None,
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.42, 0.58, 0.72, 0.85)),
+            BackgroundColor(Color::srgba(0.03, 0.05, 0.09, 0.94)),
+        ))
+        .with_children(|root| {
+            // هدر بالای پنل
+            root.spawn(Node {
+                width: percent(100),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                padding: UiRect::bottom(px(4.0)),
+                ..default()
+            })
+            .with_children(|hdr| {
+                hdr.spawn((
+                    Text::new("MATCH SCOREBOARD  [`]"),
+                    TextFont {
+                        font_size: FontSize::Px(14.5),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.86, 0.45)),
+                ));
+                hdr.spawn((
+                    ScoreboardClockText,
+                    Text::new("00:00"),
+                    TextFont {
+                        font_size: FontSize::Px(13.5),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.86, 0.92, 0.98)),
+                ));
+            });
+
+            // کانتینر دو جدول زیر هم (Dawn و Dusk)
+            root.spawn((
+                ScoreboardTablesContainer,
+                Pickable::IGNORE,
+                Node {
+                    width: percent(100),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(10.0),
+                    ..default()
+                },
+            ));
+        });
+}
+
+fn spawn_scoreboard_team_table(
+    parent: &mut ChildSpawnerCommands,
+    config: &GameConfig,
+    items_cfg: &ItemsConfig,
+    asset_server: &AssetServer,
+    icon_cache: &mut ItemIconCache,
+    team: TeamId,
+    is_ally_team: bool,
+    heroes: &[&ScoreboardHeroInfo],
+) {
+    let sb = &config.scoreboard;
+    let (team_title, accent_col, header_bg, table_border) = match team {
+        TeamId::Dawn => (
+            if is_ally_team { "TEAM DAWN  [ALLIES]" } else { "TEAM DAWN  [ENEMIES]" },
+            Color::srgb(0.20, 0.85, 0.56),
+            Color::srgba(0.05, 0.18, 0.13, 0.92),
+            Color::srgba(0.20, 0.72, 0.48, 0.60),
+        ),
+        TeamId::Dusk => (
+            if is_ally_team { "TEAM DUSK  [ALLIES]" } else { "TEAM DUSK  [ENEMIES]" },
+            Color::srgb(0.92, 0.28, 0.24),
+            Color::srgba(0.20, 0.06, 0.07, 0.92),
+            Color::srgba(0.82, 0.26, 0.24, 0.60),
+        ),
+        TeamId::Neutral => (
+            "NEUTRAL",
+            Color::srgb(0.70, 0.75, 0.80),
+            Color::srgba(0.10, 0.12, 0.16, 0.92),
+            Color::srgba(0.40, 0.45, 0.52, 0.60),
+        ),
+    };
+
+    parent
+        .spawn((
+            Pickable::IGNORE,
+            Node {
+                width: percent(100),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(4.0),
+                padding: UiRect::all(px(8.0)),
+                border: UiRect::all(px(1.0)),
+                border_radius: BorderRadius::all(px(8.0)),
+                ..default()
+            },
+            BorderColor::all(table_border),
+            BackgroundColor(Color::srgba(0.05, 0.07, 0.11, 0.88)),
+        ))
+        .with_children(|table| {
+            // هدر تیم + عنوان ستون‌ها
+            table
+                .spawn((
+                    Node {
+                        width: percent(100),
+                        padding: UiRect::axes(px(8.0), px(5.0)),
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: px(8.0),
+                        border_radius: BorderRadius::all(px(5.0)),
+                        ..default()
+                    },
+                    BackgroundColor(header_bg),
+                ))
+                .with_children(|hdr| {
+                    hdr.spawn((
+                        Node {
+                            width: px(185.0),
+                            ..default()
+                        },
+                    ))
+                    .with_children(|c| {
+                        c.spawn((
+                            Text::new(team_title),
+                            TextFont {
+                                font_size: FontSize::Px(12.0),
+                                ..default()
+                            },
+                            TextColor(accent_col),
+                        ));
+                    });
+
+                    hdr.spawn(Node {
+                        width: px(88.0),
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    })
+                    .with_children(|c| {
+                        c.spawn((
+                            Text::new(if is_ally_team { "LVL / XP" } else { "LVL" }),
+                            TextFont {
+                                font_size: FontSize::Px(10.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.75, 0.82, 0.90)),
+                        ));
+                    });
+
+                    hdr.spawn(Node {
+                        width: px(86.0),
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    })
+                    .with_children(|c| {
+                        c.spawn((
+                            Text::new("K / D / A"),
+                            TextFont {
+                                font_size: FontSize::Px(10.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.75, 0.82, 0.90)),
+                        ));
+                    });
+
+                    if is_ally_team {
+                        hdr.spawn(Node {
+                            width: px(74.0),
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        })
+                        .with_children(|c| {
+                            c.spawn((
+                                Text::new("GOLD"),
+                                TextFont {
+                                    font_size: FontSize::Px(10.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(1.0, 0.86, 0.32)),
+                            ));
+                        });
+
+                        hdr.spawn(Node {
+                            flex_grow: 1.0,
+                            justify_content: JustifyContent::FlexStart,
+                            ..default()
+                        })
+                        .with_children(|c| {
+                            c.spawn((
+                                Text::new("ITEMS"),
+                                TextFont {
+                                    font_size: FontSize::Px(10.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.75, 0.82, 0.90)),
+                            ));
+                        });
+                    }
+                });
+
+            if heroes.is_empty() {
+                table.spawn((
+                    Text::new("No players in this team"),
+                    TextFont {
+                        font_size: FontSize::Px(11.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgba(0.60, 0.66, 0.74, 0.75)),
+                ));
+                return;
+            }
+
+            // ردیف هر هیرو
+            for h in heroes {
+                let row_bg = if h.is_local_player {
+                    Color::srgba(0.11, 0.16, 0.24, 0.95)
+                } else {
+                    Color::srgba(0.07, 0.09, 0.14, 0.86)
+                };
+                let row_border = if h.is_local_player {
+                    Color::srgba(0.95, 0.78, 0.24, 0.72)
+                } else {
+                    Color::srgba(0.22, 0.28, 0.36, 0.45)
+                };
+
+                table
+                    .spawn((
+                        Node {
+                            width: percent(100),
+                            min_height: px(sb.row_height_px),
+                            padding: UiRect::axes(px(8.0), px(4.0)),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: px(8.0),
+                            border: UiRect::all(px(1.0)),
+                            border_radius: BorderRadius::all(px(6.0)),
+                            ..default()
+                        },
+                        BorderColor::all(row_border),
+                        BackgroundColor(row_bg),
+                    ))
+                    .with_children(|row| {
+                        // ستون ۱: عکس و نام هیرو
+                        row.spawn(Node {
+                            width: px(185.0),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: px(8.0),
+                            ..default()
+                        })
+                        .with_children(|hero_col| {
+                            let p_border = if h.is_disconnected {
+                                Color::srgb(0.84, 0.20, 0.20)
+                            } else if h.is_dead {
+                                Color::srgb(0.40, 0.40, 0.44)
+                            } else {
+                                accent_col
+                            };
+                            hero_col
+                                .spawn((
+                                    Node {
+                                        width: px(sb.portrait_width_px),
+                                        height: px(sb.portrait_height_px),
+                                        border: UiRect::all(px(1.5)),
+                                        border_radius: BorderRadius::all(px(4.0)),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        overflow: Overflow::clip(),
+                                        ..default()
+                                    },
+                                    BorderColor::all(p_border),
+                                    BackgroundColor(Color::srgba(0.08, 0.11, 0.16, 0.95)),
+                                ))
+                                .with_children(|frame| {
+                                    if custom_glb_exists(&h.portrait_path) {
+                                        frame.spawn((
+                                            ImageNode::new(asset_server.load(&h.portrait_path)),
+                                            Node {
+                                                width: percent(100),
+                                                height: percent(100),
+                                                ..default()
+                                            },
+                                        ));
+                                    } else {
+                                        frame.spawn((
+                                            Text::new(hero_initials(&h.display_name)),
+                                            TextFont {
+                                                font_size: FontSize::Px(12.0),
+                                                ..default()
+                                            },
+                                            TextColor(Color::WHITE),
+                                        ));
+                                    }
+                                    if h.is_dead && h.respawn_remaining > 0.0 {
+                                        frame.spawn((
+                                            Node {
+                                                position_type: PositionType::Absolute,
+                                                width: percent(100),
+                                                height: percent(100),
+                                                justify_content: JustifyContent::Center,
+                                                align_items: AlignItems::Center,
+                                                ..default()
+                                            },
+                                            BackgroundColor(Color::srgba(0.04, 0.04, 0.06, 0.74)),
+                                        ))
+                                        .with_children(|ov| {
+                                            ov.spawn((
+                                                Text::new(format!("{}", h.respawn_remaining.ceil() as u32)),
+                                                TextFont {
+                                                    font_size: FontSize::Px(12.5),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(1.0, 0.35, 0.32)),
+                                            ));
+                                        });
+                                    }
+                                    if h.is_disconnected {
+                                        frame.spawn((
+                                            Node {
+                                                position_type: PositionType::Absolute,
+                                                left: px(0.0),
+                                                width: percent(100),
+                                                height: px(2.5),
+                                                ..default()
+                                            },
+                                            BackgroundColor(Color::srgb(0.98, 0.20, 0.20)),
+                                        ));
+                                    }
+                                });
+
+                            hero_col
+                                .spawn(Node {
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: px(1.0),
+                                    ..default()
+                                })
+                                .with_children(|nm| {
+                                    let name_col = if h.is_disconnected {
+                                        Color::srgba(0.60, 0.62, 0.66, 0.85)
+                                    } else if h.is_local_player {
+                                        Color::srgb(1.0, 0.90, 0.42)
+                                    } else {
+                                        Color::srgb(0.94, 0.96, 1.0)
+                                    };
+                                    nm.spawn((
+                                        Text::new(&h.display_name),
+                                        TextFont {
+                                            font_size: FontSize::Px(12.0),
+                                            ..default()
+                                        },
+                                        TextColor(name_col),
+                                    ));
+                                    if h.is_local_player || h.is_disconnected {
+                                        let sub = if h.is_disconnected {
+                                            "DISCONNECTED"
+                                        } else {
+                                            "YOU"
+                                        };
+                                        let sub_col = if h.is_disconnected {
+                                            Color::srgb(0.96, 0.34, 0.34)
+                                        } else {
+                                            Color::srgb(0.45, 0.90, 1.0)
+                                        };
+                                        nm.spawn((
+                                            Text::new(sub),
+                                            TextFont {
+                                                font_size: FontSize::Px(9.0),
+                                                ..default()
+                                            },
+                                            TextColor(sub_col),
+                                        ));
+                                    }
+                                });
+                        });
+
+                        // ستون ۲: کپسول سطح و XP (برای هم‌تیمی‌ها دقیقاً مشابه کپسول پایین سمت چپ؛ برای دشمن فقط سطح فعلی)
+                        row.spawn(Node {
+                            width: px(88.0),
+                            flex_direction: FlexDirection::Column,
+                            align_items: AlignItems::Center,
+                            row_gap: px(2.0),
+                            ..default()
+                        })
+                        .with_children(|lvl_col| {
+                            if let Some(ref xp) = h.xp_info {
+                                let ring_box = sb.level_ring_size_px;
+                                let center_xy = ring_box * 0.5;
+                                let arc_r = ring_box * 0.42;
+                                let seg_size = (ring_box * 0.085).max(3.0);
+                                let inner_d = ring_box * 0.62;
+                                let seg_count = sb.xp_ring_segments;
+                                let xp_frac = if h.level >= 25 || xp.xp_for_next_level == 0 {
+                                    1.0
+                                } else {
+                                    (xp.xp_into_level as f32 / xp.xp_for_next_level as f32).clamp(0.0, 1.0)
+                                };
+                                let lit_count = (xp_frac * seg_count as f32).round() as usize;
+                                let lit_col = Color::srgb(1.0, 0.84, 0.24);
+                                let dim_col = Color::srgba(0.20, 0.24, 0.30, 0.65);
+
+                                lvl_col
+                                    .spawn(Node {
+                                        width: px(ring_box),
+                                        height: px(ring_box),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    })
+                                    .with_children(|ring| {
+                                        for i in 0..seg_count {
+                                            let angle = -std::f32::consts::FRAC_PI_2
+                                                + (i as f32) * (std::f32::consts::TAU / seg_count as f32);
+                                            let sx = center_xy + angle.cos() * arc_r - seg_size * 0.5;
+                                            let sy = center_xy + angle.sin() * arc_r - seg_size * 0.5;
+                                            ring.spawn((
+                                                Node {
+                                                    position_type: PositionType::Absolute,
+                                                    left: px(sx),
+                                                    top: px(sy),
+                                                    width: px(seg_size),
+                                                    height: px(seg_size),
+                                                    border_radius: BorderRadius::MAX,
+                                                    ..default()
+                                                },
+                                                BackgroundColor(if i < lit_count { lit_col } else { dim_col }),
+                                            ));
+                                        }
+
+                                        ring.spawn((
+                                            Node {
+                                                width: px(inner_d),
+                                                height: px(inner_d),
+                                                justify_content: JustifyContent::Center,
+                                                align_items: AlignItems::Center,
+                                                border: UiRect::all(px(1.8)),
+                                                border_radius: BorderRadius::MAX,
+                                                ..default()
+                                            },
+                                            BorderColor::all(Color::srgb(0.95, 0.78, 0.24)),
+                                            BackgroundColor(Color::srgba(0.06, 0.08, 0.12, 0.94)),
+                                        ))
+                                        .with_children(|inner| {
+                                            inner.spawn((
+                                                Text::new(format!("{}", h.level)),
+                                                TextFont {
+                                                    font_size: FontSize::Px(13.0),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(1.0, 0.88, 0.36)),
+                                            ));
+                                        });
+                                    });
+
+                                let xp_txt = if h.level >= 25 || xp.xp_for_next_level == 0 {
+                                    "MAX LVL".to_string()
+                                } else {
+                                    format!("XP {}/{}", xp.xp_into_level, xp.xp_for_next_level)
+                                };
+                                lvl_col.spawn((
+                                    Text::new(xp_txt),
+                                    TextFont {
+                                        font_size: FontSize::Px(9.0),
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(0.85, 0.78, 0.45)),
+                                ));
+                            } else {
+                                // برای دشمن: فقط سطح فعلی هیرو (بدون حلقه و مقدار XP)
+                                let badge_d = sb.level_ring_size_px * 0.68;
+                                lvl_col
+                                    .spawn((
+                                        Node {
+                                            width: px(badge_d),
+                                            height: px(badge_d),
+                                            justify_content: JustifyContent::Center,
+                                            align_items: AlignItems::Center,
+                                            border: UiRect::all(px(1.8)),
+                                            border_radius: BorderRadius::MAX,
+                                            ..default()
+                                        },
+                                        BorderColor::all(Color::srgba(0.72, 0.76, 0.84, 0.85)),
+                                        BackgroundColor(Color::srgba(0.06, 0.08, 0.12, 0.94)),
+                                    ))
+                                    .with_children(|inner| {
+                                        inner.spawn((
+                                            Text::new(format!("{}", h.level)),
+                                            TextFont {
+                                                font_size: FontSize::Px(13.5),
+                                                ..default()
+                                            },
+                                            TextColor(Color::srgb(0.92, 0.95, 1.0)),
+                                        ));
+                                    });
+                            }
+                        });
+
+                        // ستون ۳: K / D / A با رنگ‌بندی مفهومی
+                        row.spawn(Node {
+                            width: px(86.0),
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            column_gap: px(4.0),
+                            ..default()
+                        })
+                        .with_children(|kda| {
+                            kda.spawn((
+                                Text::new(format!("{}", h.kills)),
+                                TextFont {
+                                    font_size: FontSize::Px(12.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.32, 0.96, 0.56)),
+                            ));
+                            kda.spawn((
+                                Text::new("/"),
+                                TextFont {
+                                    font_size: FontSize::Px(11.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgba(0.55, 0.62, 0.70, 0.80)),
+                            ));
+                            kda.spawn((
+                                Text::new(format!("{}", h.deaths)),
+                                TextFont {
+                                    font_size: FontSize::Px(12.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.98, 0.36, 0.36)),
+                            ));
+                            kda.spawn((
+                                Text::new("/"),
+                                TextFont {
+                                    font_size: FontSize::Px(11.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgba(0.55, 0.62, 0.70, 0.80)),
+                            ));
+                            kda.spawn((
+                                Text::new(format!("{}", h.assists)),
+                                TextFont {
+                                    font_size: FontSize::Px(12.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.45, 0.86, 1.0)),
+                            ));
+                        });
+
+                        // ستون ۴ و ۵: گلد و آیتم‌ها (فقط برای هم‌تیمی‌ها — سرور برای دشمن None می‌فرستد)
+                        if is_ally_team {
+                            let gold_val = h.gold.unwrap_or(0);
+                            row.spawn((
+                                Node {
+                                    width: px(74.0),
+                                    padding: UiRect::axes(px(7.0), px(3.0)),
+                                    flex_direction: FlexDirection::Row,
+                                    justify_content: JustifyContent::Center,
+                                    align_items: AlignItems::Center,
+                                    column_gap: px(5.0),
+                                    border_radius: BorderRadius::all(px(5.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.24, 0.19, 0.05, 0.82)),
+                            ))
+                            .with_children(|g| {
+                                g.spawn((
+                                    Node {
+                                        width: px(9.5),
+                                        height: px(9.5),
+                                        border_radius: BorderRadius::MAX,
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(1.0, 0.82, 0.16)),
+                                ));
+                                g.spawn((
+                                    Text::new(format!("{}", gold_val)),
+                                    TextFont {
+                                        font_size: FontSize::Px(12.0),
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(1.0, 0.88, 0.35)),
+                                ));
+                            });
+
+                            row.spawn(Node {
+                                flex_grow: 1.0,
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                column_gap: px(4.0),
+                                ..default()
+                            })
+                            .with_children(|items_row| {
+                                let inv_slice = h.inventory.as_deref().unwrap_or(&[]);
+                                for slot_idx in 0..sb.max_item_slots {
+                                    if let Some(inv_item) = inv_slice.iter().find(|it| it.slot == slot_idx) {
+                                        if let Some(item_def) = items_cfg.get_item(&inv_item.item_id) {
+                                            items_row
+                                                .spawn(Node {
+                                                    width: px(sb.item_icon_size_px),
+                                                    height: px(sb.item_icon_size_px),
+                                                    justify_content: JustifyContent::Center,
+                                                    align_items: AlignItems::Center,
+                                                    ..default()
+                                                })
+                                                .with_children(|slot_node| {
+                                                    spawn_item_icon_badge(
+                                                        slot_node,
+                                                        asset_server,
+                                                        icon_cache,
+                                                        item_def,
+                                                        sb.item_icon_size_px,
+                                                        8.5,
+                                                    );
+                                                    if !item_def.modes.is_empty() {
+                                                        let m_idx = inv_item.active_mode.min(item_def.modes.len() - 1);
+                                                        let mc = item_def.modes[m_idx].color_rgb;
+                                                        slot_node.spawn((
+                                                            Node {
+                                                                position_type: PositionType::Absolute,
+                                                                right: px(2.0),
+                                                                bottom: px(2.0),
+                                                                width: px(6.0),
+                                                                height: px(6.0),
+                                                                border_radius: BorderRadius::MAX,
+                                                                ..default()
+                                                            },
+                                                            BackgroundColor(Color::srgb(mc.0, mc.1, mc.2)),
+                                                        ));
+                                                    }
+                                                });
+                                            continue;
+                                        }
+                                    }
+                                    items_row.spawn((
+                                        Node {
+                                            width: px(sb.item_icon_size_px),
+                                            height: px(sb.item_icon_size_px),
+                                            border: UiRect::all(px(1.0)),
+                                            border_radius: BorderRadius::all(px(5.0)),
+                                            ..default()
+                                        },
+                                        BorderColor::all(Color::srgba(0.24, 0.30, 0.38, 0.55)),
+                                        BackgroundColor(Color::srgba(0.06, 0.08, 0.12, 0.72)),
+                                    ));
+                                }
+                            });
+                        }
+                    });
+            }
+        });
+}
+
+#[derive(SystemParam)]
+struct ScoreboardUiParams<'w, 's> {
+    config: Res<'w, GameConfig>,
+    items_cfg: Res<'w, ItemsConfig>,
+    asset_server: Res<'w, AssetServer>,
+    icon_cache: ResMut<'w, ItemIconCache>,
+    keyboard: Res<'w, ButtonInput<KeyCode>>,
+    match_flow: Res<'w, ClientMatchFlow>,
+    chat_state: Res<'w, ChatUiState>,
+    shop_ui: Res<'w, ShopUiState>,
+    settings_ui: Res<'w, SettingsUiState>,
+    hero_hud: Res<'w, LatestHeroSnapshot>,
+    top_bar: Res<'w, LatestTopBarState>,
+    scoreboard: Res<'w, LatestScoreboard>,
+    cache: ResMut<'w, ScoreboardRenderCache>,
+    root_q: Query<'w, 's, &'static mut Node, With<ScoreboardRoot>>,
+    clock_q: Query<'w, 's, &'static mut Text, With<ScoreboardClockText>>,
+    container_q: Query<'w, 's, (Entity, Option<&'static Children>), With<ScoreboardTablesContainer>>,
+}
+
+fn update_scoreboard_ui_system(
+    mut commands: Commands,
+    mut p: ScoreboardUiParams,
+) {
+    let Ok(mut root_node) = p.root_q.single_mut() else {
+        return;
+    };
+
+    let can_open = p.match_flow.is_in_game()
+        && !p.chat_state.is_open
+        && !p.shop_ui.search_focused
+        && p.settings_ui.listening_slot.is_none();
+    let is_open = can_open && p.keyboard.pressed(KeyCode::Backquote);
+
+    if !is_open {
+        if root_node.display != Display::None {
+            root_node.display = Display::None;
+        }
+        p.cache.was_open = false;
+        return;
+    }
+
+    if root_node.display != Display::Flex {
+        root_node.display = Display::Flex;
+    }
+
+    let total_secs = p.top_bar.match_elapsed_secs.max(0.0) as u32;
+    if let Ok(mut clock_txt) = p.clock_q.single_mut() {
+        **clock_txt = format!("{:02}:{:02}", total_secs / 60, total_secs % 60);
+    }
+
+    if p.cache.was_open && p.cache.last_snapshot == p.scoreboard.0 {
+        return;
+    }
+    p.cache.was_open = true;
+    p.cache.last_snapshot = p.scoreboard.0.clone();
+
+    let my_team = p.hero_hud.0.team;
+    let dawn_heroes: Vec<&ScoreboardHeroInfo> = p.scoreboard
+        .0
+        .iter()
+        .filter(|h| h.team == TeamId::Dawn)
+        .collect();
+    let dusk_heroes: Vec<&ScoreboardHeroInfo> = p.scoreboard
+        .0
+        .iter()
+        .filter(|h| h.team == TeamId::Dusk)
+        .collect();
+
+    if let Ok((cont_ent, ch_opt)) = p.container_q.single() {
+        if let Some(ch) = ch_opt {
+            for child in ch.iter() {
+                commands.entity(child).despawn();
+            }
+        }
+        commands.entity(cont_ent).with_children(|parent| {
+            spawn_scoreboard_team_table(
+                parent,
+                &p.config,
+                &p.items_cfg,
+                &p.asset_server,
+                &mut p.icon_cache,
+                TeamId::Dawn,
+                my_team == TeamId::Dawn,
+                &dawn_heroes,
+            );
+            spawn_scoreboard_team_table(
+                parent,
+                &p.config,
+                &p.items_cfg,
+                &p.asset_server,
+                &mut p.icon_cache,
+                TeamId::Dusk,
+                my_team == TeamId::Dusk,
+                &dusk_heroes,
+            );
+        });
     }
 }

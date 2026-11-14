@@ -48,6 +48,10 @@ pub struct ItemStatsModifier {
     pub max_hp_bonus: f32,
     pub max_stamina_bonus: f32,
     pub armor_bonus: f32,
+    pub grenade_damage_bonus: f32,
+    pub grenade_aoe_bonus: f32,
+    pub grenade_max_charges_bonus: i32,
+    pub grenade_recharge_speed_pct: f32,
 }
 
 impl ItemStatsModifier {
@@ -69,6 +73,10 @@ impl ItemStatsModifier {
             max_hp_bonus: 0.0,
             max_stamina_bonus: 0.0,
             armor_bonus: 0.0,
+            grenade_damage_bonus: 0.0,
+            grenade_aoe_bonus: 0.0,
+            grenade_max_charges_bonus: 0,
+            grenade_recharge_speed_pct: 0.0,
         }
     }
 
@@ -89,6 +97,10 @@ impl ItemStatsModifier {
         self.max_hp_bonus += other.max_hp_bonus;
         self.max_stamina_bonus += other.max_stamina_bonus;
         self.armor_bonus += other.armor_bonus;
+        self.grenade_damage_bonus += other.grenade_damage_bonus;
+        self.grenade_aoe_bonus += other.grenade_aoe_bonus;
+        self.grenade_max_charges_bonus += other.grenade_max_charges_bonus;
+        self.grenade_recharge_speed_pct += other.grenade_recharge_speed_pct;
     }
 
     pub fn split_buffs_and_debuffs(&self) -> (Vec<String>, Vec<String>) {
@@ -141,6 +153,10 @@ impl ItemStatsModifier {
         push_f32(&mut buffs, &mut debuffs, self.max_stamina_bonus, "Max Stamina", "");
         push_f32(&mut buffs, &mut debuffs, self.stamina_regen_bonus, "Stamina Regen", "/s");
         push_f32(&mut buffs, &mut debuffs, self.armor_bonus, "Armor", "");
+        push_f32(&mut buffs, &mut debuffs, self.grenade_damage_bonus, "Grenade Damage", "");
+        push_f32(&mut buffs, &mut debuffs, self.grenade_aoe_bonus, "Grenade AOE", "m");
+        push_i32(&mut buffs, &mut debuffs, self.grenade_max_charges_bonus, "Grenade Max Charges");
+        push_pct(&mut buffs, &mut debuffs, self.grenade_recharge_speed_pct, "Grenade Recharge Speed");
 
         (buffs, debuffs)
     }
@@ -441,6 +457,19 @@ pub fn recompute_player_slot_stats(
             p.ammo_in_mag = p.ammo_in_mag.min(p.hero_pistol.magazine_size);
             p.other_weapon_ammo_in_mag = p.other_weapon_ammo_in_mag.min(p.hero_weapon.magazine_size);
         }
+    }
+
+    // تقویت نارنجک‌ها با آیتم‌ها
+    let base_g = base.grenade;
+    p.hero_grenade.damage = (base_g.damage + total_mod.grenade_damage_bonus).max(1.0);
+    p.hero_grenade.aoe_radius = (base_g.aoe_radius + total_mod.grenade_aoe_bonus).max(0.5);
+    p.hero_grenade.max_charges =
+        ((base_g.max_charges as i32) + total_mod.grenade_max_charges_bonus).max(1) as u32;
+    let g_recharge_mult = (1.0 + total_mod.grenade_recharge_speed_pct).max(0.25);
+    p.hero_grenade.recharge_secs = (base_g.recharge_secs / g_recharge_mult).max(1.0);
+    p.grenade_charges = p.grenade_charges.min(p.hero_grenade.max_charges);
+    if p.grenade_charges < p.hero_grenade.max_charges && p.grenade_recharge_remaining <= 0.0 {
+        p.grenade_recharge_remaining = p.hero_grenade.recharge_secs;
     }
 }
 

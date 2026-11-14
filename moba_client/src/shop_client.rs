@@ -175,7 +175,7 @@ impl Default for ShopUiState {
 }
 
 #[derive(Resource, Default)]
-struct ItemIconCache(std::collections::HashMap<String, Option<Handle<Image>>>);
+pub struct ItemIconCache(std::collections::HashMap<String, Option<Handle<Image>>>);
 
 impl ItemIconCache {
     fn get_or_load(&mut self, icon_path: &str, asset_server: &AssetServer) -> Option<Handle<Image>> {
@@ -236,7 +236,7 @@ impl Plugin for ShopPlugin {
     }
 }
 
-fn spawn_item_icon_badge(
+pub fn spawn_item_icon_badge(
     parent: &mut ChildSpawnerCommands,
     asset_server: &AssetServer,
     icon_cache: &mut ItemIconCache,

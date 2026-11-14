@@ -44,11 +44,26 @@ pub struct ChatConfig {
     pub message_fade_secs: f32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScoreboardConfig {
+    pub panel_left_px: f32,
+    pub panel_top_px: f32,
+    pub panel_width_px: f32,
+    pub row_height_px: f32,
+    pub portrait_width_px: f32,
+    pub portrait_height_px: f32,
+    pub level_ring_size_px: f32,
+    pub xp_ring_segments: usize,
+    pub item_icon_size_px: f32,
+    pub max_item_slots: usize,
+}
+
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
     pub pause: PauseConfig,
     pub ping: PingConfig,
     pub chat: ChatConfig,
+    pub scoreboard: ScoreboardConfig,
     pub network: NetworkConfig,
     pub window: WindowConfig,
     pub camera: CameraConfig,
@@ -88,6 +103,7 @@ impl GameConfig {
         cfg.validate_barracks();
         cfg.validate_ancients();
         cfg.validate_chat();
+        cfg.validate_scoreboard();
         cfg.validate_ping();
         cfg.validate_pause();
         cfg.validate_camera();
@@ -169,6 +185,12 @@ impl GameConfig {
             assert!(hero.weapon.projectile_speed > 0.0, "projectile_speed اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.max_range > 0.0, "max_range اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.pellets_per_shot > 0, "pellets_per_shot اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.grenade.damage > 0.0, "grenade.damage هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.grenade.aoe_radius > 0.0, "grenade.aoe_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.grenade.fuse_secs > 0.0, "grenade.fuse_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.grenade.throw_duration_secs > 0.0, "grenade.throw_duration_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.grenade.max_charges > 0, "grenade.max_charges هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.grenade.recharge_secs > 0.0, "grenade.recharge_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
         }
     }
 
@@ -248,6 +270,17 @@ impl GameConfig {
         assert!(self.ping.world_ring_radius > 0.0, "ping.world_ring_radius باید بزرگ‌تر از صفر باشد");
         assert!(self.ping.beam_height > 0.0, "ping.beam_height باید بزرگ‌تر از صفر باشد");
         assert!(self.ping.minimap_pulse_speed > 0.0, "ping.minimap_pulse_speed باید بزرگ‌تر از صفر باشد");
+    }
+
+    pub fn validate_scoreboard(&self) {
+        let sb = &self.scoreboard;
+        assert!(sb.panel_width_px > 100.0, "scoreboard.panel_width_px باید بزرگ‌تر از 100 باشد");
+        assert!(sb.row_height_px > 20.0, "scoreboard.row_height_px باید بزرگ‌تر از 20 باشد");
+        assert!(sb.portrait_width_px > 10.0 && sb.portrait_height_px > 10.0, "ابعاد پورتریت scoreboard نامعتبر است");
+        assert!(sb.level_ring_size_px > 16.0, "scoreboard.level_ring_size_px باید بزرگ‌تر از 16 باشد");
+        assert!(sb.xp_ring_segments >= 8, "scoreboard.xp_ring_segments باید حداقل 8 باشد");
+        assert!(sb.item_icon_size_px > 10.0, "scoreboard.item_icon_size_px باید بزرگ‌تر از 10 باشد");
+        assert!(sb.max_item_slots > 0, "scoreboard.max_item_slots باید بزرگ‌تر از صفر باشد");
     }
 
     pub fn validate_chat(&self) {
@@ -730,6 +763,16 @@ pub struct CourierConfig {
     pub vision_range: f32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct HeroGrenadeDef {
+    pub damage: f32,
+    pub aoe_radius: f32,
+    pub fuse_secs: f32,
+    pub throw_duration_secs: f32,
+    pub max_charges: u32,
+    pub recharge_secs: f32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HeroDef {
     pub id: String,
@@ -754,6 +797,7 @@ pub struct HeroDef {
     pub high_ground_vision_bonus: f32,
     pub weapon: HeroWeaponDef,
     pub pistol: HeroWeaponDef,
+    pub grenade: HeroGrenadeDef,
     pub level_growth: HeroLevelGrowth,
     pub courier: CourierConfig,
 }
@@ -815,9 +859,6 @@ pub struct CombatConfig {
     pub grenade_max_throw_dist: f32,
     pub grenade_horizontal_vel_factor: f32,
     pub grenade_vertical_vel: f32,
-    pub grenade_fuse_secs: f32,
-    pub grenade_target_kill_radius: f32,
-    pub grenade_soldier_kill_radius: f32,
     pub grenade_explosion_trauma_add: f32,
     pub grenade_explosion_trauma_max: f32,
     pub hero_stand_hitbox_height: f32,
@@ -1421,6 +1462,7 @@ pub enum GameplayFxEvent {
     },
     GrenadeExploded {
         pos: Vec3,
+        aoe_radius: f32,
         trauma_add: f32,
         trauma_max: f32,
     },
@@ -2016,6 +2058,10 @@ pub struct HeroSnapshot {
     pub weapon_damage: f32,
     pub projectile_speed: f32,
     pub weapon_max_range: f32,
+    pub grenade_charges: u32,
+    pub grenade_max_charges: u32,
+    pub grenade_recharge_remaining: f32,
+    pub grenade_throw_duration_secs: f32,
     pub last_hits: u32,
     pub denies: u32,
     pub assists: u32,
@@ -2030,6 +2076,33 @@ pub struct HeroSnapshot {
     pub courier_order: CourierOrder,
     pub courier_in_fountain: bool,
     pub courier_inventory: Vec<InventoryItemState>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ScoreboardXpInfo {
+    pub xp: u32,
+    pub xp_into_level: u32,
+    pub xp_for_next_level: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ScoreboardHeroInfo {
+    pub slot_index: usize,
+    pub team: TeamId,
+    pub hero_id: String,
+    pub display_name: String,
+    pub portrait_path: String,
+    pub is_local_player: bool,
+    pub is_dead: bool,
+    pub is_disconnected: bool,
+    pub respawn_remaining: f32,
+    pub level: u32,
+    pub kills: u32,
+    pub deaths: u32,
+    pub assists: u32,
+    pub xp_info: Option<ScoreboardXpInfo>,
+    pub gold: Option<u32>,
+    pub inventory: Option<Vec<InventoryItemState>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2068,6 +2141,9 @@ pub struct RemotePlayerSnapshot {
     pub active_weapon: ActiveWeaponSlot,
     pub ammo_in_mag: u32,
     pub magazine_size: u32,
+    pub grenade_charges: u32,
+    pub grenade_max_charges: u32,
+    pub grenade_throw_duration_secs: f32,
     pub level: u32,
     pub armor: f32,
     pub move_speed: f32,
@@ -2082,6 +2158,8 @@ pub struct RemotePlayerSnapshot {
 pub struct ServerWorldSnapshot {
     pub tick: u64,
     pub match_elapsed_secs: f32,
+    pub dawn_total_kills: u32,
+    pub dusk_total_kills: u32,
     pub soldier_pos: Vec3,
     pub soldier_facing_dir: Vec3,
     pub aim_world_dir: Vec3,
@@ -2104,6 +2182,7 @@ pub struct ServerWorldSnapshot {
     pub hero: HeroSnapshot,
     pub other_players: Vec<RemotePlayerSnapshot>,
     pub top_bar_heroes: Vec<TopBarHeroInfo>,
+    pub scoreboard_heroes: Vec<ScoreboardHeroInfo>,
     pub fog_visible_mask: Vec<u8>,
     pub bullets: Vec<BulletSnapshot>,
     pub grenades: Vec<GrenadeSnapshot>,
@@ -3364,6 +3443,8 @@ pub struct PhysicsGrenade {
     pub owner_slot: usize,
     pub owner_team: TeamId,
     pub remaining_fuse: f32,
+    pub damage: f32,
+    pub aoe_radius: f32,
 }
 
 #[derive(Component)]
@@ -3906,6 +3987,11 @@ pub fn soldier_physics_bundle(
 pub fn grenade_physics_bundle(
     config: &GameConfig,
     id: u64,
+    owner_slot: usize,
+    owner_team: TeamId,
+    fuse_secs: f32,
+    damage: f32,
+    aoe_radius: f32,
     translation: Vec3,
     rotation: Quat,
     linear_velocity: Vec3,
@@ -3922,9 +4008,11 @@ pub fn grenade_physics_bundle(
     (
         PhysicsGrenade {
             id,
-            owner_slot: 0,
-            owner_team: TeamId::Dawn,
-            remaining_fuse: config.combat.grenade_fuse_secs,
+            owner_slot,
+            owner_team,
+            remaining_fuse: fuse_secs,
+            damage,
+            aoe_radius,
         },
         CustomRigidBody::Dynamic,
         CustomCollider::ball(config.physics.grenade_collider_radius),
@@ -4546,6 +4634,9 @@ pub struct PlayerSlotState {
     pub hero_vision_range: f32,
     pub hero_weapon: HeroWeaponDef,
     pub hero_pistol: HeroWeaponDef,
+    pub hero_grenade: HeroGrenadeDef,
+    pub grenade_charges: u32,
+    pub grenade_recharge_remaining: f32,
     pub active_weapon: ActiveWeaponSlot,
     pub other_weapon_ammo_in_mag: u32,
     pub ammo_in_mag: u32,
@@ -4629,6 +4720,9 @@ pub struct AuthoritativeWorldState {
     pub hero_vision_range: f32,
     pub hero_weapon: HeroWeaponDef,
     pub hero_pistol: HeroWeaponDef,
+    pub hero_grenade: HeroGrenadeDef,
+    pub grenade_charges: u32,
+    pub grenade_recharge_remaining: f32,
     pub active_weapon: ActiveWeaponSlot,
     pub other_weapon_ammo_in_mag: u32,
     pub ammo_in_mag: u32,
@@ -4766,6 +4860,9 @@ impl AuthoritativeWorldState {
             ammo_in_mag: hero.weapon.magazine_size,
             hero_weapon: hero.weapon,
             hero_pistol: hero.pistol,
+            hero_grenade: hero.grenade,
+            grenade_charges: hero.grenade.max_charges,
+            grenade_recharge_remaining: 0.0,
             active_weapon: ActiveWeaponSlot::Primary,
             other_weapon_ammo_in_mag: hero.pistol.magazine_size,
             current_move_speed: config.soldier.run_speed * hero.move_speed_multiplier,
@@ -4950,6 +5047,9 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.hero_vision_range, &mut p.hero_vision_range);
         std::mem::swap(&mut self.hero_weapon, &mut p.hero_weapon);
         std::mem::swap(&mut self.hero_pistol, &mut p.hero_pistol);
+        std::mem::swap(&mut self.hero_grenade, &mut p.hero_grenade);
+        std::mem::swap(&mut self.grenade_charges, &mut p.grenade_charges);
+        std::mem::swap(&mut self.grenade_recharge_remaining, &mut p.grenade_recharge_remaining);
         std::mem::swap(&mut self.active_weapon, &mut p.active_weapon);
         std::mem::swap(&mut self.other_weapon_ammo_in_mag, &mut p.other_weapon_ammo_in_mag);
         std::mem::swap(&mut self.ammo_in_mag, &mut p.ammo_in_mag);
@@ -5365,6 +5465,9 @@ impl AuthoritativeWorldState {
                 ammo_in_mag: hero.weapon.magazine_size,
                 hero_weapon: hero.weapon,
                 hero_pistol: hero.pistol,
+                hero_grenade: hero.grenade,
+                grenade_charges: hero.grenade.max_charges,
+                grenade_recharge_remaining: 0.0,
                 active_weapon: ActiveWeaponSlot::Primary,
                 other_weapon_ammo_in_mag: hero.pistol.magazine_size,
                 current_move_speed: config.soldier.run_speed * hero.move_speed_multiplier,
@@ -5433,8 +5536,57 @@ impl AuthoritativeWorldState {
             })
             .collect();
 
+        let scoreboard_heroes: Vec<ScoreboardHeroInfo> = self
+            .players
+            .iter()
+            .map(|p| {
+                let portrait = config.active_hero(p.hero_index).portrait_path.clone();
+                let is_ally = p.hero_team == viewer_team;
+                let xp_info = if is_ally {
+                    let cur_base = config.combat.xp_thresholds_per_level[(p.hero_level as usize - 1).min(24)];
+                    let xp_into_level = p.hero_xp.saturating_sub(cur_base);
+                    let xp_for_next_level = if p.hero_level >= 25 {
+                        0
+                    } else {
+                        let next_base = config.combat.xp_thresholds_per_level[p.hero_level as usize];
+                        next_base.saturating_sub(cur_base)
+                    };
+                    Some(ScoreboardXpInfo {
+                        xp: p.hero_xp,
+                        xp_into_level,
+                        xp_for_next_level,
+                    })
+                } else {
+                    None
+                };
+                ScoreboardHeroInfo {
+                    slot_index: p.slot_index,
+                    team: p.hero_team,
+                    hero_id: p.hero_id.clone(),
+                    display_name: p.hero_display_name.clone(),
+                    portrait_path: portrait,
+                    is_local_player: p.slot_index == slot_index,
+                    is_dead: p.is_dead,
+                    is_disconnected: p.is_disconnected,
+                    respawn_remaining: if p.is_dead {
+                        p.respawn_remaining.max(0.0)
+                    } else {
+                        0.0
+                    },
+                    level: p.hero_level,
+                    kills: p.kills,
+                    deaths: p.deaths,
+                    assists: p.assists,
+                    xp_info,
+                    gold: if is_ally { Some(p.hero_gold) } else { None },
+                    inventory: if is_ally { Some(p.inventory.clone()) } else { None },
+                }
+            })
+            .collect();
+
         self.swap_slot_in(slot_index);
         let mut snap = self.build_snapshot(config);
+        snap.scoreboard_heroes = scoreboard_heroes;
         if let Some(me) = self.players.get(slot_index) {
             snap.hero.courier_hp = me.courier_hp;
             snap.hero.courier_max_hp = me.courier_max_hp;
@@ -5518,6 +5670,9 @@ impl AuthoritativeWorldState {
                 max_stamina: p.hero_max_stamina,
                 active_weapon: p.active_weapon,
                 ammo_in_mag: p.ammo_in_mag,
+                grenade_charges: p.grenade_charges,
+                grenade_max_charges: p.hero_grenade.max_charges,
+                grenade_throw_duration_secs: p.hero_grenade.throw_duration_secs,
                 magazine_size: if p.active_weapon == ActiveWeaponSlot::Pistol {
                     p.hero_pistol.magazine_size
                 } else {
@@ -5545,6 +5700,8 @@ impl AuthoritativeWorldState {
                 is_visible: true,
             });
         }
+        snap.dawn_total_kills = self.players.iter().filter(|p| p.hero_team == TeamId::Dawn).map(|p| p.kills).sum();
+        snap.dusk_total_kills = self.players.iter().filter(|p| p.hero_team == TeamId::Dusk).map(|p| p.kills).sum();
         snap.other_players = others;
         snap.top_bar_heroes = top_bar;
         let max_vis = config.chat.max_visible_messages;
@@ -5656,6 +5813,9 @@ impl AuthoritativeWorldState {
         self.ammo_in_mag = hero.weapon.magazine_size;
         self.hero_weapon = hero.weapon;
         self.hero_pistol = hero.pistol;
+        self.hero_grenade = hero.grenade;
+        self.grenade_charges = hero.grenade.max_charges;
+        self.grenade_recharge_remaining = 0.0;
         self.active_weapon = ActiveWeaponSlot::Primary;
         self.other_weapon_ammo_in_mag = hero.pistol.magazine_size;
         self.current_move_speed = config.soldier.run_speed * hero.move_speed_multiplier;
@@ -5667,6 +5827,8 @@ impl AuthoritativeWorldState {
         ServerWorldSnapshot {
             tick: self.tick,
             match_elapsed_secs: self.match_elapsed_secs,
+            dawn_total_kills: 0,
+            dusk_total_kills: 0,
             soldier_pos: self.soldier_pos,
             soldier_facing_dir: self.soldier_facing_dir,
             aim_world_dir: self.aim_world_dir,
@@ -5763,6 +5925,10 @@ impl AuthoritativeWorldState {
                 } else {
                     self.hero_weapon.max_range
                 },
+                grenade_charges: self.grenade_charges,
+                grenade_max_charges: self.hero_grenade.max_charges,
+                grenade_recharge_remaining: self.grenade_recharge_remaining.max(0.0),
+                grenade_throw_duration_secs: self.hero_grenade.throw_duration_secs,
                 last_hits: self.last_hits,
                 denies: self.denies,
                 assists: self.assists,
@@ -5780,6 +5946,7 @@ impl AuthoritativeWorldState {
             },
             other_players: Vec::new(),
             top_bar_heroes: Vec::new(),
+            scoreboard_heroes: Vec::new(),
             fog_visible_mask: self.fog_of_war.pack_visible_mask(),
             bullets: self.bullets_snapshot.clone(),
             grenades: self.grenades_snapshot.clone(),
@@ -6486,6 +6653,8 @@ fn shared_drive_single_player(
             world.active_weapon = ActiveWeaponSlot::Primary;
             world.ammo_in_mag = world.hero_weapon.magazine_size;
             world.other_weapon_ammo_in_mag = world.hero_pistol.magazine_size;
+            world.grenade_charges = world.hero_grenade.max_charges;
+            world.grenade_recharge_remaining = 0.0;
             world.base_stance = Stance::Run;
             let spawn_pos = world.active_spawn_pos;
             world.soldier_pos = spawn_pos;
@@ -6554,14 +6723,35 @@ fn shared_drive_single_player(
             world.firing_anim_remaining = None;
         }
 
+        if world.grenade_charges < world.hero_grenade.max_charges {
+            if world.grenade_recharge_remaining <= 0.0 {
+                world.grenade_recharge_remaining = world.hero_grenade.recharge_secs;
+            }
+            world.grenade_recharge_remaining -= dt;
+            if world.grenade_recharge_remaining <= 0.0 {
+                world.grenade_charges += 1;
+                if world.grenade_charges < world.hero_grenade.max_charges {
+                    world.grenade_recharge_remaining = world.hero_grenade.recharge_secs;
+                } else {
+                    world.grenade_recharge_remaining = 0.0;
+                }
+            }
+        }
+
         if input.grenade_just_pressed
+            && world.grenade_charges > 0
             && world.grenade_elapsed_and_duration.is_none()
             && !world.traversal.is_active
         {
-            let dur = config.exact_anim_duration("toss_grenade");
+            if world.grenade_charges == world.hero_grenade.max_charges {
+                world.grenade_recharge_remaining = world.hero_grenade.recharge_secs;
+            }
+            world.grenade_charges -= 1;
+            let dur = world.hero_grenade.throw_duration_secs;
             world.grenade_elapsed_and_duration = Some((0.0, dur));
             world.grenade_spawned_for_throw = false;
             world.firing_anim_remaining = None;
+            world.reload_remaining = None;
         }
 
         // ۴. تغییر وضعیت نشستن (Ctrl) و راه رفتن (Shift)
@@ -7306,6 +7496,11 @@ fn step_shooting_and_grenade_spawn(
             commands.spawn(grenade_physics_bundle(
                 config,
                 id,
+                world.active_slot,
+                world.hero_team,
+                world.hero_grenade.fuse_secs,
+                world.hero_grenade.damage,
+                world.hero_grenade.aoe_radius,
                 spawn_pos,
                 Quat::IDENTITY,
                 lin_vel,
@@ -7481,13 +7676,19 @@ fn shared_authoritative_react_system(
         ancient_idx_by_entity.insert(entity, p_anc.index);
     }
 
-    let mut exploded_positions = Vec::new();
+    let mut exploded_grenades = Vec::new();
     world.grenades_snapshot.clear();
 
     for (entity, mut grenade, tf, vel) in &mut grenade_query {
         grenade.remaining_fuse -= dt;
         if grenade.remaining_fuse <= 0.0 {
-            exploded_positions.push(tf.translation);
+            exploded_grenades.push((
+                tf.translation,
+                grenade.owner_slot,
+                grenade.owner_team,
+                grenade.damage,
+                grenade.aoe_radius,
+            ));
             commands.entity(entity).despawn();
         } else {
             world.grenades_snapshot.push(GrenadeSnapshot {
@@ -7500,31 +7701,122 @@ fn shared_authoritative_react_system(
         }
     }
 
-    for pos in exploded_positions {
-        let world_inner = &mut *world;
-        for (idx, target) in world_inner.targets.iter_mut().enumerate() {
-            if !target.is_dead
-                && target.base_pos.distance(pos) < config.combat.grenade_target_kill_radius
-            {
-                target.hp = 0.0;
-                target.is_dead = true;
-                target.respawn_remaining = target.respawn_duration;
-                let t_pos = target.base_pos;
-                if let Some(&t_ent) = target_entity_by_idx.get(&idx) {
-                    commands.entity(t_ent).insert(ColliderDisabled);
-                }
-                world_inner.last_hits += 1;
-                world_inner.hero_gold += 35;
-                if world_inner.soldier_pos.distance(t_pos) <= world_inner.hero_xp_gain_radius {
-                    world_inner.hero_xp += 45;
+    for (pos, owner_slot, owner_team, dmg, aoe_radius) in exploded_grenades {
+        // ۱. صدمه به اهداف تمرینی داخل شعاع AOE
+        for idx in 0..world.targets.len() {
+            let target_dead = world.targets[idx].is_dead;
+            let t_pos = world.targets[idx].base_pos;
+            if !target_dead && t_pos.distance(pos) <= aoe_radius {
+                world.targets[idx].hp -= dmg;
+                world.targets[idx].hit_flash_timer = config.fx.target_hit_flash_secs;
+                if world.targets[idx].hp <= 0.0 {
+                    world.targets[idx].hp = 0.0;
+                    world.targets[idx].is_dead = true;
+                    world.targets[idx].respawn_remaining = world.targets[idx].respawn_duration;
+                    if let Some(&t_ent) = target_entity_by_idx.get(&idx) {
+                        commands.entity(t_ent).insert(ColliderDisabled);
+                    }
+                    let world_inner = &mut *world;
+                    if let Some(attacker) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        attacker.last_hits += 1;
+                        attacker.hero_gold += 35;
+                        if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
+                            grant_xp_to_player_slot(attacker, 45, &config, &mut world_inner.pending_fx);
+                        }
+                    }
                 }
             }
         }
 
-        if !world.is_dead
-            && world.soldier_pos.distance(pos) < config.combat.grenade_soldier_kill_radius
-        {
-            trigger_random_death(&mut world, &config);
+        // ۲. صدمه AOE به هیروهای دشمن داخل شعاع انفجار
+        for p_idx in 0..world.players.len() {
+            if world.players[p_idx].is_dead || world.players[p_idx].hero_team == owner_team {
+                continue;
+            }
+            let h_pos = world.players[p_idx].soldier_pos + Vec3::Y * 0.9;
+            if h_pos.distance(pos) <= aoe_radius {
+                let armor = world.players[p_idx].hero_armor;
+                let eff_dmg = (dmg * dota2_armor_multiplier(armor)).max(1.0);
+                world.players[p_idx].hero_hp = (world.players[p_idx].hero_hp - eff_dmg).max(0.0);
+                if world.players[p_idx].hero_hp <= 0.0 && !world.players[p_idx].is_dead {
+                    world.swap_slot_in(p_idx);
+                    trigger_random_death(&mut world, &config);
+                    world.swap_slot_in(p_idx);
+
+                    let world_inner = &mut *world;
+                    if let Some(attacker) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        attacker.kills += 1;
+                        attacker.hero_gold += 225;
+                        grant_xp_to_player_slot(attacker, 150, &config, &mut world_inner.pending_fx);
+                    }
+                }
+            }
+        }
+
+        // ۳. صدمه AOE به سربازان لاین و کمپ‌های دشمن
+        for c_idx in 0..world.creeps.len() {
+            if world.creeps[c_idx].is_dead || world.creeps[c_idx].team == owner_team {
+                continue;
+            }
+            let c_pos = world.creeps[c_idx].pos;
+            if (c_pos + Vec3::Y * 0.8).distance(pos) <= aoe_radius {
+                let c_stats = resolve_creep_stats(&config, world.creeps[c_idx].creep_type_id.as_deref());
+                let (_, _, armor_bonus, _, _) = lane_creep_buffs(
+                    &config,
+                    &world.barracks,
+                    world.creeps[c_idx].team,
+                    world.creeps[c_idx].lane,
+                    world.creeps[c_idx].camp_index.is_none(),
+                );
+                let eff_dmg = (dmg * dota2_armor_multiplier(c_stats.armor + armor_bonus)).max(1.0);
+                world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
+                if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
+                    for c in &mut world.creeps {
+                        if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
+                            c.is_aggroed = true;
+                        }
+                    }
+                }
+                if world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead {
+                    world.creeps[c_idx].is_dead = true;
+                    world.creeps[c_idx].anim_state = CreepAnimState::Die;
+                    world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
+                    let gold_bounty = c_stats.gold_bounty;
+                    let xp_bounty = c_stats.xp_bounty;
+                    let world_inner = &mut *world;
+                    if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        killer.last_hits += 1;
+                        killer.hero_gold += gold_bounty;
+                        world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
+                            pos: c_pos,
+                            gold: gold_bounty,
+                        });
+                    }
+                    let eligible_indices: Vec<usize> = world
+                        .players
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            !p.is_dead
+                                && p.hero_team == owner_team
+                                && p.soldier_pos.distance(c_pos) <= p.hero_xp_gain_radius
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !eligible_indices.is_empty() {
+                        let share = xp_bounty / (eligible_indices.len() as u32);
+                        let world_inner = &mut *world;
+                        for idx in eligible_indices {
+                            grant_xp_to_player_slot(
+                                &mut world_inner.players[idx],
+                                share,
+                                &config,
+                                &mut world_inner.pending_fx,
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         if let Some((water_y, _)) = sample_water_surface_at(&config, pos) {
@@ -7536,6 +7828,7 @@ fn shared_authoritative_react_system(
 
         world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
             pos,
+            aoe_radius,
             trauma_add: config.combat.grenade_explosion_trauma_add,
             trauma_max: config.combat.grenade_explosion_trauma_max,
         });
@@ -7734,6 +8027,7 @@ fn shared_authoritative_react_system(
                 }
                 world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
                     pos: cour_pos,
+                    aoe_radius: 3.5,
                     trauma_add: config.combat.shot_fire_trauma_add,
                     trauma_max: config.combat.shot_fire_trauma_max,
                 });
@@ -7999,6 +8293,7 @@ fn shared_authoritative_react_system(
                         world.winning_team = Some(winner);
                         world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
                             pos: anc_pos + Vec3::Y * 3.0,
+                            aoe_radius: 9.0,
                             trauma_add: config.combat.grenade_explosion_trauma_add,
                             trauma_max: config.combat.grenade_explosion_trauma_max,
                         });

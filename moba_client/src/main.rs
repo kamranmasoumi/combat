@@ -4,9 +4,10 @@ use bevy::input::ButtonState;
 use bevy::asset::RenderAssetUsages;
 use bevy::gltf::GltfMaterialName;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
-use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::camera::Hdr;
 use bevy::math::Affine2;
-use bevy::shader::ShaderRef;
+use bevy::post_process::bloom::Bloom;
+use bevy_hanabi::prelude::HanabiMainCamera;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::gltf::Gltf;
 use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight, NotShadowCaster};
@@ -37,6 +38,8 @@ use std::path::Path;
 use std::time::Duration;
 
 mod audio_client;
+mod vfx_client;
+use vfx_client::{ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
 mod shop_client;
 use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
 use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
@@ -244,7 +247,7 @@ fn main() {
             is_pointer_over_minimap: false,
             is_dragging_minimap: false,
         })
-        .add_plugins(MaterialPlugin::<WaterSurfaceMaterial>::default())
+        .add_plugins(MobaVfxPlugin)
         .insert_resource(bevy::winit::WinitSettings::game())
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .add_plugins(MobaSharedPhysicsPlugin {
@@ -472,13 +475,6 @@ struct ExplosionSmokeParticle {
 }
 
 #[derive(Component)]
-struct BulletTrail {
-    start: Vec3,
-    end: Vec3,
-    timer: Timer,
-}
-
-#[derive(Component)]
 struct MuzzleFlash {
     timer: Timer,
 }
@@ -502,41 +498,6 @@ struct CascadingWaterfallSheet {
 }
 
 /// کامپوننت حلقه‌های موج آب (هم در پای آبشارها و هم هنگام راه رفتن بازیکن در آب)
-#[derive(ShaderType, Debug, Clone)]
-struct WaterUniforms {
-    base_color: Vec4,
-    foam_color: Vec4,
-    flow_and_params: Vec4,
-    player_ripple: Vec4,
-}
-
-#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
-struct WaterSurfaceMaterial {
-    #[uniform(0)]
-    uniforms: WaterUniforms,
-    #[texture(1)]
-    #[sampler(2)]
-    foam_tex: Handle<Image>,
-}
-
-impl Material for WaterSurfaceMaterial {
-    fn vertex_shader() -> ShaderRef {
-        "shaders/water.wesl".into()
-    }
-
-    fn fragment_shader() -> ShaderRef {
-        "shaders/water.wesl".into()
-    }
-
-    fn enable_prepass() -> bool {
-        false
-    }
-
-    fn alpha_mode(&self) -> AlphaMode {
-        AlphaMode::Blend
-    }
-}
-
 #[derive(Component)]
 struct WaterfallMistEmitter {
     base_pos: Vec3,
@@ -921,6 +882,7 @@ fn setup_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut water_materials: ResMut<Assets<WaterSurfaceMaterial>>,
+    mut vfx_queue: ResMut<VfxEventQueue>,
 ) {
     let spawn_pos = Vec3::new(
         config.soldier.spawn_pos.0,
@@ -934,6 +896,9 @@ fn setup_scene(
     );
     commands.spawn((
         Camera3d::default(),
+        Hdr,
+        Bloom::NATURAL,
+        HanabiMainCamera,
         MobaCamera,
         DistanceFog {
             color: Color::srgba(0.68, 0.76, 0.84, 1.0),
@@ -1144,19 +1109,7 @@ fn setup_scene(
     }
 
     // ۴. برکه‌های فیروزه‌ای طبیعی، جویبارهای جنگلی و جریان پویا (River Segments & Lagoons)
-    let streak_mesh = meshes.add(Cuboid::new(0.45, 0.03, 2.2));
-    let streak_mat = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.85, 0.98, 1.0, 0.65),
-        emissive: LinearRgba::new(0.65, 1.55, 1.95, 0.65),
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        ..default()
-    });
-    let shore_rock_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.36, 0.39, 0.35),
-        perceptual_roughness: 0.86,
-        ..default()
-    });
+
 
     let foam_noise_handle = images.add(bake_water_foam_noise_texture());
     commands.insert_resource(SharedWaterFoamTexture(foam_noise_handle.clone()));
@@ -1164,7 +1117,7 @@ fn setup_scene(
         Plane3d::default()
             .mesh()
             .size(1.0, 1.0)
-            .subdivisions(20),
+            .subdivisions(6),
     );
 
     for seg in &config.map.river_segments {
@@ -1197,15 +1150,16 @@ fn setup_scene(
         } else {
             let water_mat = water_materials.add(WaterSurfaceMaterial {
                 uniforms: WaterUniforms {
-                    base_color: Vec4::new(c.0, c.1, c.2, 0.76),
+                    base_color: Vec4::new(c.0, c.1, c.2, 0.80),
                     foam_color: Vec4::new(
-                        (c.0 + 0.55 + em.0 * 0.25).min(1.0),
-                        (c.1 + 0.42 + em.1 * 0.25).min(1.0),
+                        (c.0 + 0.65 + em.0 * 0.25).min(1.0),
+                        (c.1 + 0.45 + em.1 * 0.25).min(1.0),
                         (c.2 + 0.35 + em.2 * 0.25).min(1.0),
                         1.0,
                     ),
                     flow_and_params: Vec4::new(flow_n.x, flow_n.y, 0.0, 0.0),
-                    player_ripple: Vec4::new(0.0, 0.0, 0.0, 0.14),
+                    camera_pos: Vec4::new(0.0, 23.0, 17.5, 0.14),
+                    player_ripple: Vec4::new(0.0, 0.0, 0.0, -1.0),
                 },
                 foam_tex: foam_noise_handle.clone(),
             });
@@ -1213,13 +1167,19 @@ fn setup_scene(
                 parent.spawn((
                     Mesh3d(subdivided_water_mesh.clone()),
                     MeshMaterial3d(water_mat),
-                    Transform::from_xyz(0.0, size.y * 0.45, 0.0)
-                        .with_scale(Vec3::new(size.x * 1.12, 1.0, size.z * 1.12)),
+                    Transform::from_xyz(0.0, size.y * 0.5, 0.0)
+                        .with_scale(Vec3::new(size.x, 1.0, size.z)),
                 ));
             });
         }
 
         spawn_map_object_label(&mut commands, config.map.show_object_labels, seg_ent, &seg.id, size.y * 0.5 + 0.8);
+
+        if size.x >= 12.0 {
+            vfx_queue.0.push(ClientVfxEvent::SpawnPondAmbient {
+                pos: pos + Vec3::Y * (size.y * 0.5 + 0.06),
+            });
+        }
 
         // نور ملایم فیروزه‌ای روی برکه‌های اصلی و حوضچه مرکزی
         commands.spawn((
@@ -1271,27 +1231,28 @@ fn setup_scene(
         } else {
             let wf_mat = water_materials.add(WaterSurfaceMaterial {
                 uniforms: WaterUniforms {
-                    base_color: Vec4::new(c.0, c.1, c.2, 0.84),
+                    base_color: Vec4::new(c.0, c.1, c.2, 0.96),
                     foam_color: Vec4::new(
-                        (0.85 + em.0 * 0.15).min(1.0),
-                        (0.95 + em.1 * 0.10).min(1.0),
+                        (0.88 + em.0 * 0.12).min(1.0),
+                        (0.96 + em.1 * 0.08).min(1.0),
                         1.0,
                         1.0,
                     ),
                     flow_and_params: Vec4::new(0.0, 1.0, 0.0, 1.0),
-                    player_ripple: Vec4::new(0.0, 0.0, 0.0, 0.22),
+                    camera_pos: Vec4::new(0.0, 23.0, 17.5, 0.22),
+                    player_ripple: Vec4::new(0.0, 0.0, 0.0, -1.0),
                 },
                 foam_tex: foam_noise_handle.clone(),
             });
             let tall_h = size.y * 1.65;
             let lift_y = (tall_h - size.y) * 0.5;
+            let wf_mesh = meshes.add(Cuboid::new(1.0, 1.0, 0.28));
             ent_cmds.with_children(|parent| {
                 parent.spawn((
-                    Mesh3d(subdivided_water_mesh.clone()),
+                    Mesh3d(wf_mesh),
                     MeshMaterial3d(wf_mat),
                     Transform::from_xyz(0.0, lift_y, 0.0)
-                        .with_rotation(Quat::from_rotation_x(PI * 0.5))
-                        .with_scale(Vec3::new(size.x, 1.0, tall_h)),
+                        .with_scale(Vec3::new(size.x, tall_h, size.z.clamp(0.8, 2.0))),
                 ));
             });
         }
@@ -2051,7 +2012,7 @@ fn setup_scene(
         }),
         bullet_mat: materials.add(StandardMaterial {
             base_color: Color::srgb(1.0, 0.92, 0.45),
-            emissive: LinearRgba::new(14.0, 8.5, 1.2, 1.0),
+            emissive: LinearRgba::new(24.0, 15.0, 2.8, 1.0),
             unlit: true,
             ..default()
         }),
@@ -2926,6 +2887,7 @@ struct SampleInputExtraParams<'w> {
     prediction: ResMut<'w, ClientPhysicsPredictionState>,
     hero_hud: Res<'w, LatestHeroSnapshot>,
     audio_q: ResMut<'w, AudioEventQueue>,
+    vfx_q: ResMut<'w, VfxEventQueue>,
 }
 
 fn client_sample_input_system(
@@ -3103,6 +3065,7 @@ struct TurretFxResources<'w, 's> {
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     audio_q: ResMut<'w, AudioEventQueue>,
+    vfx_q: ResMut<'w, VfxEventQueue>,
     turret_gun_q: Query<'w, 's, &'static mut TurretGunBone>,
     turret_muzzle_q: Query<'w, 's, (&'static TurretMuzzlePoint, &'static GlobalTransform)>,
 }
@@ -3445,6 +3408,7 @@ fn client_receive_snapshot_and_sync_system(
             &mut fx_res.meshes,
             &mut fx_res.materials,
             &mut fx_res.audio_q,
+            &mut fx_res.vfx_q,
             &mut fx_res.turret_gun_q,
             &fx_res.turret_muzzle_q,
             fx_live_muzzle,
@@ -3500,6 +3464,7 @@ fn spawn_fx_from_server_event(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     audio_q: &mut AudioEventQueue,
+    vfx_q: &mut VfxEventQueue,
     turret_gun_q: &mut Query<&mut TurretGunBone>,
     turret_muzzle_q: &Query<(&TurretMuzzlePoint, &GlobalTransform)>,
     live_muzzle_opt: Option<Vec3>,
@@ -3513,6 +3478,12 @@ fn spawn_fx_from_server_event(
             trauma_add,
             trauma_max,
         } => {
+            if matches!(source, moba_shared::ShotAudioSource::Hero { .. }) {
+                vfx_q.0.push(ClientVfxEvent::MuzzleSmoke {
+                    pos: muzzle_pos,
+                    dir: shot_dir,
+                });
+            }
             audio_q.0.push(ClientAudioEvent::ShotFired {
                 pos: muzzle_pos,
                 source,
@@ -3576,15 +3547,11 @@ fn spawn_fx_from_server_event(
             shake.trauma = (shake.trauma + trauma_add).min(trauma_max);
         }
         GameplayFxEvent::BulletTrailSegment { start, end } => {
-            commands.spawn(BulletTrail {
-                start,
-                end,
-                timer: Timer::from_seconds(config.fx.trail_lifetime_secs, TimerMode::Once),
-            });
+            vfx_q.0.push(ClientVfxEvent::MagneticTrail { start, end });
         }
         GameplayFxEvent::BulletImpact {
             impact_pos,
-            bullet_dir,
+            bullet_dir: _,
             surface,
             target_destroyed,
             trauma_add,
@@ -3594,45 +3561,10 @@ fn spawn_fx_from_server_event(
                 pos: impact_pos,
                 surface,
             });
-            let spark_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(1.0, 0.75, 0.2),
-                emissive: LinearRgba::new(12.0, 5.5, 0.5, 1.0),
-                unlit: true,
-                ..default()
+            vfx_q.0.push(ClientVfxEvent::BulletImpact {
+                pos: impact_pos,
+                surface,
             });
-            let spark_count = if target_destroyed {
-                config.fx.hit_spark_count_destroyed
-            } else {
-                config.fx.hit_spark_count_normal
-            };
-            let speed = if target_destroyed {
-                config.fx.hit_spark_speed_destroyed
-            } else {
-                config.fx.hit_spark_speed_normal
-            };
-
-            for _ in 0..spark_count {
-                let rx = render_state.next_fx_rand();
-                let ry = render_state.next_fx_rand();
-                let rz = render_state.next_fx_rand();
-                let spread = Vec3::new(
-                    (rx - 0.5) * speed,
-                    ry * speed * 0.9 + 1.2,
-                    (rz - 0.5) * speed,
-                ) - bullet_dir * 2.5;
-
-                commands.spawn((
-                    Mesh3d(meshes.add(Cuboid::new(0.03, 0.03, 0.12))),
-                    MeshMaterial3d(spark_mat.clone()),
-                    particle_physics_bundle(
-                        config,
-                        impact_pos,
-                        spread,
-                        config.fx.hit_spark_lifetime_secs,
-                        true,
-                    ),
-                ));
-            }
 
             if target_destroyed {
                 shake.trauma = (shake.trauma + trauma_add).min(trauma_max);
@@ -4254,12 +4186,10 @@ fn spawn_laser_and_reticle_visuals(
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn laser_sight_gizmo_system(
-    mut gizmos: Gizmos,
     time: Res<Time>,
     config: Res<GameConfig>,
     match_flow: Res<ClientMatchFlow>,
     muzzle_query: Query<&GlobalTransform, With<MuzzlePoint>>,
-    trail_query: Query<&BulletTrail>,
     render_state: Res<ClientRenderState>,
     mut core_query: Query<
         (&mut Transform, &mut Visibility),
@@ -4311,19 +4241,6 @@ fn laser_sight_gizmo_system(
         ),
     >,
 ) {
-    for trail in &trail_query {
-        let alpha = 1.0 - trail.timer.fraction();
-        let dir = (trail.end - trail.start).normalize_or_zero();
-        let right = dir.cross(Vec3::Y).normalize_or_zero() * 0.014;
-
-        let core_color = Color::srgba(1.0, 0.94, 0.55, alpha);
-        let glow_color = Color::srgba(1.0, 0.55, 0.1, alpha * 0.65);
-
-        gizmos.line(trail.start, trail.end, core_color);
-        gizmos.line(trail.start + right, trail.end + right, glow_color);
-        gizmos.line(trail.start - right, trail.end - right, glow_color);
-    }
-
     let hide_laser = !match_flow.is_in_game()
         || render_state.is_dead
         || render_state.traversal_active
@@ -4564,7 +4481,6 @@ fn gameplay_fx_system(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut audio_q: ResMut<AudioEventQueue>,
     mut flash_query: Query<(Entity, &mut MuzzleFlash)>,
-    mut trail_query: Query<(Entity, &mut BulletTrail)>,
     mut smoke_query: Query<(Entity, &mut Transform, &mut ExplosionSmokeParticle)>,
     mut led_query: Query<(&mut GrenadeBlinkLed, &GlobalTransform, &mut PointLight)>,
 ) {
@@ -4605,12 +4521,7 @@ fn gameplay_fx_system(
         }
     }
 
-    for (entity, mut trail) in &mut trail_query {
-        trail.timer.tick(time.delta());
-        if trail.timer.is_finished() {
-            commands.entity(entity).despawn();
-        }
-    }
+
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6034,19 +5945,43 @@ fn bake_water_foam_noise_texture() -> Image {
 
 fn water_shader_update_system(
     time: Res<Time>,
+    config: Res<GameConfig>,
+    prediction: Res<ClientPhysicsPredictionState>,
     camera_query: Query<&GlobalTransform, With<MobaCamera>>,
     mut water_materials: ResMut<Assets<WaterSurfaceMaterial>>,
+    mut prev_hero_pos: Local<Option<Vec3>>,
 ) {
     let t = time.elapsed_secs();
+    let dt = time.delta_secs().max(0.0001);
     let cam_pos = camera_query
         .single()
         .map(|gtf| gtf.translation())
         .unwrap_or(Vec3::new(0.0, 23.0, 17.5));
+
+    let hero_ripple = if let Some(hero_pos) = prediction.latest_authoritative_feet_pos {
+        let speed = if let Some(prev) = *prev_hero_pos {
+            (hero_pos - prev).xz().length() / dt
+        } else {
+            0.0
+        };
+        *prev_hero_pos = Some(hero_pos);
+        let in_water = moba_shared::sample_water_surface_at(&config, hero_pos).is_some();
+        Vec4::new(
+            hero_pos.x,
+            hero_pos.y,
+            hero_pos.z,
+            if in_water { speed } else { -1.0 },
+        )
+    } else {
+        Vec4::new(0.0, 0.0, 0.0, -1.0)
+    };
+
     for (_, mat) in water_materials.iter_mut() {
         mat.uniforms.flow_and_params.z = t;
-        mat.uniforms.player_ripple.x = cam_pos.x;
-        mat.uniforms.player_ripple.y = cam_pos.y;
-        mat.uniforms.player_ripple.z = cam_pos.z;
+        mat.uniforms.camera_pos.x = cam_pos.x;
+        mat.uniforms.camera_pos.y = cam_pos.y;
+        mat.uniforms.camera_pos.z = cam_pos.z;
+        mat.uniforms.player_ripple = hero_ripple;
     }
 }
 
@@ -6055,24 +5990,34 @@ fn waterfall_mist_particle_system(
     time: Res<Time>,
     mut render_state: ResMut<ClientRenderState>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut water_materials: ResMut<Assets<WaterSurfaceMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    camera_query: Query<&GlobalTransform, With<MobaCamera>>,
     mut emitter_query: Query<&mut WaterfallMistEmitter>,
     mut mist_query: Query<(Entity, &mut Transform, &mut WaterfallMistParticle)>,
-    mut cached_assets: Local<Option<(Handle<Mesh>, Handle<StandardMaterial>)>>,
+    mut cached_assets: Local<Option<(Handle<Mesh>, Handle<WaterSurfaceMaterial>)>>,
 ) {
     let (mist_mesh, mist_mat) = cached_assets.get_or_insert_with(|| {
-        let m = meshes.add(Sphere::new(0.45));
-        let mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(0.88, 0.97, 1.0, 0.42),
-            emissive: LinearRgba::new(0.65, 1.25, 1.55, 0.42),
-            alpha_mode: AlphaMode::Blend,
-            unlit: true,
-            ..default()
+        let m = meshes.add(Plane3d::default().mesh().size(1.0, 1.0));
+        let noise_tex = images.add(bake_water_foam_noise_texture());
+        let mat = water_materials.add(WaterSurfaceMaterial {
+            uniforms: WaterUniforms {
+                base_color: Vec4::new(0.85, 0.96, 1.0, 0.42),
+                foam_color: Vec4::new(0.88, 0.97, 1.0, 1.0),
+                flow_and_params: Vec4::new(0.0, 0.0, 0.0, 2.0),
+                camera_pos: Vec4::new(0.0, 23.0, 17.5, 0.2),
+                player_ripple: Vec4::new(0.0, 0.0, 0.0, -1.0),
+            },
+            foam_tex: noise_tex,
         });
         (m, mat)
     });
 
     let dt = time.delta_secs();
+    let cam_pos = camera_query
+        .single()
+        .map(|gtf| gtf.translation())
+        .unwrap_or(Vec3::new(0.0, 23.0, 17.5));
 
     for mut emitter in &mut emitter_query {
         emitter.timer.tick(time.delta());
@@ -6081,17 +6026,19 @@ fn waterfall_mist_particle_system(
                 let rx = render_state.next_fx_rand() - 0.5;
                 let rz = render_state.next_fx_rand() - 0.5;
                 let ry = render_state.next_fx_rand();
-                let spawn_p = emitter.base_pos + Vec3::new(rx * emitter.width * 0.85, 0.2, rz * 1.6);
-                let vel = Vec3::new(rx * 1.8, 1.4 + ry * 1.4, rz * 1.8);
+                let spawn_p = emitter.base_pos + Vec3::new(rx * emitter.width * 0.9, 0.35, rz * 1.8);
+                let vel = Vec3::new(rx * 2.8, 0.55 + ry * 0.75, rz * 2.8);
                 commands.spawn((
                     Mesh3d(mist_mesh.clone()),
                     MeshMaterial3d(mist_mat.clone()),
-                    Transform::from_translation(spawn_p).with_scale(Vec3::splat(0.75)),
+                    Transform::from_translation(spawn_p)
+                        .looking_at(cam_pos, Vec3::Y)
+                        .with_scale(Vec3::splat(1.2)),
                     WaterfallMistParticle {
                         vel,
-                        timer: Timer::from_seconds(1.45, TimerMode::Once),
-                        start_scale: 0.75,
-                        end_scale: 2.8,
+                        timer: Timer::from_seconds(1.55, TimerMode::Once),
+                        start_scale: 1.2,
+                        end_scale: 4.2,
                     },
                 ));
             }
@@ -6101,9 +6048,12 @@ fn waterfall_mist_particle_system(
     for (entity, mut tf, mut p) in &mut mist_query {
         p.timer.tick(time.delta());
         tf.translation += p.vel * dt;
-        p.vel *= (1.0 - 0.9 * dt).max(0.1);
+        p.vel *= (1.0 - 1.15 * dt).max(0.08);
         let frac = p.timer.fraction();
-        let s = p.start_scale.lerp(p.end_scale, frac) * (1.0 - (frac - 0.65).max(0.0) * 2.4).max(0.05);
+        let fade = (1.0 - (frac - 0.55).max(0.0) / 0.45).clamp(0.0, 1.0);
+        let s = p.start_scale.lerp(p.end_scale, frac) * fade.max(0.05);
+        tf.look_at(cam_pos, Vec3::Y);
+        tf.rotate_local_x(std::f32::consts::FRAC_PI_2);
         tf.scale = Vec3::splat(s);
         if p.timer.is_finished() {
             commands.entity(entity).despawn();

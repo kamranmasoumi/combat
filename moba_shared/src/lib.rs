@@ -2485,7 +2485,7 @@ pub fn sample_water_surface_at(config: &GameConfig, world_pos: Vec3) -> Option<(
         // استفاده از شکل بیضوی/نرم در صفحه افقی برای طبیعی‌تر شدن مرز برکه‌ها
         let nx = local.x / half.x.max(0.1);
         let nz = local.z / half.z.max(0.1);
-        if nx * nx + nz * nz <= 1.05 {
+        if nx * nx + nz * nz <= 1.00 {
             let flow = Vec2::new(seg.flow_dir.0, seg.flow_dir.1).normalize_or_zero();
             return Some((water_top_y, flow));
         }

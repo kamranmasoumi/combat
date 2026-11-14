@@ -4,7 +4,7 @@ use moba_shared::{
     create_shared_renet_server, parse_server_cli_args, try_buy_cart, try_buy_item,
     step_couriers_system, try_courier_deliver, try_courier_move_to, try_courier_return_to_fountain, try_cycle_item_mode, try_sell_courier_item, try_sell_item, try_swap_inventory_slots, AuthoritativeMatchState, AuthoritativeWorldState,
     ClientInputCommand, ClientLobbyMessage, GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase,
-    MobaPhysicsSet, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier, ServerMatchMessage,
+    MobaPhysicsSet, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier, ServerLobbyPacket, ServerMatchMessage,
     CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
 };
 use renet::{RenetServer, ServerEvent};
@@ -32,6 +32,13 @@ fn main() {
         .next()
         .expect("آدرس سرور در config.ron نامعتبر است");
     config.network.server_bind_addr = format!("{}:{}", ip, cli_port);
+    let pub_ip = config
+        .network
+        .server_public_addr
+        .split(':')
+        .next()
+        .expect("server_public_addr در config.ron نامعتبر است");
+    config.network.server_public_addr = format!("{}:{}", pub_ip, cli_port);
     config.network.max_clients = required_players;
 
     let tick_hz = config.network.server_tick_rate_hz;
@@ -96,6 +103,15 @@ fn server_network_receive_system(
         match event {
             ServerEvent::ClientConnected { client_id } => {
                 if match_state.on_client_connected(client_id, &config) {
+                    let mut safe_cfg = config.clone();
+                    safe_cfg.network.private_key = [0; 32];
+                    let sync_pkt = ServerLobbyPacket::SyncConfigs {
+                        game_config: safe_cfg,
+                        items_config: items_config.clone(),
+                    };
+                    if let Ok(bytes) = bincode::serialize(&sync_pkt) {
+                        net_inner.server.send_message(client_id, CHANNEL_RELIABLE_LOBBY, bytes);
+                    }
                     if match_state.phase == MatchPhase::InGame {
                         if let Some(slot_idx) = match_state.slot_for_client(client_id) {
                             world.set_slot_connected(slot_idx, true, &config);
@@ -297,10 +313,10 @@ fn server_send_snapshot_system(
         let snap = match_state.snapshot();
         for p in &match_state.players {
             if let (true, Some(cid)) = (p.connected, p.client_id) {
-                let msg = ServerMatchMessage {
+                let msg = ServerLobbyPacket::MatchState(ServerMatchMessage {
                     your_slot: p.slot_index,
                     state: snap.clone(),
-                };
+                });
                 if let Ok(bytes) = bincode::serialize(&msg) {
                     net.server.send_message(cid, CHANNEL_RELIABLE_LOBBY, bytes);
                 }

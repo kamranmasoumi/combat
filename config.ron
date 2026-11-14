@@ -1,7 +1,8 @@
 GameConfig(
     network: NetworkConfig(
-        server_bind_addr: "127.0.0.1:5000",
-        client_bind_addr: "127.0.0.1:0",
+        server_bind_addr: "0.0.0.0:5000",
+        server_public_addr: "127.0.0.1:5000",
+        client_bind_addr: "0.0.0.0:0",
         server_tick_rate_hz: 60.0,
         protocol_id: 7001,
         max_clients: 10,

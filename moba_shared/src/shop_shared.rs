@@ -188,10 +188,14 @@ impl ItemsConfig {
         let content = fs::read_to_string(path).unwrap_or_else(|e| {
             panic!("خطای بحرانی: فایل کانفیگ آیتم‌ها '{}' خوانده نشد: {}", path, e)
         });
-        let cfg = ron::from_str::<ItemsConfig>(&content).unwrap_or_else(|e| {
+        Self::load_from_str(&content, path)
+    }
+
+    pub fn load_from_str(content: &str, label: &str) -> Self {
+        let cfg = ron::from_str::<ItemsConfig>(content).unwrap_or_else(|e| {
             panic!(
                 "خطای بحرانی: ساختار فایل کانفیگ آیتم‌ها '{}' نامعتبر است: {}",
-                path, e
+                label, e
             )
         });
         cfg.validate();

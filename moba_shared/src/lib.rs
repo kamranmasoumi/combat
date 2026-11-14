@@ -73,10 +73,14 @@ impl GameConfig {
     pub fn load_from_file(path: &str) -> Self {
         let content = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("خطای بحرانی: فایل کانفیگ '{}' خوانده نشد: {}", path, e));
-        let cfg = ron::from_str::<GameConfig>(&content).unwrap_or_else(|e| {
+        Self::load_from_str(&content, path)
+    }
+
+    pub fn load_from_str(content: &str, label: &str) -> Self {
+        let cfg = ron::from_str::<GameConfig>(content).unwrap_or_else(|e| {
             panic!(
                 "خطای بحرانی: ساختار فایل کانفیگ '{}' نامعتبر است: {}",
-                path, e
+                label, e
             )
         });
         cfg.validate_unique_map_ids();
@@ -415,15 +419,25 @@ pub fn parse_server_cli_args() -> (u16, usize) {
 pub fn apply_client_cli_overrides(net: &mut NetworkConfig) {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 {
-        let port: u16 = args[1].parse().unwrap_or_else(|e| {
-            panic!("خطای بحرانی کلاینت: پورت '{}' معتبر نیست: {}", args[1], e)
-        });
-        let ip = net
-            .server_bind_addr
-            .split(':')
-            .next()
-            .expect("آدرس سرور نامعتبر است");
-        net.server_bind_addr = format!("{}:{}", ip, port);
+        if args[1].contains(':') {
+            let _: SocketAddr = args[1].parse().unwrap_or_else(|e| {
+                panic!("خطای بحرانی کلاینت: آدرس سرور '{}' معتبر نیست: {}", args[1], e)
+            });
+            net.server_public_addr = args[1].clone();
+            net.server_bind_addr = args[1].clone();
+        } else {
+            let port: u16 = args[1].parse().unwrap_or_else(|e| {
+                panic!("خطای بحرانی کلاینت: پورت '{}' معتبر نیست: {}", args[1], e)
+            });
+            let ip = net
+                .server_public_addr
+                .split(':')
+                .next()
+                .expect("آدرس سرور نامعتبر است")
+                .to_string();
+            net.server_public_addr = format!("{}:{}", ip, port);
+            net.server_bind_addr = format!("{}:{}", ip, port);
+        }
     }
     if args.len() >= 3 {
         let cid: u64 = args[2].parse().unwrap_or_else(|e| {
@@ -439,6 +453,7 @@ pub fn apply_client_cli_overrides(net: &mut NetworkConfig) {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NetworkConfig {
     pub server_bind_addr: String,
+    pub server_public_addr: String,
     pub client_bind_addr: String,
     pub server_tick_rate_hz: f64,
     pub protocol_id: u64,
@@ -503,11 +518,17 @@ pub fn create_shared_renet_server(net: &NetworkConfig) -> (RenetServer, NetcodeS
         .duration_since(UNIX_EPOCH)
         .expect("خطای بحرانی: ساعت سیستم نامعتبر است");
 
+    let mut public_addresses = vec![server_addr];
+    if let Ok(pub_addr) = net.server_public_addr.parse::<SocketAddr>() {
+        if !public_addresses.contains(&pub_addr) {
+            public_addresses.push(pub_addr);
+        }
+    }
     let server_config = ServerConfig {
         current_time,
         max_clients: net.max_clients,
         protocol_id: net.protocol_id,
-        public_addresses: vec![server_addr],
+        public_addresses,
         authentication: ServerAuthentication::Secure {
             private_key: net.private_key,
         },
@@ -521,10 +542,10 @@ pub fn create_shared_renet_server(net: &NetworkConfig) -> (RenetServer, NetcodeS
 }
 
 pub fn create_shared_renet_client(net: &NetworkConfig) -> (RenetClient, NetcodeClientTransport) {
-    let server_addr: SocketAddr = net.server_bind_addr.parse().unwrap_or_else(|e| {
+    let server_addr: SocketAddr = net.server_public_addr.parse().unwrap_or_else(|e| {
         panic!(
-            "خطای بحرانی کلاینت: آدرس سرور '{}' معتبر نیست: {}",
-            net.server_bind_addr, e
+            "خطای بحرانی کلاینت: آدرس عمومی سرور '{}' معتبر نیست: {}",
+            net.server_public_addr, e
         )
     });
     let client_addr: SocketAddr = net.client_bind_addr.parse().unwrap_or_else(|e| {
@@ -1620,6 +1641,15 @@ pub enum ClientLobbyMessage {
 pub struct ServerMatchMessage {
     pub your_slot: usize,
     pub state: MatchStateSnapshot,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ServerLobbyPacket {
+    MatchState(ServerMatchMessage),
+    SyncConfigs {
+        game_config: GameConfig,
+        items_config: crate::shop_shared::ItemsConfig,
+    },
 }
 
 #[derive(Resource, Clone, Debug)]

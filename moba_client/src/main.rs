@@ -13,7 +13,7 @@ use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalA
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
-use bevy::window::{CursorOptions, MonitorSelection, PresentMode, PrimaryWindow, WindowMode, WindowResolution};
+use bevy::window::{CursorOptions, PresentMode, PrimaryWindow, WindowResolution};
 use moba_shared::{
     ancient_physics_bundle, barracks_physics_bundle, center_bridge_physics_bundle, create_shared_renet_client,
     grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
@@ -23,7 +23,7 @@ use moba_shared::{
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CourierOrder, CourierSnapshot, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
-    ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerLobbyPacket, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, ItemsConfig, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
@@ -40,8 +40,27 @@ mod shop_client;
 use shop_client::{CourierControlState, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
 
 fn main() {
-    let mut config = GameConfig::load_from_file("config.ron");
-    let items_config = ItemsConfig::load_from_file("items.ron");
+    let mut config = GameConfig::load_from_str(
+        include_str!("../../config.ron"),
+        "embedded:config.ron",
+    );
+    let items_config = ItemsConfig::load_from_str(
+        include_str!("../../items.ron"),
+        "embedded:items.ron",
+    );
+    if let Some(build_addr) = option_env!("MOBA_SERVER_ADDR") {
+        if !build_addr.trim().is_empty() {
+            config.network.server_public_addr = build_addr.trim().to_string();
+            config.network.server_bind_addr = build_addr.trim().to_string();
+        }
+    }
+    if std::env::args().nth(2).is_none() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(101);
+        config.network.client_id = (nanos % 900_000_000) + 1_000;
+    }
     apply_client_cli_overrides(&mut config.network);
     let tick_hz = config.network.server_tick_rate_hz;
     let substeps = config.physics.substeps;
@@ -118,7 +137,6 @@ fn main() {
                 title: config.window.title.clone(),
                 resolution: WindowResolution::new(config.window.width, config.window.height),
                 present_mode: PresentMode::AutoNoVsync,
-                mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
                 ..default()
             }),
             ..default()
@@ -7178,7 +7196,9 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
 }
 
 fn client_lobby_sync_system(
-    config: Res<GameConfig>,
+    mut config: ResMut<GameConfig>,
+    mut items_config: ResMut<ItemsConfig>,
+    mut shop_ui: ResMut<ShopUiState>,
     hero_hud: Res<LatestHeroSnapshot>,
     mut net: ResMut<ClientNetwork>,
     mut match_flow: ResMut<ClientMatchFlow>,
@@ -7186,9 +7206,26 @@ fn client_lobby_sync_system(
     soldier_loaded: Query<(), With<SoldierMarker>>,
 ) {
     while let Some(bytes) = net.client.receive_message(CHANNEL_RELIABLE_LOBBY) {
-        if let Ok(msg) = bincode::deserialize::<ServerMatchMessage>(&bytes) {
-            match_flow.your_slot = Some(msg.your_slot);
-            match_flow.snapshot = Some(msg.state);
+        if let Ok(pkt) = bincode::deserialize::<ServerLobbyPacket>(&bytes) {
+            match pkt {
+                ServerLobbyPacket::MatchState(msg) => {
+                    match_flow.your_slot = Some(msg.your_slot);
+                    match_flow.snapshot = Some(msg.state);
+                }
+                ServerLobbyPacket::SyncConfigs {
+                    game_config: mut srv_cfg,
+                    items_config: srv_items,
+                } => {
+                    srv_cfg.network.server_bind_addr = config.network.server_bind_addr.clone();
+                    srv_cfg.network.server_public_addr = config.network.server_public_addr.clone();
+                    srv_cfg.network.client_bind_addr = config.network.client_bind_addr.clone();
+                    srv_cfg.network.client_id = config.network.client_id;
+                    srv_cfg.network.private_key = config.network.private_key;
+                    *config = srv_cfg;
+                    *items_config = srv_items;
+                    shop_ui.dirty = true;
+                }
+            }
         }
     }
 

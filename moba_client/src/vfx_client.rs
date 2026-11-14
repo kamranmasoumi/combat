@@ -83,6 +83,7 @@ pub enum ClientVfxEvent {
     MagneticTrail { start: Vec3, end: Vec3 },
     BulletImpact { pos: Vec3, surface: ImpactSurface },
     SpawnPondAmbient { pos: Vec3 },
+    SpawnWaterfallSpray { pos: Vec3 },
 }
 
 #[derive(Resource, Default)]
@@ -96,6 +97,7 @@ struct HanabiEffectHandles {
     metal_sparks: Handle<EffectAsset>,
     water_splash: Handle<EffectAsset>,
     pond_ambient_bubbles: Handle<EffectAsset>,
+    waterfall_dense_spray: Handle<EffectAsset>,
     trail_mesh: Handle<Mesh>,
     blood_decal_mesh: Handle<Mesh>,
     blood_decal_mat: Handle<StandardMaterial>,
@@ -387,6 +389,56 @@ fn init_hanabi_vfx_assets_system(
             }),
     );
 
+    // ۷. افکت متراکم پاشش و اسپری آب در پای آبشار (Dense Water Spray Effect)
+    let spray_writer = ExprWriter::new();
+    let s_init_pos = SetPositionSphereModifier {
+        center: spray_writer.lit(Vec3::ZERO).expr(),
+        radius: spray_writer.lit(14.0_f32).expr(),
+        dimension: ShapeDimension::Volume,
+    };
+    let s_init_vel = SetVelocitySphereModifier {
+        center: spray_writer.lit(Vec3::new(0.0, -3.5, 0.0)).expr(),
+        speed: spray_writer.lit(4.5_f32).uniform(spray_writer.lit(11.5_f32)).expr(),
+    };
+    let s_init_life = SetAttributeModifier::new(
+        Attribute::LIFETIME,
+        spray_writer.lit(0.45_f32).uniform(spray_writer.lit(1.05_f32)).expr(),
+    );
+    let s_init_age = SetAttributeModifier::new(Attribute::AGE, spray_writer.lit(0.0_f32).expr());
+    let s_accel = AccelModifier::new(spray_writer.lit(Vec3::new(0.0, -11.5, 0.0)).expr());
+    let s_drag = LinearDragModifier::new(spray_writer.lit(1.6_f32).expr());
+
+    let mut spray_color_grad: bevy_hanabi::Gradient<Vec4> = bevy_hanabi::Gradient::new();
+    spray_color_grad.add_key(0.0, Vec4::new(0.88, 1.0, 0.99, 0.92));
+    spray_color_grad.add_key(0.35, Vec4::new(0.75, 0.96, 0.96, 0.78));
+    spray_color_grad.add_key(0.75, Vec4::new(0.65, 0.92, 0.95, 0.35));
+    spray_color_grad.add_key(1.0, Vec4::new(0.80, 0.98, 1.0, 0.0));
+
+    let mut spray_size_grad: bevy_hanabi::Gradient<Vec3> = bevy_hanabi::Gradient::new();
+    spray_size_grad.add_key(0.0, Vec3::splat(0.14));
+    spray_size_grad.add_key(0.35, Vec3::splat(0.28));
+    spray_size_grad.add_key(1.0, Vec3::splat(0.06));
+
+    let waterfall_dense_spray = effects.add(
+        EffectAsset::new(2048, SpawnerSettings::rate(140.0_f32.into()), spray_writer.finish())
+            .with_name("waterfall_dense_spray")
+            .init(s_init_pos)
+            .init(s_init_vel)
+            .init(s_init_life)
+            .init(s_init_age)
+            .update(s_accel)
+            .update(s_drag)
+            .render(ColorOverLifetimeModifier::new(spray_color_grad))
+            .render(SizeOverLifetimeModifier {
+                gradient: spray_size_grad,
+                screen_space_size: false,
+            })
+            .render(OrientModifier {
+                mode: OrientMode::ParallelCameraDepthPlane,
+                rotation: None,
+            }),
+    );
+
     commands.insert_resource(HanabiEffectHandles {
         muzzle_smoke,
         blood_burst,
@@ -394,6 +446,7 @@ fn init_hanabi_vfx_assets_system(
         metal_sparks,
         water_splash,
         pond_ambient_bubbles,
+        waterfall_dense_spray,
         trail_mesh,
         blood_decal_mesh,
         blood_decal_mat,
@@ -509,6 +562,13 @@ fn process_vfx_events_system(
                     Visibility::default(),
                 ));
             }
+            ClientVfxEvent::SpawnWaterfallSpray { pos } => {
+                commands.spawn((
+                    ParticleEffect::new(handles.waterfall_dense_spray.clone()),
+                    Transform::from_translation(pos),
+                    Visibility::default(),
+                ));
+            }
         }
     }
 }
@@ -599,29 +659,27 @@ pub fn build_canyon_terrain_and_river_meshes(canyon: &moba_shared::CanyonConfig)
             normals.push([n.x, n.y, n.z]);
             uvs.push([ix as f32 / nx as f32, iz as f32 / nz as f32]);
 
-            // رنگ‌بندی لایه‌ای: کوه‌های سنگی بلند -> چمن فلات -> دیواره صخره‌ای دره -> بستر زیر آب
-            let col = if y > 0.25 {
+            // رنگ‌بندی لایه‌ای با تبدیل دقیق sRGB به Linear برای حفظ کنتراست و شفافیت رنگ‌ها در Bevy
+            let srgb_col = if y > 0.25 {
                 let peak_t = ((y - 0.25) / 6.5).clamp(0.0, 1.0);
-                [
+                Color::srgb(
                     0.34 + 0.14 * peak_t,
                     0.32 + 0.12 * peak_t,
                     0.29 + 0.10 * peak_t,
-                    1.0,
-                ]
+                )
             } else if y > -0.35 {
-                [0.31, 0.37, 0.24, 1.0]
+                Color::srgb(0.31, 0.37, 0.24)
             } else if y > canyon.water_y {
                 let rock_t = ((-0.35 - y) / (0.35 - canyon.water_y).abs()).clamp(0.0, 1.0);
-                [
+                Color::srgb(
                     0.38 - 0.14 * rock_t,
                     0.35 - 0.10 * rock_t,
                     0.30 - 0.05 * rock_t,
-                    1.0,
-                ]
+                )
             } else {
-                [0.14, 0.26, 0.24, 1.0]
+                Color::srgb(0.14, 0.26, 0.24)
             };
-            colors.push(col);
+            colors.push(srgb_col.to_linear().to_f32_array());
         }
     }
 
@@ -689,4 +747,66 @@ pub fn build_canyon_terrain_and_river_meshes(canyon: &moba_shared::CanyonConfig)
     river_mesh.insert_indices(Indices::U32(w_indices));
 
     (terrain_mesh, river_mesh)
+}
+
+
+/// ساخت مش سه‌بعدی منحنی و طبیعی برای آبشار (دارای قوس ریزش از لبه کوه و موج‌دار بودن عرضی)
+pub fn build_curved_waterfall_mesh() -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+
+    let cols: usize = 36;
+    let rows: usize = 24;
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity((cols + 1) * (rows + 1) * 2);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity((cols + 1) * (rows + 1) * 2);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity((cols + 1) * (rows + 1) * 2);
+    let mut indices: Vec<u32> = Vec::with_capacity(cols * rows * 12);
+
+    // لایه جلو و پشت برای اطمینان از دید کامل در هر زاویه دوربین
+    for side in 0..2 {
+        let base_idx = positions.len() as u32;
+        let z_off = if side == 0 { 0.04 } else { -0.04 };
+        let n_sign = if side == 0 { 1.0_f32 } else { -1.0_f32 };
+
+        for iy in 0..=rows {
+            let v = (iy as f32) / (rows as f32); // 0 = بالا (لبه کوه), 1 = پایین (محل برخورد به آب)
+            let y = 0.5 - v;
+            let arc_z = -0.50 + 1.05 * (1.0 - (1.0 - v).powi(2));
+            let dz_dv = 2.10 * (1.0 - v);
+
+            for ix in 0..=cols {
+                let u = (ix as f32) / (cols as f32);
+                let x = u - 0.5;
+                let rock_wave = (0.14 * (x * 8.5).sin() + 0.07 * (x * 19.0).cos()) * (1.0 - v * 0.45);
+                let z = arc_z + rock_wave + z_off;
+
+                let n = Vec3::new(0.0, dz_dv, 1.0).normalize() * n_sign;
+                positions.push([x, y, z]);
+                normals.push([n.x, n.y, n.z]);
+                uvs.push([u, v]);
+            }
+        }
+
+        let stride = (cols + 1) as u32;
+        for iy in 0..rows {
+            for ix in 0..cols {
+                let i00 = base_idx + (iy as u32) * stride + (ix as u32);
+                let i10 = i00 + 1;
+                let i01 = i00 + stride;
+                let i11 = i01 + 1;
+                if side == 0 {
+                    indices.extend_from_slice(&[i00, i01, i10, i10, i01, i11]);
+                } else {
+                    indices.extend_from_slice(&[i00, i10, i01, i10, i11, i01]);
+                }
+            }
+        }
+    }
+
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
 }

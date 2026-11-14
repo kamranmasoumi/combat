@@ -757,6 +757,7 @@ pub struct LightingConfig {
     pub directional_shadow_normal_bias: f32,
     pub ambient_color_rgb: (f32, f32, f32),
     pub ambient_brightness: f32,
+    pub ground_y: f32,
     pub ground_size: (f32, f32),
     pub ground_color_rgb: (f32, f32, f32),
     pub ground_roughness: f32,
@@ -1257,6 +1258,11 @@ pub struct CanyonConfig {
     pub flow_dir: (f32, f32),
     pub water_color_rgb: (f32, f32, f32),
     pub foam_color_rgb: (f32, f32, f32),
+    pub mist_color_rgb: (f32, f32, f32),
+    pub mist_height_offset: f32,
+    pub mist_fade_distance: f32,
+    pub mist_intensity: f32,
+    pub mist_drift_speed: f32,
     pub grid_resolution: (u32, u32),
 }
 
@@ -2715,6 +2721,7 @@ pub struct StaticColliderEntry {
 #[derive(Resource, Default, Clone, Debug)]
 pub struct CustomPhysicsWorld {
     pub static_colliders: Vec<StaticColliderEntry>,
+    pub canyon: Option<CanyonConfig>,
 }
 
 impl CustomPhysicsWorld {
@@ -2760,8 +2767,26 @@ impl CustomPhysicsWorld {
 
             if let Some(hit) = hit_opt {
                 if hit.toi < closest_toi {
+                    // داخل دره عمیق، صفحه صاف فلات و زمین زیرین وجود ندارد (حفر شده است)
+                    if entry.bounding_radius > 200.0 {
+                        if let Some(ref canyon) = self.canyon {
+                            if canyon_sample_height(canyon, hit.point.x, hit.point.z) < -0.15 {
+                                continue;
+                            }
+                        }
+                    }
                     closest_toi = hit.toi;
                     best_hit = Some((entry.entity, hit));
+                }
+            }
+        }
+
+        if (query_groups.filters & GROUP_WORLD) != 0 {
+            if let Some(ref canyon) = self.canyon {
+                if let Some(c_hit) = ray_intersect_canyon(canyon, origin, unit_dir, closest_toi) {
+                    if c_hit.toi < closest_toi {
+                        best_hit = Some((Entity::PLACEHOLDER, c_hit));
+                    }
                 }
             }
         }
@@ -3107,6 +3132,74 @@ impl CustomPhysicsWorld {
 
         (center, grounded)
     }
+}
+
+
+fn ray_intersect_canyon(
+    canyon: &CanyonConfig,
+    origin: Vec3,
+    unit_dir: Vec3,
+    max_toi: f32,
+) -> Option<RayHit> {
+    if !canyon.enabled || max_toi <= 0.0 {
+        return None;
+    }
+    if origin.y > 0.5 && unit_dir.y >= 0.0 {
+        return None;
+    }
+
+    let limit_t = max_toi.min(240.0);
+    let step = 0.65_f32;
+    let mut prev_t = 0.0_f32;
+    let mut prev_p = origin;
+    let mut prev_ch = canyon_sample_height(canyon, prev_p.x, prev_p.z);
+
+    let mut t = step;
+    while t <= limit_t + step * 0.5 {
+        let cur_t = t.min(limit_t);
+        let p = origin + unit_dir * cur_t;
+        if p.x.abs() <= 180.0 && p.z.abs() <= 120.0 && p.y <= 0.35 {
+            let ch = canyon_sample_height(canyon, p.x, p.z);
+            let relevant = ch < -0.15 || prev_ch < -0.15;
+            if relevant && p.y <= ch && prev_p.y > prev_ch {
+                let mut lo = prev_t;
+                let mut hi = cur_t;
+                for _ in 0..6 {
+                    let mid = 0.5 * (lo + hi);
+                    let mp = origin + unit_dir * mid;
+                    let mch = canyon_sample_height(canyon, mp.x, mp.z);
+                    if mp.y <= mch {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                let hit_p = origin + unit_dir * hi;
+                let hit_ch = canyon_sample_height(canyon, hit_p.x, hit_p.z);
+                let normal = if hit_ch < -0.15 && prev_ch < -0.15 {
+                    Vec3::Y
+                } else {
+                    Vec3::new(-unit_dir.x, 0.0, -unit_dir.z).normalize_or_zero()
+                };
+                return Some(RayHit {
+                    toi: hi,
+                    point: hit_p,
+                    normal,
+                });
+            }
+            prev_ch = ch;
+        } else {
+            prev_ch = 0.0;
+        }
+        prev_t = cur_t;
+        prev_p = p;
+        if cur_t >= limit_t {
+            break;
+        }
+        t += step;
+    }
+
+    None
 }
 
 fn ray_intersect_single_entry(
@@ -4430,7 +4523,7 @@ pub const FOW_GRID_H: usize = 120;
 #[derive(Clone, Debug)]
 pub struct SharedFogOfWar {
     pub terrain_y: Vec<f32>,
-    pub blocker: Vec<bool>,
+    pub blocker_top_y: Vec<f32>,
     pub explored: Vec<bool>,
     pub visible_now: Vec<bool>,
     pub allied_sources: Vec<(Vec3, f32)>,
@@ -4440,15 +4533,20 @@ impl SharedFogOfWar {
     pub fn from_config(config: &GameConfig, hero_team: TeamId) -> Self {
         let total = FOW_GRID_W * FOW_GRID_H;
         let mut terrain_y = vec![0.0_f32; total];
-        let mut blocker = vec![false; total];
+        let mut blocker_top_y = vec![f32::NEG_INFINITY; total];
 
         for gz in 0..FOW_GRID_H {
             for gx in 0..FOW_GRID_W {
                 let (wx, wz) = Self::cell_to_world(config, gx, gz);
                 let idx = gz * FOW_GRID_W + gx;
 
-                let mut best_y = -1.6_f32;
+                let canyon_h = canyon_sample_height(&config.map.canyon, wx, wz);
+                let inside_canyon = config.map.canyon.enabled && canyon_h < -0.15;
+                let mut best_y = if inside_canyon { canyon_h } else { -1.6_f32 };
                 for plat in &config.map.terrains {
+                    if inside_canyon && plat.elevation_tier <= 0 {
+                        continue;
+                    }
                     let loc = plat.model_transform.location;
                     let scl = plat.model_transform.scale;
                     let hx = plat.size.0 * 0.5 * scl.0.abs();
@@ -4456,6 +4554,29 @@ impl SharedFogOfWar {
                     if (wx - loc.0).abs() <= hx && (wz - loc.2).abs() <= hz {
                         let top_y = loc.1 + plat.size.1 * 0.5 * scl.1.abs();
                         best_y = best_y.max(top_y);
+                    }
+                }
+                if inside_canyon {
+                    for lane in &config.map.lanes {
+                        let half_w = lane.width * 0.5;
+                        for seg_idx in 0..lane.waypoints.len().saturating_sub(1) {
+                            let a = lane.waypoints[seg_idx];
+                            let b = lane.waypoints[seg_idx + 1];
+                            let abx = b.0 - a.0;
+                            let abz = b.2 - a.2;
+                            let l2 = abx * abx + abz * abz;
+                            let t = if l2 > 1e-4 {
+                                (((wx - a.0) * abx + (wz - a.2) * abz) / l2).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            let cx = a.0 + abx * t;
+                            let cz = a.2 + abz * t;
+                            if (wx - cx).hypot(wz - cz) <= half_w {
+                                let cy = a.1 + (b.1 - a.1) * t + lane.thickness * 0.5;
+                                best_y = best_y.max(cy);
+                            }
+                        }
                     }
                 }
 
@@ -4478,7 +4599,7 @@ impl SharedFogOfWar {
 
                 terrain_y[idx] = best_y;
 
-                let mut blocked = false;
+                let mut max_blocker_y = f32::NEG_INFINITY;
                 for mtn in &config.map.mountains {
                     let loc = mtn.model_transform.location;
                     let scl = mtn.model_transform.scale;
@@ -4492,47 +4613,38 @@ impl SharedFogOfWar {
                         Quat::from_rotation_y(-mtn.model_transform.rotation.1.to_radians());
                     let local = inv_rot * Vec3::new(wx - loc.0, 0.0, wz - loc.2);
                     if local.x.abs() <= hx && local.z.abs() <= hz {
-                        blocked = true;
-                        break;
+                        max_blocker_y = max_blocker_y.max(top_y);
                     }
                 }
-                if !blocked {
-                    for obs in &config.obstacles {
-                        if obs.can_vault {
-                            continue;
-                        }
-                        let loc = obs.model_transform.location;
-                        let scl = obs.model_transform.scale;
-                        let hx = obs.size.0 * 0.5 * scl.0.abs();
-                        let hz = obs.size.2 * 0.5 * scl.2.abs();
-                        let inv_rot =
-                            Quat::from_rotation_y(-obs.model_transform.rotation.1.to_radians());
-                        let local = inv_rot * Vec3::new(wx - loc.0, 0.0, wz - loc.2);
-                        if local.x.abs() <= hx && local.z.abs() <= hz {
-                            blocked = true;
-                            break;
-                        }
+                for obs in &config.obstacles {
+                    if obs.can_vault {
+                        continue;
+                    }
+                    let loc = obs.model_transform.location;
+                    let scl = obs.model_transform.scale;
+                    let top_y = loc.1 + obs.size.1 * 0.5 * scl.1.abs();
+                    let hx = obs.size.0 * 0.5 * scl.0.abs();
+                    let hz = obs.size.2 * 0.5 * scl.2.abs();
+                    let inv_rot =
+                        Quat::from_rotation_y(-obs.model_transform.rotation.1.to_radians());
+                    let local = inv_rot * Vec3::new(wx - loc.0, 0.0, wz - loc.2);
+                    if local.x.abs() <= hx && local.z.abs() <= hz {
+                        max_blocker_y = max_blocker_y.max(top_y);
                     }
                 }
-                if !blocked {
-                    for tree in &config.map.trees {
-                        let loc = tree.model_transform.location;
-                        let ts = tree
-                            .model_transform
-                            .scale
-                            .0
-                            .abs()
-                            .max(tree.model_transform.scale.2.abs());
-                        let r = (tree.trunk_radius * 1.45 * ts).max(0.85);
-                        let tdx = wx - loc.0;
-                        let tdz = wz - loc.2;
-                        if tdx * tdx + tdz * tdz <= r * r {
-                            blocked = true;
-                            break;
-                        }
+                for tree in &config.map.trees {
+                    let loc = tree.model_transform.location;
+                    let scl = tree.model_transform.scale;
+                    let ts = scl.0.abs().max(scl.2.abs());
+                    let top_y = loc.1 + (tree.trunk_height + tree.canopy_height) * scl.1.abs();
+                    let r = (tree.trunk_radius * 1.45 * ts).max(0.85);
+                    let tdx = wx - loc.0;
+                    let tdz = wz - loc.2;
+                    if tdx * tdx + tdz * tdz <= r * r {
+                        max_blocker_y = max_blocker_y.max(top_y);
                     }
                 }
-                blocker[idx] = blocked;
+                blocker_top_y[idx] = max_blocker_y;
             }
         }
 
@@ -4564,7 +4676,7 @@ impl SharedFogOfWar {
 
         Self {
             terrain_y,
-            blocker,
+            blocker_top_y,
             explored: vec![false; total],
             visible_now: vec![false; total],
             allied_sources,
@@ -4642,7 +4754,7 @@ impl SharedFogOfWar {
                 self.visible_now[idx] = true;
                 self.explored[idx] = true;
 
-                if self.blocker[idx] && dist > 1.8 {
+                if self.blocker_top_y[idx] >= origin_y + config.map.high_ground_occlusion_min_diff && dist > 1.8 {
                     break;
                 }
             }
@@ -6527,6 +6639,7 @@ fn spawn_server_environment_colliders_system(mut commands: Commands, config: Res
 
 /// همگام‌سازی لیست کولایدرهای ثابت نقشه با CustomPhysicsWorld در ابتدای هر تیک فیزیک
 fn sync_static_colliders_to_world_system(
+    config: Res<GameConfig>,
     mut physics_world: ResMut<CustomPhysicsWorld>,
     static_query: Query<(
         Entity,
@@ -6539,6 +6652,11 @@ fn sync_static_colliders_to_world_system(
     )>,
 ) {
     physics_world.static_colliders.clear();
+    physics_world.canyon = if config.map.canyon.enabled {
+        Some(config.map.canyon.clone())
+    } else {
+        None
+    };
     for (entity, tf, body, collider, mat, groups, disabled) in &static_query {
         if *body != CustomRigidBody::Fixed {
             continue;
@@ -6720,6 +6838,7 @@ fn shared_authoritative_drive_system(
     turret_query: Query<&PhysicsTurret>,
     barracks_query: Query<&PhysicsBarracks>,
     ancient_query: Query<&PhysicsAncient>,
+    elev_query: Query<&ElevationSurface>,
 ) {
     if match_state
         .as_ref()
@@ -6771,6 +6890,7 @@ fn shared_authoritative_drive_system(
                 &turret_query,
                 &barracks_query,
                 &ancient_query,
+                &elev_query,
                 &hero_aim_targets,
             );
         }
@@ -6787,6 +6907,7 @@ fn shared_authoritative_drive_system(
         &physics_world,
         &mut world,
         &target_query,
+        &elev_query,
     );
 
     step_turrets_system(
@@ -6887,6 +7008,7 @@ fn shared_drive_single_player(
     turret_query: &Query<&PhysicsTurret>,
     barracks_query: &Query<&PhysicsBarracks>,
     ancient_query: &Query<&PhysicsAncient>,
+    elev_query: &Query<&ElevationSurface>,
     hero_aim_targets: &[(usize, TeamId, Vec3, f32, Stance, bool)],
 ) {
 
@@ -7283,6 +7405,7 @@ fn shared_drive_single_player(
             physics_world,
             obstacle_query,
             target_query,
+            elev_query,
             soldier_tf,
             controller,
             dt,
@@ -7385,6 +7508,7 @@ fn step_traversal_custom(
     physics_world: &CustomPhysicsWorld,
     obstacle_query: &Query<&PhysicsObstacle>,
     target_query: &Query<&PhysicsTarget>,
+    elev_query: &Query<&ElevationSurface>,
     soldier_tf: &mut Transform,
     controller: &mut CustomCharacterController,
     dt: f32,
@@ -7398,7 +7522,25 @@ fn step_traversal_custom(
             .lerp(world.traversal.target_pos, frac);
         world.soldier_facing_dir = world.traversal.travel_dir;
 
-        if world.traversal.kind == TraversalKind::ObstacleVault
+        if world.traversal.anim_name == "run_to_dive" {
+            controller.translation = None;
+            let arc_y = world.traversal.start_pos.y.lerp(world.traversal.target_pos.y, frac * frac)
+                + (frac * (1.0 - frac)) * 2.2;
+            soldier_tf.translation = Vec3::new(
+                current_pos.x,
+                arc_y + config.physics.soldier_capsule_center_y * world.hero_scale,
+                current_pos.z,
+            );
+            world.soldier_pos = Vec3::new(current_pos.x, arc_y, current_pos.z);
+            if frac >= 0.85 && (world.traversal.elapsed - dt) / world.traversal.duration < 0.85 {
+                if let Some((water_y, _)) = sample_water_surface_at(config, world.traversal.target_pos) {
+                    world.pending_fx.push(GameplayFxEvent::WaterSplash {
+                        pos: Vec3::new(current_pos.x, water_y, current_pos.z),
+                        intensity: 1.45,
+                    });
+                }
+            }
+        } else if world.traversal.kind == TraversalKind::ObstacleVault
             || world.traversal.kind == TraversalKind::JumpOver
         {
             controller.translation = None;
@@ -7429,21 +7571,13 @@ fn step_traversal_custom(
             controller.translation = Some(Vec3::new(step_delta.x, grav_y, step_delta.z));
         }
 
-        if world.traversal.kind == TraversalKind::RunningJump {
+        if world.traversal.kind == TraversalKind::RunningJump && world.traversal.anim_name != "run_to_dive" {
             let current_soldier_pos = world.soldier_pos;
-            if let Some((water_y, _)) = sample_water_surface_at(config, current_soldier_pos) {
-                let splash_pos = Vec3::new(current_soldier_pos.x, water_y, current_soldier_pos.z);
-                world.pending_fx.push(GameplayFxEvent::WaterSplash {
-                    pos: splash_pos,
-                    intensity: 1.15,
-                });
-            } else {
-                let dust_pos = current_soldier_pos - world.traversal.travel_dir * 0.4
-                    + Vec3::new(0.0, 0.08, 0.0);
-                world
-                    .pending_fx
-                    .push(GameplayFxEvent::SlideDust { pos: dust_pos });
-            }
+            let dust_pos = current_soldier_pos - world.traversal.travel_dir * 0.4
+                + Vec3::new(0.0, 0.08, 0.0);
+            world
+                .pending_fx
+                .push(GameplayFxEvent::SlideDust { pos: dust_pos });
         }
 
         if world.traversal.elapsed >= world.traversal.duration {
@@ -7638,38 +7772,56 @@ fn step_traversal_custom(
         world.soldier_pos.z + travel_dir.z * safe_dist,
     );
 
+    let canyon_bed = canyon_sample_height(&config.map.canyon, target_pos.x, target_pos.z);
+    let inside_canyon_carve = config.map.canyon.enabled && canyon_bed < -0.15;
     let landing_ray_orig = Vec3::new(target_pos.x, target_pos.y + 4.0, target_pos.z);
-    let landing_ground_y = physics_world
+    let bridge_or_ground_hit = physics_world
         .cast_ray(
             landing_ray_orig,
             Vec3::NEG_Y,
-            12.0,
+            14.0,
             query_groups,
             |entity| {
                 if let Ok(t) = target_query.get(entity) {
-                    !world.targets[t.index].is_dead
-                } else {
-                    true
+                    if world.targets[t.index].is_dead {
+                        return false;
+                    }
                 }
+                if inside_canyon_carve {
+                    if let Ok(elev) = elev_query.get(entity) {
+                        if elev.elevation_tier <= 0 {
+                            return false;
+                        }
+                    }
+                }
+                true
             },
         )
-        .map(|(_, hit)| hit.point.y)
-        .unwrap_or(target_pos.y);
+        .map(|(_, hit)| hit.point.y);
 
-    let canyon_bed = canyon_sample_height(&config.map.canyon, target_pos.x, target_pos.z);
-    let effective_landing_y = if canyon_bed < -0.15 { canyon_bed } else { landing_ground_y };
-    let leads_to_deep_water =
-        if let Some((water_y, _)) = sample_water_surface_at(config, Vec3::new(target_pos.x, effective_landing_y, target_pos.z)) {
-            let extra_depth = sample_waterfall_depth_offset(config, target_pos.x, target_pos.z);
-            let effective_bed_y = if canyon_bed < -0.15 {
-                canyon_bed
-            } else {
-                (landing_ground_y - extra_depth).max(-1.6)
-            };
-            (water_y - effective_bed_y) >= 0.85
+    let effective_landing_y = if let Some(hit_y) = bridge_or_ground_hit {
+        hit_y
+    } else if inside_canyon_carve {
+        let swim_floor = config.map.canyon.water_y - 1.15;
+        canyon_bed.max(swim_floor)
+    } else {
+        target_pos.y
+    };
+
+    let leads_to_deep_water = if bridge_or_ground_hit.is_some() && inside_canyon_carve {
+        // روی پل یا مسیر لاین بالای دره هستیم، بنابراین شیرجه داخل آب اجرا نمی‌شود
+        false
+    } else if let Some((water_y, _)) = sample_water_surface_at(config, Vec3::new(target_pos.x, effective_landing_y, target_pos.z)) {
+        let extra_depth = sample_waterfall_depth_offset(config, target_pos.x, target_pos.z);
+        let effective_bed_y = if inside_canyon_carve {
+            canyon_bed
         } else {
-            false
+            (effective_landing_y - extra_depth).max(-1.6)
         };
+        (water_y - effective_bed_y) >= 0.85
+    } else {
+        false
+    };
 
     let final_anim_name = if leads_to_deep_water {
         exact_duration = config.exact_anim_duration("run_to_dive");
@@ -7690,11 +7842,15 @@ fn step_traversal_custom(
                 }
             },
         );
-        target_pos = Vec3::new(
-            world.soldier_pos.x + travel_dir.x * safe_dist,
-            world.soldier_pos.y,
-            world.soldier_pos.z + travel_dir.z * safe_dist,
-        );
+        let dive_x = world.soldier_pos.x + travel_dir.x * safe_dist;
+        let dive_z = world.soldier_pos.z + travel_dir.z * safe_dist;
+        let dive_bed = canyon_sample_height(&config.map.canyon, dive_x, dive_z);
+        let dive_end_y = if config.map.canyon.enabled && dive_bed < -0.15 {
+            dive_bed.max(config.map.canyon.water_y - 1.15)
+        } else {
+            effective_landing_y
+        };
+        target_pos = Vec3::new(dive_x, dive_end_y, dive_z);
         "run_to_dive"
     } else {
         anim_name
@@ -9002,6 +9158,7 @@ fn step_lane_creeps_system(
     physics_world: &CustomPhysicsWorld,
     world: &mut AuthoritativeWorldState,
     target_query: &Query<&PhysicsTarget>,
+    elev_query: &Query<&ElevationSurface>,
 ) {
     world.match_elapsed_secs += dt;
 
@@ -9496,22 +9653,38 @@ fn step_lane_creeps_system(
             }
         }
 
-        // ج) هم‌ترازی ارتفاع سرباز با سطح واقعی زمین/رمپ/پلتفرم
-        let ray_origin = Vec3::new(
-            world.creeps[idx].pos.x,
-            world.creeps[idx].pos.y + 3.0,
-            world.creeps[idx].pos.z,
-        );
-        if let Some((_ent, hit)) = physics_world.cast_ray(
+        // ج) هم‌ترازی ارتفاع سرباز با سطح واقعی زمین/رمپ/پل و بستر دره عمیق
+        let cx = world.creeps[idx].pos.x;
+        let cz = world.creeps[idx].pos.z;
+        let canyon_h = canyon_sample_height(&config.map.canyon, cx, cz);
+        let inside_canyon = config.map.canyon.enabled && canyon_h < -0.15;
+        let ray_origin = Vec3::new(cx, world.creeps[idx].pos.y + 3.0, cz);
+        let hit_opt = physics_world.cast_ray(
             ray_origin,
             Vec3::NEG_Y,
-            12.0,
+            18.0,
             query_groups,
-            |ent| target_query.get(ent).is_err(),
-        ) {
+            |ent| {
+                if target_query.get(ent).is_ok() {
+                    return false;
+                }
+                if inside_canyon {
+                    if let Ok(elev) = elev_query.get(ent) {
+                        if elev.elevation_tier <= 0 {
+                            return false;
+                        }
+                    }
+                }
+                true
+            },
+        );
+        if let Some((_ent, hit)) = hit_opt {
             if hit.normal.y > 0.5 {
                 world.creeps[idx].pos.y = hit.point.y;
             }
+        } else if inside_canyon {
+            let swim_floor = config.map.canyon.water_y - 1.15;
+            world.creeps[idx].pos.y = canyon_h.max(swim_floor);
         }
 
         // جلوگیری از ورود و گیر افتادن سربازان پشت پایه تاورها (به همراه لغزش مماسی دور تاور)

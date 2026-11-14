@@ -39,7 +39,7 @@ use std::time::Duration;
 
 mod audio_client;
 mod vfx_client;
-use vfx_client::{build_canyon_terrain_and_river_meshes, ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
+use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
 mod shop_client;
 use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
 use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
@@ -962,42 +962,9 @@ fn setup_scene(
             perceptual_roughness: config.lighting.ground_roughness,
             ..default()
         })),
-        Transform::from_xyz(0.0, -5.5, 0.0),
+        Transform::from_xyz(0.0, config.lighting.ground_y, 0.0),
     ));
     commands.spawn(ground_physics_bundle(&config));
-
-    // لایه ابر و مه دره در اطراف لبه‌های پرتگاه نقشه
-    let cloud_mat = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.82, 0.87, 0.92, 0.52),
-        emissive: LinearRgba::new(0.18, 0.22, 0.26, 0.52),
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        ..default()
-    });
-    for &(cx, cz, rad) in &[
-        (-155.0, -95.0, 42.0),
-        (-155.0, 95.0, 42.0),
-        (155.0, -95.0, 42.0),
-        (155.0, 95.0, 42.0),
-        (0.0, -118.0, 48.0),
-        (0.0, 118.0, 48.0),
-        (-95.0, -115.0, 38.0),
-        (95.0, -115.0, 38.0),
-        (-95.0, 115.0, 38.0),
-        (95.0, 115.0, 38.0),
-    ] {
-        commands.spawn((
-            Mesh3d(meshes.add(Cylinder::new(rad, 1.2))),
-            MeshMaterial3d(cloud_mat.clone()),
-            Transform::from_xyz(cx, -3.8, cz),
-            AmbientFloatingMote {
-                base_pos: Vec3::new(cx, -3.8, cz),
-                drift_amp: Vec3::new(2.5, 0.35, 2.0),
-                freq: 0.35,
-                phase: (cx + cz) * 0.05,
-            },
-        ));
-    }
 
 
 
@@ -1283,21 +1250,25 @@ fn setup_scene(
                 },
                 foam_tex: foam_noise_handle.clone(),
             });
-            let tall_h = size.y * 1.65;
-            let lift_y = (tall_h - size.y) * 0.5;
-            let wf_mesh = meshes.add(Cuboid::new(1.0, 1.0, 0.28));
+            let wf_mesh = meshes.add(build_curved_waterfall_mesh());
             ent_cmds.with_children(|parent| {
                 parent.spawn((
                     Mesh3d(wf_mesh),
                     MeshMaterial3d(wf_mat),
-                    Transform::from_xyz(0.0, lift_y, 0.0)
-                        .with_scale(Vec3::new(size.x, tall_h, size.z.clamp(0.8, 2.0))),
+                    Transform::from_scale(Vec3::new(size.x, size.y, size.z)),
+                    bevy::light::NotShadowCaster,
                 ));
             });
         }
 
         // سیستم ذرات مه در پای هر آبشار
-        let mist_pos = tf.translation - Vec3::Y * (size.y * 0.45 * tf.scale.y);
+        let mut mist_pos = tf.translation - Vec3::Y * (size.y * 0.45 * tf.scale.y);
+        if config.map.canyon.enabled && wf.id == "waterfall_canyon_nw_mouth" {
+            mist_pos.y = config.map.canyon.water_y;
+        }
+        vfx_queue.0.push(ClientVfxEvent::SpawnWaterfallSpray {
+            pos: mist_pos + Vec3::Y * 0.35,
+        });
         commands.spawn(WaterfallMistEmitter {
             base_pos: mist_pos,
             width: size.x * tf.scale.x,
@@ -6061,24 +6032,26 @@ fn waterfall_mist_particle_system(
     for mut emitter in &mut emitter_query {
         emitter.timer.tick(time.delta());
         if emitter.timer.just_finished() {
-            for _ in 0..2 {
+            let puff_count = if emitter.width > 20.0 { 7 } else { 3 };
+            for _ in 0..puff_count {
                 let rx = render_state.next_fx_rand() - 0.5;
                 let rz = render_state.next_fx_rand() - 0.5;
                 let ry = render_state.next_fx_rand();
-                let spawn_p = emitter.base_pos + Vec3::new(rx * emitter.width * 0.9, 0.35, rz * 1.8);
-                let vel = Vec3::new(rx * 2.8, 0.55 + ry * 0.75, rz * 2.8);
+                let spawn_p = emitter.base_pos + Vec3::new(rx * emitter.width * 0.85, 0.25 + ry * 0.5, rz * 3.2);
+                let vel = Vec3::new(rx * 4.2, 1.4 + ry * 1.8, rz * 4.2);
                 commands.spawn((
                     Mesh3d(mist_mesh.clone()),
                     MeshMaterial3d(mist_mat.clone()),
                     Transform::from_translation(spawn_p)
                         .looking_at(cam_pos, Vec3::Y)
-                        .with_scale(Vec3::splat(1.2)),
+                        .with_scale(Vec3::splat(1.8)),
                     WaterfallMistParticle {
                         vel,
-                        timer: Timer::from_seconds(1.55, TimerMode::Once),
-                        start_scale: 1.2,
-                        end_scale: 4.2,
+                        timer: Timer::from_seconds(1.15, TimerMode::Once),
+                        start_scale: 1.8,
+                        end_scale: 5.6,
                     },
+                    NotShadowCaster,
                 ));
             }
         }

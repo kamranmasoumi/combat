@@ -39,7 +39,7 @@ use std::time::Duration;
 
 mod audio_client;
 mod vfx_client;
-use vfx_client::{ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
+use vfx_client::{build_canyon_terrain_and_river_meshes, ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
 mod shop_client;
 use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
 use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
@@ -999,6 +999,11 @@ fn setup_scene(
         ));
     }
 
+
+
+    let foam_noise_handle = images.add(bake_water_foam_noise_texture());
+    commands.insert_resource(SharedWaterFoamTexture(foam_noise_handle.clone()));
+
     // ۲. سطوح ارتفاعی زمین، حوضچه‌های برکه و پایگاه‌های دایره‌ای غرب (Dawn) و شرق (Dusk)
     for plat in &config.map.terrains {
         let size = Vec3::new(plat.size.0, plat.size.1, plat.size.2);
@@ -1017,6 +1022,41 @@ fn setup_scene(
                     &plat.model_transform,
                 ));
             });
+        } else if plat.id == "terrain_center_mid_strip" {
+            let canyon = &config.map.canyon;
+            let (canyon_terrain_mesh, canyon_river_mesh) = build_canyon_terrain_and_river_meshes(canyon);
+            let offset_y = -plat.model_transform.location.1;
+            let wc = canyon.water_color_rgb;
+            let fc = canyon.foam_color_rgb;
+            let fdir = Vec2::new(canyon.flow_dir.0, canyon.flow_dir.1).normalize_or_zero();
+            let river_mat = water_materials.add(WaterSurfaceMaterial {
+                uniforms: WaterUniforms {
+                    base_color: Vec4::new(wc.0, wc.1, wc.2, 0.90),
+                    foam_color: Vec4::new(fc.0, fc.1, fc.2, 1.0),
+                    flow_and_params: Vec4::new(fdir.x, fdir.y, 0.0, 3.0),
+                    camera_pos: Vec4::new(0.0, 23.0, 17.5, 0.22),
+                    player_ripple: Vec4::new(0.0, 0.0, 0.0, -1.0),
+                },
+                foam_tex: foam_noise_handle.clone(),
+            });
+            ent_cmds.with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(meshes.add(canyon_terrain_mesh)),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::WHITE,
+                        perceptual_roughness: plat.roughness,
+                        ..default()
+                    })),
+                    Transform::from_xyz(0.0, offset_y, 0.0),
+                ));
+            });
+            commands.spawn((
+                Mesh3d(meshes.add(canyon_river_mesh)),
+                MeshMaterial3d(river_mat),
+                Transform::IDENTITY,
+                Visibility::Visible,
+                bevy::light::NotShadowCaster,
+            ));
         } else {
             ent_cmds.insert((
                 Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
@@ -1111,8 +1151,7 @@ fn setup_scene(
     // ۴. برکه‌های فیروزه‌ای طبیعی، جویبارهای جنگلی و جریان پویا (River Segments & Lagoons)
 
 
-    let foam_noise_handle = images.add(bake_water_foam_noise_texture());
-    commands.insert_resource(SharedWaterFoamTexture(foam_noise_handle.clone()));
+
     let subdivided_water_mesh = meshes.add(
         Plane3d::default()
             .mesh()

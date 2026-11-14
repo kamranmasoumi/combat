@@ -1245,12 +1245,29 @@ impl ModelTransformConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CanyonConfig {
+    pub enabled: bool,
+    pub start_corner: (f32, f32),
+    pub end_corner: (f32, f32),
+    pub water_y: f32,
+    pub floor_depth: f32,
+    pub base_half_width: f32,
+    pub center_basin_boost: f32,
+    pub meander_amplitude: f32,
+    pub flow_dir: (f32, f32),
+    pub water_color_rgb: (f32, f32, f32),
+    pub foam_color_rgb: (f32, f32, f32),
+    pub grid_resolution: (u32, u32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MapConfig {
     pub map_dimensions: (f32, f32),
     pub show_object_labels: bool,
     pub base_vision_range: f32,
     pub high_ground_vision_bonus: f32,
     pub high_ground_occlusion_min_diff: f32,
+    pub canyon: CanyonConfig,
     pub terrains: Vec<TerrainPlatformDef>,
     pub ramps: Vec<RampDef>,
     pub river_segments: Vec<RiverSegmentDef>,
@@ -2447,6 +2464,60 @@ fn segment_hits_hero_capsule(
     }
 }
 
+fn canyon_meander_and_half_w(canyon: &CanyonConfig, x: f32, z: f32) -> (f32, f32, f32, Vec2, Vec2) {
+    let start = Vec2::new(canyon.start_corner.0, canyon.start_corner.1);
+    let end = Vec2::new(canyon.end_corner.0, canyon.end_corner.1);
+    let mid = (start + end) * 0.5;
+    let span = end - start;
+    let half_len = (span.length() * 0.5).max(1.0);
+    let dir = span.normalize_or_zero();
+    let perp = Vec2::new(-dir.y, dir.x);
+
+    let p = Vec2::new(x, z) - mid;
+    let along = p.dot(dir);
+    let s = (along / half_len).clamp(-1.2, 1.2);
+
+    let amp = canyon.meander_amplitude;
+    let meander = amp * (s * 3.8).sin()
+        + (amp * 0.48) * (s * 7.6 + 0.7).cos()
+        + (amp * 0.20) * (s * 13.5 - 0.4).sin();
+
+    let rock_jitter = 2.4 * (x * 0.15 + z * 0.11).sin()
+        + 1.3 * (x * 0.29 - z * 0.23).cos();
+    let signed_perp = p.dot(perp) - meander;
+    let dist = signed_perp.abs() + rock_jitter * 0.55;
+
+    let base_half_w = canyon.base_half_width
+        + 4.8 * (s * 5.2 + 0.4).sin()
+        + 2.6 * (s * 11.0 - 0.8).cos();
+    let center_basin_boost = canyon.center_basin_boost * (-s * s * 13.5).exp();
+    let half_w = (base_half_w + center_basin_boost).max(9.5);
+    (dist, half_w, signed_perp, dir, perp)
+}
+
+/// فاصله افقی نقطه از دیواره ۹۰ درجه دره (>0 یعنی داخل دره، <=0 یعنی بیرون روی فلات)
+pub fn canyon_edge_distance(canyon: &CanyonConfig, x: f32, z: f32) -> f32 {
+    if !canyon.enabled {
+        return -100.0;
+    }
+    let (dist, half_w, _, _, _) = canyon_meander_and_half_w(canyon, x, z);
+    half_w - dist
+}
+
+/// ارتفاع دقیق دره با دیواره‌های کاملاً عمودی ۹۰ درجه (بدون شیب بالا رفتن)
+pub fn canyon_sample_height(canyon: &CanyonConfig, x: f32, z: f32) -> f32 {
+    if !canyon.enabled {
+        return 0.0;
+    }
+    let (dist, half_w, _, _, _) = canyon_meander_and_half_w(canyon, x, z);
+    if dist < half_w {
+        let bed_ripple = 0.25 * (x * 0.22).sin() * (z * 0.22).cos();
+        canyon.floor_depth + bed_ripple
+    } else {
+        0.0
+    }
+}
+
 pub fn sample_waterfall_depth_offset(config: &GameConfig, wx: f32, wz: f32) -> f32 {
     let mut max_extra_depth = 0.0_f32;
     let basin_radius = 16.0_f32;
@@ -2489,6 +2560,12 @@ pub fn sample_water_surface_at(config: &GameConfig, world_pos: Vec3) -> Option<(
             let flow = Vec2::new(seg.flow_dir.0, seg.flow_dir.1).normalize_or_zero();
             return Some((water_top_y, flow));
         }
+    }
+    let ch = canyon_sample_height(&config.map.canyon, world_pos.x, world_pos.z);
+    let wy = config.map.canyon.water_y;
+    if config.map.canyon.enabled && ch < wy - 0.10 && world_pos.y >= ch - 0.5 && world_pos.y <= wy + 2.5 {
+        let f = Vec2::new(config.map.canyon.flow_dir.0, config.map.canyon.flow_dir.1).normalize_or_zero();
+        return Some((wy, f));
     }
     None
 }
@@ -2900,6 +2977,9 @@ impl CustomPhysicsWorld {
         let max_down_dist = 100.0_f32;
         let mut highest_walkable_y: Option<f32> = None;
 
+        let canyon_h_center = canyon_sample_height(&config.map.canyon, center.x, center.z);
+        let inside_canyon_carve = canyon_h_center < -0.15;
+
         for offset in &footprint_offsets {
             let ray_origin = Vec3::new(
                 center.x + offset.x,
@@ -2908,6 +2988,9 @@ impl CustomPhysicsWorld {
             );
             for entry in &self.static_colliders {
                 if entry.disabled || !soldier_groups.interacts_with(entry.groups) {
+                    continue;
+                }
+                if inside_canyon_carve && entry.bounding_radius > 200.0 {
                     continue;
                 }
                 let dx = ray_origin.x - entry.translation.x;
@@ -2929,13 +3012,28 @@ impl CustomPhysicsWorld {
             }
         }
 
-        // ۳. اعمال گرانش و چسبیدن نرم به سطح رمپ، زمین یا کف شیب‌دار برکه‌ها (عمیق‌تر در نزدیکی آبشار)
+        // ۳. اعمال گرانش، بستر دره عمیق و شناوری روی سطح آب دره
         let mut adjusted_walkable_y = highest_walkable_y;
+        if inside_canyon_carve {
+            let swim_floor = config.map.canyon.water_y - 1.15;
+            let canyon_walk_y = if canyon_h_center < swim_floor {
+                swim_floor
+            } else {
+                canyon_h_center
+            };
+            adjusted_walkable_y = Some(adjusted_walkable_y.map_or(canyon_walk_y, |y| y.max(canyon_walk_y)));
+        } else if canyon_h_center > 0.05 {
+            if canyon_h_center <= feet_y + autostep_max_h + 0.12 {
+                adjusted_walkable_y = Some(adjusted_walkable_y.map_or(canyon_h_center, |y| y.max(canyon_h_center)));
+            }
+        }
         if let Some(gy) = adjusted_walkable_y {
-            let probe_pos = Vec3::new(center.x, gy, center.z);
-            if sample_water_surface_at(config, probe_pos).is_some() {
-                let extra_depth = sample_waterfall_depth_offset(config, center.x, center.z);
-                adjusted_walkable_y = Some((gy - extra_depth).max(-1.6));
+            if !inside_canyon_carve {
+                let probe_pos = Vec3::new(center.x, gy, center.z);
+                if sample_water_surface_at(config, probe_pos).is_some() {
+                    let extra_depth = sample_waterfall_depth_offset(config, center.x, center.z);
+                    adjusted_walkable_y = Some((gy - extra_depth).max(-1.6));
+                }
             }
         }
 
@@ -2949,14 +3047,34 @@ impl CustomPhysicsWorld {
                 free_fall_feet_y
             }
         } else {
-            (feet_y + desired_delta.y).max(-1.6)
+            (feet_y + desired_delta.y).max(-12.0)
         };
 
         center.y = new_feet_y + center_y_offset;
 
-        // ۴. اصلاح نهایی نفوذ افقی و عمودی در ارتفاع جدید
+        // ۴. اصلاح نهایی نفوذ افقی و عمودی در ارتفاع جدید و برخورد به دیواره‌های صخره‌ای دره
+        // قفل دیواره ۹۰ درجه دره: وقتی بازیکن داخل دره است نمی‌تواند از دیواره بالا برود (جز با نردبان)
+        if config.map.canyon.enabled && new_feet_y < -0.35 {
+            let edge_d = canyon_edge_distance(&config.map.canyon, center.x, center.z);
+            if edge_d < radius + 0.15 {
+                let eps = 0.8_f32;
+                let gx = canyon_edge_distance(&config.map.canyon, center.x + eps, center.z)
+                    - canyon_edge_distance(&config.map.canyon, center.x - eps, center.z);
+                let gz = canyon_edge_distance(&config.map.canyon, center.x, center.z + eps)
+                    - canyon_edge_distance(&config.map.canyon, center.x, center.z - eps);
+                let inward_dir = Vec3::new(gx, 0.0, gz).normalize_or_zero();
+                if inward_dir != Vec3::ZERO {
+                    let push = (radius + 0.15 - edge_d).clamp(0.0, 1.5);
+                    center += inward_dir * push;
+                }
+            }
+        }
+
         for entry in &self.static_colliders {
             if entry.disabled || !soldier_groups.interacts_with(entry.groups) {
+                continue;
+            }
+            if inside_canyon_carve && entry.bounding_radius > 200.0 {
                 continue;
             }
             let max_r = entry.bounding_radius + half_seg + eff_radius;
@@ -4364,6 +4482,10 @@ impl SharedFogOfWar {
                 for mtn in &config.map.mountains {
                     let loc = mtn.model_transform.location;
                     let scl = mtn.model_transform.scale;
+                    let top_y = loc.1 + mtn.size.1 * 0.5 * scl.1.abs();
+                    if top_y < best_y + config.map.high_ground_occlusion_min_diff {
+                        continue;
+                    }
                     let hx = mtn.size.0 * 0.5 * scl.0.abs();
                     let hz = mtn.size.2 * 0.5 * scl.2.abs();
                     let inv_rot =
@@ -7534,10 +7656,16 @@ fn step_traversal_custom(
         .map(|(_, hit)| hit.point.y)
         .unwrap_or(target_pos.y);
 
+    let canyon_bed = canyon_sample_height(&config.map.canyon, target_pos.x, target_pos.z);
+    let effective_landing_y = if canyon_bed < -0.15 { canyon_bed } else { landing_ground_y };
     let leads_to_deep_water =
-        if let Some((water_y, _)) = sample_water_surface_at(config, Vec3::new(target_pos.x, landing_ground_y, target_pos.z)) {
+        if let Some((water_y, _)) = sample_water_surface_at(config, Vec3::new(target_pos.x, effective_landing_y, target_pos.z)) {
             let extra_depth = sample_waterfall_depth_offset(config, target_pos.x, target_pos.z);
-            let effective_bed_y = (landing_ground_y - extra_depth).max(-1.6);
+            let effective_bed_y = if canyon_bed < -0.15 {
+                canyon_bed
+            } else {
+                (landing_ground_y - extra_depth).max(-1.6)
+            };
             (water_y - effective_bed_y) >= 0.85
         } else {
             false

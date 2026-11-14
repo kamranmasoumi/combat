@@ -555,3 +555,138 @@ fn update_vfx_lifetimes_system(
         }
     }
 }
+// -----------------------------------------------------------------------------
+// ساخت مش سه‌بعدی دره عمیق پرپیچ‌وخم (شمال‌غرب به جنوب‌شرق) و سطح رودخانه
+// -----------------------------------------------------------------------------
+
+pub fn build_canyon_terrain_and_river_meshes(canyon: &moba_shared::CanyonConfig) -> (Mesh, Mesh) {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+
+    let nx: usize = canyon.grid_resolution.0.max(32) as usize;
+    let nz: usize = canyon.grid_resolution.1.max(32) as usize;
+    let min_x = -180.0_f32;
+    let max_x = 180.0_f32;
+    let min_z = -120.0_f32;
+    let max_z = 120.0_f32;
+    let dx = (max_x - min_x) / (nx as f32);
+    let dz = (max_z - min_z) / (nz as f32);
+
+    let cols = nx + 1;
+    let rows = nz + 1;
+    let v_count = cols * rows;
+
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(v_count);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(v_count);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(v_count);
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(v_count);
+    let mut heights: Vec<f32> = Vec::with_capacity(v_count);
+
+    let eps = 0.75_f32;
+    for iz in 0..rows {
+        let z = min_z + (iz as f32) * dz;
+        for ix in 0..cols {
+            let x = min_x + (ix as f32) * dx;
+            let y = moba_shared::canyon_sample_height(canyon, x, z);
+            heights.push(y);
+            positions.push([x, y, z]);
+
+            let hx0 = moba_shared::canyon_sample_height(canyon, x - eps, z);
+            let hx1 = moba_shared::canyon_sample_height(canyon, x + eps, z);
+            let hz0 = moba_shared::canyon_sample_height(canyon, x, z - eps);
+            let hz1 = moba_shared::canyon_sample_height(canyon, x, z + eps);
+            let n = Vec3::new(hx0 - hx1, 2.0 * eps, hz0 - hz1).normalize();
+            normals.push([n.x, n.y, n.z]);
+            uvs.push([ix as f32 / nx as f32, iz as f32 / nz as f32]);
+
+            // رنگ‌بندی لایه‌ای: کوه‌های سنگی بلند -> چمن فلات -> دیواره صخره‌ای دره -> بستر زیر آب
+            let col = if y > 0.25 {
+                let peak_t = ((y - 0.25) / 6.5).clamp(0.0, 1.0);
+                [
+                    0.34 + 0.14 * peak_t,
+                    0.32 + 0.12 * peak_t,
+                    0.29 + 0.10 * peak_t,
+                    1.0,
+                ]
+            } else if y > -0.35 {
+                [0.31, 0.37, 0.24, 1.0]
+            } else if y > canyon.water_y {
+                let rock_t = ((-0.35 - y) / (0.35 - canyon.water_y).abs()).clamp(0.0, 1.0);
+                [
+                    0.38 - 0.14 * rock_t,
+                    0.35 - 0.10 * rock_t,
+                    0.30 - 0.05 * rock_t,
+                    1.0,
+                ]
+            } else {
+                [0.14, 0.26, 0.24, 1.0]
+            };
+            colors.push(col);
+        }
+    }
+
+    let mut indices: Vec<u32> = Vec::with_capacity(nx * nz * 6);
+    for iz in 0..nz {
+        for ix in 0..nx {
+            let i00 = (iz * cols + ix) as u32;
+            let i10 = i00 + 1;
+            let i01 = ((iz + 1) * cols + ix) as u32;
+            let i11 = i01 + 1;
+            indices.extend_from_slice(&[i00, i01, i10, i10, i01, i11]);
+        }
+    }
+
+    let mut terrain_mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+    terrain_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    terrain_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    terrain_mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    terrain_mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    terrain_mesh.insert_indices(Indices::U32(indices));
+
+    let water_y = canyon.water_y;
+    let mut w_positions: Vec<[f32; 3]> = Vec::new();
+    let mut w_normals: Vec<[f32; 3]> = Vec::new();
+    let mut w_uvs: Vec<[f32; 2]> = Vec::new();
+    let mut w_indices: Vec<u32> = Vec::new();
+    let mut w_vert_map = vec![u32::MAX; v_count];
+
+    for iz in 0..nz {
+        for ix in 0..nx {
+            let idx00 = iz * cols + ix;
+            let idx10 = idx00 + 1;
+            let idx01 = (iz + 1) * cols + ix;
+            let idx11 = idx01 + 1;
+            let min_h = heights[idx00]
+                .min(heights[idx10])
+                .min(heights[idx01])
+                .min(heights[idx11]);
+            if min_h >= water_y + 0.40 {
+                continue;
+            }
+            for &vidx in &[idx00, idx10, idx01, idx11] {
+                if w_vert_map[vidx] == u32::MAX {
+                    let vx = min_x + ((vidx % cols) as f32) * dx;
+                    let vz = min_z + ((vidx / cols) as f32) * dz;
+                    let depth_norm = (moba_shared::canyon_edge_distance(canyon, vx, vz) / 10.0).clamp(0.0, 1.0);
+                    w_vert_map[vidx] = w_positions.len() as u32;
+                    w_positions.push([vx, water_y, vz]);
+                    w_normals.push([0.0, 1.0, 0.0]);
+                    w_uvs.push([depth_norm, 0.0]);
+                }
+            }
+            let w00 = w_vert_map[idx00];
+            let w10 = w_vert_map[idx10];
+            let w01 = w_vert_map[idx01];
+            let w11 = w_vert_map[idx11];
+            w_indices.extend_from_slice(&[w00, w01, w10, w10, w01, w11]);
+        }
+    }
+
+    let mut river_mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+    river_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, w_positions);
+    river_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, w_normals);
+    river_mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, w_uvs);
+    river_mesh.insert_indices(Indices::U32(w_indices));
+
+    (terrain_mesh, river_mesh)
+}

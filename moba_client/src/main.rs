@@ -36,7 +36,9 @@ use std::f32::consts::PI;
 use std::path::Path;
 use std::time::Duration;
 
+mod audio_client;
 mod shop_client;
+use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
 use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
 
 
@@ -199,6 +201,7 @@ fn main() {
             has_local_items,
         })
         .add_plugins(ShopPlugin)
+        .add_plugins(MobaAudioPlugin)
         .insert_resource(ClientNetwork { client, transport })
         .insert_resource(render_state)
         .insert_resource(ClientPhysicsPredictionState::new())
@@ -315,7 +318,7 @@ fn main() {
                 .chain()
                 .after(sync_remote_players_system),
         )
-        .add_systems(Update, (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system))
+        .add_systems(Update, (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system))
         .add_systems(
             PostUpdate,
             align_weapon_horizontally_system.before(TransformSystems::Propagate),
@@ -457,6 +460,7 @@ struct NetworkGrenadeVisual {
 #[derive(Component)]
 struct GrenadeBlinkLed {
     mat: Handle<StandardMaterial>,
+    was_on: bool,
 }
 
 #[derive(Component)]
@@ -2920,6 +2924,8 @@ struct SampleInputExtraParams<'w> {
     inspected: ResMut<'w, InspectedUnit>,
     hero_move_target: ResMut<'w, HeroClickMoveTarget>,
     prediction: ResMut<'w, ClientPhysicsPredictionState>,
+    hero_hud: Res<'w, LatestHeroSnapshot>,
+    audio_q: ResMut<'w, AudioEventQueue>,
 }
 
 fn client_sample_input_system(
@@ -3062,6 +3068,13 @@ fn client_sample_input_system(
         ex.prediction.base_stance
     };
 
+    if cmd.fire_just_pressed && ex.hero_hud.0.ammo_in_mag == 0 {
+        ex.audio_q.0.push(ClientAudioEvent::EmptyGunClick);
+    }
+    if cmd.grenade_just_pressed && ex.hero_hud.0.grenade_charges == 0 {
+        ex.audio_q.0.push(ClientAudioEvent::EmptyGrenadeClick);
+    }
+
     if let Some(ref mut existing) = ex.prediction.latest_input {
         existing.accumulate_from(cmd);
     } else {
@@ -3089,6 +3102,7 @@ fn client_flush_input_to_server_system(
 struct TurretFxResources<'w, 's> {
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
+    audio_q: ResMut<'w, AudioEventQueue>,
     turret_gun_q: Query<'w, 's, &'static mut TurretGunBone>,
     turret_muzzle_q: Query<'w, 's, (&'static TurretMuzzlePoint, &'static GlobalTransform)>,
 }
@@ -3403,7 +3417,7 @@ fn client_receive_snapshot_and_sync_system(
                     ))
                     .with_children(|g| {
                         g.spawn((
-                            GrenadeBlinkLed { mat: led_mat.clone() },
+                            GrenadeBlinkLed { mat: led_mat.clone(), was_on: false },
                             Mesh3d(fx_res.meshes.add(Sphere::new(config.physics.grenade_collider_radius * 0.45))),
                             MeshMaterial3d(led_mat),
                             Transform::from_xyz(0.0, config.physics.grenade_collider_radius * 0.9, 0.0),
@@ -3430,6 +3444,7 @@ fn client_receive_snapshot_and_sync_system(
             &mut shake,
             &mut fx_res.meshes,
             &mut fx_res.materials,
+            &mut fx_res.audio_q,
             &mut fx_res.turret_gun_q,
             &fx_res.turret_muzzle_q,
             fx_live_muzzle,
@@ -3484,6 +3499,7 @@ fn spawn_fx_from_server_event(
     shake: &mut CameraShake,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    audio_q: &mut AudioEventQueue,
     turret_gun_q: &mut Query<&mut TurretGunBone>,
     turret_muzzle_q: &Query<(&TurretMuzzlePoint, &GlobalTransform)>,
     live_muzzle_opt: Option<Vec3>,
@@ -3493,9 +3509,14 @@ fn spawn_fx_from_server_event(
         GameplayFxEvent::ShotFired {
             muzzle_pos,
             shot_dir,
+            source,
             trauma_add,
             trauma_max,
         } => {
+            audio_q.0.push(ClientAudioEvent::ShotFired {
+                pos: muzzle_pos,
+                source,
+            });
             let muzzle_pos = match live_muzzle_opt {
                 Some(lm) if (lm - muzzle_pos).length_squared() <= 5.0 * 5.0 => lm,
                 _ => muzzle_pos,
@@ -3564,10 +3585,15 @@ fn spawn_fx_from_server_event(
         GameplayFxEvent::BulletImpact {
             impact_pos,
             bullet_dir,
+            surface,
             target_destroyed,
             trauma_add,
             trauma_max,
         } => {
+            audio_q.0.push(ClientAudioEvent::BulletImpact {
+                pos: impact_pos,
+                surface,
+            });
             let spark_mat = materials.add(StandardMaterial {
                 base_color: Color::srgb(1.0, 0.75, 0.2),
                 emissive: LinearRgba::new(12.0, 5.5, 0.5, 1.0),
@@ -3618,6 +3644,7 @@ fn spawn_fx_from_server_event(
             trauma_add,
             trauma_max,
         } => {
+            audio_q.0.push(ClientAudioEvent::GrenadeExploded { pos });
             let fire_mat = materials.add(StandardMaterial {
                 base_color: Color::srgb(1.0, 0.55, 0.1),
                 emissive: LinearRgba::new(16.0, 6.0, 0.8, 1.0),
@@ -3730,6 +3757,7 @@ fn spawn_fx_from_server_event(
             );
         }
         GameplayFxEvent::HeroLeveledUp { pos, new_level: _ } => {
+            audio_q.0.push(ClientAudioEvent::HeroLeveledUp);
             let dur = config.fx.level_up_vfx_duration_secs;
             let pillar_mat = materials.add(StandardMaterial {
                 base_color: Color::srgba(1.0, 0.86, 0.25, 0.42),
@@ -3786,6 +3814,7 @@ fn spawn_fx_from_server_event(
             }
         }
         GameplayFxEvent::LastHitGold { pos, gold } => {
+            audio_q.0.push(ClientAudioEvent::LastHitGold);
             let coin_mat = materials.add(StandardMaterial {
                 base_color: Color::srgb(1.0, 0.84, 0.16),
                 emissive: LinearRgba::new(5.5, 4.0, 0.4, 1.0),
@@ -3847,6 +3876,9 @@ fn spawn_fx_from_server_event(
             target_pos: _,
             shot_dir,
         } => {
+            audio_q.0.push(ClientAudioEvent::TurretShotFired {
+                pos: config.map.turrets[turret_index].model_transform.location_vec(),
+            });
             let jitter = (render_state.next_fx_rand() - 0.5) * 2.0 * config.fx.turret_recoil_jitter_rad;
             for mut gun in turret_gun_q.iter_mut() {
                 if gun.turret_index == turret_index {
@@ -3898,6 +3930,7 @@ fn spawn_fx_from_server_event(
             ));
         }
         GameplayFxEvent::CreepDenied { pos } => {
+            audio_q.0.push(ClientAudioEvent::CreepDenied);
             commands
                 .spawn((
                     FloatingWorldPopup {
@@ -4529,15 +4562,22 @@ fn gameplay_fx_system(
     mut commands: Commands,
     time: Res<Time>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut audio_q: ResMut<AudioEventQueue>,
     mut flash_query: Query<(Entity, &mut MuzzleFlash)>,
     mut trail_query: Query<(Entity, &mut BulletTrail)>,
     mut smoke_query: Query<(Entity, &mut Transform, &mut ExplosionSmokeParticle)>,
-    mut led_query: Query<(&GrenadeBlinkLed, &mut PointLight)>,
+    mut led_query: Query<(&mut GrenadeBlinkLed, &GlobalTransform, &mut PointLight)>,
 ) {
     let t_secs = time.elapsed_secs();
     let dt = time.delta_secs();
     let blink_on = (t_secs * 16.0).sin() > 0.0;
-    for (led, mut light) in &mut led_query {
+    for (mut led, gtf, mut light) in &mut led_query {
+        if blink_on && !led.was_on {
+            audio_q.0.push(ClientAudioEvent::GrenadeBeep {
+                pos: gtf.translation(),
+            });
+        }
+        led.was_on = blink_on;
         light.intensity = if blink_on { 120_000.0 } else { 0.0 };
         if let Some(mut mat) = materials.get_mut(&led.mat) {
             mat.emissive = if blink_on {
@@ -12817,5 +12857,185 @@ fn update_scoreboard_ui_system(
                 &dusk_heroes,
             );
         });
+    }
+}
+
+
+#[derive(SystemParam)]
+struct AudioSyncStateParams<'w> {
+    config: Res<'w, GameConfig>,
+    match_flow: Res<'w, ClientMatchFlow>,
+    render_state: Res<'w, ClientRenderState>,
+    hero_hud: Res<'w, LatestHeroSnapshot>,
+    match_result: Res<'w, LatestMatchResult>,
+    latest_creeps: Res<'w, LatestCreeps>,
+    latest_couriers: Res<'w, LatestCouriers>,
+    latest_turrets: Res<'w, LatestTurrets>,
+    latest_barracks: Res<'w, LatestBarracks>,
+    latest_ancients: Res<'w, LatestAncients>,
+    camera_control: Res<'w, CameraControlState>,
+    audio_ctx: ResMut<'w, AudioFrameContext>,
+    audio_q: ResMut<'w, AudioEventQueue>,
+}
+
+#[derive(Default)]
+struct AudioTransitionTracker {
+    prev_in_game: bool,
+    prev_dead: bool,
+    prev_courier_dead: bool,
+    prev_weapon: Option<ActiveWeaponSlot>,
+    prev_upper: Option<UpperBodyAction>,
+    prev_traversal: bool,
+    prev_winner: Option<TeamId>,
+    prev_dead_turrets: Vec<bool>,
+    prev_dead_barracks: Vec<bool>,
+    prev_dead_ancients: Vec<bool>,
+}
+
+fn sync_audio_context_system(
+    mut p: AudioSyncStateParams,
+    mut tr: Local<AudioTransitionTracker>,
+) {
+    let in_game = p.match_flow.is_in_game();
+    p.audio_ctx.in_game = in_game;
+    p.audio_ctx.hero_pos = p.render_state.soldier_pos;
+    p.audio_ctx.listener_pos = p
+        .camera_control
+        .free_look_target
+        .unwrap_or(p.render_state.soldier_pos + p.camera_control.current_cursor_lead);
+    p.audio_ctx.hero_hp_ratio = (p.hero_hud.0.hp / p.hero_hud.0.max_hp.max(1.0)).clamp(0.0, 1.0);
+    p.audio_ctx.hero_is_dead = p.render_state.is_dead;
+    p.audio_ctx.current_locomotion = p.render_state.current_locomotion.clone();
+    p.audio_ctx.in_water = p.render_state.in_water;
+
+    // نزدیک‌ترین Courier در حال پرواز و نزدیک‌ترین سرباز لاین در حال دویدن
+    let listener = p.audio_ctx.listener_pos;
+    p.audio_ctx.active_courier_pos = p
+        .latest_couriers
+        .0
+        .iter()
+        .filter(|c| !c.is_dead && c.is_visible && c.order != CourierOrder::Idle)
+        .min_by(|a, b| {
+            a.pos
+                .distance_squared(listener)
+                .total_cmp(&b.pos.distance_squared(listener))
+        })
+        .map(|c| c.pos);
+
+    let mut nearest_creep: Option<(f32, Vec3)> = None;
+    let mut running_count = 0usize;
+    for c in &p.latest_creeps.0 {
+        if !c.is_dead && c.is_visible && c.anim_state == CreepAnimState::Run {
+            running_count += 1;
+            let d2 = c.pos.distance_squared(listener);
+            if nearest_creep.map_or(true, |(bd2, _)| d2 < bd2) {
+                nearest_creep = Some((d2, c.pos));
+            }
+        }
+    }
+    p.audio_ctx.running_creeps_nearest_pos = nearest_creep.map(|(_, pos)| pos);
+    p.audio_ctx.running_creeps_count = running_count;
+
+    if !in_game {
+        tr.prev_in_game = false;
+        return;
+    }
+
+    if !tr.prev_in_game {
+        tr.prev_in_game = true;
+        p.audio_q.0.push(ClientAudioEvent::MatchStarted);
+    }
+
+    if p.render_state.is_dead && !tr.prev_dead {
+        p.audio_q.0.push(ClientAudioEvent::HeroDeath);
+    } else if !p.render_state.is_dead && tr.prev_dead {
+        p.audio_q.0.push(ClientAudioEvent::HeroRespawn);
+    }
+    tr.prev_dead = p.render_state.is_dead;
+
+    if p.hero_hud.0.courier_is_dead && !tr.prev_courier_dead {
+        p.audio_q.0.push(ClientAudioEvent::CourierDeath);
+    } else if !p.hero_hud.0.courier_is_dead && tr.prev_courier_dead {
+        p.audio_q.0.push(ClientAudioEvent::CourierRespawn);
+    }
+    tr.prev_courier_dead = p.hero_hud.0.courier_is_dead;
+
+    if let Some(prev_w) = tr.prev_weapon {
+        if prev_w != p.hero_hud.0.active_weapon {
+            p.audio_q.0.push(ClientAudioEvent::WeaponSwitch);
+        }
+    }
+    tr.prev_weapon = Some(p.hero_hud.0.active_weapon);
+
+    if tr.prev_upper != Some(p.render_state.upper_action) {
+        match p.render_state.upper_action {
+            UpperBodyAction::Reloading => {
+                p.audio_q.0.push(if p.hero_hud.0.active_weapon == ActiveWeaponSlot::Pistol {
+                    ClientAudioEvent::PistolReload
+                } else {
+                    ClientAudioEvent::PrimaryReload
+                });
+            }
+            UpperBodyAction::TossGrenade => {
+                p.audio_q.0.push(ClientAudioEvent::GrenadeThrow);
+            }
+            _ => {}
+        }
+        tr.prev_upper = Some(p.render_state.upper_action);
+    }
+
+    if p.render_state.traversal_active && !tr.prev_traversal {
+        p.audio_q.0.push(ClientAudioEvent::TraversalMove {
+            anim_name: p.render_state.traversal_anim_name.clone(),
+        });
+    }
+    tr.prev_traversal = p.render_state.traversal_active;
+
+    if tr.prev_winner.is_none() {
+        if let Some(winner) = p.match_result.0 {
+            p.audio_q.0.push(ClientAudioEvent::MatchEnded {
+                victory: winner == p.hero_hud.0.team,
+            });
+            tr.prev_winner = Some(winner);
+        }
+    }
+
+    if tr.prev_dead_turrets.len() != p.latest_turrets.0.len() {
+        tr.prev_dead_turrets = p.latest_turrets.0.iter().map(|t| t.is_dead).collect();
+    } else {
+        for (i, t) in p.latest_turrets.0.iter().enumerate() {
+            if t.is_dead && !tr.prev_dead_turrets[i] {
+                p.audio_q.0.push(ClientAudioEvent::TurretDestroyed {
+                    pos: p.config.map.turrets[i].model_transform.location_vec(),
+                });
+            }
+            tr.prev_dead_turrets[i] = t.is_dead;
+        }
+    }
+
+    if tr.prev_dead_barracks.len() != p.latest_barracks.0.len() {
+        tr.prev_dead_barracks = p.latest_barracks.0.iter().map(|b| b.is_dead).collect();
+    } else {
+        for (i, b) in p.latest_barracks.0.iter().enumerate() {
+            if b.is_dead && !tr.prev_dead_barracks[i] {
+                p.audio_q.0.push(ClientAudioEvent::BuildingDestroyed {
+                    pos: p.config.map.barracks[i].model_transform.location_vec(),
+                });
+            }
+            tr.prev_dead_barracks[i] = b.is_dead;
+        }
+    }
+
+    if tr.prev_dead_ancients.len() != p.latest_ancients.0.len() {
+        tr.prev_dead_ancients = p.latest_ancients.0.iter().map(|a| a.is_dead).collect();
+    } else {
+        for (i, a) in p.latest_ancients.0.iter().enumerate() {
+            if a.is_dead && !tr.prev_dead_ancients[i] {
+                p.audio_q.0.push(ClientAudioEvent::BuildingDestroyed {
+                    pos: p.config.map.ancients[i].model_transform.location_vec(),
+                });
+            }
+            tr.prev_dead_ancients[i] = a.is_dead;
+        }
     }
 }

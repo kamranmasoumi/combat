@@ -5,9 +5,11 @@ use bevy::input::ButtonState;
 use bevy::prelude::*;
 use bevy::ui::RelativeCursorPosition;
 use bevy::window::PrimaryWindow;
+use crate::audio_client::{AudioCategory, AudioEventQueue, AudioSettingsState, ClientAudioEvent};
 use moba_shared::{
     ClientLobbyMessage, CourierOrder, InventoryItemState, ItemCategory, ItemDef, ItemsConfig,
 };
+use moba_shared::GameConfig;
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -225,6 +227,7 @@ impl Plugin for ShopPlugin {
                 (
                     sell_confirm_modal_system,
                     settings_modal_interaction_system,
+                    audio_mixer_slider_interaction_system,
                     rebuild_settings_modal_system,
                     inventory_shortcut_trigger_system,
                     hud_inventory_drag_and_drop_system,
@@ -407,6 +410,22 @@ struct SettingsSlotBindBtn(usize);
 
 #[derive(Component)]
 struct SettingsSlotClearBtn(usize);
+
+#[derive(Component)]
+struct SettingsAudioContainer;
+
+#[derive(Component)]
+struct AudioSliderTrack {
+    channel: Option<usize>, // None = Master, Some(idx) = AudioCategory index
+}
+
+#[derive(Component)]
+struct AudioChannelMuteBtn {
+    channel: Option<usize>,
+}
+
+#[derive(Component)]
+struct AudioResetBtn;
 
 #[derive(Component)]
 struct SettingsStatusText;
@@ -1115,6 +1134,30 @@ fn spawn_shop_and_inventory_ui(mut commands: Commands) {
                     ));
 
                     card.spawn((
+                        Text::new("ADVANCED AUDIO MIXER"),
+                        TextFont {
+                            font_size: FontSize::Px(15.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.45, 0.88, 1.0)),
+                    ));
+
+                    card.spawn((
+                        SettingsAudioContainer,
+                        Node {
+                            width: percent(100),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(7.0),
+                            padding: UiRect::all(px(10.0)),
+                            border: UiRect::all(px(1.0)),
+                            border_radius: BorderRadius::all(px(8.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.28, 0.40, 0.54, 0.75)),
+                        BackgroundColor(Color::srgba(0.06, 0.09, 0.14, 0.90)),
+                    ));
+
+                    card.spawn((
                         SettingsStatusText,
                         Text::new("Select a slot to assign a shortcut."),
                         TextFont {
@@ -1273,8 +1316,10 @@ fn shop_hotkey_and_button_system(
     ctx: Res<ShopContextSnapshot>,
     mut ui_state: ResMut<ShopUiState>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
+    mut audio_q: ResMut<AudioEventQueue>,
     mut p: ShopInteractionParams,
 ) {
+    let was_open = ui_state.is_open;
     if ui_state.selected_item_id.is_empty() {
         if let Some(first) = items_cfg.items.first() {
             ui_state.selected_item_id = first.id.clone();
@@ -1301,7 +1346,15 @@ fn shop_hotkey_and_button_system(
             ui_state.is_open = false;
             ui_state.search_focused = false;
         }
-        if let Ok(mut m_node) = p.modal_q.single_mut() {
+        if ui_state.is_open != was_open {
+        audio_q.0.push(if ui_state.is_open {
+            ClientAudioEvent::ShopOpen
+        } else {
+            ClientAudioEvent::ShopClose
+        });
+    }
+
+    if let Ok(mut m_node) = p.modal_q.single_mut() {
             if m_node.display != Display::None {
                 m_node.display = Display::None;
             }
@@ -1383,6 +1436,7 @@ fn shop_hotkey_and_button_system(
                     &mut ui_state.cart,
                     !ctrl_held,
                 );
+                audio_q.0.push(ClientAudioEvent::ShopAddCart);
             }
             ui_state.dirty = true;
         }
@@ -1391,6 +1445,14 @@ fn shop_hotkey_and_button_system(
     for (inter, buy_btn) in &p.buy_now_q {
         if *inter == Interaction::Pressed {
             ui_state.search_focused = false;
+            let is_combine = items_cfg
+                .effective_purchase_cost(&buy_btn.0, &ctx.inventory)
+                .is_some_and(|(_, consumed)| !consumed.is_empty());
+            audio_q.0.push(if is_combine {
+                ClientAudioEvent::ShopCombine
+            } else {
+                ClientAudioEvent::ShopBuy
+            });
             outgoing.0.push(ClientLobbyMessage::BuyItem {
                 item_id: buy_btn.0.clone(),
             });
@@ -1409,6 +1471,7 @@ fn shop_hotkey_and_button_system(
                 &mut ui_state.cart,
                 false,
             );
+            audio_q.0.push(ClientAudioEvent::ShopAddCart);
             ui_state.dirty = true;
         }
     }
@@ -1422,6 +1485,14 @@ fn shop_hotkey_and_button_system(
 
     for inter in &p.buy_cart_q {
         if *inter == Interaction::Pressed && !ui_state.cart.is_empty() {
+            let has_combine = ui_state.cart.iter().any(|cid| {
+                items_cfg.get_item(cid).is_some_and(|it| !it.recipe.is_empty())
+            });
+            audio_q.0.push(if has_combine {
+                ClientAudioEvent::ShopCombine
+            } else {
+                ClientAudioEvent::ShopBuy
+            });
             outgoing.0.push(ClientLobbyMessage::BuyCart {
                 item_ids: ui_state.cart.clone(),
             });
@@ -2689,6 +2760,7 @@ fn sell_confirm_modal_system(
     ctx: Res<ShopContextSnapshot>,
     mut ui_state: ResMut<ShopUiState>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
+    mut audio_q: ResMut<AudioEventQueue>,
     accept_q: Query<(&Interaction, &SellConfirmAcceptBtn), Changed<Interaction>>,
     cancel_q: Query<&Interaction, (Changed<Interaction>, With<SellConfirmCancelBtn>)>,
     mut modal_q: Query<&mut Node, With<SellConfirmModalRoot>>,
@@ -2697,6 +2769,7 @@ fn sell_confirm_modal_system(
 ) {
     for (inter, btn) in &accept_q {
         if *inter == Interaction::Pressed {
+            audio_q.0.push(ClientAudioEvent::ShopSell);
             outgoing.0.push(ClientLobbyMessage::SellItem { inv_index: btn.0 });
             ui_state.pending_sell_slot = None;
             ui_state.dirty = true;
@@ -2983,6 +3056,190 @@ fn settings_modal_interaction_system(
     }
 }
 
+
+fn audio_mixer_slider_interaction_system(
+    config: Res<GameConfig>,
+    settings_ui: Res<SettingsUiState>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut audio_settings: ResMut<AudioSettingsState>,
+    slider_q: Query<(&AudioSliderTrack, &RelativeCursorPosition)>,
+    mute_q: Query<(&Interaction, &AudioChannelMuteBtn), Changed<Interaction>>,
+    reset_q: Query<&Interaction, (Changed<Interaction>, With<AudioResetBtn>)>,
+) {
+    if !settings_ui.is_open {
+        return;
+    }
+
+    for inter in &reset_q {
+        if *inter == Interaction::Pressed {
+            audio_settings.reset_from_config(&config.audio);
+        }
+    }
+
+    for (inter, mbtn) in &mute_q {
+        if *inter == Interaction::Pressed {
+            match mbtn.channel {
+                None => audio_settings.master_muted = !audio_settings.master_muted,
+                Some(idx) if idx < 7 => audio_settings.channel_muted[idx] = !audio_settings.channel_muted[idx],
+                _ => {}
+            }
+            audio_settings.dirty = true;
+        }
+    }
+
+    if mouse.pressed(MouseButton::Left) {
+        for (track, rel) in &slider_q {
+            if let Some(pos) = rel.normalized {
+                if (-0.52..=0.52).contains(&pos.x) && (-0.55..=0.55).contains(&pos.y) {
+                    let val = (pos.x + 0.5).clamp(0.0, 1.0);
+                    match track.channel {
+                        None => {
+                            if (audio_settings.master_volume - val).abs() > 0.005 {
+                                audio_settings.master_volume = val;
+                                audio_settings.dirty = true;
+                            }
+                        }
+                        Some(idx) if idx < 7 => {
+                            if (audio_settings.channel_volumes[idx] - val).abs() > 0.005 {
+                                audio_settings.channel_volumes[idx] = val;
+                                audio_settings.dirty = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spawn_audio_slider_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    channel: Option<usize>,
+    value: f32,
+    muted: bool,
+    accent_col: Color,
+) {
+    let pct = (value * 100.0).round() as u32;
+    parent
+        .spawn(Node {
+            width: percent(100),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(10.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn(Node {
+                width: px(155.0),
+                ..default()
+            })
+            .with_children(|lbl| {
+                lbl.spawn((
+                    Text::new(label),
+                    TextFont {
+                        font_size: FontSize::Px(11.5),
+                        ..default()
+                    },
+                    TextColor(if muted {
+                        Color::srgba(0.55, 0.58, 0.65, 0.7)
+                    } else {
+                        Color::srgb(0.88, 0.94, 1.0)
+                    }),
+                ));
+            });
+
+            row.spawn((
+                Interaction::default(),
+                AudioChannelMuteBtn { channel },
+                Node {
+                    width: px(44.0),
+                    padding: UiRect::axes(px(4.0), px(3.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(px(1.0)),
+                    border_radius: BorderRadius::all(px(4.0)),
+                    ..default()
+                },
+                BorderColor::all(if muted {
+                    Color::srgb(0.95, 0.30, 0.30)
+                } else {
+                    Color::srgba(0.35, 0.48, 0.62, 0.75)
+                }),
+                BackgroundColor(if muted {
+                    Color::srgba(0.34, 0.08, 0.08, 0.92)
+                } else {
+                    Color::srgba(0.10, 0.14, 0.20, 0.92)
+                }),
+            ))
+            .with_children(|mb| {
+                mb.spawn((
+                    Pickable::IGNORE,
+                    Text::new(if muted { "MUTED" } else { "ON" }),
+                    TextFont {
+                        font_size: FontSize::Px(9.5),
+                        ..default()
+                    },
+                    TextColor(if muted {
+                        Color::srgb(1.0, 0.45, 0.45)
+                    } else {
+                        Color::srgb(0.45, 0.95, 0.65)
+                    }),
+                ));
+            });
+
+            // نوار اسلایدر قابل کلیک و درگ
+            row.spawn((
+                AudioSliderTrack { channel },
+                RelativeCursorPosition::default(),
+                Node {
+                    flex_grow: 1.0,
+                    height: px(16.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::FlexStart,
+                    border: UiRect::all(px(1.0)),
+                    border_radius: BorderRadius::all(px(5.0)),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.28, 0.38, 0.52, 0.85)),
+                BackgroundColor(Color::srgba(0.04, 0.06, 0.09, 0.95)),
+            ))
+            .with_children(|track| {
+                track.spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: percent((value * 100.0).clamp(0.0, 100.0)),
+                        height: percent(100),
+                        ..default()
+                    },
+                    BackgroundColor(if muted {
+                        Color::srgba(0.45, 0.45, 0.48, 0.55)
+                    } else {
+                        accent_col
+                    }),
+                ));
+            });
+
+            row.spawn(Node {
+                width: px(42.0),
+                justify_content: JustifyContent::FlexEnd,
+                ..default()
+            })
+            .with_children(|pct_box| {
+                pct_box.spawn((
+                    Text::new(format!("{}%", pct)),
+                    TextFont {
+                        font_size: FontSize::Px(11.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.85, 0.92, 1.0)),
+                ));
+            });
+        });
+}
+
 fn rebuild_settings_modal_system(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -2990,14 +3247,19 @@ fn rebuild_settings_modal_system(
     items_cfg: Res<ItemsConfig>,
     ctx: Res<ShopContextSnapshot>,
     mut settings_ui: ResMut<SettingsUiState>,
+    mut audio_settings: ResMut<AudioSettingsState>,
     shortcuts: Res<InventoryShortcutsState>,
     container_q: Query<(Entity, Option<&Children>), With<SettingsSlotsContainer>>,
+    audio_cont_q: Query<(Entity, Option<&Children>), With<SettingsAudioContainer>>,
     mut status_q: Query<(&mut Text, &mut TextColor), With<SettingsStatusText>>,
 ) {
-    if !settings_ui.is_open || !settings_ui.dirty {
+    if !settings_ui.is_open || (!settings_ui.dirty && !audio_settings.dirty) {
         return;
     }
+    let rebuild_slots = settings_ui.dirty;
+    let rebuild_audio = settings_ui.dirty || audio_settings.dirty;
     settings_ui.dirty = false;
+    audio_settings.dirty = false;
 
     if let Ok((mut st_txt, mut st_col)) = status_q.single_mut() {
         if let Some((msg, is_err)) = &settings_ui.status_message {
@@ -3013,6 +3275,65 @@ fn rebuild_settings_modal_system(
         }
     }
 
+    if rebuild_audio {
+        if let Ok((ac_ent, ac_ch)) = audio_cont_q.single() {
+            clear_children(&mut commands, ac_ch);
+            commands.entity(ac_ent).with_children(|ac| {
+                spawn_audio_slider_row(
+                    ac,
+                    "MASTER VOLUME",
+                    None,
+                    audio_settings.master_volume,
+                    audio_settings.master_muted,
+                    Color::srgb(0.98, 0.80, 0.24),
+                );
+                for cat in AudioCategory::ALL {
+                    let idx = cat.index();
+                    spawn_audio_slider_row(
+                        ac,
+                        cat.label(),
+                        Some(idx),
+                        audio_settings.channel_volumes[idx],
+                        audio_settings.channel_muted[idx],
+                        Color::srgb(0.24, 0.78, 0.96),
+                    );
+                }
+                ac.spawn(Node {
+                    width: percent(100),
+                    justify_content: JustifyContent::FlexEnd,
+                    margin: UiRect::top(px(4.0)),
+                    ..default()
+                })
+                .with_children(|rrow| {
+                    rrow.spawn((
+                        Interaction::default(),
+                        AudioResetBtn,
+                        Node {
+                            padding: UiRect::axes(px(10.0), px(4.0)),
+                            border: UiRect::all(px(1.0)),
+                            border_radius: BorderRadius::all(px(5.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.45, 0.65, 0.85, 0.8)),
+                        BackgroundColor(Color::srgba(0.10, 0.16, 0.24, 0.95)),
+                    ))
+                    .with_children(|rb| {
+                        rb.spawn((
+                            Pickable::IGNORE,
+                            Text::new("RESET AUDIO TO CONFIG"),
+                            TextFont {
+                                font_size: FontSize::Px(10.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.85, 0.94, 1.0)),
+                        ));
+                    });
+                });
+            });
+        }
+    }
+
+    if rebuild_slots {
     if let Ok((cont_ent, ch)) = container_q.single() {
         clear_children(&mut commands, ch);
         commands.entity(cont_ent).with_children(|row| {
@@ -3140,6 +3461,7 @@ fn rebuild_settings_modal_system(
                 });
             }
         });
+    }
     }
 }
 
@@ -3294,6 +3616,7 @@ fn courier_hud_and_hotkey_system(
     keys: Res<ButtonInput<KeyCode>>,
     mut courier_ctrl: ResMut<CourierControlState>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
+    mut audio_q: ResMut<AudioEventQueue>,
     mut p: CourierHudParams,
 ) {
     if !ctx.in_game {
@@ -3323,6 +3646,7 @@ fn courier_hud_and_hotkey_system(
     }
     for (inter, btn) in &p.shop_sell_cour_q {
         if *inter == Interaction::Pressed {
+            audio_q.0.push(ClientAudioEvent::ShopSell);
             outgoing.0.push(ClientLobbyMessage::SellCourierItem { inv_index: btn.0 });
         }
     }

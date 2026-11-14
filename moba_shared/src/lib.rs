@@ -58,12 +58,100 @@ pub struct ScoreboardConfig {
     pub max_item_slots: usize,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroWeaponAudioDef {
+    pub primary_fire_sound: String,
+    pub pistol_fire_sound: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AmbientZoneAudioDef {
+    pub id: String,
+    pub center: (f32, f32, f32),
+    pub radius: f32,
+    pub sound_path: String,
+    pub base_volume: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AudioConfig {
+    pub master_volume: f32,
+    pub music_volume: f32,
+    pub ambience_volume: f32,
+    pub weapons_volume: f32,
+    pub movement_volume: f32,
+    pub units_volume: f32,
+    pub ui_volume: f32,
+    pub alerts_volume: f32,
+    pub spatial_scale: f32,
+    pub max_hearing_distance: f32,
+    pub hero_weapons: HashMap<String, HeroWeaponAudioDef>,
+    pub run_to_dive_sound: String,
+    pub running_slide_sound: String,
+    pub grenade_countdown_beep_sound: String,
+    pub grenade_explosion_sound: String,
+    pub footstep_sounds: Vec<String>,
+    pub footstep_interval_secs: f32,
+    pub weapon_switch_sound: String,
+    pub swim_stroke_sound: String,
+    pub swim_interval_secs: f32,
+    pub shallow_water_step_sound: String,
+    pub shallow_water_step_interval_secs: f32,
+    pub quick_roll_to_run_sound: String,
+    pub grenade_throw_sound: String,
+    pub running_dive_roll_sound: String,
+    pub hero_death_sound: String,
+    pub jump_over_sound: String,
+    pub obstacle_jump_sound: String,
+    pub primary_reload_sound: String,
+    pub pistol_reload_sound: String,
+    pub impact_stone_wall_sound: String,
+    pub impact_turret_sound: String,
+    pub impact_character_sound: String,
+    pub impact_building_sound: String,
+    pub impact_water_sound: String,
+    pub creep_fire_sound: String,
+    pub creep_fire_max_concurrent: usize,
+    pub creep_fire_crowd_ducking: f32,
+    pub creep_run_loop_sound: String,
+    pub gold_gain_sound: String,
+    pub deny_sound: String,
+    pub turret_destroy_sound: String,
+    pub turret_fire_sound: String,
+    pub building_destroy_sound: String,
+    pub victory_sound: String,
+    pub defeat_sound: String,
+    pub low_hp_threshold_ratio: f32,
+    pub heartbeat_sound: String,
+    pub heartbeat_min_interval_secs: f32,
+    pub heartbeat_max_interval_secs: f32,
+    pub low_hp_world_duck_min_factor: f32,
+    pub low_hp_vignette_max_alpha: f32,
+    pub hero_respawn_sound: String,
+    pub courier_death_sound: String,
+    pub courier_respawn_sound: String,
+    pub courier_fly_loop_sound: String,
+    pub match_start_sound: String,
+    pub background_music_sound: String,
+    pub shop_add_cart_sound: String,
+    pub shop_buy_sound: String,
+    pub shop_sell_sound: String,
+    pub shop_combine_sound: String,
+    pub shop_open_sound: String,
+    pub shop_close_sound: String,
+    pub empty_gun_click_sound: String,
+    pub empty_grenade_click_sound: String,
+    pub level_up_sound: String,
+    pub ambient_zones: Vec<AmbientZoneAudioDef>,
+}
+
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
     pub pause: PauseConfig,
     pub ping: PingConfig,
     pub chat: ChatConfig,
     pub scoreboard: ScoreboardConfig,
+    pub audio: AudioConfig,
     pub network: NetworkConfig,
     pub window: WindowConfig,
     pub camera: CameraConfig,
@@ -104,6 +192,7 @@ impl GameConfig {
         cfg.validate_ancients();
         cfg.validate_chat();
         cfg.validate_scoreboard();
+        cfg.validate_audio();
         cfg.validate_ping();
         cfg.validate_pause();
         cfg.validate_camera();
@@ -270,6 +359,25 @@ impl GameConfig {
         assert!(self.ping.world_ring_radius > 0.0, "ping.world_ring_radius باید بزرگ‌تر از صفر باشد");
         assert!(self.ping.beam_height > 0.0, "ping.beam_height باید بزرگ‌تر از صفر باشد");
         assert!(self.ping.minimap_pulse_speed > 0.0, "ping.minimap_pulse_speed باید بزرگ‌تر از صفر باشد");
+    }
+
+    pub fn validate_audio(&self) {
+        let a = &self.audio;
+        assert!(a.spatial_scale > 0.0, "audio.spatial_scale باید بزرگ‌تر از صفر باشد");
+        assert!(a.max_hearing_distance > 1.0, "audio.max_hearing_distance باید بزرگ‌تر از 1 باشد");
+        assert!(a.footstep_interval_secs > 0.05, "audio.footstep_interval_secs نامعتبر است");
+        assert!(a.swim_interval_secs > 0.05, "audio.swim_interval_secs نامعتبر است");
+        assert!(a.shallow_water_step_interval_secs > 0.05, "audio.shallow_water_step_interval_secs نامعتبر است");
+        assert!(a.creep_fire_max_concurrent > 0, "audio.creep_fire_max_concurrent باید حداقل 1 باشد");
+        assert!(a.low_hp_threshold_ratio > 0.0 && a.low_hp_threshold_ratio < 1.0, "audio.low_hp_threshold_ratio باید بین 0 و 1 باشد");
+        assert!(a.heartbeat_min_interval_secs > 0.1 && a.heartbeat_max_interval_secs >= a.heartbeat_min_interval_secs, "بازه ضربان قلب نامعتبر است");
+        for hero in &self.heroes {
+            assert!(
+                a.hero_weapons.contains_key(&hero.id),
+                "تنظیمات صدای سلاح برای هیرو '{}' در audio.hero_weapons تعریف نشده است!",
+                hero.id
+            );
+        }
     }
 
     pub fn validate_scoreboard(&self) {
@@ -1441,11 +1549,30 @@ impl ClientInputCommand {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImpactSurface {
+    StoneWall,
+    Turret,
+    Character,
+    Building,
+    Water,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ShotAudioSource {
+    Hero {
+        hero_id: String,
+        weapon_kind: WeaponKind,
+    },
+    Creep,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum GameplayFxEvent {
     ShotFired {
         muzzle_pos: Vec3,
         shot_dir: Vec3,
+        source: ShotAudioSource,
         trauma_add: f32,
         trauma_max: f32,
     },
@@ -1456,6 +1583,7 @@ pub enum GameplayFxEvent {
     BulletImpact {
         impact_pos: Vec3,
         bullet_dir: Vec3,
+        surface: ImpactSurface,
         target_destroyed: bool,
         trauma_add: f32,
         trauma_max: f32,
@@ -7586,6 +7714,10 @@ fn step_shooting_and_grenade_spawn(
         world.pending_fx.push(GameplayFxEvent::ShotFired {
             muzzle_pos,
             shot_dir: first_dir,
+            source: ShotAudioSource::Hero {
+                hero_id: world.hero_id.clone(),
+                weapon_kind: active_w.weapon_kind,
+            },
             trauma_add: config.combat.shot_fire_trauma_add,
             trauma_max: config.combat.shot_fire_trauma_max,
         });
@@ -7987,6 +8119,7 @@ fn shared_authoritative_react_system(
             world.pending_fx.push(GameplayFxEvent::BulletImpact {
                 impact_pos,
                 bullet_dir: step_dir,
+                surface: ImpactSurface::Character,
                 target_destroyed: enemy_killed,
                 trauma_add: config.combat.shot_fire_trauma_add,
                 trauma_max: config.combat.shot_fire_trauma_max,
@@ -8039,6 +8172,7 @@ fn shared_authoritative_react_system(
             world.pending_fx.push(GameplayFxEvent::BulletImpact {
                 impact_pos,
                 bullet_dir: step_dir,
+                surface: ImpactSurface::Character,
                 target_destroyed: cour_killed,
                 trauma_add: config.combat.shot_fire_trauma_add,
                 trauma_max: config.combat.shot_fire_trauma_max,
@@ -8164,6 +8298,7 @@ fn shared_authoritative_react_system(
             world.pending_fx.push(GameplayFxEvent::BulletImpact {
                 impact_pos,
                 bullet_dir: step_dir,
+                surface: ImpactSurface::Character,
                 target_destroyed: creep_killed,
                 trauma_add: config.combat.shot_fire_trauma_add * 0.5,
                 trauma_max: config.combat.shot_fire_trauma_max,
@@ -8174,7 +8309,9 @@ fn shared_authoritative_react_system(
 
         if let Some((hit_entity, impact_pos, _)) = ray_hit {
             let mut target_destroyed = false;
+            let mut impact_surface = ImpactSurface::StoneWall;
             if let Some(&tur_idx) = turret_idx_by_entity.get(&hit_entity) {
+                impact_surface = ImpactSurface::Turret;
                 let turret_team = world.turrets[tur_idx].team;
                 let turret_invuln = world.turrets[tur_idx].is_invulnerable;
                 let turret_dead = world.turrets[tur_idx].is_dead;
@@ -8219,6 +8356,7 @@ fn shared_authoritative_react_system(
                     }
                 }
             } else if let Some(&bar_idx) = barracks_idx_by_entity.get(&hit_entity) {
+                impact_surface = ImpactSurface::Building;
                 let bar_team = world.barracks[bar_idx].team;
                 let bar_lane = world.barracks[bar_idx].lane;
                 let bar_kind = world.barracks[bar_idx].kind;
@@ -8273,6 +8411,7 @@ fn shared_authoritative_react_system(
                     }
                 }
             } else if let Some(&anc_idx) = ancient_idx_by_entity.get(&hit_entity) {
+                impact_surface = ImpactSurface::Building;
                 let anc_team = world.ancients[anc_idx].team;
                 let anc_invuln = world.ancients[anc_idx].is_invulnerable;
                 let anc_dead = world.ancients[anc_idx].is_dead;
@@ -8300,6 +8439,7 @@ fn shared_authoritative_react_system(
                     }
                 }
             } else if let Some(&t_idx) = target_idx_by_entity.get(&hit_entity) {
+                impact_surface = ImpactSurface::Character;
                 let target = &mut world.targets[t_idx];
                 target.hp -= bullet.damage;
                 target.hit_flash_timer = config.fx.target_hit_flash_secs;
@@ -8335,6 +8475,7 @@ fn shared_authoritative_react_system(
             world.pending_fx.push(GameplayFxEvent::BulletImpact {
                 impact_pos,
                 bullet_dir: step_dir,
+                surface: impact_surface,
                 target_destroyed,
                 trauma_add: config.combat.target_destroy_trauma_add,
                 trauma_max: config.combat.target_destroy_trauma_max,
@@ -8347,9 +8488,18 @@ fn shared_authoritative_react_system(
                 let crossed_water = (old_pos.y >= water_y - 0.15 && new_pos.y <= water_y + 0.15)
                     || (mid_pos.y - water_y).abs() <= 0.35;
                 if crossed_water {
+                    let wp = Vec3::new(mid_pos.x, water_y, mid_pos.z);
                     world.pending_fx.push(GameplayFxEvent::WaterSplash {
-                        pos: Vec3::new(mid_pos.x, water_y, mid_pos.z),
+                        pos: wp,
                         intensity: 1.15,
+                    });
+                    world.pending_fx.push(GameplayFxEvent::BulletImpact {
+                        impact_pos: wp,
+                        bullet_dir: step_dir,
+                        surface: ImpactSurface::Water,
+                        target_destroyed: false,
+                        trauma_add: 0.0,
+                        trauma_max: config.combat.shot_fire_trauma_max,
                     });
                 }
             }
@@ -9112,6 +9262,7 @@ fn step_lane_creeps_system(
                     world.pending_fx.push(GameplayFxEvent::ShotFired {
                         muzzle_pos,
                         shot_dir,
+                        source: ShotAudioSource::Creep,
                         trauma_add: 0.0,
                         trauma_max: config.combat.shot_fire_trauma_max,
                     });

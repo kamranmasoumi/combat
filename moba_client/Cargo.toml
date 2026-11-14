@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 moba_shared = { path = "../moba_shared" }
-bevy = { workspace = true, features = ["3d", "ui", "audio", "serialize", "jpeg"] }
+bevy = { workspace = true, features = ["3d", "ui", "audio", "serialize", "jpeg", "mp3", "wav"] }
 renet = { workspace = true }
 renet_netcode = { workspace = true }
 bincode = { workspace = true }

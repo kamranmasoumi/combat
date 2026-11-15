@@ -354,6 +354,14 @@ impl GameConfig {
         );
         assert!(self.camera.occlusion_terrain_cutout_radius > 0.0, "occlusion_terrain_cutout_radius باید بزرگ‌تر از صفر باشد");
         assert!(self.camera.occlusion_terrain_rim_width > 0.0, "occlusion_terrain_rim_width باید بزرگ‌تر از صفر باشد");
+        for hero in &self.heroes {
+            assert!(hero.wall_climb.attach_distance > 0.0, "hero.wall_climb.attach_distance باید بزرگ‌تر از صفر باشد");
+            assert!(hero.wall_climb.climb_up_speed > 0.0, "hero.wall_climb.climb_up_speed باید بزرگ‌تر از صفر باشد");
+            assert!(hero.wall_climb.climb_down_speed > 0.0, "hero.wall_climb.climb_down_speed باید بزرگ‌تر از صفر باشد");
+            assert!(hero.wall_climb.top_ledge_trigger_below > 0.0, "hero.wall_climb.top_ledge_trigger_below باید بزرگ‌تر از صفر باشد");
+            assert!(hero.wall_climb.top_exit_forward_dist > 0.0, "hero.wall_climb.top_exit_forward_dist باید بزرگ‌تر از صفر باشد");
+            assert!(hero.wall_climb.climb_to_top_duration > 0.0, "hero.wall_climb.climb_to_top_duration باید بزرگ‌تر از صفر باشد");
+        }
     }
 
     pub fn validate_pause(&self) {
@@ -490,6 +498,10 @@ impl GameConfig {
                 index
             )
         })
+    }
+
+    pub fn hero_by_id(&self, id: &str) -> &HeroDef {
+        self.heroes.iter().find(|h| h.id == id).unwrap_or_else(|| self.active_hero(0))
     }
 
     pub fn validate_unique_map_ids(&self) {
@@ -935,6 +947,7 @@ pub struct HeroDef {
     pub deep_water_speed_multiplier: f32,
     pub vision_range: f32,
     pub high_ground_vision_bonus: f32,
+    pub wall_climb: WallClimbConfig,
     pub weapon: HeroWeaponDef,
     pub pistol: HeroWeaponDef,
     pub grenade: HeroGrenadeDef,
@@ -952,6 +965,18 @@ pub struct HeroLevelGrowth {
     pub hp_regen_per_level: f32,
     pub stamina_regen_per_level: f32,
     pub armor_per_level: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WallClimbConfig {
+    pub attach_distance: f32,
+    pub climb_up_speed: f32,
+    pub climb_down_speed: f32,
+    pub top_exit_y: f32,
+    pub top_ledge_trigger_below: f32,
+    pub top_exit_forward_dist: f32,
+    pub climb_to_top_duration: f32,
+    pub anim_speed_scale: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1496,6 +1521,7 @@ pub struct MountainDef {
     pub size: (f32, f32, f32),
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
+    pub climbable: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1576,6 +1602,7 @@ pub enum TraversalKind {
     ObstacleVault,
     FallDive,
     PitClimb,
+    ClimbToTop,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -5240,6 +5267,8 @@ pub struct PlayerSlotState {
     pub hero_slide_stamina_cost: f32,
     pub hero_jump_over_stamina_cost: f32,
     pub space_hold_secs: Option<f32>,
+    pub wall_climb_mountain_index: Option<usize>,
+    pub wall_climb_last_dir: i8,
     pub hero_armor: f32,
     pub hero_scale: f32,
     pub hero_move_speed_multiplier: f32,
@@ -5326,6 +5355,8 @@ pub struct AuthoritativeWorldState {
     pub hero_slide_stamina_cost: f32,
     pub hero_jump_over_stamina_cost: f32,
     pub space_hold_secs: Option<f32>,
+    pub wall_climb_mountain_index: Option<usize>,
+    pub wall_climb_last_dir: i8,
     pub hero_armor: f32,
     pub hero_scale: f32,
     pub hero_move_speed_multiplier: f32,
@@ -5465,6 +5496,8 @@ impl AuthoritativeWorldState {
             hero_slide_stamina_cost: hero.slide_stamina_cost,
             hero_jump_over_stamina_cost: hero.jump_over_stamina_cost,
             space_hold_secs: None,
+            wall_climb_mountain_index: None,
+            wall_climb_last_dir: 1,
             hero_armor: hero.armor,
             hero_scale: hero.hero_scale,
             hero_move_speed_multiplier: hero.move_speed_multiplier,
@@ -5653,6 +5686,8 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.hero_slide_stamina_cost, &mut p.hero_slide_stamina_cost);
         std::mem::swap(&mut self.hero_jump_over_stamina_cost, &mut p.hero_jump_over_stamina_cost);
         std::mem::swap(&mut self.space_hold_secs, &mut p.space_hold_secs);
+        std::mem::swap(&mut self.wall_climb_mountain_index, &mut p.wall_climb_mountain_index);
+        std::mem::swap(&mut self.wall_climb_last_dir, &mut p.wall_climb_last_dir);
         std::mem::swap(&mut self.hero_armor, &mut p.hero_armor);
         std::mem::swap(&mut self.hero_scale, &mut p.hero_scale);
         std::mem::swap(&mut self.hero_move_speed_multiplier, &mut p.hero_move_speed_multiplier);
@@ -6070,6 +6105,8 @@ impl AuthoritativeWorldState {
                 hero_slide_stamina_cost: hero.slide_stamina_cost,
                 hero_jump_over_stamina_cost: hero.jump_over_stamina_cost,
                 space_hold_secs: None,
+                wall_climb_mountain_index: None,
+                wall_climb_last_dir: 1,
                 hero_armor: hero.armor,
                 hero_scale: hero.hero_scale,
                 hero_move_speed_multiplier: hero.move_speed_multiplier,
@@ -7286,6 +7323,8 @@ fn shared_drive_single_player(
             world.hero_hp = world.hero_max_hp;
             world.hero_stamina = world.hero_max_stamina;
             world.space_hold_secs = None;
+            world.wall_climb_mountain_index = None;
+            world.wall_climb_last_dir = 1;
             world.active_weapon = ActiveWeaponSlot::Primary;
             world.ammo_in_mag = world.hero_weapon.magazine_size;
             world.other_weapon_ammo_in_mag = world.hero_pistol.magazine_size;
@@ -7689,7 +7728,16 @@ fn shared_drive_single_player(
             };
         }
 
-        // ۷. سیستم پرش، غلت و عبور از مانع با پرتو و کپسول فیزیک اختصاصی
+        // ۷. سیستم کوهنوردی از کوه‌های قابل صعود دره + پرش، غلت و عبور از مانع
+        let is_wall_climbing = step_wall_climb_custom(
+            world,
+            input,
+            config,
+            soldier_tf,
+            controller,
+            dt,
+        );
+        if !is_wall_climbing {
         step_traversal_custom(
             world,
             input,
@@ -7703,6 +7751,7 @@ fn shared_drive_single_player(
             controller,
             dt,
         );
+        }
 
         // ۸. جابجایی فیزیکی ۳بعدی کاراکتر همراه با مقاومت طبیعی آب و رانش جریان برکه‌ها
         let water_sample = sample_water_surface_at(config, world.soldier_pos);
@@ -7719,7 +7768,7 @@ fn shared_drive_single_player(
             let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
             let deep_mult = hero_cfg.deep_water_speed_multiplier;
 
-            if is_deep_water && !world.traversal.is_active {
+            if is_deep_water && !world.traversal.is_active && world.wall_climb_mountain_index.is_none() {
                 if world.is_moving {
                     world.current_locomotion = "swimming".to_string();
                     world.firing_anim_remaining = None;
@@ -7747,7 +7796,7 @@ fn shared_drive_single_player(
                 world.water_splash_cooldown = config.physics.water_splash_interval_secs;
             }
 
-            if !world.traversal.is_active {
+            if !world.traversal.is_active && world.wall_climb_mountain_index.is_none() {
                 let grav_y = config.physics.character_gravity_step_y * dt;
                 let flow_drift = Vec3::new(flow_dir.x, 0.0, flow_dir.y) * 0.35 * dt;
                 if world.is_moving {
@@ -7771,7 +7820,7 @@ fn shared_drive_single_player(
                     controller.translation = Some(Vec3::new(flow_drift.x, grav_y, flow_drift.z));
                 }
             }
-        } else if !world.traversal.is_active {
+        } else if !world.traversal.is_active && world.wall_climb_mountain_index.is_none() {
             let grav_y = config.physics.character_gravity_step_y * dt;
             if world.is_moving {
                 let hero_move_mult = world.hero_move_speed_multiplier;
@@ -7791,6 +7840,194 @@ fn shared_drive_single_player(
 
     // ۹. شلیک گلوله و پرتاب نارنجک
     step_shooting_and_grenade_spawn(commands, world, input, config, dt);
+}
+
+fn find_nearest_climbable_mountain(config: &GameConfig, attach_dist: f32, pos: Vec3) -> Option<(usize, Vec3, Vec3)> {
+    let mut best: Option<(f32, usize, Vec3, Vec3)> = None;
+
+    for (idx, mtn) in config.map.mountains.iter().enumerate() {
+        if !mtn.climbable {
+            continue;
+        }
+        let tf = mtn.model_transform.to_transform();
+        let hx = mtn.size.0 * 0.5 * tf.scale.x.abs();
+        let hz = mtn.size.2 * 0.5 * tf.scale.z.abs();
+        let inv_rot = tf.rotation.inverse();
+        let local = inv_rot * (pos - tf.translation);
+        let cx = local.x.clamp(-hx, hx);
+        let cz = local.z.clamp(-hz, hz);
+        let dx = local.x - cx;
+        let dz = local.z - cz;
+        let dist = (dx * dx + dz * dz).sqrt();
+        if dist <= attach_dist {
+            let local_normal = if dist > 1e-4 {
+                Vec3::new(dx / dist, 0.0, dz / dist)
+            } else {
+                let to_edge_x = hx - local.x.abs();
+                let to_edge_z = hz - local.z.abs();
+                if to_edge_x < to_edge_z {
+                    Vec3::new(local.x.signum(), 0.0, 0.0)
+                } else {
+                    Vec3::new(0.0, 0.0, local.z.signum())
+                }
+            };
+            let world_normal = (tf.rotation * local_normal).xz().normalize_or_zero();
+            let world_normal3 = Vec3::new(world_normal.x, 0.0, world_normal.y);
+            let wall_pt = tf.translation + tf.rotation * Vec3::new(cx, 0.0, cz);
+            if best.as_ref().is_none_or(|b| dist < b.0) {
+                best = Some((dist, idx, wall_pt, world_normal3));
+            }
+        }
+    }
+
+    best.map(|(_, idx, pt, n)| (idx, pt, n))
+}
+
+fn step_wall_climb_custom(
+    world: &mut AuthoritativeWorldState,
+    input: &ClientInputCommand,
+    config: &GameConfig,
+    soldier_tf: &mut Transform,
+    controller: &mut CustomCharacterController,
+    dt: f32,
+) -> bool {
+    let wc = &config.active_hero(world.hero_index).wall_climb;
+
+    if let Some(mtn_idx) = world.wall_climb_mountain_index {
+        let Some(mtn) = config.map.mountains.get(mtn_idx) else {
+            world.wall_climb_mountain_index = None;
+            return false;
+        };
+        if !mtn.climbable || world.traversal.is_active {
+            world.wall_climb_mountain_index = None;
+            return false;
+        }
+
+        if input.space_just_pressed {
+            world.wall_climb_mountain_index = None;
+            return false;
+        }
+
+        let tf = mtn.model_transform.to_transform();
+        let hx = mtn.size.0 * 0.5 * tf.scale.x.abs();
+        let hz = mtn.size.2 * 0.5 * tf.scale.z.abs();
+        let inv_rot = tf.rotation.inverse();
+        let local = inv_rot * (world.soldier_pos - tf.translation);
+        let cx = local.x.clamp(-hx, hx);
+        let cz = local.z.clamp(-hz, hz);
+        let dx = local.x - cx;
+        let dz = local.z - cz;
+        let dist = (dx * dx + dz * dz).sqrt();
+        let local_normal = if dist > 1e-4 {
+            Vec3::new(dx / dist, 0.0, dz / dist)
+        } else {
+            Vec3::new(-world.soldier_facing_dir.x, 0.0, -world.soldier_facing_dir.z)
+        };
+        let wall_normal_xz = (tf.rotation * local_normal).xz().normalize_or_zero();
+        let wall_normal = Vec3::new(wall_normal_xz.x, 0.0, wall_normal_xz.y);
+        let wall_pt = tf.translation + tf.rotation * Vec3::new(cx, 0.0, cz);
+
+        let mut cur_y = world.soldier_pos.y;
+        let move_up = input.move_input.z < -0.15;
+        let move_down = input.move_input.z > 0.15;
+
+        if move_up {
+            cur_y += wc.climb_up_speed * dt;
+            world.wall_climb_last_dir = 1;
+            world.current_locomotion = "climbing_up_wall".to_string();
+        } else if move_down {
+            cur_y -= wc.climb_down_speed * dt;
+            world.wall_climb_last_dir = -1;
+            world.current_locomotion = "climbing_down_wall".to_string();
+        } else {
+            world.current_locomotion = if world.wall_climb_last_dir >= 0 {
+                "climbing_up_wall_paused".to_string()
+            } else {
+                "climbing_down_wall_paused".to_string()
+            };
+        }
+
+        if cur_y >= wc.top_exit_y - wc.top_ledge_trigger_below && move_up {
+            world.wall_climb_mountain_index = None;
+            let into_plateau = -wall_normal;
+            let start_pos = Vec3::new(
+                wall_pt.x + wall_normal.x * (config.soldier.player_radius + 0.12),
+                cur_y,
+                wall_pt.z + wall_normal.z * (config.soldier.player_radius + 0.12),
+            );
+            let mut exit_dist = wc.top_exit_forward_dist;
+            for step_i in 0..=24 {
+                let d = wc.top_exit_forward_dist + (step_i as f32) * 0.5;
+                let cx = wall_pt.x + into_plateau.x * d;
+                let cz = wall_pt.z + into_plateau.z * d;
+                if canyon_sample_height(&config.map.canyon, cx, cz) >= -0.05 {
+                    exit_dist = d + 1.2;
+                    break;
+                }
+            }
+            let target_pos = Vec3::new(
+                wall_pt.x + into_plateau.x * exit_dist,
+                wc.top_exit_y,
+                wall_pt.z + into_plateau.z * exit_dist,
+            );
+            world.traversal = SharedTraversalState {
+                is_active: true,
+                kind: TraversalKind::ClimbToTop,
+                anim_name: "climbing_to_top".to_string(),
+                elapsed: 0.0,
+                duration: wc.climb_to_top_duration,
+                start_pos,
+                target_pos,
+                travel_dir: into_plateau,
+            };
+            world.soldier_facing_dir = into_plateau;
+            controller.translation = None;
+            return true;
+        }
+
+        if cur_y <= config.map.canyon.water_y + 0.1 && move_down {
+            world.wall_climb_mountain_index = None;
+            return false;
+        }
+
+        let attach_pos = Vec3::new(
+            wall_pt.x + wall_normal.x * (config.soldier.player_radius + 0.15),
+            cur_y,
+            wall_pt.z + wall_normal.z * (config.soldier.player_radius + 0.15),
+        );
+        world.soldier_pos = attach_pos;
+        soldier_tf.translation = attach_pos + Vec3::Y * (config.physics.soldier_capsule_center_y * world.hero_scale);
+        world.soldier_facing_dir = -wall_normal;
+        controller.translation = None;
+        controller.grounded = false;
+        return true;
+    }
+
+    if !world.traversal.is_active && world.soldier_pos.y < wc.top_exit_y - 1.5 {
+        if let Some((idx, wall_pt, wall_normal)) = find_nearest_climbable_mountain(config, wc.attach_distance, world.soldier_pos) {
+            let pressing_w = input.move_input.z < -0.15;
+            let moving_toward_wall = input.move_input.length_squared() > 0.04
+                && input.move_input.normalize().dot(-wall_normal) > 0.35;
+            if pressing_w || moving_toward_wall {
+                world.wall_climb_mountain_index = Some(idx);
+                world.wall_climb_last_dir = 1;
+                let attach_pos = Vec3::new(
+                    wall_pt.x + wall_normal.x * (config.soldier.player_radius + 0.15),
+                    world.soldier_pos.y,
+                    wall_pt.z + wall_normal.z * (config.soldier.player_radius + 0.15),
+                );
+                world.soldier_pos = attach_pos;
+                soldier_tf.translation = attach_pos + Vec3::Y * (config.physics.soldier_capsule_center_y * world.hero_scale);
+                world.soldier_facing_dir = -wall_normal;
+                world.current_locomotion = "climbing_up_wall".to_string();
+                controller.translation = None;
+                    controller.grounded = false;
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7867,6 +8104,19 @@ fn step_traversal_custom(
                 current_pos.z,
             );
             world.soldier_pos = Vec3::new(current_pos.x, smooth_y, current_pos.z);
+        } else if world.traversal.kind == TraversalKind::ClimbToTop {
+            controller.translation = None;
+            let rise_t = (frac / 0.65).clamp(0.0, 1.0);
+            let step_t = ((frac - 0.55) / 0.45).clamp(0.0, 1.0);
+            let smooth_y = world.traversal.start_pos.y.lerp(world.traversal.target_pos.y, rise_t);
+            let smooth_x = world.traversal.start_pos.x.lerp(world.traversal.target_pos.x, step_t);
+            let smooth_z = world.traversal.start_pos.z.lerp(world.traversal.target_pos.z, step_t);
+            soldier_tf.translation = Vec3::new(
+                smooth_x,
+                smooth_y + config.physics.soldier_capsule_center_y * world.hero_scale,
+                smooth_z,
+            );
+            world.soldier_pos = Vec3::new(smooth_x, smooth_y, smooth_z);
         } else if world.traversal.kind == TraversalKind::ObstacleVault
             || world.traversal.kind == TraversalKind::JumpOver
         {

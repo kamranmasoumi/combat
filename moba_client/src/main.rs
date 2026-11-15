@@ -25,7 +25,7 @@ use moba_shared::{
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CourierOrder, CourierSnapshot, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
-    ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerLobbyPacket, ServerMatchMessage, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerLobbyPacket, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
     FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, ItemsConfig, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ScoreboardHeroInfo, ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
@@ -1284,8 +1284,8 @@ fn setup_scene(
     }
 
     // ۵. آبشارهای طبیعی چندطبقه همراه با ریزش متحرک آب، کف درخشان و مه آبشار
-    let cascade_drop_mesh = meshes.add(Cuboid::new(0.75, 1.1, 0.18));
-    let cascade_drop_mat = materials.add(StandardMaterial {
+    let _cascade_drop_mesh = meshes.add(Cuboid::new(0.75, 1.1, 0.18));
+    let _cascade_drop_mat = materials.add(StandardMaterial {
         base_color: Color::srgba(0.85, 0.97, 1.0, 0.82),
         emissive: LinearRgba::new(1.1, 2.1, 2.8, 0.82),
         alpha_mode: AlphaMode::Blend,
@@ -3299,7 +3299,7 @@ fn client_receive_snapshot_and_sync_system(
             Without<NetworkGrenadeVisual>,
         ),
     >,
-    mut soldier_physics_query: Query<
+    soldier_physics_query: Query<
         &mut Transform,
         (
             With<PhysicsSoldier>,
@@ -4995,13 +4995,53 @@ fn soldier_animation_player_system(
         return;
     }
 
+    let loco_blend = Duration::from_millis(config.animations.locomotion_blend_ms);
+    let is_wall_climb_loco = render_state.current_locomotion.starts_with("climbing_");
+    if is_wall_climb_loco {
+        let is_paused = render_state.current_locomotion.ends_with("_paused");
+        let clip_name = render_state
+            .current_locomotion
+            .strip_suffix("_paused")
+            .unwrap_or(&render_state.current_locomotion);
+        let climb_node = anim_assets.get_or_fallback(clip_name, "freehang_climb");
+        let climb_speed = if is_paused {
+            0.0
+        } else {
+            config.hero_by_id(&hero_hud.0.hero_id).wall_climb.anim_speed_scale
+        };
+
+        let prev_base = render_state
+            .previous_lower_anim
+            .strip_suffix("_paused")
+            .unwrap_or(&render_state.previous_lower_anim);
+        if prev_base != clip_name || !lower_player.is_playing_animation(climb_node) {
+            let l_act = lower_trans
+                .play(&mut lower_player, climb_node, loco_blend)
+                .repeat();
+            l_act.set_speed(climb_speed);
+            let u_act = upper_trans
+                .play(&mut upper_player, climb_node, loco_blend)
+                .repeat();
+            u_act.set_speed(climb_speed);
+        } else if render_state.previous_lower_anim != render_state.current_locomotion {
+            if let Some(l_act) = lower_player.animation_mut(climb_node) {
+                l_act.set_speed(climb_speed);
+            }
+            if let Some(u_act) = upper_player.animation_mut(climb_node) {
+                u_act.set_speed(climb_speed);
+            }
+        }
+        render_state.previous_lower_anim = render_state.current_locomotion.clone();
+        render_state.previous_upper_anim = render_state.current_locomotion.clone();
+        return;
+    }
+
     let fallback_anim = if render_state.current_locomotion == "swimming" {
         "walk_forward"
     } else {
         "idle"
     };
     let lower_node = anim_assets.get_or_fallback(&render_state.current_locomotion, fallback_anim);
-    let loco_blend = Duration::from_millis(config.animations.locomotion_blend_ms);
 
     if render_state.current_locomotion != render_state.previous_lower_anim
         || !lower_player.is_playing_animation(lower_node)
@@ -5291,7 +5331,7 @@ fn minimap_interaction_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     window_query: Query<&Window, With<PrimaryWindow>>,
-    render_state: Res<ClientRenderState>,
+    _render_state: Res<ClientRenderState>,
     courier_ctrl: Res<CourierControlState>,
     mut inspected: ResMut<InspectedUnit>,
     mut hero_move_target: ResMut<HeroClickMoveTarget>,
@@ -7449,13 +7489,40 @@ impl ClientMatchFlow {
 struct MatchOverlayRoot;
 
 #[derive(Component)]
+struct MatchPhaseBadgeText;
+
+#[derive(Component)]
 struct MatchPhaseHeaderText;
 
 #[derive(Component)]
-struct MatchStatusBodyText;
+struct MatchTurnBannerText;
+
+#[derive(Component)]
+struct MatchTimerText;
+
+#[derive(Component)]
+struct MatchTimerFillBar;
+
+#[derive(Component)]
+struct MatchDynamicContentRoot;
+
+#[derive(Component)]
+struct MatchBottomBarFill;
+
+#[derive(Component)]
+struct MatchBottomStatusText;
+
+#[derive(Component)]
+struct HeroSelectWorkspaceRoot;
 
 #[derive(Component)]
 struct HeroPickRowRoot;
+
+#[derive(Component)]
+struct HeroSpecsPanelRoot;
+
+#[derive(Component)]
+struct DraftStripRoot;
 
 #[derive(Component)]
 struct HeroPickButton {
@@ -7463,13 +7530,37 @@ struct HeroPickButton {
 }
 
 #[derive(Component)]
+struct HeroPickStatusBadge {
+    hero_index: usize,
+}
+
+#[derive(Component)]
 struct HeroLockInButton;
 
 #[derive(Component)]
-struct HeroPreviewRoot;
+struct HeroLockInButtonText;
+
+#[derive(Component)]
+struct HeroPreviewRoot {
+    weapon_kind: WeaponKind,
+}
+
+#[derive(Component)]
+struct BattleShowcaseHero {
+    slot_index: usize,
+    weapon_kind: WeaponKind,
+}
+
+#[derive(Component)]
+struct ShowcaseWeaponAttached;
 
 #[derive(Component)]
 struct HeroPreviewAnimStarted;
+
+#[derive(Component)]
+struct PulseAnimatedDot {
+    phase_offset: f32,
+}
 
 #[derive(Component)]
 struct RemotePlayerVisual {
@@ -7710,6 +7801,17 @@ struct SnapshotHudSyncParams<'w, 's> {
     fixed_history: ResMut<'w, FixedSoldierTransformHistory>,
 }
 
+fn weapon_kind_short_badge(wk: WeaponKind) -> (&'static str, Color) {
+    match wk {
+        WeaponKind::AutomaticRifle => ("AR", Color::srgb(0.22, 0.78, 0.95)),
+        WeaponKind::Sniper => ("SNP", Color::srgb(0.45, 0.92, 0.55)),
+        WeaponKind::Shotgun => ("SHT", Color::srgb(0.95, 0.58, 0.22)),
+        WeaponKind::Throwable => ("GRN", Color::srgb(0.95, 0.35, 0.35)),
+        WeaponKind::Pistol => ("PST", Color::srgb(0.75, 0.78, 0.92)),
+    }
+}
+
+#[allow(deprecated)]
 fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
     commands
         .spawn((
@@ -7720,126 +7822,372 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
                 top: px(0.0),
                 width: percent(100),
                 height: percent(100),
-                padding: UiRect::all(px(28.0)),
+                padding: UiRect::axes(px(28.0), px(20.0)),
                 flex_direction: FlexDirection::Column,
                 justify_content: JustifyContent::SpaceBetween,
+                row_gap: px(14.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.90)),
+            BackgroundColor(Color::srgba(0.03, 0.05, 0.08, 0.94)),
         ))
         .with_children(|root| {
             root.spawn((
-                MatchPhaseHeaderText,
-                Text::new("Connecting to MOBA Server..."),
-                TextFont {
-                    font_size: FontSize::Px(26.0),
+                Node {
+                    width: percent(100),
+                    padding: UiRect::axes(px(18.0), px(12.0)),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(10.0)),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: px(16.0),
                     ..default()
                 },
-                TextColor(Color::srgb(0.95, 0.86, 0.45)),
-            ));
-
-            root.spawn(Node {
-                width: percent(100),
-                flex_direction: FlexDirection::Row,
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::FlexStart,
-                column_gap: px(24.0),
-                ..default()
-            })
-            .with_children(|mid| {
-                mid.spawn((
-                    HeroPickRowRoot,
-                    Node {
-                        width: px(420.0),
-                        flex_direction: FlexDirection::Column,
-                        row_gap: px(8.0),
-                        display: Display::None,
-                        ..default()
-                    },
-                ))
-                .with_children(|list| {
-                    for (idx, hero) in config.heroes.iter().enumerate() {
-                        list.spawn((
-                            Interaction::default(),
-                            HeroPickButton { hero_index: idx },
-                            Node {
-                                width: percent(100),
-                                padding: UiRect::all(px(10.0)),
-                                border: UiRect::all(px(1.5)),
-                                border_radius: BorderRadius::all(px(6.0)),
-                                flex_direction: FlexDirection::Column,
-                                ..default()
-                            },
-                            BorderColor::all(Color::srgba(0.45, 0.65, 0.80, 0.8)),
-                            BackgroundColor(Color::srgba(0.08, 0.12, 0.18, 0.95)),
-                        ))
-                        .with_children(|btn| {
-                            btn.spawn((
-                                Text::new(format!(
-                                    "{} [{:?}] | {:?} | HP:{:.0} DMG:{:.0} RNG:{:.0}m",
-                                    hero.display_name,
-                                    hero.team,
-                                    hero.weapon.weapon_kind,
-                                    hero.max_hp,
-                                    hero.weapon.damage,
-                                    hero.weapon.max_range
-                                )),
-                                TextFont {
-                                    font_size: FontSize::Px(13.5),
-                                    ..default()
-                                },
-                                TextColor(Color::srgb(0.92, 0.96, 1.0)),
-                            ));
-                        });
-                    }
-
-                    list.spawn((
-                        Interaction::default(),
-                        HeroLockInButton,
+                BorderColor::all(Color::srgba(0.22, 0.48, 0.68, 0.65)),
+                BackgroundColor(Color::srgba(0.06, 0.09, 0.14, 0.92)),
+            ))
+            .with_children(|hdr| {
+                hdr.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px(14.0),
+                    ..default()
+                })
+                .with_children(|left| {
+                    left.spawn((
                         Node {
-                            width: percent(100),
-                            margin: UiRect::top(px(8.0)),
-                            padding: UiRect::all(px(12.0)),
-                            justify_content: JustifyContent::Center,
-                            align_items: AlignItems::Center,
-                            border: UiRect::all(px(2.0)),
+                            padding: UiRect::axes(px(10.0), px(5.0)),
                             border_radius: BorderRadius::all(px(6.0)),
                             ..default()
                         },
-                        BorderColor::all(Color::srgb(0.25, 0.90, 0.55)),
-                        BackgroundColor(Color::srgb(0.10, 0.42, 0.25)),
+                        BackgroundColor(Color::srgba(0.12, 0.55, 0.72, 0.35)),
                     ))
-                    .with_children(|btn| {
-                        btn.spawn((
-                            Text::new("LOCK IN HERO"),
-                            TextFont {
-                                font_size: FontSize::Px(16.0),
-                                ..default()
-                            },
-                            TextColor(Color::WHITE),
+                    .with_children(|b| {
+                        b.spawn((
+                            MatchPhaseBadgeText,
+                            Text::new("PHASE 1 / 3"),
+                            TextFont { font_size: FontSize::Px(12.0), ..default() },
+                            TextColor(Color::srgb(0.45, 0.92, 1.0)),
                         ));
                     });
+                    left.spawn((
+                        MatchPhaseHeaderText,
+                        Text::new("CONNECTING TO ARENA..."),
+                        TextFont { font_size: FontSize::Px(22.0), ..default() },
+                        TextColor(Color::srgb(0.96, 0.98, 1.0)),
+                    ));
                 });
 
-                mid.spawn((
-                    MatchStatusBodyText,
-                    Text::new("Waiting for server state..."),
-                    TextFont {
-                        font_size: FontSize::Px(16.0),
+                hdr.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px(16.0),
+                    ..default()
+                })
+                .with_children(|right| {
+                    right.spawn((
+                        MatchTurnBannerText,
+                        Text::new("SYNCING"),
+                        TextFont { font_size: FontSize::Px(14.5), ..default() },
+                        TextColor(Color::srgb(0.95, 0.84, 0.36)),
+                    ));
+
+                    right.spawn((
+                        Node {
+                            width: px(140.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(4.0),
+                            align_items: AlignItems::FlexEnd,
+                            ..default()
+                        },
+                    ))
+                    .with_children(|tm| {
+                        tm.spawn((
+                            MatchTimerText,
+                            Text::new("--"),
+                            TextFont { font_size: FontSize::Px(15.0), ..default() },
+                            TextColor(Color::srgb(0.92, 0.96, 1.0)),
+                        ));
+                        tm.spawn((
+                            Node {
+                                width: percent(100),
+                                height: px(6.0),
+                                border_radius: BorderRadius::all(px(3.0)),
+                                overflow: Overflow::clip(),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.15, 0.20, 0.28, 0.95)),
+                        ))
+                        .with_children(|track| {
+                            track.spawn((
+                                MatchTimerFillBar,
+                                Node {
+                                    width: percent(100),
+                                    height: percent(100),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.24, 0.85, 0.96)),
+                            ));
+                        });
+                    });
+                });
+            });
+
+            root.spawn((
+                MatchDynamicContentRoot,
+                Node {
+                    width: percent(100),
+                    flex_grow: 1.0,
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    row_gap: px(16.0),
+                    ..default()
+                },
+            ));
+
+            root.spawn((
+                HeroSelectWorkspaceRoot,
+                Node {
+                    width: percent(100),
+                    flex_grow: 1.0,
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::SpaceBetween,
+                    row_gap: px(12.0),
+                    display: Display::None,
+                    ..default()
+                },
+            ))
+            .with_children(|hs| {
+                hs.spawn(Node {
+                    width: percent(100),
+                    flex_grow: 1.0,
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Stretch,
+                    column_gap: px(20.0),
+                    ..default()
+                })
+                .with_children(|cols| {
+                    cols.spawn((
+                        HeroPickRowRoot,
+                        Node {
+                            width: px(360.0),
+                            padding: UiRect::all(px(14.0)),
+                            border: UiRect::all(px(1.5)),
+                            border_radius: BorderRadius::all(px(10.0)),
+                            flex_direction: FlexDirection::Column,
+                            justify_content: JustifyContent::SpaceBetween,
+                            row_gap: px(10.0),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.24, 0.45, 0.65, 0.55)),
+                        BackgroundColor(Color::srgba(0.05, 0.08, 0.13, 0.88)),
+                    ))
+                    .with_children(|list| {
+                        list.spawn(Node {
+                            width: percent(100),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(8.0),
+                            ..default()
+                        })
+                        .with_children(|cards| {
+                            cards.spawn((
+                                Text::new("HERO ROSTER"),
+                                TextFont { font_size: FontSize::Px(13.0), ..default() },
+                                TextColor(Color::srgb(0.55, 0.80, 0.98)),
+                            ));
+
+                            for (idx, hero) in config.heroes.iter().enumerate() {
+                                let (w_tag, w_col) = weapon_kind_short_badge(hero.weapon.weapon_kind);
+                                let team_col = if hero.team == TeamId::Dawn {
+                                    Color::srgb(0.18, 0.88, 0.62)
+                                } else {
+                                    Color::srgb(0.95, 0.34, 0.34)
+                                };
+                                cards.spawn((
+                                    Interaction::default(),
+                                    HeroPickButton { hero_index: idx },
+                                    Node {
+                                        width: percent(100),
+                                        padding: UiRect::all(px(10.0)),
+                                        border: UiRect::all(px(1.5)),
+                                        border_radius: BorderRadius::all(px(8.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        align_items: AlignItems::Center,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        column_gap: px(10.0),
+                                        ..default()
+                                    },
+                                    BorderColor::all(Color::srgba(0.28, 0.42, 0.58, 0.65)),
+                                    BackgroundColor(Color::srgba(0.08, 0.12, 0.18, 0.92)),
+                                ))
+                                .with_children(|btn| {
+                                    btn.spawn(Node {
+                                        flex_direction: FlexDirection::Row,
+                                        align_items: AlignItems::Center,
+                                        column_gap: px(10.0),
+                                        ..default()
+                                    })
+                                    .with_children(|left| {
+                                        left.spawn((
+                                            Node {
+                                                width: px(5.0),
+                                                height: px(36.0),
+                                                border_radius: BorderRadius::all(px(3.0)),
+                                                ..default()
+                                            },
+                                            BackgroundColor(team_col),
+                                        ));
+                                        left.spawn((
+                                            Node {
+                                                width: px(38.0),
+                                                height: px(32.0),
+                                                justify_content: JustifyContent::Center,
+                                                align_items: AlignItems::Center,
+                                                border: UiRect::all(px(1.2)),
+                                                border_radius: BorderRadius::all(px(6.0)),
+                                                ..default()
+                                            },
+                                            BorderColor::all(w_col),
+                                            BackgroundColor(w_col.with_alpha(0.18)),
+                                        ))
+                                        .with_children(|ic| {
+                                            ic.spawn((
+                                                Text::new(w_tag),
+                                                TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                                TextColor(w_col),
+                                            ));
+                                        });
+                                        left.spawn(Node {
+                                            flex_direction: FlexDirection::Column,
+                                            row_gap: px(2.0),
+                                            ..default()
+                                        })
+                                        .with_children(|info| {
+                                            info.spawn((
+                                                Text::new(hero.display_name.clone()),
+                                                TextFont { font_size: FontSize::Px(14.5), ..default() },
+                                                TextColor(Color::srgb(0.95, 0.98, 1.0)),
+                                            ));
+                                            info.spawn((
+                                                Text::new(format!(
+                                                    "HP {:.0}  •  DMG {:.0}  •  RNG {:.0}m",
+                                                    hero.max_hp, hero.weapon.damage, hero.weapon.max_range
+                                                )),
+                                                TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                                TextColor(Color::srgb(0.68, 0.78, 0.88)),
+                                            ));
+                                        });
+                                    });
+
+                                    btn.spawn((
+                                        HeroPickStatusBadge { hero_index: idx },
+                                        Text::new("READY"),
+                                        TextFont { font_size: FontSize::Px(10.5), ..default() },
+                                        TextColor(Color::srgb(0.35, 0.88, 0.65)),
+                                    ));
+                                });
+                            }
+                        });
+
+                        list.spawn((
+                            Interaction::default(),
+                            HeroLockInButton,
+                            Node {
+                                width: percent(100),
+                                height: px(46.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(px(2.0)),
+                                border_radius: BorderRadius::all(px(8.0)),
+                                ..default()
+                            },
+                            BorderColor::all(Color::srgb(0.22, 0.92, 0.58)),
+                            BackgroundColor(Color::srgb(0.10, 0.45, 0.28)),
+                        ))
+                        .with_children(|btn| {
+                            btn.spawn((
+                                HeroLockInButtonText,
+                                Text::new("LOCK IN HERO"),
+                                TextFont { font_size: FontSize::Px(16.0), ..default() },
+                                TextColor(Color::WHITE),
+                            ));
+                        });
+                    });
+
+                    cols.spawn((
+                        HeroSpecsPanelRoot,
+                        Node {
+                            width: px(420.0),
+                            padding: UiRect::all(px(14.0)),
+                            border: UiRect::all(px(1.5)),
+                            border_radius: BorderRadius::all(px(10.0)),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(8.0),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.24, 0.45, 0.65, 0.55)),
+                        BackgroundColor(Color::srgba(0.05, 0.08, 0.13, 0.88)),
+                    ));
+                });
+
+                hs.spawn((
+                    DraftStripRoot,
+                    Node {
+                        width: percent(100),
+                        padding: UiRect::axes(px(12.0), px(8.0)),
+                        border: UiRect::all(px(1.2)),
+                        border_radius: BorderRadius::all(px(8.0)),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        column_gap: px(8.0),
                         ..default()
                     },
-                    TextColor(Color::srgb(0.88, 0.92, 0.96)),
+                    BorderColor::all(Color::srgba(0.22, 0.40, 0.58, 0.55)),
+                    BackgroundColor(Color::srgba(0.05, 0.08, 0.13, 0.88)),
                 ));
             });
 
             root.spawn((
-                Text::new("MOBA Tactical Shooter - Server Authoritative Draft & Match Flow"),
-                TextFont {
-                    font_size: FontSize::Px(12.0),
+                Node {
+                    width: percent(100),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(6.0),
                     ..default()
                 },
-                TextColor(Color::srgba(0.65, 0.72, 0.80, 0.8)),
-            ));
+            ))
+            .with_children(|ftr| {
+                ftr.spawn((
+                    Node {
+                        width: percent(100),
+                        height: px(6.0),
+                        border_radius: BorderRadius::all(px(3.0)),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.12, 0.16, 0.24, 0.90)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        MatchBottomBarFill,
+                        Node {
+                            width: percent(0),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.22, 0.86, 0.95)),
+                    ));
+                });
+
+                ftr.spawn((
+                    MatchBottomStatusText,
+                    Text::new("SIMORGH MOBA  •  SERVER AUTHORITATIVE DRAFT & BATTLE"),
+                    TextFont { font_size: FontSize::Px(12.0), ..default() },
+                    TextColor(Color::srgba(0.68, 0.78, 0.88, 0.85)),
+                ));
+            });
         });
 }
 
@@ -7901,73 +8249,279 @@ fn client_lobby_sync_system(
     }
 }
 
+fn spawn_showcase_weapon_on_hand(
+    commands: &mut Commands,
+    hand_ent: Entity,
+    weapon_kind: WeaponKind,
+    tuner: &moba_shared::WeaponTunerConfig,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let (body_col, accent_col, barrel_len, body_len) = match weapon_kind {
+        WeaponKind::AutomaticRifle => (Color::srgb(0.14, 0.16, 0.20), Color::srgb(0.22, 0.65, 0.85), 0.34, 0.38),
+        WeaponKind::Sniper => (Color::srgb(0.15, 0.22, 0.18), Color::srgb(0.40, 0.88, 0.52), 0.56, 0.42),
+        WeaponKind::Shotgun => (Color::srgb(0.22, 0.17, 0.13), Color::srgb(0.92, 0.54, 0.22), 0.36, 0.36),
+        WeaponKind::Throwable => (Color::srgb(0.26, 0.15, 0.12), Color::srgb(0.95, 0.32, 0.28), 0.24, 0.28),
+        WeaponKind::Pistol => (Color::srgb(0.18, 0.20, 0.24), Color::srgb(0.75, 0.78, 0.92), 0.18, 0.22),
+    };
+    let body_mat = materials.add(StandardMaterial {
+        base_color: body_col,
+        metallic: 0.82,
+        perceptual_roughness: 0.32,
+        ..default()
+    });
+    let accent_mat = materials.add(StandardMaterial {
+        base_color: accent_col,
+        emissive: LinearRgba::from(accent_col) * 0.45,
+        metallic: 0.6,
+        perceptual_roughness: 0.3,
+        ..default()
+    });
+    let off = tuner.initial_offset;
+    let rot_d = tuner.initial_rotation_deg;
+    let root_tf = Transform::from_xyz(off.0, off.1, off.2)
+        .with_rotation(Quat::from_euler(
+            EulerRot::XYZ,
+            rot_d.0.to_radians(),
+            rot_d.1.to_radians(),
+            rot_d.2.to_radians(),
+        ))
+        .with_scale(Vec3::splat(tuner.initial_scale));
+
+    commands
+        .entity(hand_ent)
+        .insert(ShowcaseWeaponAttached)
+        .with_children(|parent| {
+            parent.spawn((root_tf, Visibility::Visible)).with_children(|w| {
+                w.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.055, 0.085, body_len))),
+                    MeshMaterial3d(body_mat.clone()),
+                    Transform::IDENTITY,
+                ));
+                w.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(0.016, barrel_len))),
+                    MeshMaterial3d(body_mat),
+                    Transform::from_xyz(0.0, 0.02, -(body_len * 0.5 + barrel_len * 0.45))
+                        .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                ));
+                w.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.032, 0.032, body_len * 0.45))),
+                    MeshMaterial3d(accent_mat),
+                    Transform::from_xyz(0.0, 0.058, -0.02),
+                ));
+            });
+        });
+}
+
+#[derive(SystemParam)]
+struct ShowcaseAssetsParams<'w, 's> {
+    asset_server: Res<'w, AssetServer>,
+    gltf_assets: Res<'w, Assets<Gltf>>,
+    clip_assets: Res<'w, Assets<AnimationClip>>,
+    animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
+    hero_anim_cache: ResMut<'w, HeroModelAnimCache>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    children_query: Query<'w, 's, &'static Children>,
+    hand_query: Query<'w, 's, (Entity, &'static Name), Without<ShowcaseWeaponAttached>>,
+    anim_player_query: Query<'w, 's, (Entity, &'static mut AnimationPlayer, Option<&'static AnimationGraphHandle>)>,
+}
+
 fn hero_preview_system(
     mut commands: Commands,
     time: Res<Time>,
     config: Res<GameConfig>,
-    asset_server: Res<AssetServer>,
-    gltf_assets: Res<Assets<Gltf>>,
-    clip_assets: Res<Assets<AnimationClip>>,
-    mut animation_graphs: ResMut<Assets<AnimationGraph>>,
-    mut hero_anim_cache: ResMut<HeroModelAnimCache>,
     mut match_flow: ResMut<ClientMatchFlow>,
     mut camera_query: Query<&mut Transform, With<MobaCamera>>,
-    mut preview_query: Query<(Entity, &mut Transform), (With<HeroPreviewRoot>, Without<MobaCamera>)>,
-    children_query: Query<&Children>,
-    mut anim_player_query: Query<(Entity, &mut AnimationPlayer, Option<&AnimationGraphHandle>)>,
+    mut preview_query: Query<(Entity, &mut Transform, &HeroPreviewRoot), Without<MobaCamera>>,
+    battle_query: Query<(Entity, &BattleShowcaseHero), (Without<MobaCamera>, Without<HeroPreviewRoot>)>,
+    mut sc: ShowcaseAssetsParams,
+    mut spawned_battle_sig: Local<Option<String>>,
 ) {
     let phase = match_flow.current_phase();
+    let now = time.elapsed_secs();
+
     if phase != MatchPhase::HeroSelect {
-        for (ent, _) in &preview_query {
+        for (ent, _, _) in &preview_query {
             commands.entity(ent).despawn();
         }
         match_flow.spawned_preview_hero_index = None;
-        return;
     }
 
-    let preview_origin = Vec3::new(0.0, 2.4, 0.0);
-    if let Ok(mut cam_tf) = camera_query.single_mut() {
-        let cam_pos = preview_origin + Vec3::new(0.0, 1.8, 4.4);
-        *cam_tf = Transform::from_translation(cam_pos).looking_at(preview_origin + Vec3::Y * 0.9, Vec3::Y);
-    }
-
-    let hero = config.active_hero(match_flow.preview_hero_index);
-    if match_flow.spawned_preview_hero_index != Some(match_flow.preview_hero_index) {
-        for (ent, _) in &preview_query {
+    if phase != MatchPhase::BattleLoading {
+        for (ent, _) in &battle_query {
             commands.entity(ent).despawn();
         }
-        let gltf_scene = asset_server.load(format!("{}#Scene0", hero.model_path));
-        commands.spawn((
-            HeroPreviewRoot,
-            WorldAssetRoot(gltf_scene),
-            Transform::from_translation(preview_origin)
-                .with_scale(Vec3::splat(hero.hero_scale)),
-        ));
-        match_flow.spawned_preview_hero_index = Some(match_flow.preview_hero_index);
+        *spawned_battle_sig = None;
+    }
+
+    if phase == MatchPhase::HeroSelect {
+        let preview_origin = Vec3::new(0.0, 2.4, 0.0);
+        if let Ok(mut cam_tf) = camera_query.single_mut() {
+            let cam_pos = preview_origin + Vec3::new(0.0, 1.55, 4.1);
+            *cam_tf = Transform::from_translation(cam_pos).looking_at(preview_origin + Vec3::Y * 0.95, Vec3::Y);
+        }
+
+        let hero = config.active_hero(match_flow.preview_hero_index);
+        if match_flow.spawned_preview_hero_index != Some(match_flow.preview_hero_index) {
+            for (ent, _, _) in &preview_query {
+                commands.entity(ent).despawn();
+            }
+            let gltf_scene = sc.asset_server.load(format!("{}#Scene0", hero.model_path));
+            commands.spawn((
+                HeroPreviewRoot {
+                    weapon_kind: hero.weapon.weapon_kind,
+                },
+                WorldAssetRoot(gltf_scene),
+                Transform::from_translation(preview_origin)
+                    .with_scale(Vec3::splat(hero.hero_scale)),
+            ));
+            match_flow.spawned_preview_hero_index = Some(match_flow.preview_hero_index);
+            return;
+        }
+
+        let cached_opt = sc.hero_anim_cache.ensure_loaded(
+            &hero.model_path,
+            &sc.asset_server,
+            &sc.gltf_assets,
+            &sc.clip_assets,
+            &mut sc.animation_graphs,
+        );
+
+        for (root_ent, mut tf, prev_root) in &mut preview_query {
+            tf.rotate_y(0.50 * time.delta_secs());
+            for desc in sc.children_query.iter_descendants(root_ent) {
+                if let Some(assets) = cached_opt {
+                    let idle_node = assets.get_or_fallback("rifle_aiming_idle", "idle");
+                    if let Ok((p_ent, mut player, graph_opt)) = sc.anim_player_query.get_mut(desc) {
+                        if graph_opt.map_or(true, |g| g.0 != assets.graph_handle) {
+                            commands
+                                .entity(p_ent)
+                                .insert((AnimationGraphHandle(assets.graph_handle.clone()), HeroPreviewAnimStarted));
+                        }
+                        if !player.is_playing_animation(idle_node) {
+                            player.play(idle_node).repeat();
+                        }
+                    }
+                }
+                if let Ok((h_ent, name)) = sc.hand_query.get(desc) {
+                    let n = name.as_str().to_lowercase();
+                    let is_left = n.contains("left") || n.contains("_l") || n.contains(".l") || n.contains("l_");
+                    let is_hand = n.contains("hand") || n.contains("wrist") || n.contains("palm");
+                    let is_finger = n.contains("thumb") || n.contains("index") || n.contains("middle")
+                        || n.contains("ring") || n.contains("pinky") || n.contains("finger") || n.contains("twist");
+                    if is_hand && is_left && !is_finger {
+                        spawn_showcase_weapon_on_hand(
+                            &mut commands,
+                            h_ent,
+                            prev_root.weapon_kind,
+                            &config.weapon_tuner,
+                            &mut sc.meshes,
+                            &mut sc.materials,
+                        );
+                    }
+                }
+            }
+        }
         return;
     }
 
-    let cached_opt = hero_anim_cache.ensure_loaded(
-        &hero.model_path,
-        &asset_server,
-        &gltf_assets,
-        &clip_assets,
-        &mut animation_graphs,
-    );
+    if phase == MatchPhase::BattleLoading {
+        let Some(snap) = match_flow.snapshot.as_ref() else { return };
+        let stage_origin = Vec3::new(0.0, 2.4, 0.0);
+        if let Ok(mut cam_tf) = camera_query.single_mut() {
+            let sway = (now * 0.45).sin() * 1.1;
+            let cam_pos = stage_origin + Vec3::new(sway, 2.35, 8.6);
+            *cam_tf = Transform::from_translation(cam_pos).looking_at(stage_origin + Vec3::Y * 0.95, Vec3::Y);
+        }
 
-    for (root_ent, mut tf) in &mut preview_query {
-        tf.rotate_y(0.55 * time.delta_secs());
-        if let Some(assets) = cached_opt {
-            let idle_node = assets.get_or_fallback("idle", "walk_forward");
-            for desc in children_query.iter_descendants(root_ent) {
-                if let Ok((p_ent, mut player, graph_opt)) = anim_player_query.get_mut(desc) {
-                    if graph_opt.map_or(true, |g| g.0 != assets.graph_handle) {
-                        commands
-                            .entity(p_ent)
-                            .insert((AnimationGraphHandle(assets.graph_handle.clone()), HeroPreviewAnimStarted));
+        let sig: String = snap
+            .players
+            .iter()
+            .map(|p| format!("{}:{}", p.slot_index, p.selected_hero_id.as_deref().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join("|");
+
+        if spawned_battle_sig.as_deref() != Some(sig.as_str()) {
+            for (ent, _) in &battle_query {
+                commands.entity(ent).despawn();
+            }
+            let dawn_list: Vec<_> = snap.players.iter().filter(|p| p.team == TeamId::Dawn).collect();
+            let dusk_list: Vec<_> = snap.players.iter().filter(|p| p.team == TeamId::Dusk).collect();
+
+            for (team_idx, list) in [(0, dawn_list), (1, dusk_list)] {
+                let count = list.len().max(1);
+                for (i, p) in list.iter().enumerate() {
+                    let hero = p
+                        .selected_hero_id
+                        .as_deref()
+                        .map(|id| config.hero_by_id(id))
+                        .unwrap_or_else(|| config.active_hero(0));
+                    let z_off = ((i as f32) - (count as f32 - 1.0) * 0.5) * 2.1;
+                    let x_off = if team_idx == 0 { -2.8 - (i as f32) * 0.35 } else { 2.8 + (i as f32) * 0.35 };
+                    let yaw = if team_idx == 0 { -std::f32::consts::FRAC_PI_2 } else { std::f32::consts::FRAC_PI_2 };
+                    let gltf_scene = sc.asset_server.load(format!("{}#Scene0", hero.model_path));
+                    commands.spawn((
+                        BattleShowcaseHero {
+                            slot_index: p.slot_index,
+                            weapon_kind: hero.weapon.weapon_kind,
+                        },
+                        WorldAssetRoot(gltf_scene),
+                        Transform::from_translation(stage_origin + Vec3::new(x_off, 0.0, z_off))
+                            .with_rotation(Quat::from_rotation_y(yaw))
+                            .with_scale(Vec3::splat(hero.hero_scale)),
+                    ));
+                }
+            }
+            *spawned_battle_sig = Some(sig);
+            return;
+        }
+
+        for (root_ent, b_hero) in &battle_query {
+            let hero = snap
+                .players
+                .get(b_hero.slot_index)
+                .and_then(|p| p.selected_hero_id.as_deref())
+                .map(|id| config.hero_by_id(id))
+                .unwrap_or_else(|| config.active_hero(0));
+
+            let cached_opt = sc.hero_anim_cache.ensure_loaded(
+                &hero.model_path,
+                &sc.asset_server,
+                &sc.gltf_assets,
+                &sc.clip_assets,
+                &mut sc.animation_graphs,
+            );
+
+            for desc in sc.children_query.iter_descendants(root_ent) {
+                if let Some(assets) = cached_opt {
+                    let aim_node = assets.get_or_fallback("rifle_aiming_idle", "idle");
+                    if let Ok((p_ent, mut player, graph_opt)) = sc.anim_player_query.get_mut(desc) {
+                        if graph_opt.map_or(true, |g| g.0 != assets.graph_handle) {
+                            commands
+                                .entity(p_ent)
+                                .insert((AnimationGraphHandle(assets.graph_handle.clone()), HeroPreviewAnimStarted));
+                        }
+                        if !player.is_playing_animation(aim_node) {
+                            player.play(aim_node).repeat();
+                        }
                     }
-                    if !player.is_playing_animation(idle_node) {
-                        player.play(idle_node).repeat();
+                }
+                if let Ok((h_ent, name)) = sc.hand_query.get(desc) {
+                    let n = name.as_str().to_lowercase();
+                    let is_left = n.contains("left") || n.contains("_l") || n.contains(".l") || n.contains("l_");
+                    let is_hand = n.contains("hand") || n.contains("wrist") || n.contains("palm");
+                    let is_finger = n.contains("thumb") || n.contains("index") || n.contains("middle")
+                        || n.contains("ring") || n.contains("pinky") || n.contains("finger") || n.contains("twist");
+                    if is_hand && is_left && !is_finger {
+                        spawn_showcase_weapon_on_hand(
+                            &mut commands,
+                            h_ent,
+                            b_hero.weapon_kind,
+                            &config.weapon_tuner,
+                            &mut sc.meshes,
+                            &mut sc.materials,
+                        );
                     }
                 }
             }
@@ -7975,23 +8529,137 @@ fn hero_preview_system(
     }
 }
 
+fn spawn_stat_bar_row(
+    parent: &mut ChildSpawnerCommands,
+    tag: &str,
+    label: &str,
+    value_txt: String,
+    ratio: f32,
+    accent: Color,
+) {
+    parent
+        .spawn(Node {
+            width: percent(100),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(3.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn(Node {
+                width: percent(100),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|top| {
+                top.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px(6.0),
+                    ..default()
+                })
+                .with_children(|lbl| {
+                    lbl.spawn((
+                        Node {
+                            width: px(24.0),
+                            height: px(16.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(px(4.0)),
+                            ..default()
+                        },
+                        BackgroundColor(accent.with_alpha(0.24)),
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Text::new(tag),
+                            TextFont { font_size: FontSize::Px(9.5), ..default() },
+                            TextColor(accent),
+                        ));
+                    });
+                    lbl.spawn((
+                        Text::new(label),
+                        TextFont { font_size: FontSize::Px(11.5), ..default() },
+                        TextColor(Color::srgb(0.76, 0.84, 0.92)),
+                    ));
+                });
+
+                top.spawn((
+                    Text::new(value_txt),
+                    TextFont { font_size: FontSize::Px(11.0), ..default() },
+                    TextColor(Color::srgb(0.95, 0.98, 1.0)),
+                ));
+            });
+
+            row.spawn((
+                Node {
+                    width: percent(100),
+                    height: px(5.0),
+                    border_radius: BorderRadius::all(px(3.0)),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.12, 0.16, 0.24, 0.9)),
+            ))
+            .with_children(|track| {
+                track.spawn((
+                    Node {
+                        width: percent((ratio.clamp(0.04, 1.0)) * 100.0),
+                        height: percent(100),
+                        ..default()
+                    },
+                    BackgroundColor(accent),
+                ));
+            });
+        });
+}
+
+#[allow(deprecated)]
+#[derive(SystemParam)]
+struct MatchOverlayUiQueries<'w, 's> {
+    overlay_q: Query<'w, 's, (&'static mut Node, &'static mut BackgroundColor), With<MatchOverlayRoot>>,
+    badge_q: Query<'w, 's, &'static mut Text, With<MatchPhaseBadgeText>>,
+    header_q: Query<'w, 's, &'static mut Text, (With<MatchPhaseHeaderText>, Without<MatchPhaseBadgeText>)>,
+    turn_q: Query<'w, 's, (&'static mut Text, &'static mut TextColor), (With<MatchTurnBannerText>, Without<MatchPhaseHeaderText>, Without<MatchPhaseBadgeText>)>,
+    timer_q: Query<'w, 's, &'static mut Text, (With<MatchTimerText>, Without<MatchTurnBannerText>, Without<MatchPhaseHeaderText>, Without<MatchPhaseBadgeText>)>,
+    timer_fill_q: Query<'w, 's, (&'static mut Node, &'static mut BackgroundColor), (With<MatchTimerFillBar>, Without<MatchOverlayRoot>)>,
+    bottom_fill_q: Query<'w, 's, &'static mut Node, (With<MatchBottomBarFill>, Without<MatchTimerFillBar>, Without<MatchOverlayRoot>)>,
+    bottom_txt_q: Query<'w, 's, &'static mut Text, (With<MatchBottomStatusText>, Without<MatchTimerText>, Without<MatchTurnBannerText>, Without<MatchPhaseHeaderText>, Without<MatchPhaseBadgeText>)>,
+    dyn_root_q: Query<'w, 's, (Entity, &'static mut Node), (With<MatchDynamicContentRoot>, Without<MatchOverlayRoot>, Without<MatchTimerFillBar>, Without<MatchBottomBarFill>)>,
+    hs_root_q: Query<'w, 's, &'static mut Node, (With<HeroSelectWorkspaceRoot>, Without<MatchDynamicContentRoot>, Without<MatchOverlayRoot>, Without<MatchTimerFillBar>, Without<MatchBottomBarFill>)>,
+    specs_root_q: Query<'w, 's, Entity, With<HeroSpecsPanelRoot>>,
+    draft_strip_q: Query<'w, 's, Entity, With<DraftStripRoot>>,
+    hero_btn_q: Query<'w, 's, (&'static Interaction, &'static HeroPickButton, &'static mut BackgroundColor, &'static mut BorderColor), (Without<MatchOverlayRoot>, Without<HeroLockInButton>, Without<MatchTimerFillBar>)>,
+    hero_badge_q: Query<'w, 's, (&'static HeroPickStatusBadge, &'static mut Text, &'static mut TextColor), (Without<MatchPhaseBadgeText>, Without<MatchPhaseHeaderText>, Without<MatchTurnBannerText>, Without<MatchTimerText>, Without<MatchBottomStatusText>)>,
+    lock_btn_q: Query<'w, 's, (&'static Interaction, &'static mut BackgroundColor, &'static mut BorderColor), (With<HeroLockInButton>, Without<MatchOverlayRoot>, Without<MatchTimerFillBar>)>,
+    lock_txt_q: Query<'w, 's, &'static mut Text, (With<HeroLockInButtonText>, Without<HeroPickStatusBadge>, Without<MatchPhaseBadgeText>, Without<MatchPhaseHeaderText>, Without<MatchTurnBannerText>, Without<MatchTimerText>, Without<MatchBottomStatusText>)>,
+    pulse_dots_q: Query<'w, 's, (&'static PulseAnimatedDot, &'static mut BackgroundColor), (Without<MatchOverlayRoot>, Without<HeroLockInButton>, Without<HeroPickButton>, Without<MatchTimerFillBar>)>,
+    children_q: Query<'w, 's, &'static Children>,
+}
+
+fn despawn_children_of(commands: &mut Commands, parent: Entity, children_q: &Query<&Children>) {
+    if let Ok(children) = children_q.get(parent) {
+        for child in children.iter() {
+            commands.entity(child).despawn();
+        }
+    }
+}
+
+#[allow(deprecated)]
 fn match_overlay_ui_system(
+    mut commands: Commands,
+    time: Res<Time>,
     config: Res<GameConfig>,
     mut net: ResMut<ClientNetwork>,
     mut match_flow: ResMut<ClientMatchFlow>,
-    mut overlay_query: Query<(&mut Node, &mut BackgroundColor), With<MatchOverlayRoot>>,
-    mut header_query: Query<&mut Text, With<MatchPhaseHeaderText>>,
-    mut body_query: Query<&mut Text, (With<MatchStatusBodyText>, Without<MatchPhaseHeaderText>)>,
-    mut pick_row_query: Query<&mut Node, (With<HeroPickRowRoot>, Without<MatchOverlayRoot>)>,
-    mut hero_btn_query: Query<
-        (&Interaction, &HeroPickButton, &mut BackgroundColor, &mut BorderColor),
-        (Changed<Interaction>, Without<MatchOverlayRoot>, Without<HeroLockInButton>),
-    >,
-    lock_btn_query: Query<&Interaction, (Changed<Interaction>, With<HeroLockInButton>)>,
+    mut ui: MatchOverlayUiQueries,
+    mut last_rebuild_key: Local<String>,
 ) {
     let phase = match_flow.current_phase();
+    let now = time.elapsed_secs();
 
-    if let Ok((mut root_node, mut root_bg)) = overlay_query.single_mut() {
+    if let Ok((mut root_node, mut root_bg)) = ui.overlay_q.single_mut() {
         if phase == MatchPhase::InGame {
             if root_node.display != Display::None {
                 root_node.display = Display::None;
@@ -8002,40 +8670,126 @@ fn match_overlay_ui_system(
             root_node.display = Display::Flex;
         }
         let target_bg = match phase {
-            MatchPhase::HeroSelect => Color::srgba(0.03, 0.05, 0.08, 0.35),
-            _ => Color::srgba(0.03, 0.05, 0.08, 0.92),
+            MatchPhase::HeroSelect => Color::srgba(0.02, 0.04, 0.07, 0.36),
+            MatchPhase::BattleLoading => Color::srgba(0.02, 0.04, 0.07, 0.28),
+            _ => Color::srgba(0.03, 0.05, 0.08, 0.94),
         };
         if root_bg.0 != target_bg {
             *root_bg = BackgroundColor(target_bg);
         }
     }
 
-    if let Ok(mut row_node) = pick_row_query.single_mut() {
-        let desired_row = if phase == MatchPhase::HeroSelect {
-            Display::Flex
-        } else {
-            Display::None
-        };
-        if row_node.display != desired_row {
-            row_node.display = desired_row;
+    if let Ok((_, mut dyn_node)) = ui.dyn_root_q.single_mut() {
+        let want = if phase == MatchPhase::HeroSelect { Display::None } else { Display::Flex };
+        if dyn_node.display != want {
+            dyn_node.display = want;
+        }
+    }
+    if let Ok(mut hs_node) = ui.hs_root_q.single_mut() {
+        let want = if phase == MatchPhase::HeroSelect { Display::Flex } else { Display::None };
+        if hs_node.display != want {
+            hs_node.display = want;
         }
     }
 
-    for (interaction, btn, mut bg, mut border) in &mut hero_btn_query {
+    for (dot, mut bg) in &mut ui.pulse_dots_q {
+        let pulse = 0.45 + 0.55 * ((now * 4.5 + dot.phase_offset).sin() * 0.5 + 0.5);
+        let c = bg.0;
+        *bg = BackgroundColor(c.with_alpha(pulse));
+    }
+
+    let taken_ids: HashSet<String> = match_flow
+        .snapshot
+        .as_ref()
+        .map(|s| s.taken_hero_ids.iter().cloned().collect())
+        .unwrap_or_default();
+    let is_my_turn = match_flow
+        .snapshot
+        .as_ref()
+        .is_some_and(|s| s.current_pick_slot == match_flow.your_slot);
+
+    for (interaction, btn, mut bg, mut border) in &mut ui.hero_btn_q {
+        let hero = config.active_hero(btn.hero_index);
+        let is_selected = btn.hero_index == match_flow.preview_hero_index;
+        let is_taken = taken_ids.contains(&hero.id);
+
         if *interaction == Interaction::Pressed {
             match_flow.preview_hero_index = btn.hero_index;
-            *bg = BackgroundColor(Color::srgba(0.16, 0.28, 0.42, 0.95));
-            *border = BorderColor::all(Color::srgb(0.95, 0.82, 0.30));
         }
+
+        let (target_bg, target_border) = if is_selected {
+            (
+                Color::srgba(0.14, 0.30, 0.48, 0.96),
+                Color::srgb(0.98, 0.82, 0.28),
+            )
+        } else if is_taken {
+            (
+                Color::srgba(0.10, 0.08, 0.10, 0.65),
+                Color::srgba(0.55, 0.25, 0.28, 0.55),
+            )
+        } else if *interaction == Interaction::Hovered {
+            (
+                Color::srgba(0.12, 0.22, 0.34, 0.94),
+                Color::srgb(0.45, 0.82, 0.98),
+            )
+        } else {
+            (
+                Color::srgba(0.07, 0.11, 0.17, 0.90),
+                Color::srgba(0.24, 0.38, 0.54, 0.60),
+            )
+        };
+        *bg = BackgroundColor(target_bg);
+        *border = BorderColor::all(target_border);
     }
 
-    if let Ok(interaction) = lock_btn_query.single() {
-        if *interaction == Interaction::Pressed && phase == MatchPhase::HeroSelect {
-            let hero = config.active_hero(match_flow.preview_hero_index);
+    for (badge, mut txt, mut col) in &mut ui.hero_badge_q {
+        let hero = config.active_hero(badge.hero_index);
+        let is_taken = taken_ids.contains(&hero.id);
+        let is_sel = badge.hero_index == match_flow.preview_hero_index;
+        let (label, c) = if is_taken {
+            ("TAKEN", Color::srgb(0.95, 0.38, 0.38))
+        } else if is_sel {
+            ("VIEWING", Color::srgb(0.98, 0.84, 0.32))
+        } else {
+            ("READY", Color::srgb(0.32, 0.88, 0.64))
+        };
+        if **txt != label {
+            **txt = label.to_string();
+        }
+        *col = TextColor(c);
+    }
+
+    let preview_hero = config.active_hero(match_flow.preview_hero_index);
+    let preview_taken = taken_ids.contains(&preview_hero.id);
+    if let Ok((interaction, mut bg, mut border)) = ui.lock_btn_q.single_mut() {
+        let can_lock = phase == MatchPhase::HeroSelect && is_my_turn && !preview_taken;
+        if *interaction == Interaction::Pressed && can_lock {
             if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::SelectHero {
-                hero_id: hero.id.clone(),
+                hero_id: preview_hero.id.clone(),
             }) {
                 net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
+            }
+        }
+        let (b_bg, b_bd) = if !can_lock {
+            (Color::srgba(0.16, 0.18, 0.22, 0.80), Color::srgba(0.40, 0.44, 0.50, 0.55))
+        } else if *interaction == Interaction::Hovered {
+            (Color::srgb(0.16, 0.62, 0.38), Color::srgb(0.45, 1.0, 0.72))
+        } else {
+            (Color::srgb(0.10, 0.48, 0.30), Color::srgb(0.24, 0.92, 0.58))
+        };
+        *bg = BackgroundColor(b_bg);
+        *border = BorderColor::all(b_bd);
+
+        if let Ok(mut ltxt) = ui.lock_txt_q.single_mut() {
+            let next_lbl = if preview_taken {
+                "HERO ALREADY TAKEN"
+            } else if !is_my_turn {
+                "WAIT FOR YOUR TURN"
+            } else {
+                "LOCK IN HERO"
+            };
+            if **ltxt != next_lbl {
+                **ltxt = next_lbl.to_string();
             }
         }
     }
@@ -8044,124 +8798,550 @@ fn match_overlay_ui_system(
         return;
     };
 
-    if let Ok(mut header) = header_query.single_mut() {
-        let next_header = match snap.phase {
-            MatchPhase::WaitingForPlayers => format!(
-                "PHASE 1: WAITING FOR PLAYERS ({} / {})",
-                snap.connected_count, snap.required_players
-            ),
-            MatchPhase::HeroSelect => {
-                let is_my_turn = snap.current_pick_slot == match_flow.your_slot;
-                let turn_txt = if is_my_turn {
-                    "YOUR TURN TO PICK!".to_string()
-                } else if let Some(s) = snap.current_pick_slot {
-                    format!("Slot {} Picking...", s + 1)
-                } else {
-                    "Draft Complete".to_string()
-                };
-                format!(
-                    "PHASE 2: HERO SELECT  |  {}  |  Time: {:.0}s",
-                    turn_txt, snap.pick_time_remaining
-                )
-            }
-            MatchPhase::BattleLoading => {
-                "PHASE 3: BATTLE LOADING (Preparing Arena...)".to_string()
-            }
+    if let Ok(mut b) = ui.badge_q.single_mut() {
+        let s = match snap.phase {
+            MatchPhase::WaitingForPlayers => "PHASE 1 / 3  •  LOBBY",
+            MatchPhase::HeroSelect => "PHASE 2 / 3  •  DRAFT",
+            MatchPhase::BattleLoading => "PHASE 3 / 3  •  VERSUS",
+            MatchPhase::InGame => "",
+        };
+        if **b != s { **b = s.to_string(); }
+    }
+    if let Ok(mut h) = ui.header_q.single_mut() {
+        let s = match snap.phase {
+            MatchPhase::WaitingForPlayers => format!("ASSEMBLING SQUADS  ({} / {})", snap.connected_count, snap.required_players),
+            MatchPhase::HeroSelect => "CHOOSE YOUR OPERATIVE".to_string(),
+            MatchPhase::BattleLoading => "BATTLE IMMINENT  •  DAWN vs DUSK".to_string(),
             MatchPhase::InGame => String::new(),
         };
-        if **header != next_header {
-            **header = next_header;
-        }
+        if **h != s { **h = s; }
     }
-
-    if let Ok(mut body) = body_query.single_mut() {
-        let mut lines = Vec::new();
-        match snap.phase {
-            MatchPhase::WaitingForPlayers => {
-                lines.push("Player Lobby Status:".to_string());
-                for p in &snap.players {
-                    let status = if p.connected {
-                        format!("CONNECTED (ID: {})", p.client_id.unwrap_or(0))
-                    } else {
-                        "WAITING...".to_string()
-                    };
-                    let me = if Some(p.slot_index) == match_flow.your_slot {
-                        " <-- YOU"
-                    } else {
-                        ""
-                    };
-                    lines.push(format!("  Slot {} [{:?}] : {}{}", p.slot_index + 1, p.team, status, me));
-                }
-            }
+    if let Ok((mut t_txt, mut t_col)) = ui.turn_q.single_mut() {
+        let (s, c) = match snap.phase {
+            MatchPhase::WaitingForPlayers => (
+                format!("{} SLOTS OPEN", snap.required_players.saturating_sub(snap.connected_count)),
+                Color::srgb(0.95, 0.78, 0.32),
+            ),
             MatchPhase::HeroSelect => {
-                let preview_h = config.active_hero(match_flow.preview_hero_index);
-                let taken = snap.taken_hero_ids.contains(&preview_h.id);
-                lines.push(format!(
-                    "Previewing: {} [{}]",
-                    preview_h.display_name,
-                    if taken { "TAKEN" } else { "AVAILABLE" }
-                ));
-                lines.push(format!(
-                    "Weapon: {:?} | Mag: {} | DMG: {:.0} | Rate: {:.2}s | Range: {:.0}m",
-                    preview_h.weapon.weapon_kind,
-                    preview_h.weapon.magazine_size,
-                    preview_h.weapon.damage,
-                    preview_h.weapon.fire_rate_secs,
-                    preview_h.weapon.max_range
-                ));
-                lines.push(format!(
-                    "HP: {:.0} (+{:.1}/s) | Armor: {:.1} | Vision: {:.0}m | Gold: {}",
-                    preview_h.max_hp,
-                    preview_h.hp_regen_per_sec,
-                    preview_h.armor,
-                    preview_h.vision_range,
-                    preview_h.starting_gold
-                ));
-                lines.push(String::new());
-                lines.push("Draft Order & Picks:".to_string());
-                for (step, &slot_idx) in snap.draft_order.iter().enumerate() {
-                    let p = &snap.players[slot_idx];
-                    let marker = if step == snap.current_draft_step { ">> " } else { "   " };
-                    let pick_name = p
-                        .selected_hero_id
-                        .as_deref()
-                        .unwrap_or("...");
-                    lines.push(format!(
-                        "{}Slot {} [{:?}] -> {}",
-                        marker,
-                        slot_idx + 1,
-                        p.team,
-                        pick_name
-                    ));
+                if is_my_turn {
+                    ("YOUR TURN TO PICK!".to_string(), Color::srgb(0.32, 0.96, 0.62))
+                } else if let Some(slot) = snap.current_pick_slot {
+                    (format!("SLOT {} PICKING...", slot + 1), Color::srgb(0.95, 0.78, 0.32))
+                } else {
+                    ("DRAFT COMPLETE".to_string(), Color::srgb(0.45, 0.88, 1.0))
                 }
             }
             MatchPhase::BattleLoading => {
-                lines.push("TEAM DAWN  vs  TEAM DUSK".to_string());
-                lines.push("----------------------------------------".to_string());
-                for p in &snap.players {
-                    let hero_name = p
-                        .selected_hero_id
-                        .as_deref()
-                        .and_then(|id| config.heroes.iter().find(|h| h.id == id))
-                        .map(|h| h.display_name.as_str())
-                        .unwrap_or("Unknown");
-                    let load_txt = if p.map_loaded { "READY" } else { "LOADING..." };
-                    lines.push(format!(
-                        "  [{:?}] Slot {} -> {} ({})",
-                        p.team,
-                        p.slot_index + 1,
-                        hero_name,
-                        load_txt
-                    ));
-                }
+                let loaded_cnt = snap.players.iter().filter(|p| p.map_loaded).count();
+                (format!("DEPLOYING {}/{}", loaded_cnt, snap.players.len()), Color::srgb(0.45, 0.92, 1.0))
             }
-            MatchPhase::InGame => {}
+            MatchPhase::InGame => (String::new(), Color::WHITE),
+        };
+        if **t_txt != s { **t_txt = s; }
+        *t_col = TextColor(c);
+    }
+
+    let (timer_label, timer_ratio, timer_col, bottom_ratio, bottom_label) = match snap.phase {
+        MatchPhase::WaitingForPlayers => {
+            let r = (snap.connected_count as f32) / (snap.required_players.max(1) as f32);
+            (
+                format!("{}/{}", snap.connected_count, snap.required_players),
+                r,
+                Color::srgb(0.28, 0.86, 0.65),
+                r,
+                format!("Waiting for players to connect... ({} / {} ready)", snap.connected_count, snap.required_players),
+            )
         }
-        let next_body = lines.join("
-");
-        if **body != next_body {
-            **body = next_body;
+        MatchPhase::HeroSelect => {
+            let max_t = moba_shared::HERO_PICK_TIME_SECS.max(1.0);
+            let r = (snap.pick_time_remaining / max_t).clamp(0.0, 1.0);
+            let col = if snap.pick_time_remaining <= 8.0 {
+                Color::srgb(0.98, 0.32, 0.32)
+            } else {
+                Color::srgb(0.26, 0.86, 0.98)
+            };
+            let draft_prog = (snap.current_draft_step as f32) / (snap.draft_order.len().max(1) as f32);
+            (
+                format!("{:.0}s", snap.pick_time_remaining.max(0.0)),
+                r,
+                col,
+                draft_prog,
+                format!("Draft Step {} of {}  •  3D Armory Preview", (snap.current_draft_step + 1).min(snap.draft_order.len().max(1)), snap.draft_order.len().max(1)),
+            )
         }
+        MatchPhase::BattleLoading => {
+            let loaded_cnt = snap.players.iter().filter(|p| p.map_loaded).count();
+            let r = (loaded_cnt as f32) / (snap.players.len().max(1) as f32);
+            (
+                format!("{:.0}%", r * 100.0),
+                r,
+                Color::srgb(0.32, 0.95, 0.68),
+                r,
+                "Synchronizing 3D Arena & Hero Assets...".to_string(),
+            )
+        }
+        MatchPhase::InGame => (String::new(), 1.0, Color::WHITE, 1.0, String::new()),
+    };
+
+    if let Ok(mut tm) = ui.timer_q.single_mut() {
+        if **tm != timer_label { **tm = timer_label; }
+    }
+    if let Ok((mut tf_node, mut tf_bg)) = ui.timer_fill_q.single_mut() {
+        tf_node.width = percent(timer_ratio * 100.0);
+        *tf_bg = BackgroundColor(timer_col);
+    }
+    if let Ok(mut bf_node) = ui.bottom_fill_q.single_mut() {
+        bf_node.width = percent(bottom_ratio * 100.0);
+    }
+    if let Ok(mut bt) = ui.bottom_txt_q.single_mut() {
+        if **bt != bottom_label { **bt = bottom_label; }
+    }
+
+    let players_sig: String = snap
+        .players
+        .iter()
+        .map(|p| format!("{}:{}:{}:{}", p.slot_index, p.connected as u8, p.selected_hero_id.as_deref().unwrap_or(""), p.map_loaded as u8))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rebuild_key = format!(
+        "{:?}|{}|{}|{}|{}",
+        snap.phase,
+        match_flow.preview_hero_index,
+        snap.current_draft_step,
+        snap.current_pick_slot.map_or(99, |s| s),
+        players_sig
+    );
+    if *last_rebuild_key == rebuild_key {
+        return;
+    }
+    *last_rebuild_key = rebuild_key;
+
+    match snap.phase {
+        MatchPhase::WaitingForPlayers => {
+            if let Ok((dyn_ent, _)) = ui.dyn_root_q.single_mut() {
+                despawn_children_of(&mut commands, dyn_ent, &ui.children_q);
+                commands.entity(dyn_ent).with_children(|center| {
+                    center.spawn(Node {
+                        width: percent(90),
+                        max_width: px(980.0),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::SpaceBetween,
+                        column_gap: px(28.0),
+                        ..default()
+                    })
+                    .with_children(|cols| {
+                        for (team_id, title, team_col) in [
+                            (TeamId::Dawn, "TEAM DAWN", Color::srgb(0.18, 0.90, 0.62)),
+                            (TeamId::Dusk, "TEAM DUSK", Color::srgb(0.95, 0.34, 0.34)),
+                        ] {
+                            cols.spawn((
+                                Node {
+                                    width: percent(48),
+                                    padding: UiRect::all(px(16.0)),
+                                    border: UiRect::all(px(1.5)),
+                                    border_radius: BorderRadius::all(px(12.0)),
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: px(10.0),
+                                    ..default()
+                                },
+                                BorderColor::all(team_col.with_alpha(0.55)),
+                                BackgroundColor(Color::srgba(0.05, 0.08, 0.13, 0.92)),
+                            ))
+                            .with_children(|panel| {
+                                panel.spawn(Node {
+                                    flex_direction: FlexDirection::Row,
+                                    align_items: AlignItems::Center,
+                                    column_gap: px(8.0),
+                                    ..default()
+                                })
+                                .with_children(|th| {
+                                    th.spawn((
+                                        Node {
+                                            width: px(12.0),
+                                            height: px(12.0),
+                                            border_radius: BorderRadius::all(px(6.0)),
+                                            ..default()
+                                        },
+                                        BackgroundColor(team_col),
+                                    ));
+                                    th.spawn((
+                                        Text::new(title),
+                                        TextFont { font_size: FontSize::Px(17.0), ..default() },
+                                        TextColor(team_col),
+                                    ));
+                                });
+
+                                for p in snap.players.iter().filter(|pl| pl.team == team_id) {
+                                    let is_me = Some(p.slot_index) == match_flow.your_slot;
+                                    let card_col = if p.connected {
+                                        Color::srgb(0.20, 0.92, 0.60)
+                                    } else {
+                                        Color::srgb(0.95, 0.72, 0.28)
+                                    };
+                                    panel.spawn((
+                                        Node {
+                                            width: percent(100),
+                                            padding: UiRect::axes(px(12.0), px(10.0)),
+                                            border: UiRect::all(px(1.2)),
+                                            border_radius: BorderRadius::all(px(8.0)),
+                                            flex_direction: FlexDirection::Row,
+                                            justify_content: JustifyContent::SpaceBetween,
+                                            align_items: AlignItems::Center,
+                                            ..default()
+                                        },
+                                        BorderColor::all(if is_me { Color::srgb(0.35, 0.90, 1.0) } else { card_col.with_alpha(0.45) }),
+                                        BackgroundColor(if p.connected { Color::srgba(0.08, 0.18, 0.15, 0.85) } else { Color::srgba(0.08, 0.10, 0.15, 0.75) }),
+                                    ))
+                                    .with_children(|card| {
+                                        card.spawn(Node {
+                                            flex_direction: FlexDirection::Row,
+                                            align_items: AlignItems::Center,
+                                            column_gap: px(10.0),
+                                            ..default()
+                                        })
+                                        .with_children(|left| {
+                                            if p.connected {
+                                                left.spawn((
+                                                    Node {
+                                                        width: px(14.0),
+                                                        height: px(14.0),
+                                                        border_radius: BorderRadius::all(px(7.0)),
+                                                        ..default()
+                                                    },
+                                                    BackgroundColor(card_col),
+                                                ));
+                                            } else {
+                                                left.spawn((
+                                                    PulseAnimatedDot { phase_offset: p.slot_index as f32 * 0.9 },
+                                                    Node {
+                                                        width: px(14.0),
+                                                        height: px(14.0),
+                                                        border_radius: BorderRadius::all(px(7.0)),
+                                                        ..default()
+                                                    },
+                                                    BackgroundColor(card_col),
+                                                ));
+                                            }
+                                            left.spawn((
+                                                Text::new(if p.connected {
+                                                    format!("SLOT {}  •  ID {}", p.slot_index + 1, p.client_id.unwrap_or(0))
+                                                } else {
+                                                    format!("SLOT {}  •  Awaiting Operative...", p.slot_index + 1)
+                                                }),
+                                                TextFont { font_size: FontSize::Px(13.5), ..default() },
+                                                TextColor(if p.connected { Color::WHITE } else { Color::srgb(0.68, 0.74, 0.82) }),
+                                            ));
+                                        });
+
+                                        card.spawn(Node {
+                                            flex_direction: FlexDirection::Row,
+                                            align_items: AlignItems::Center,
+                                            column_gap: px(6.0),
+                                            ..default()
+                                        })
+                                        .with_children(|right| {
+                                            if is_me {
+                                                right.spawn((
+                                                    Node {
+                                                        padding: UiRect::axes(px(7.0), px(2.0)),
+                                                        border_radius: BorderRadius::all(px(4.0)),
+                                                        ..default()
+                                                    },
+                                                    BackgroundColor(Color::srgba(0.20, 0.78, 0.98, 0.25)),
+                                                ))
+                                                .with_children(|yb| {
+                                                    yb.spawn((
+                                                        Text::new("YOU"),
+                                                        TextFont { font_size: FontSize::Px(10.5), ..default() },
+                                                        TextColor(Color::srgb(0.45, 0.94, 1.0)),
+                                                    ));
+                                                });
+                                            }
+                                            right.spawn((
+                                                Text::new(if p.connected { "JOINED" } else { "WAITING" }),
+                                                TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                                TextColor(card_col),
+                                            ));
+                                        });
+                                    });
+                                }
+                            });
+                        }
+                    });
+                });
+            }
+        }
+        MatchPhase::HeroSelect => {
+            if let Ok(specs_ent) = ui.specs_root_q.single() {
+                despawn_children_of(&mut commands, specs_ent, &ui.children_q);
+                let h = config.active_hero(match_flow.preview_hero_index);
+                let (w_tag, w_col) = weapon_kind_short_badge(h.weapon.weapon_kind);
+                let team_col = if h.team == TeamId::Dawn {
+                    Color::srgb(0.18, 0.90, 0.62)
+                } else {
+                    Color::srgb(0.95, 0.34, 0.34)
+                };
+
+                commands.entity(specs_ent).with_children(|sp| {
+                    sp.spawn(Node {
+                        width: percent(100),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::SpaceBetween,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    })
+                    .with_children(|hdr| {
+                        hdr.spawn(Node {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(2.0),
+                            ..default()
+                        })
+                        .with_children(|t| {
+                            t.spawn((
+                                Text::new(h.display_name.clone()),
+                                TextFont { font_size: FontSize::Px(20.0), ..default() },
+                                TextColor(Color::WHITE),
+                            ));
+                            t.spawn((
+                                Text::new(format!("{:?}  •  Gold: {}g  •  XP Rad: {:.0}m", h.team, h.starting_gold, h.xp_gain_radius)),
+                                TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                TextColor(team_col),
+                            ));
+                        });
+                        hdr.spawn((
+                            Node {
+                                padding: UiRect::axes(px(10.0), px(5.0)),
+                                border: UiRect::all(px(1.2)),
+                                border_radius: BorderRadius::all(px(6.0)),
+                                ..default()
+                            },
+                            BorderColor::all(w_col),
+                            BackgroundColor(w_col.with_alpha(0.18)),
+                        ))
+                        .with_children(|wb| {
+                            wb.spawn((
+                                Text::new(format!("{} | {:?}", w_tag, h.weapon.weapon_kind)),
+                                TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                TextColor(w_col),
+                            ));
+                        });
+                    });
+
+                    spawn_stat_bar_row(sp, "HP", "Health & Regen", format!("{:.0}  (+{:.1}/s)", h.max_hp, h.hp_regen_per_sec), h.max_hp / 1000.0, Color::srgb(0.20, 0.90, 0.52));
+                    spawn_stat_bar_row(sp, "ARM", "Armor Rating", format!("{:.1}", h.armor), h.armor / 15.0, Color::srgb(0.42, 0.72, 0.98));
+                    spawn_stat_bar_row(sp, "STM", "Stamina & Regen", format!("{:.0}  (+{:.0}/s)  | Slide {:.0} / Jump {:.0}", h.max_stamina, h.stamina_regen_per_sec, h.slide_stamina_cost, h.jump_over_stamina_cost), h.max_stamina / 150.0, Color::srgb(0.98, 0.78, 0.25));
+                    spawn_stat_bar_row(sp, "SPD", "Mobility & Water", format!("{:.2}x  | Water {:.2}x / {:.2}x", h.move_speed_multiplier, h.shallow_water_speed_multiplier, h.deep_water_speed_multiplier), h.move_speed_multiplier / 1.25, Color::srgb(0.25, 0.90, 0.95));
+                    spawn_stat_bar_row(sp, "CLM", "Wall Climb (Up/Dn)", format!("{:.1} / {:.1} m/s  (Top {:.2}s)", h.wall_climb.climb_up_speed, h.wall_climb.climb_down_speed, h.wall_climb.climb_to_top_duration), h.wall_climb.climb_up_speed / 8.0, Color::srgb(0.32, 0.88, 0.76));
+                    spawn_stat_bar_row(sp, "VIS", "Vision & High Ground", format!("{:.0}m  (+{:.0}m HG)", h.vision_range, h.high_ground_vision_bonus), h.vision_range / 55.0, Color::srgb(0.72, 0.55, 0.98));
+
+                    spawn_stat_bar_row(sp, "DMG", "Primary Weapon", format!("{:.0} dmg x{} | {:.2}s | Mag {} | Rel {:.1}s | {:.0}m", h.weapon.damage, h.weapon.pellets_per_shot, h.weapon.fire_rate_secs, h.weapon.magazine_size, h.weapon.reload_duration_secs, h.weapon.max_range), (h.weapon.damage * h.weapon.pellets_per_shot as f32) / 140.0, Color::srgb(0.98, 0.42, 0.35));
+                    spawn_stat_bar_row(sp, "PST", "Secondary Pistol", format!("{:.0} dmg | {:.2}s | Mag {} | Rel {:.1}s | {:.0}m", h.pistol.damage, h.pistol.fire_rate_secs, h.pistol.magazine_size, h.pistol.reload_duration_secs, h.pistol.max_range), h.pistol.damage / 40.0, Color::srgb(0.75, 0.80, 0.95));
+                    spawn_stat_bar_row(sp, "GRN", "Tactical Grenade", format!("{:.0} dmg | AoE {:.1}m | x{} | CD {:.0}s", h.grenade.damage, h.grenade.aoe_radius, h.grenade.max_charges, h.grenade.recharge_secs), h.grenade.damage / 220.0, Color::srgb(0.98, 0.58, 0.20));
+
+                    sp.spawn((
+                        Node {
+                            width: percent(100),
+                            margin: UiRect::top(px(4.0)),
+                            padding: UiRect::all(px(8.0)),
+                            border_radius: BorderRadius::all(px(6.0)),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(3.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.10, 0.14, 0.22, 0.90)),
+                    ))
+                    .with_children(|lg| {
+                        lg.spawn((
+                            Text::new("PER-LEVEL GROWTH"),
+                            TextFont { font_size: FontSize::Px(10.5), ..default() },
+                            TextColor(Color::srgb(0.55, 0.82, 0.98)),
+                        ));
+                        lg.spawn((
+                            Text::new(format!(
+                                "+{:.0} HP  •  +{:.1} DMG  •  +{:.2} ARM  •  +{:.1}m RNG  •  -{:.4}s Rate",
+                                h.level_growth.max_hp_per_level,
+                                h.level_growth.damage_per_level,
+                                h.level_growth.armor_per_level,
+                                h.level_growth.max_range_per_level,
+                                h.level_growth.fire_rate_reduction_per_level
+                            )),
+                            TextFont { font_size: FontSize::Px(11.0), ..default() },
+                            TextColor(Color::srgb(0.84, 0.90, 0.96)),
+                        ));
+                    });
+                });
+            }
+
+            if let Ok(strip_ent) = ui.draft_strip_q.single() {
+                despawn_children_of(&mut commands, strip_ent, &ui.children_q);
+                commands.entity(strip_ent).with_children(|st| {
+                    for (step, &slot_idx) in snap.draft_order.iter().enumerate() {
+                        let p = &snap.players[slot_idx];
+                        let is_active = step == snap.current_draft_step;
+                        let team_col = if p.team == TeamId::Dawn {
+                            Color::srgb(0.18, 0.88, 0.62)
+                        } else {
+                            Color::srgb(0.95, 0.34, 0.34)
+                        };
+                        let hero_lbl = p
+                            .selected_hero_id
+                            .as_deref()
+                            .map(|id| config.hero_by_id(id).display_name.as_str())
+                            .unwrap_or("Picking...");
+                        st.spawn((
+                            Node {
+                                padding: UiRect::axes(px(10.0), px(5.0)),
+                                border: UiRect::all(px(if is_active { 1.8 } else { 1.0 })),
+                                border_radius: BorderRadius::all(px(6.0)),
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                column_gap: px(6.0),
+                                ..default()
+                            },
+                            BorderColor::all(if is_active { Color::srgb(0.98, 0.84, 0.30) } else { team_col.with_alpha(0.45) }),
+                            BackgroundColor(if is_active { Color::srgba(0.18, 0.24, 0.34, 0.95) } else { Color::srgba(0.07, 0.10, 0.15, 0.85) }),
+                        ))
+                        .with_children(|chip| {
+                            chip.spawn((
+                                Node {
+                                    width: px(8.0),
+                                    height: px(8.0),
+                                    border_radius: BorderRadius::all(px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(team_col),
+                            ));
+                            chip.spawn((
+                                Text::new(format!("S{}: {}", slot_idx + 1, hero_lbl)),
+                                TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                TextColor(Color::WHITE),
+                            ));
+                        });
+                    }
+                });
+            }
+        }
+        MatchPhase::BattleLoading => {
+            if let Ok((dyn_ent, _)) = ui.dyn_root_q.single_mut() {
+                despawn_children_of(&mut commands, dyn_ent, &ui.children_q);
+                commands.entity(dyn_ent).with_children(|center| {
+                    center.spawn(Node {
+                        width: percent(96),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::SpaceBetween,
+                        align_items: AlignItems::Center,
+                        column_gap: px(24.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn(Node {
+                            width: px(310.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(8.0),
+                            ..default()
+                        })
+                        .with_children(|col| {
+                            col.spawn((
+                                Text::new("TEAM DAWN"),
+                                TextFont { font_size: FontSize::Px(15.0), ..default() },
+                                TextColor(Color::srgb(0.20, 0.92, 0.62)),
+                            ));
+                            for p in snap.players.iter().filter(|pl| pl.team == TeamId::Dawn) {
+                                let h = p.selected_hero_id.as_deref().map(|id| config.hero_by_id(id)).unwrap_or_else(|| config.active_hero(0));
+                                let (w_tag, w_col) = weapon_kind_short_badge(h.weapon.weapon_kind);
+                                col.spawn((
+                                    Node {
+                                        padding: UiRect::all(px(10.0)),
+                                        border: UiRect::all(px(1.5)),
+                                        border_radius: BorderRadius::all(px(8.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    },
+                                    BorderColor::all(Color::srgba(0.20, 0.90, 0.62, 0.70)),
+                                    BackgroundColor(Color::srgba(0.05, 0.12, 0.11, 0.82)),
+                                ))
+                                .with_children(|c| {
+                                    c.spawn(Node { flex_direction: FlexDirection::Column, row_gap: px(2.0), ..default() })
+                                        .with_children(|t| {
+                                            t.spawn((Text::new(h.display_name.clone()), TextFont { font_size: FontSize::Px(14.0), ..default() }, TextColor(Color::WHITE)));
+                                            t.spawn((Text::new(format!("Slot {}  •  {}", p.slot_index + 1, w_tag)), TextFont { font_size: FontSize::Px(11.0), ..default() }, TextColor(w_col)));
+                                        });
+                                    c.spawn((
+                                        Text::new(if p.map_loaded { "READY" } else { "LOADING" }),
+                                        TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                        TextColor(if p.map_loaded { Color::srgb(0.32, 0.96, 0.64) } else { Color::srgb(0.98, 0.76, 0.28) }),
+                                    ));
+                                });
+                            }
+                        });
+
+                        row.spawn((
+                            Node {
+                                padding: UiRect::axes(px(22.0), px(12.0)),
+                                border: UiRect::all(px(2.0)),
+                                border_radius: BorderRadius::all(px(14.0)),
+                                ..default()
+                            },
+                            BorderColor::all(Color::srgba(0.98, 0.78, 0.28, 0.85)),
+                            BackgroundColor(Color::srgba(0.08, 0.06, 0.12, 0.78)),
+                        ))
+                        .with_children(|vs| {
+                            vs.spawn((
+                                Text::new("VS"),
+                                TextFont { font_size: FontSize::Px(34.0), ..default() },
+                                TextColor(Color::srgb(0.98, 0.84, 0.34)),
+                            ));
+                        });
+
+                        row.spawn(Node {
+                            width: px(310.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(8.0),
+                            ..default()
+                        })
+                        .with_children(|col| {
+                            col.spawn((
+                                Text::new("TEAM DUSK"),
+                                TextFont { font_size: FontSize::Px(15.0), ..default() },
+                                TextColor(Color::srgb(0.95, 0.34, 0.34)),
+                            ));
+                            for p in snap.players.iter().filter(|pl| pl.team == TeamId::Dusk) {
+                                let h = p.selected_hero_id.as_deref().map(|id| config.hero_by_id(id)).unwrap_or_else(|| config.active_hero(0));
+                                let (w_tag, w_col) = weapon_kind_short_badge(h.weapon.weapon_kind);
+                                col.spawn((
+                                    Node {
+                                        padding: UiRect::all(px(10.0)),
+                                        border: UiRect::all(px(1.5)),
+                                        border_radius: BorderRadius::all(px(8.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    },
+                                    BorderColor::all(Color::srgba(0.95, 0.34, 0.34, 0.70)),
+                                    BackgroundColor(Color::srgba(0.14, 0.06, 0.08, 0.82)),
+                                ))
+                                .with_children(|c| {
+                                    c.spawn(Node { flex_direction: FlexDirection::Column, row_gap: px(2.0), ..default() })
+                                        .with_children(|t| {
+                                            t.spawn((Text::new(h.display_name.clone()), TextFont { font_size: FontSize::Px(14.0), ..default() }, TextColor(Color::WHITE)));
+                                            t.spawn((Text::new(format!("Slot {}  •  {}", p.slot_index + 1, w_tag)), TextFont { font_size: FontSize::Px(11.0), ..default() }, TextColor(w_col)));
+                                        });
+                                    c.spawn((
+                                        Text::new(if p.map_loaded { "READY" } else { "LOADING" }),
+                                        TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                        TextColor(if p.map_loaded { Color::srgb(0.32, 0.96, 0.64) } else { Color::srgb(0.98, 0.76, 0.28) }),
+                                    ));
+                                });
+                            }
+                        });
+                    });
+                });
+            }
+        }
+        MatchPhase::InGame => {}
     }
 }
 
@@ -8413,13 +9593,20 @@ fn sync_remote_players_system(
                     };
 
                     let is_looping_lower = !rp.is_dead && rp.traversal_anim.is_none();
-                    let lower_node = assets.get_or_fallback(&desired_lower, "idle");
+                    let lower_is_paused = desired_lower.ends_with("_paused");
+                    let lower_clip_name = desired_lower.strip_suffix("_paused").unwrap_or(&desired_lower);
+                    let lower_node = assets.get_or_fallback(lower_clip_name, "idle");
                     for (lp, mut player, mut trans) in &mut lower_query {
                         if lp.slot_index == rp.slot_index {
                             if vis_comp.last_lower != desired_lower
                                 || (is_looping_lower && !player.is_playing_animation(lower_node))
                             {
                                 let active = trans.play(&mut player, lower_node, Duration::from_millis(120));
+                                if lower_is_paused {
+                                    active.set_speed(0.0);
+                                } else if lower_clip_name.starts_with("climbing_") {
+                                    active.set_speed(res.config.hero_by_id(&rp.hero_id).wall_climb.anim_speed_scale);
+                                }
                                 if is_looping_lower {
                                     active.repeat();
                                 }
@@ -8431,7 +9618,9 @@ fn sync_remote_players_system(
                     let is_looping_upper = !rp.is_dead
                         && rp.traversal_anim.is_none()
                         && (rp.upper_anim.is_none() || rp.upper_anim.as_deref() == Some("pistol_run"));
-                    let upper_node = assets.get_or_fallback(&desired_upper, "idle");
+                    let upper_is_paused = desired_upper.ends_with("_paused");
+                    let upper_clip_name = desired_upper.strip_suffix("_paused").unwrap_or(&desired_upper);
+                    let upper_node = assets.get_or_fallback(upper_clip_name, "idle");
                     for (up, mut player, mut trans) in &mut upper_query {
                         if up.slot_index == rp.slot_index {
                             if vis_comp.last_upper != desired_upper
@@ -8443,6 +9632,10 @@ fn sync_remote_players_system(
                                     let clip_dur = assets.durations.get("toss_grenade").copied().unwrap_or(throw_dur);
                                     let speed = (clip_dur / throw_dur).max(0.1);
                                     active.set_speed(speed);
+                                } else if upper_is_paused {
+                                    active.set_speed(0.0);
+                                } else if upper_clip_name.starts_with("climbing_") {
+                                    active.set_speed(res.config.hero_by_id(&rp.hero_id).wall_climb.anim_speed_scale);
                                 }
                                 if is_looping_upper {
                                     active.repeat();

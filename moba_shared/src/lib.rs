@@ -343,6 +343,8 @@ impl GameConfig {
             "cursor_lead_deadzone_ratio باید بین [0.0, 1.0) باشد"
         );
         assert!(self.camera.cursor_lead_lerp_speed > 0.0, "cursor_lead_lerp_speed باید بزرگ‌تر از صفر باشد");
+        assert!(self.camera.edge_pan_margin_px > 0.0, "edge_pan_margin_px باید بزرگ‌تر از صفر باشد");
+        assert!(self.camera.edge_pan_speed > 0.0, "edge_pan_speed باید بزرگ‌تر از صفر باشد");
     }
 
     pub fn validate_pause(&self) {
@@ -758,6 +760,8 @@ pub struct CameraConfig {
     pub cursor_lead_max_distance_z: f32,
     pub cursor_lead_deadzone_ratio: f32,
     pub cursor_lead_lerp_speed: f32,
+    pub edge_pan_margin_px: f32,
+    pub edge_pan_speed: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2557,6 +2561,47 @@ pub fn canyon_sample_height(canyon: &CanyonConfig, x: f32, z: f32) -> f32 {
     }
 }
 
+/// ارتفاع هدف دوربین در حالت Free-Look: روی پل مرکزی و تمام لاین‌ها (بالا، وسط، پایین) بالا می‌رود و فقط در بستر باز دره پایین می‌آید
+pub fn sample_camera_focus_y(config: &GameConfig, x: f32, z: f32) -> f32 {
+    let cb = &config.map.center_bridge;
+    let cb_tf = cb.model_transform.to_transform();
+    let cb_rad = cb.outer_radius * cb_tf.scale.x.max(cb_tf.scale.z);
+    let dx = x - cb_tf.translation.x;
+    let dz = z - cb_tf.translation.z;
+    if dx * dx + dz * dz <= cb_rad * cb_rad {
+        return cb_tf.translation.y + cb.deck_thickness * 0.5 * cb_tf.scale.y;
+    }
+
+    let p_xz = Vec2::new(x, z);
+    for lane in &config.map.lanes {
+        let half_w = lane.width * 0.5;
+        let half_w_sq = half_w * half_w;
+        for pair in lane.waypoints.windows(2) {
+            let a = Vec3::new(pair[0].0, pair[0].1, pair[0].2);
+            let b = Vec3::new(pair[1].0, pair[1].1, pair[1].2);
+            let a_xz = Vec2::new(a.x, a.z);
+            let b_xz = Vec2::new(b.x, b.z);
+            let ab = b_xz - a_xz;
+            let len_sq = ab.length_squared();
+            let t = if len_sq > 1e-5 {
+                ((p_xz - a_xz).dot(ab) / len_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let closest = a_xz + ab * t;
+            if (p_xz - closest).length_squared() <= half_w_sq {
+                return a.y + (b.y - a.y) * t + lane.thickness * 0.5;
+            }
+        }
+    }
+
+    if config.map.canyon.enabled && canyon_sample_height(&config.map.canyon, x, z) < -0.15 {
+        config.map.canyon.water_y
+    } else {
+        0.0
+    }
+}
+
 pub fn sample_waterfall_depth_offset(config: &GameConfig, wx: f32, wz: f32) -> f32 {
     let mut max_extra_depth = 0.0_f32;
     let basin_radius = 16.0_f32;
@@ -3033,9 +3078,28 @@ impl CustomPhysicsWorld {
                             }
                         }
 
-                        if !stepped_up && horiz_normal != Vec3::ZERO {
-                            center += horiz_normal * (wall_hit.penetration + nudge);
-                            any_wall_push = true;
+                        if !stepped_up {
+                            let push_dir = if horiz_normal != Vec3::ZERO {
+                                horiz_normal
+                            } else if entry.is_non_walkable_wall && config.map.canyon.enabled {
+                                let eps = 0.8_f32;
+                                let gx = canyon_edge_distance(&config.map.canyon, center.x + eps, center.z)
+                                    - canyon_edge_distance(&config.map.canyon, center.x - eps, center.z);
+                                let gz = canyon_edge_distance(&config.map.canyon, center.x, center.z + eps)
+                                    - canyon_edge_distance(&config.map.canyon, center.x, center.z - eps);
+                                Vec3::new(gx, 0.0, gz).normalize_or_zero()
+                            } else {
+                                Vec3::ZERO
+                            };
+                            if push_dir != Vec3::ZERO {
+                                let push_amt = if entry.is_non_walkable_wall && horiz_normal == Vec3::ZERO {
+                                    0.18_f32
+                                } else {
+                                    wall_hit.penetration + nudge
+                                };
+                                center += push_dir * push_amt;
+                                any_wall_push = true;
+                            }
                         }
                     }
                 }
@@ -3131,7 +3195,7 @@ impl CustomPhysicsWorld {
                 free_fall_feet_y
             }
         } else {
-            (feet_y + desired_delta.y).max(-12.0)
+            (feet_y + desired_delta.y).max(config.map.canyon.floor_depth - 5.0)
         };
 
         center.y = new_feet_y + center_y_offset;
@@ -3183,6 +3247,16 @@ impl CustomPhysicsWorld {
                             .normalize_or_zero();
                         if horiz_normal != Vec3::ZERO {
                             center += horiz_normal * (contact.penetration + nudge);
+                        } else if entry.is_non_walkable_wall && config.map.canyon.enabled {
+                            let eps = 0.8_f32;
+                            let gx = canyon_edge_distance(&config.map.canyon, center.x + eps, center.z)
+                                - canyon_edge_distance(&config.map.canyon, center.x - eps, center.z);
+                            let gz = canyon_edge_distance(&config.map.canyon, center.x, center.z + eps)
+                                - canyon_edge_distance(&config.map.canyon, center.x, center.z - eps);
+                            let inward_dir = Vec3::new(gx, 0.0, gz).normalize_or_zero();
+                            if inward_dir != Vec3::ZERO {
+                                center += inward_dir * 0.18;
+                            }
                         }
                     }
                 }
@@ -7735,12 +7809,31 @@ fn step_traversal_custom(
             };
             let arc_y = world.traversal.start_pos.y.lerp(world.traversal.target_pos.y, frac * frac)
                 + (frac * (1.0 - frac)) * arc_boost;
+            let mut dive_x = current_pos.x;
+            let mut dive_z = current_pos.z;
+            if config.map.canyon.enabled && arc_y < -0.35 {
+                let edge_d = canyon_edge_distance(&config.map.canyon, dive_x, dive_z);
+                let min_edge = config.soldier.player_radius * world.hero_scale + 0.45;
+                if edge_d < min_edge {
+                    let eps = 0.8_f32;
+                    let gx = canyon_edge_distance(&config.map.canyon, dive_x + eps, dive_z)
+                        - canyon_edge_distance(&config.map.canyon, dive_x - eps, dive_z);
+                    let gz = canyon_edge_distance(&config.map.canyon, dive_x, dive_z + eps)
+                        - canyon_edge_distance(&config.map.canyon, dive_x, dive_z - eps);
+                    let inward = Vec3::new(gx, 0.0, gz).normalize_or_zero();
+                    if inward != Vec3::ZERO {
+                        let push = (min_edge - edge_d).clamp(0.0, 2.5);
+                        dive_x += inward.x * push;
+                        dive_z += inward.z * push;
+                    }
+                }
+            }
             soldier_tf.translation = Vec3::new(
-                current_pos.x,
+                dive_x,
                 arc_y + config.physics.soldier_capsule_center_y * world.hero_scale,
-                current_pos.z,
+                dive_z,
             );
-            world.soldier_pos = Vec3::new(current_pos.x, arc_y, current_pos.z);
+            world.soldier_pos = Vec3::new(dive_x, arc_y, dive_z);
             if frac >= 0.85 && (world.traversal.elapsed - dt) / world.traversal.duration < 0.85 {
                 if let Some((water_y, _)) = sample_water_surface_at(config, world.traversal.target_pos) {
                     world.pending_fx.push(GameplayFxEvent::WaterSplash {
@@ -7923,7 +8016,7 @@ fn step_traversal_custom(
             .cast_ray(
                 landing_ray_orig,
                 Vec3::NEG_Y,
-                18.0,
+                32.0,
                 query_groups,
                 |entity| {
                     if let Ok(t) = target_query.get(entity) {
@@ -7946,6 +8039,9 @@ fn step_traversal_custom(
                     true
                 },
             )
+            .filter(|(ent, hit)| {
+                *ent != Entity::PLACEHOLDER && hit.point.y >= config.map.canyon.water_y - 0.25
+            })
             .map(|(_, hit)| hit.point.y);
 
         let effective_landing_y = if let Some(hit_y) = bridge_or_ground_hit {
@@ -8146,7 +8242,7 @@ fn step_traversal_custom(
         .cast_ray(
             landing_ray_orig,
             Vec3::NEG_Y,
-            14.0,
+            32.0,
             query_groups,
             |entity| {
                 if let Ok(t) = target_query.get(entity) {
@@ -8169,6 +8265,9 @@ fn step_traversal_custom(
                 true
             },
         )
+        .filter(|(ent, hit)| {
+            *ent != Entity::PLACEHOLDER && hit.point.y >= config.map.canyon.water_y - 0.25
+        })
         .map(|(_, hit)| hit.point.y);
 
     let effective_landing_y = if let Some(hit_y) = bridge_or_ground_hit {

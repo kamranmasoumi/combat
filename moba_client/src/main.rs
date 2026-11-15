@@ -3062,7 +3062,8 @@ fn client_sample_input_system(
     if keyboard.pressed(KeyCode::KeyD) {
         move_vec.x += 1.0;
     }
-    if move_vec.length_squared() > 0.01 {
+    let wasd_pressed = move_vec.length_squared() > 0.01;
+    if wasd_pressed {
         ex.hero_move_target.0 = None;
     } else if let Some(target) = ex.hero_move_target.0 {
         let delta = Vec3::new(
@@ -3094,7 +3095,7 @@ fn client_sample_input_system(
     let client_muzzle_world_pos = muzzle_query.single().ok().map(|gtf| gtf.translation());
 
     let alt_held = keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight);
-    let hero_action_taken = move_vec.length_squared() > 0.01
+    let hero_action_taken = wasd_pressed
         || keyboard.just_pressed(KeyCode::Space)
         || keyboard.just_pressed(KeyCode::KeyR)
         || keyboard.just_pressed(KeyCode::KeyE)
@@ -4646,56 +4647,93 @@ fn gameplay_fx_system(
 
 }
 
+#[derive(SystemParam)]
+struct CameraFollowExtraParams<'w> {
+    pause_state: Res<'w, LatestPauseState>,
+    chat_state: Res<'w, ChatUiState>,
+    shop_ui: Res<'w, ShopUiState>,
+    settings_ui: Res<'w, SettingsUiState>,
+    latest_couriers: Res<'w, LatestCouriers>,
+    courier_ctrl: ResMut<'w, CourierControlState>,
+    inspected: ResMut<'w, InspectedUnit>,
+    camera_control: ResMut<'w, CameraControlState>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn camera_follow_system(
     time: Res<Time>,
     config: Res<GameConfig>,
     match_flow: Res<ClientMatchFlow>,
-    pause_state: Res<LatestPauseState>,
-    chat_state: Res<ChatUiState>,
     mut shake: ResMut<CameraShake>,
     mut render_state: ResMut<ClientRenderState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
-    shop_ui: Res<ShopUiState>,
-    mut camera_control: ResMut<CameraControlState>,
+    mut ex: CameraFollowExtraParams,
     window_query: Query<&Window, With<PrimaryWindow>>,
     soldier_query: Query<&Transform, (With<SoldierMarker>, Without<MobaCamera>)>,
     mut camera_query: Query<&mut Transform, With<MobaCamera>>,
     mut last_mid_cursor: Local<Option<Vec2>>,
+    mut last_f2_time: Local<Option<f32>>,
+    mut smoothed_focus: Local<Option<Vec3>>,
 ) {
     if !match_flow.is_in_game() {
+        *smoothed_focus = None;
         return;
     }
     let Ok(soldier_tf) = soldier_query.single() else { return };
     let Ok(mut camera_tf) = camera_query.single_mut() else { return };
 
-    if !chat_state.is_open && !shop_ui.is_open && keyboard.just_pressed(KeyCode::KeyC) {
-        camera_control.camera_unlocked = !camera_control.camera_unlocked;
-        if camera_control.camera_unlocked {
-            if camera_control.free_look_target.is_none() {
-                camera_control.free_look_target = Some(soldier_tf.translation);
+    let dt = time.delta_secs();
+    let now_secs = time.elapsed_secs();
+    let half_x = config.map.map_dimensions.0 * 0.5;
+    let half_z = config.map.map_dimensions.1 * 0.5;
+
+    // دوبار زدن پشت‌سرهم F2: فعال‌سازی کنترل Courier و انتقال دوربین روی Courier
+    if !ex.chat_state.is_open
+        && !ex.shop_ui.is_open
+        && !ex.settings_ui.is_open
+        && keyboard.just_pressed(KeyCode::F2)
+    {
+        let is_double_tap = last_f2_time.is_some_and(|prev| (now_secs - prev) <= 0.38);
+        *last_f2_time = Some(now_secs);
+        if is_double_tap {
+            if let Some(my_c) = ex.latest_couriers
+                .0
+                .iter()
+                .find(|c| Some(c.owner_slot) == match_flow.your_slot)
+            {
+                ex.courier_ctrl.selected = true;
+                *ex.inspected = InspectedUnit::OwnCourier;
+                ex.camera_control.free_look_target = Some(Vec3::new(my_c.pos.x, 0.0, my_c.pos.z));
             }
-        } else {
-            camera_control.free_look_target = None;
         }
     }
 
-    if !chat_state.is_open && !shop_ui.is_open && mouse_button.pressed(MouseButton::Middle) {
+    if !ex.chat_state.is_open && !ex.shop_ui.is_open && !ex.settings_ui.is_open && keyboard.just_pressed(KeyCode::KeyC) {
+        ex.camera_control.camera_unlocked = !ex.camera_control.camera_unlocked;
+        if ex.camera_control.camera_unlocked {
+            if ex.camera_control.free_look_target.is_none() {
+                ex.camera_control.free_look_target = Some(soldier_tf.translation);
+            }
+        } else {
+            ex.camera_control.free_look_target = None;
+        }
+    }
+
+    // جابجایی دوربین با نگه داشتن غلطک موس (Middle Mouse)
+    if !ex.chat_state.is_open && !ex.shop_ui.is_open && !ex.settings_ui.is_open && mouse_button.pressed(MouseButton::Middle) {
         if let Ok(window) = window_query.single() {
             if let Some(cursor) = window.cursor_position() {
                 if let Some(prev) = *last_mid_cursor {
                     let delta = cursor - prev;
                     if delta.length_squared() > 0.01 {
-                        let base = camera_control
+                        let base = ex.camera_control
                             .free_look_target
                             .unwrap_or(soldier_tf.translation);
                         let pan_speed = 0.065;
-                        let half_x = config.map.map_dimensions.0 * 0.5;
-                        let half_z = config.map.map_dimensions.1 * 0.5;
                         let next_x = (base.x - delta.x * pan_speed).clamp(-half_x, half_x);
                         let next_z = (base.z - delta.y * pan_speed).clamp(-half_z, half_z);
-                        camera_control.free_look_target = Some(Vec3::new(next_x, base.y, next_z));
+                        ex.camera_control.free_look_target = Some(Vec3::new(next_x, base.y, next_z));
                     }
                 }
                 *last_mid_cursor = Some(cursor);
@@ -4705,7 +4743,45 @@ fn camera_follow_system(
         *last_mid_cursor = None;
     }
 
-    let dt = time.delta_secs();
+    // جابجایی دوربین با بردن نشانه‌گر موس به لبه‌های صفحه هنگام آزاد بودن دوربین (مشابه Dota 2)
+    if ex.camera_control.camera_unlocked
+        && !ex.chat_state.is_open
+        && !ex.shop_ui.is_open
+        && !ex.settings_ui.is_open
+        && !ex.camera_control.is_dragging_minimap
+        && !mouse_button.pressed(MouseButton::Middle)
+    {
+        if let Ok(window) = window_query.single() {
+            if let Some(cursor) = window.cursor_position() {
+                let win_w = window.width().max(1.0);
+                let win_h = window.height().max(1.0);
+                let margin = config.camera.edge_pan_margin_px;
+                let mut edge_dir = Vec2::ZERO;
+                if cursor.x <= margin {
+                    edge_dir.x -= 1.0;
+                } else if cursor.x >= win_w - margin {
+                    edge_dir.x += 1.0;
+                }
+                if cursor.y <= margin {
+                    edge_dir.y -= 1.0;
+                } else if cursor.y >= win_h - margin {
+                    edge_dir.y += 1.0;
+                }
+                if edge_dir != Vec2::ZERO {
+                    let dir_n = edge_dir.normalize();
+                    let base = ex.camera_control
+                        .free_look_target
+                        .unwrap_or(soldier_tf.translation);
+                    let next_x = (base.x + dir_n.x * config.camera.edge_pan_speed * dt)
+                        .clamp(-half_x, half_x);
+                    let next_z = (base.z + dir_n.y * config.camera.edge_pan_speed * dt)
+                        .clamp(-half_z, half_z);
+                    ex.camera_control.free_look_target = Some(Vec3::new(next_x, base.y, next_z));
+                }
+            }
+        }
+    }
+
     shake.trauma = (shake.trauma - config.camera.trauma_decay_rate * dt).max(0.0);
     let shake_power = shake.trauma * shake.trauma;
 
@@ -4720,11 +4796,11 @@ fn camera_follow_system(
     );
 
     let mut desired_lead = Vec3::ZERO;
-    if camera_control.free_look_target.is_none()
-        && !camera_control.is_pointer_over_minimap
-        && !camera_control.is_dragging_minimap
-        && !chat_state.is_open
-        && pause_state.0.phase == PausePhase::Running
+    if ex.camera_control.free_look_target.is_none()
+        && !ex.camera_control.is_pointer_over_minimap
+        && !ex.camera_control.is_dragging_minimap
+        && !ex.chat_state.is_open
+        && ex.pause_state.0.phase == PausePhase::Running
     {
         if let Ok(window) = window_query.single() {
             if let Some(cursor) = window.cursor_position() {
@@ -4750,23 +4826,34 @@ fn camera_follow_system(
     }
 
     let lead_alpha = (1.0 - (-config.camera.cursor_lead_lerp_speed * dt).exp()).clamp(0.0, 1.0);
-    camera_control.current_cursor_lead =
-        camera_control.current_cursor_lead.lerp(desired_lead, lead_alpha);
+    ex.camera_control.current_cursor_lead =
+        ex.camera_control.current_cursor_lead.lerp(desired_lead, lead_alpha);
 
     let camera_offset = Vec3::new(
         config.camera.offset.0,
         config.camera.offset.1,
         config.camera.offset.2,
     );
-    let focus_pos = camera_control
-        .free_look_target
-        .unwrap_or(soldier_tf.translation + camera_control.current_cursor_lead);
-    let target_pos = focus_pos + camera_offset + shake_offset;
+
+    let desired_focus = if let Some(free_target) = ex.camera_control.free_look_target {
+        // در حالت Free-Look ارتفاع دوربین بر اساس سطح همان نقطه (پل مرکزی، لاین‌ها، فلات یا سطح آب دره) تنظیم می‌شود
+        let terrain_y = moba_shared::sample_camera_focus_y(&config, free_target.x, free_target.z);
+        Vec3::new(free_target.x, terrain_y, free_target.z)
+    } else {
+        soldier_tf.translation + ex.camera_control.current_cursor_lead
+    };
 
     let cam_alpha = (1.0 - (-config.camera.follow_lerp_speed * dt).exp()).clamp(0.0, 1.0);
-    camera_tf.translation = camera_tf.translation.lerp(target_pos, cam_alpha);
+    let cur_focus = match *smoothed_focus {
+        Some(prev) => prev.lerp(desired_focus, cam_alpha),
+        None => desired_focus,
+    };
+    *smoothed_focus = Some(cur_focus);
+
+    // هم translation و هم look_at از یک نقطه مشترک (cur_focus) استفاده می‌کنند تا دوربین هرگز نچرخد
+    camera_tf.translation = cur_focus + camera_offset + shake_offset;
     camera_tf.look_at(
-        focus_pos + shake_offset * config.camera.look_at_shake_factor,
+        cur_focus + shake_offset * config.camera.look_at_shake_factor,
         Vec3::Y,
     );
 }
@@ -5174,7 +5261,7 @@ fn minimap_interaction_system(
         let v = ((cursor.y - min_y) / MINIMAP_HEIGHT_PX).clamp(0.0, 1.0);
         let world_x = (u - 0.5) * config.map.map_dimensions.0;
         let world_z = (v - 0.5) * config.map.map_dimensions.1;
-        camera_control.free_look_target = Some(Vec3::new(world_x, render_state.soldier_pos.y, world_z));
+        camera_control.free_look_target = Some(Vec3::new(world_x, 0.0, world_z));
     }
 
     if inside && !chat_state.is_open && mouse_button.just_pressed(MouseButton::Right) {
@@ -12058,6 +12145,7 @@ fn courier_manual_move_input_system(
     mouse: Res<ButtonInput<MouseButton>>,
     window_q: Query<&Window, With<PrimaryWindow>>,
     cam_q: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    map_obj_q: Query<&MapObjectId>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
 ) {
     if !match_flow.is_in_game()
@@ -12141,6 +12229,15 @@ fn courier_manual_move_input_system(
         }
     }
 
+    let hero_in_pit = is_point_in_roshan_pit_circle(
+        &config.map.roshan_pit,
+        guards.render_state.soldier_pos.x,
+        guards.render_state.soldier_pos.z,
+        config.map.roshan_pit.outer_radius,
+    );
+    let pit_roof_id = format!("{}_roof", config.map.roshan_pit.id);
+    let pit_wall_prefix = format!("{}_wall_", config.map.roshan_pit.id);
+
     let terrain_hit = guards
         .physics_world
         .cast_ray(
@@ -12148,9 +12245,25 @@ fn courier_manual_move_input_system(
             ray_dir,
             400.0,
             soldier_collision_groups(),
-            |_| true,
+            |ent| {
+                if let Ok(obj) = map_obj_q.get(ent) {
+                    if obj.0 == pit_roof_id {
+                        return false;
+                    }
+                    if hero_in_pit && obj.0.starts_with(&pit_wall_prefix) {
+                        return false;
+                    }
+                }
+                true
+            },
         )
-        .map(|(_, hit)| hit.point)
+        .map(|(_, hit)| {
+            if let Some((water_y, _)) = moba_shared::sample_water_surface_at(&config, hit.point) {
+                Vec3::new(hit.point.x, water_y, hit.point.z)
+            } else {
+                hit.point
+            }
+        })
         .or_else(|| {
             if ray_dir.y.abs() > 1e-4 {
                 let t = (guards.render_state.soldier_pos.y - ray.origin.y) / ray_dir.y;

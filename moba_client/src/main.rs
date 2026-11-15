@@ -16,7 +16,7 @@ use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use bevy::window::{CursorOptions, MonitorSelection, PresentMode, PrimaryWindow, WindowMode, WindowResolution};
 use moba_shared::{
-    ancient_physics_bundle, barracks_physics_bundle, center_bridge_physics_bundle, create_shared_renet_client,
+    ancient_physics_bundle, barracks_physics_bundle, center_bridge_physics_bundle, is_point_in_roshan_pit_circle, roshan_pit_physics_bundles, create_shared_renet_client,
     grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
     mountain_physics_bundle, obstacle_physics_bundle, orient_soldier_towards,
     particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
@@ -661,6 +661,9 @@ struct HeroStatGrenadeText;
 struct TreeVisualMarker {
     shadows_optimized: bool,
 }
+
+#[derive(Component)]
+struct RoshanPitVisualRoot;
 
 #[derive(Component)]
 struct VisionOccludable {
@@ -1330,6 +1333,115 @@ fn setup_scene(
     }
 
     spawn_map_object_label(&mut commands, config.map.show_object_labels, bridge_ent, &bridge.id, bridge.deck_thickness * 0.5 + 1.2);
+
+    // ۶-ب. غار استوانه‌ای نیم‌دایره و سرپوشیده روشان در عریض‌ترین بخش رودخانه
+    if config.map.roshan_pit.enabled {
+        let pit = &config.map.roshan_pit;
+        for pit_bundle in roshan_pit_physics_bundles(&config) {
+            commands.spawn(pit_bundle);
+        }
+
+        let pit_tf = pit.model_transform.to_transform();
+        let pit_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(pit.color_rgb.0, pit.color_rgb.1, pit.color_rgb.2),
+            perceptual_roughness: pit.roughness,
+            ..default()
+        });
+        let roof_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(
+                pit.color_rgb.0 * 0.85,
+                pit.color_rgb.1 * 0.88,
+                pit.color_rgb.2 * 0.82,
+            ),
+            perceptual_roughness: 0.94,
+            ..default()
+        });
+        let floor_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.32, 0.30, 0.27),
+            perceptual_roughness: 0.92,
+            ..default()
+        });
+
+        let mut pit_cmds = commands.spawn((
+            RoshanPitVisualRoot,
+            pit_tf,
+            Visibility::Visible,
+            VisionOccludable {
+                is_faded: false,
+                half_extents: Vec3::new(pit.outer_radius, pit.wall_height * 0.6, pit.outer_radius),
+            },
+        ));
+        let pit_ent = pit_cmds.id();
+
+        if custom_glb_exists(&pit.model_path) {
+            pit_cmds.with_children(|parent| {
+                parent.spawn(glb_model_bundle(
+                    &asset_server,
+                    &pit.model_path,
+                    &pit.model_transform,
+                ));
+            });
+        } else {
+            let ent_rad = pit.entrance_angle_deg.to_radians();
+            let half_gap_rad = pit.entrance_half_angle_deg.to_radians();
+            let arc_span = std::f32::consts::TAU - 2.0 * half_gap_rad;
+            let start_ang = ent_rad + half_gap_rad;
+            let segments = 16_usize;
+            let step_ang = arc_span / (segments as f32);
+            let r_mid = 0.5 * (pit.inner_radius + pit.outer_radius);
+            let wall_thick = (pit.outer_radius - pit.inner_radius).max(0.5);
+            let seg_len = 2.0 * r_mid * (step_ang * 0.5).sin() + 0.35;
+
+            pit_cmds.with_children(|parent| {
+                // کف خشک سنگی روی آب رودخانه
+                parent.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(pit.outer_radius, pit.floor_thickness))),
+                    MeshMaterial3d(floor_mat),
+                    Transform::from_xyz(0.0, 0.15 - pit.floor_thickness * 0.5, 0.0),
+                ));
+
+                // دیواره‌های استوانه‌ای نیم‌دایره
+                let wall_mesh = meshes.add(Cuboid::new(seg_len, pit.wall_height, wall_thick));
+                for i in 0..segments {
+                    let ang = start_ang + (i as f32 + 0.5) * step_ang;
+                    let offset = Vec3::new(ang.cos() * r_mid, pit.wall_height * 0.5, ang.sin() * r_mid);
+                    let radial = Vec3::new(offset.x, 0.0, offset.z).normalize_or_zero();
+                    let rot = Transform::IDENTITY.looking_to(radial, Vec3::Y).rotation;
+                    parent.spawn((
+                        Mesh3d(wall_mesh.clone()),
+                        MeshMaterial3d(pit_mat.clone()),
+                        Transform::from_translation(offset).with_rotation(rot),
+                    ));
+                }
+
+                // سقف سرپوشیده غار تا از بیرون اصلاً داخلش دیده نشود
+                parent.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(pit.outer_radius + 0.3, pit.roof_thickness))),
+                    MeshMaterial3d(roof_mat),
+                    Transform::from_xyz(0.0, pit.wall_height + pit.roof_thickness * 0.5, 0.0),
+                ));
+
+                // نور مشعل گرم فقط برای فضای داخلی غار
+                parent.spawn((
+                    PointLight {
+                        color: Color::srgb(1.0, 0.62, 0.25),
+                        intensity: 220_000.0,
+                        range: pit.inner_radius * 1.4,
+                        shadow_maps_enabled: false,
+                        ..default()
+                    },
+                    Transform::from_xyz(0.0, 3.8, 0.0),
+                ));
+            });
+        }
+        spawn_map_object_label(
+            &mut commands,
+            config.map.show_object_labels,
+            pit_ent,
+            &pit.id,
+            pit.wall_height + 1.5,
+        );
+    }
 
     // ۷. مسیرهای سنگ‌فرش ۳ لاین اصلی (Top, Mid, Bot)
     for lane in &config.map.lanes {
@@ -5525,6 +5637,21 @@ fn bake_minimap_image(config: &GameConfig) -> Image {
         [55, 215, 235, 255],
     );
 
+    // ۵-ب. غار روشان روی مینی‌مپ
+    if config.map.roshan_pit.enabled {
+        let pit = &config.map.roshan_pit;
+        let pit_loc = pit.model_transform.location;
+        let pit_r = pit.outer_radius * px_per_unit_x;
+        draw_circle(&mut pixels, pit_loc.0, pit_loc.2, pit_r, [76, 72, 66, 255]);
+        draw_circle(
+            &mut pixels,
+            pit_loc.0,
+            pit_loc.2,
+            pit.inner_radius * px_per_unit_x,
+            [48, 44, 40, 255],
+        );
+    }
+
     // ۶. آبشارها
     for wf in &config.map.waterfalls {
         let loc = wf.model_transform.location;
@@ -5819,7 +5946,8 @@ fn occlusion_transparency_system(
     time: Res<Time>,
     render_state: Res<ClientRenderState>,
     camera_query: Query<&GlobalTransform, With<MobaCamera>>,
-    mut occludable_query: Query<(Entity, &GlobalTransform, &mut VisionOccludable)>,
+    config: Res<GameConfig>,
+    mut occludable_query: Query<(Entity, &GlobalTransform, &mut VisionOccludable, Has<RoshanPitVisualRoot>)>,
     children_query: Query<&Children>,
     mut mat_mesh_query: Query<(
         &mut MeshMaterial3d<StandardMaterial>,
@@ -5835,7 +5963,14 @@ fn occlusion_transparency_system(
     let dt = time.delta_secs();
     let fade_speed = (10.0 * dt).clamp(0.05, 1.0);
 
-    for (root_entity, root_gtf, mut occ) in &mut occludable_query {
+    let hero_in_roshan_pit = is_point_in_roshan_pit_circle(
+        &config.map.roshan_pit,
+        render_state.soldier_pos.x,
+        render_state.soldier_pos.z,
+        config.map.roshan_pit.outer_radius,
+    );
+
+    for (root_entity, root_gtf, mut occ, is_roshan_pit) in &mut occludable_query {
         let (scale, rot, center) = root_gtf.to_scale_rotation_translation();
         let padded_half = Vec3::new(
             occ.half_extents.x * scale.x.abs() + 1.2,
@@ -5843,7 +5978,11 @@ fn occlusion_transparency_system(
             occ.half_extents.z * scale.z.abs() + 1.2,
         );
 
-        let is_blocking = segment_intersects_aabb(cam_pos, hero_focus, center, padded_half, rot);
+        let is_blocking = if is_roshan_pit {
+            hero_in_roshan_pit
+        } else {
+            segment_intersects_aabb(cam_pos, hero_focus, center, padded_half, rot)
+        };
         if !is_blocking && !occ.is_faded {
             continue;
         }

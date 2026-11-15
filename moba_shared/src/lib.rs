@@ -187,6 +187,7 @@ impl GameConfig {
             )
         });
         cfg.validate_unique_map_ids();
+        cfg.validate_roshan_pit();
         cfg.validate_fountains();
         cfg.validate_barracks();
         cfg.validate_ancients();
@@ -438,6 +439,15 @@ impl GameConfig {
         }
     }
 
+    pub fn validate_roshan_pit(&self) {
+        let p = &self.map.roshan_pit;
+        assert!(p.outer_radius > p.inner_radius && p.inner_radius > 0.5, "شعاع‌های غار روشان نامعتبر است");
+        assert!(p.wall_height > 1.0 && p.floor_thickness > 0.05 && p.roof_thickness > 0.05, "ابعاد ارتفاعی غار روشان نامعتبر است");
+        assert!(p.entrance_half_angle_deg > 5.0 && p.entrance_half_angle_deg < 85.0, "زاویه ورودی غار روشان نامعتبر است");
+        assert!(!p.climb_enter_anim.trim().is_empty(), "climb_enter_anim غار روشان نمی‌تواند خالی باشد");
+        assert!(p.climb_enter_distance > 0.5, "climb_enter_distance غار روشان باید بزرگ‌تر از 0.5 باشد");
+    }
+
     pub fn validate_fountains(&self) {
         assert!(
             !self.map.fountains.is_empty(),
@@ -499,6 +509,7 @@ impl GameConfig {
         for item in &self.map.waterfalls {
             check_id(&item.id, "map.waterfalls");
         }
+        check_id(&self.map.roshan_pit.id, "map.roshan_pit");
         check_id(&self.map.center_bridge.id, "map.center_bridge");
         for item in &self.map.fountains {
             check_id(&item.id, "map.fountains");
@@ -1267,6 +1278,25 @@ pub struct CanyonConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RoshanPitConfig {
+    pub enabled: bool,
+    pub id: String,
+    pub model_path: String,
+    pub model_transform: ModelTransformConfig,
+    pub outer_radius: f32,
+    pub inner_radius: f32,
+    pub wall_height: f32,
+    pub floor_thickness: f32,
+    pub roof_thickness: f32,
+    pub entrance_angle_deg: f32,
+    pub entrance_half_angle_deg: f32,
+    pub climb_enter_anim: String,
+    pub climb_enter_distance: f32,
+    pub color_rgb: (f32, f32, f32),
+    pub roughness: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MapConfig {
     pub map_dimensions: (f32, f32),
     pub show_object_labels: bool,
@@ -1278,6 +1308,7 @@ pub struct MapConfig {
     pub ramps: Vec<RampDef>,
     pub river_segments: Vec<RiverSegmentDef>,
     pub waterfalls: Vec<WaterfallDef>,
+    pub roshan_pit: RoshanPitConfig,
     pub center_bridge: CenterBridgeDef,
     pub fountains: Vec<FountainDef>,
     pub ancients: Vec<AncientDef>,
@@ -1523,6 +1554,8 @@ pub enum TraversalKind {
     RunningDiveRoll,
     QuickRollToRun,
     ObstacleVault,
+    FallDive,
+    PitClimb,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2541,8 +2574,33 @@ pub fn sample_waterfall_depth_offset(config: &GameConfig, wx: f32, wz: f32) -> f
     max_extra_depth
 }
 
+#[inline]
+pub fn is_point_in_roshan_pit_circle(pit: &RoshanPitConfig, wx: f32, wz: f32, radius: f32) -> bool {
+    if !pit.enabled {
+        return false;
+    }
+    let loc = pit.model_transform.location;
+    let dx = wx - loc.0;
+    let dz = wz - loc.2;
+    dx * dx + dz * dz <= radius * radius
+}
+
+#[inline]
+pub fn is_point_inside_roshan_pit(pit: &RoshanPitConfig, wx: f32, wz: f32) -> bool {
+    is_point_in_roshan_pit_circle(pit, wx, wz, pit.inner_radius)
+}
+
 /// بررسی قرار گرفتن یک نقطه ۳بعدی درون برکه‌ها و رودخانه‌های نقشه و برگرداندن ارتفاع سطح آب و بردار جریان
 pub fn sample_water_surface_at(config: &GameConfig, world_pos: Vec3) -> Option<(f32, Vec2)> {
+    // کف غار روشان سطح زمین خشک محسوب می‌شود و آب نیست
+    if is_point_in_roshan_pit_circle(
+        &config.map.roshan_pit,
+        world_pos.x,
+        world_pos.z,
+        config.map.roshan_pit.outer_radius,
+    ) {
+        return None;
+    }
     for seg in &config.map.river_segments {
         let seg_tf = seg.model_transform.to_transform();
         let seg_pos = seg_tf.translation;
@@ -2715,6 +2773,7 @@ pub struct StaticColliderEntry {
     pub material: SurfaceMaterial,
     pub groups: CollisionGroups,
     pub disabled: bool,
+    pub is_non_walkable_wall: bool,
 }
 
 /// دنیای فیزیک اختصاصی که لیست کولایدرهای ثابت فعال را برای پرتوافکنی و برخوردها نگه می‌دارد
@@ -2942,7 +3001,7 @@ impl CustomPhysicsWorld {
                         let mut stepped_up = false;
 
                         // اگر برخورد در پایین پا و زیر سقف Autostep باشد، هم زیر مرکز و هم کمی جلوتر روی لبه مانع تست می‌کنیم
-                        if wall_hit.contact_point.y <= feet_y + autostep_max_h + 0.08 {
+                        if !entry.is_non_walkable_wall && wall_hit.contact_point.y <= feet_y + autostep_max_h + 0.08 {
                             let probe_points = [
                                 Vec2::new(center.x, center.z),
                                 Vec2::new(
@@ -3012,7 +3071,7 @@ impl CustomPhysicsWorld {
                 center.z + offset.y,
             );
             for entry in &self.static_colliders {
-                if entry.disabled || !soldier_groups.interacts_with(entry.groups) {
+                if entry.disabled || entry.is_non_walkable_wall || !soldier_groups.interacts_with(entry.groups) {
                     continue;
                 }
                 if inside_canyon_carve && entry.bounding_radius > 200.0 {
@@ -3110,7 +3169,7 @@ impl CustomPhysicsWorld {
                 let sphere_pos = center + Vec3::Y * oy;
                 if let Some(contact) = sphere_vs_static_collider(sphere_pos, eff_radius, entry) {
                     if contact.normal.y >= max_slope_cos {
-                        if oy <= -half_seg * 0.5 && contact.penetration > 0.0 {
+                        if !entry.is_non_walkable_wall && oy <= -half_seg * 0.5 && contact.penetration > 0.0 {
                             center.y += contact.normal.y * contact.penetration;
                             grounded = true;
                         }
@@ -3910,6 +3969,95 @@ pub fn ramp_physics_bundle(
     )
 }
 
+pub fn roshan_pit_physics_bundles(
+    config: &GameConfig,
+) -> Vec<(
+    MapObjectId,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
+    CollisionGroups,
+    Transform,
+)> {
+    let pit = &config.map.roshan_pit;
+    if !pit.enabled {
+        return Vec::new();
+    }
+    let mut bundles = Vec::new();
+    let tf = pit.model_transform.to_transform();
+    let base_pos = tf.translation;
+    let base_rot = tf.rotation;
+    let mat = SurfaceMaterial {
+        friction: config.physics.ground_friction,
+        restitution: config.physics.ground_restitution,
+    };
+    let obs_mat = SurfaceMaterial {
+        friction: config.physics.obstacle_friction,
+        restitution: config.physics.obstacle_restitution,
+    };
+
+    // ۱. کف خشک غار (روی سطح آب رودخانه)
+    let floor_top_y = base_pos.y + 0.15;
+    let floor_center_y = floor_top_y - pit.floor_thickness * 0.5;
+    bundles.push((
+        MapObjectId(format!("{}_floor", pit.id)),
+        CustomRigidBody::Fixed,
+        CustomCollider::cylinder(pit.floor_thickness * 0.5, pit.outer_radius),
+        mat,
+        world_collision_groups(),
+        Transform::from_xyz(base_pos.x, floor_center_y, base_pos.z),
+    ));
+
+    // ۲. سقف سرپوشیده غار
+    let roof_center_y = base_pos.y + pit.wall_height + pit.roof_thickness * 0.5;
+    bundles.push((
+        MapObjectId(format!("{}_roof", pit.id)),
+        CustomRigidBody::Fixed,
+        CustomCollider::cylinder(pit.roof_thickness * 0.5, pit.outer_radius),
+        obs_mat,
+        world_collision_groups(),
+        Transform::from_xyz(base_pos.x, roof_center_y, base_pos.z),
+    ));
+
+    // ۳. دیواره‌های استوانه‌ای نیم‌دایره (با دهانه ورودی رو به آبشار)
+    let segments = 16_usize;
+    let ent_rad = pit.entrance_angle_deg.to_radians();
+    let half_gap_rad = pit.entrance_half_angle_deg.to_radians();
+    let arc_span = std::f32::consts::TAU - 2.0 * half_gap_rad;
+    let start_ang = ent_rad + half_gap_rad;
+    let step_ang = arc_span / (segments as f32);
+    let r_mid = 0.5 * (pit.inner_radius + pit.outer_radius);
+    let wall_thick = (pit.outer_radius - pit.inner_radius).max(0.5);
+    let seg_len = 2.0 * r_mid * (step_ang * 0.5).sin() + 0.35;
+    let wall_center_y = base_pos.y + pit.wall_height * 0.5;
+
+    for i in 0..segments {
+        let ang = start_ang + (i as f32 + 0.5) * step_ang;
+        let local_offset = Vec3::new(ang.cos() * r_mid, 0.0, ang.sin() * r_mid);
+        let world_offset = base_rot * local_offset;
+        let radial = Vec3::new(world_offset.x, 0.0, world_offset.z).normalize_or_zero();
+        let seg_rot = Transform::IDENTITY.looking_to(radial, Vec3::Y).rotation;
+        bundles.push((
+            MapObjectId(format!("{}_wall_{}", pit.id, i)),
+            CustomRigidBody::Fixed,
+            CustomCollider::cuboid(seg_len * 0.5, pit.wall_height * 0.5, wall_thick * 0.5),
+            obs_mat,
+            world_collision_groups(),
+            Transform {
+                translation: Vec3::new(
+                    base_pos.x + world_offset.x,
+                    wall_center_y,
+                    base_pos.z + world_offset.z,
+                ),
+                rotation: seg_rot,
+                scale: Vec3::ONE,
+            },
+        ));
+    }
+
+    bundles
+}
+
 pub fn center_bridge_physics_bundle(
     config: &GameConfig,
     bridge: &CenterBridgeDef,
@@ -4286,7 +4434,10 @@ pub fn soldier_physics_bundle_for_slot(
             config.soldier.player_radius * hero_scale,
         ),
         soldier_collision_groups(),
-        CustomCharacterController::default(),
+        CustomCharacterController {
+            translation: None,
+            grounded: true,
+        },
         Transform::from_translation(spawn_pos),
     )
 }
@@ -4465,6 +4616,12 @@ pub fn can_observer_see_point_with_range(
     base_range: f32,
     high_ground_bonus: f32,
 ) -> bool {
+    let obs_in_pit = is_point_inside_roshan_pit(&config.map.roshan_pit, observer_feet_pos.x, observer_feet_pos.z);
+    let tgt_in_pit = is_point_inside_roshan_pit(&config.map.roshan_pit, target_feet_pos.x, target_feet_pos.z);
+    if obs_in_pit != tgt_in_pit {
+        return false;
+    }
+
     let height_diff = target_feet_pos.y - observer_feet_pos.y;
     if height_diff >= config.map.high_ground_occlusion_min_diff {
         return false;
@@ -4726,6 +4883,7 @@ impl SharedFogOfWar {
             .map(|(gx, gz)| self.terrain_y[gz * FOW_GRID_W + gx])
             .unwrap_or(origin.y);
 
+        let observer_in_pit = is_point_inside_roshan_pit(&config.map.roshan_pit, origin.x, origin.z);
         let step_size = 1.5_f32;
         let steps = (vision_range / step_size).ceil() as usize;
 
@@ -4741,6 +4899,10 @@ impl SharedFogOfWar {
                 }
                 let wx = origin.x + dx * dist;
                 let wz = origin.z + dz * dist;
+                let cell_in_pit = is_point_inside_roshan_pit(&config.map.roshan_pit, wx, wz);
+                if observer_in_pit != cell_in_pit {
+                    break;
+                }
                 let Some((gx, gz)) = Self::world_to_cell(config, wx, wz) else {
                     break;
                 };
@@ -6589,6 +6751,10 @@ fn spawn_server_environment_colliders_system(mut commands: Commands, config: Res
         &config.map.center_bridge,
     ));
 
+    for pit_bundle in roshan_pit_physics_bundles(&config) {
+        commands.spawn(pit_bundle);
+    }
+
     for lane in &config.map.lanes {
         for seg_idx in 0..lane.waypoints.len().saturating_sub(1) {
             let a = lane.waypoints[seg_idx];
@@ -6649,6 +6815,7 @@ fn sync_static_colliders_to_world_system(
         &SurfaceMaterial,
         &CollisionGroups,
         Has<ColliderDisabled>,
+        Option<&PhysicsMountain>,
     )>,
 ) {
     physics_world.static_colliders.clear();
@@ -6657,7 +6824,7 @@ fn sync_static_colliders_to_world_system(
     } else {
         None
     };
-    for (entity, tf, body, collider, mat, groups, disabled) in &static_query {
+    for (entity, tf, body, collider, mat, groups, disabled, mtn_opt) in &static_query {
         if *body != CustomRigidBody::Fixed {
             continue;
         }
@@ -6672,6 +6839,7 @@ fn sync_static_colliders_to_world_system(
             material: *mat,
             groups: *groups,
             disabled,
+            is_non_walkable_wall: mtn_opt.is_some_and(|m| m.id.starts_with("mtn_canyon_")),
         });
     }
 }
@@ -6838,6 +7006,8 @@ fn shared_authoritative_drive_system(
     turret_query: Query<&PhysicsTurret>,
     barracks_query: Query<&PhysicsBarracks>,
     ancient_query: Query<&PhysicsAncient>,
+    mountain_query: Query<&PhysicsMountain>,
+    map_obj_query: Query<&MapObjectId>,
     elev_query: Query<&ElevationSurface>,
 ) {
     if match_state
@@ -6890,6 +7060,8 @@ fn shared_authoritative_drive_system(
                 &turret_query,
                 &barracks_query,
                 &ancient_query,
+                &mountain_query,
+                &map_obj_query,
                 &elev_query,
                 &hero_aim_targets,
             );
@@ -7008,6 +7180,8 @@ fn shared_drive_single_player(
     turret_query: &Query<&PhysicsTurret>,
     barracks_query: &Query<&PhysicsBarracks>,
     ancient_query: &Query<&PhysicsAncient>,
+    mountain_query: &Query<&PhysicsMountain>,
+    map_obj_query: &Query<&MapObjectId>,
     elev_query: &Query<&ElevationSurface>,
     hero_aim_targets: &[(usize, TeamId, Vec3, f32, Stance, bool)],
 ) {
@@ -7150,23 +7324,53 @@ fn shared_drive_single_player(
             let max_aim_dist = config.combat.aim_lock_ray_max_distance;
             let aim_groups = soldier_collision_groups();
 
-            // الف) ابتدا برخورد اشعه ماوس با هندسه واقعی نقشه (پلتفرم‌ها، دیوارها، رمپ‌ها و اهداف) را پیدا کن
-            let world_hit_opt = physics_world.cast_ray(
-                input.aim_ray_origin,
-                ray_dir,
-                max_aim_dist,
-                aim_groups,
-                |ent| {
-                    if let Ok(t) = target_query.get(ent) {
-                        !world.targets[t.index].is_dead
+            let hero_in_pit = is_point_in_roshan_pit_circle(
+                &config.map.roshan_pit,
+                world.soldier_pos.x,
+                world.soldier_pos.z,
+                config.map.roshan_pit.outer_radius,
+            );
+            let pit_roof_id = format!("{}_roof", config.map.roshan_pit.id);
+            let pit_wall_prefix = format!("{}_wall_", config.map.roshan_pit.id);
+
+            // الف) ابتدا برخورد اشعه ماوس با هندسه واقعی نقشه (با نادیده گرفتن سقف و دیوارهای نیمه‌شفاف غار برای بازیکن داخل غار)
+            let world_hit_opt = physics_world
+                .cast_ray(
+                    input.aim_ray_origin,
+                    ray_dir,
+                    max_aim_dist,
+                    aim_groups,
+                    |ent| {
+                        if let Ok(t) = target_query.get(ent) {
+                            if world.targets[t.index].is_dead {
+                                return false;
+                            }
+                        }
+                        if let Ok(obj) = map_obj_query.get(ent) {
+                            if obj.0 == pit_roof_id {
+                                return false;
+                            }
+                            if hero_in_pit && obj.0.starts_with(&pit_wall_prefix) {
+                                return false;
+                            }
+                        }
+                        true
+                    },
+                )
+                .filter(|(_, hit)| {
+                    if hero_in_pit {
+                        is_point_in_roshan_pit_circle(
+                            &config.map.roshan_pit,
+                            hit.point.x,
+                            hit.point.z,
+                            config.map.roshan_pit.outer_radius,
+                        )
                     } else {
                         true
                     }
-                },
-            );
-            let world_toi = world_hit_opt.as_ref().map(|(_, h)| h.toi).unwrap_or(f32::MAX);
+                });
 
-            // ب) بررسی برخورد تحلیلی اشعه ماوس با کپسول هیروهای دشمن قابل مشاهده (فقط اگر قبل از مانع به هیرو بخورد)
+            // ب) بررسی برخورد تحلیلی اشعه ماوس با کپسول هیروهای دشمن قابل مشاهده (مستقل از موانع بین دوربین و هدف)
             let mut best_enemy_hit: Option<(f32, Vec3)> = None;
             for &(e_slot, e_team, e_pos, e_scale, e_stance, e_dead) in hero_aim_targets {
                 if e_slot == world.active_slot || e_team == world.hero_team || e_dead {
@@ -7192,9 +7396,7 @@ fn shared_drive_single_player(
                     config.combat.bullet_hit_forgiveness_height_bottom,
                     config.combat.bullet_hit_forgiveness_height_top,
                 ) {
-                    if toi <= world_toi + 0.05
-                        && best_enemy_hit.map_or(true, |(prev_toi, _)| toi < prev_toi)
-                    {
+                    if best_enemy_hit.map_or(true, |(prev_toi, _)| toi < prev_toi) {
                         let chest_h = if e_stance == Stance::Crouch {
                             config.combat.hero_crouch_aim_chest_height * e_scale
                         } else {
@@ -7205,7 +7407,7 @@ fn shared_drive_single_player(
                 }
             }
 
-            // ج) بررسی برخورد اشعه موس با سربازان لاین و کمپ (سرباز دشمن/کمپ یا سرباز خودی قابل دیناید)
+            // ج) بررسی برخورد اشعه موس با سربازان لاین و کمپ و غول روشان (مستقل از سقف و موانع بین دوربین و هدف)
             let mut best_creep_hit: Option<(u64, f32, Vec3)> = None;
             for c in &world.creeps {
                 if c.is_dead {
@@ -7232,8 +7434,8 @@ fn shared_drive_single_player(
                     config.combat.bullet_hit_forgiveness_height_bottom,
                     config.combat.bullet_hit_forgiveness_height_top,
                 ) {
-                    let prev_best_toi = best_creep_hit.map(|(_, t, _)| t).unwrap_or(world_toi + 0.05);
-                    if toi <= world_toi + 0.05 && toi < prev_best_toi {
+                    let prev_best_toi = best_creep_hit.map(|(_, t, _)| t).unwrap_or(f32::MAX);
+                    if toi < prev_best_toi {
                         best_creep_hit = Some((c.id, toi, c.pos + Vec3::Y * c_stats.aim_chest_height));
                     }
                 }
@@ -7266,8 +7468,8 @@ fn shared_drive_single_player(
                     0.2,
                     0.2,
                 ) {
-                    let prev_best = best_courier_hit.map(|(t, _)| t).unwrap_or(world_toi + 0.05);
-                    if toi <= world_toi + 0.05 && toi < prev_best {
+                    let prev_best = best_courier_hit.map(|(t, _)| t).unwrap_or(f32::MAX);
+                    if toi < prev_best {
                         best_courier_hit = Some((toi, p.courier_pos));
                     }
                 }
@@ -7405,6 +7607,7 @@ fn shared_drive_single_player(
             physics_world,
             obstacle_query,
             target_query,
+            mountain_query,
             elev_query,
             soldier_tf,
             controller,
@@ -7508,6 +7711,7 @@ fn step_traversal_custom(
     physics_world: &CustomPhysicsWorld,
     obstacle_query: &Query<&PhysicsObstacle>,
     target_query: &Query<&PhysicsTarget>,
+    mountain_query: &Query<&PhysicsMountain>,
     elev_query: &Query<&ElevationSurface>,
     soldier_tf: &mut Transform,
     controller: &mut CustomCharacterController,
@@ -7524,8 +7728,13 @@ fn step_traversal_custom(
 
         if world.traversal.anim_name == "run_to_dive" {
             controller.translation = None;
+            let arc_boost = if world.traversal.kind == TraversalKind::FallDive {
+                0.0
+            } else {
+                2.2
+            };
             let arc_y = world.traversal.start_pos.y.lerp(world.traversal.target_pos.y, frac * frac)
-                + (frac * (1.0 - frac)) * 2.2;
+                + (frac * (1.0 - frac)) * arc_boost;
             soldier_tf.translation = Vec3::new(
                 current_pos.x,
                 arc_y + config.physics.soldier_capsule_center_y * world.hero_scale,
@@ -7540,6 +7749,15 @@ fn step_traversal_custom(
                     });
                 }
             }
+        } else if world.traversal.kind == TraversalKind::PitClimb {
+            controller.translation = None;
+            let smooth_y = world.traversal.start_pos.y.lerp(world.traversal.target_pos.y, frac);
+            soldier_tf.translation = Vec3::new(
+                current_pos.x,
+                smooth_y + config.physics.soldier_capsule_center_y * world.hero_scale,
+                current_pos.z,
+            );
+            world.soldier_pos = Vec3::new(current_pos.x, smooth_y, current_pos.z);
         } else if world.traversal.kind == TraversalKind::ObstacleVault
             || world.traversal.kind == TraversalKind::JumpOver
         {
@@ -7591,6 +7809,49 @@ fn step_traversal_custom(
         return;
     }
 
+    // ورود به غار روشان از دم در ورودی با فشردن Space و اجرای انیمیشن Freehang Climb
+    if input.space_just_pressed && config.map.roshan_pit.enabled {
+        let pit = &config.map.roshan_pit;
+        if !is_point_in_roshan_pit_circle(pit, world.soldier_pos.x, world.soldier_pos.z, pit.inner_radius) {
+            let pit_tf = pit.model_transform.to_transform();
+            let pit_center = pit_tf.translation;
+            let ent_rad = pit.entrance_angle_deg.to_radians();
+            let local_dir = Vec3::new(ent_rad.cos(), 0.0, ent_rad.sin());
+            let outward_dir = (pit_tf.rotation * local_dir).normalize_or_zero();
+            let ent_world = pit_center + outward_dir * pit.outer_radius;
+            let dist_to_ent = Vec2::new(
+                world.soldier_pos.x - ent_world.x,
+                world.soldier_pos.z - ent_world.z,
+            ).length();
+            let floor_top_y = pit_center.y + 0.15;
+
+            if dist_to_ent <= pit.climb_enter_distance && world.soldier_pos.y <= floor_top_y + 0.5 {
+                let anim = pit.climb_enter_anim.clone();
+                let dur = config.exact_anim_duration(&anim);
+                let inward_dir = -outward_dir;
+                let inside_r = (pit.inner_radius - 1.5).max(1.0);
+                let target_pos = Vec3::new(
+                    pit_center.x + outward_dir.x * inside_r,
+                    floor_top_y,
+                    pit_center.z + outward_dir.z * inside_r,
+                );
+                world.traversal.is_active = true;
+                world.traversal.kind = TraversalKind::PitClimb;
+                world.traversal.anim_name = anim;
+                world.traversal.elapsed = 0.0;
+                world.traversal.duration = dur;
+                world.traversal.start_pos = world.soldier_pos;
+                world.traversal.target_pos = target_pos;
+                world.traversal.travel_dir = inward_dir;
+                world.soldier_facing_dir = inward_dir;
+                world.space_hold_secs = None;
+                world.firing_anim_remaining = None;
+                world.reload_remaining = None;
+                return;
+            }
+        }
+    }
+
     if let Some((water_y, _)) = sample_water_surface_at(config, world.soldier_pos) {
         if (water_y - world.soldier_pos.y) >= 0.85 {
             world.space_hold_secs = None;
@@ -7623,6 +7884,112 @@ fn step_traversal_custom(
             )
             .is_some()
     };
+
+    // اگر بازیکن بدون زدن Space از لبه دره یا پل به سمت آب عمیق سقوط کند، انیمیشن run_to_dive اجرا می‌شود
+    if !controller.grounded
+        && !input.space_held
+        && !input.space_just_pressed
+        && world.space_hold_secs.is_none()
+    {
+        let dive_dur = config.exact_anim_duration("run_to_dive");
+        let fall_horiz_dist = config.soldier.walk_speed * dive_dur;
+        let shape_pos = Vec3::new(
+            world.soldier_pos.x,
+            world.soldier_pos.y + config.physics.soldier_capsule_center_y,
+            world.soldier_pos.z,
+        );
+        let safe_dist = physics_world.sweep_capsule_horizontal(
+            shape_pos,
+            config.physics.soldier_capsule_half_segment,
+            config.soldier.player_radius,
+            travel_dir,
+            fall_horiz_dist,
+            config.soldier.free_traversal_wall_padding,
+            query_groups,
+            |entity| {
+                if let Ok(t) = target_query.get(entity) {
+                    !world.targets[t.index].is_dead
+                } else {
+                    true
+                }
+            },
+        );
+        let dive_x = world.soldier_pos.x + travel_dir.x * safe_dist;
+        let dive_z = world.soldier_pos.z + travel_dir.z * safe_dist;
+        let dive_bed = canyon_sample_height(&config.map.canyon, dive_x, dive_z);
+        let inside_canyon_carve = config.map.canyon.enabled && dive_bed < -0.15;
+        let landing_ray_orig = Vec3::new(dive_x, world.soldier_pos.y + 1.0, dive_z);
+        let bridge_or_ground_hit = physics_world
+            .cast_ray(
+                landing_ray_orig,
+                Vec3::NEG_Y,
+                18.0,
+                query_groups,
+                |entity| {
+                    if let Ok(t) = target_query.get(entity) {
+                        if world.targets[t.index].is_dead {
+                            return false;
+                        }
+                    }
+                    if let Ok(mtn) = mountain_query.get(entity) {
+                        if mtn.id.starts_with("mtn_canyon_") {
+                            return false;
+                        }
+                    }
+                    if inside_canyon_carve {
+                        if let Ok(elev) = elev_query.get(entity) {
+                            if elev.elevation_tier <= 0 {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                },
+            )
+            .map(|(_, hit)| hit.point.y);
+
+        let effective_landing_y = if let Some(hit_y) = bridge_or_ground_hit {
+            hit_y
+        } else if inside_canyon_carve {
+            let swim_floor = config.map.canyon.water_y - 1.15;
+            dive_bed.max(swim_floor)
+        } else {
+            world.soldier_pos.y
+        };
+
+        let leads_to_deep_water = if bridge_or_ground_hit.is_some() && inside_canyon_carve {
+            false
+        } else if let Some((water_y, _)) = sample_water_surface_at(
+            config,
+            Vec3::new(dive_x, effective_landing_y, dive_z),
+        ) {
+            let extra_depth = sample_waterfall_depth_offset(config, dive_x, dive_z);
+            let effective_bed_y = if inside_canyon_carve {
+                dive_bed
+            } else {
+                (effective_landing_y - extra_depth).max(-1.6)
+            };
+            world.soldier_pos.y > water_y + config.physics.character_snap_to_ground
+                && (water_y - effective_bed_y) >= 0.85
+        } else {
+            false
+        };
+
+        if leads_to_deep_water {
+            world.traversal.is_active = true;
+            world.traversal.kind = TraversalKind::FallDive;
+            world.traversal.anim_name = "run_to_dive".to_string();
+            world.traversal.elapsed = 0.0;
+            world.traversal.duration = dive_dur;
+            world.traversal.start_pos = world.soldier_pos;
+            world.traversal.target_pos = Vec3::new(dive_x, effective_landing_y, dive_z);
+            world.traversal.travel_dir = travel_dir;
+            world.soldier_facing_dir = travel_dir;
+            world.firing_anim_remaining = None;
+            world.reload_remaining = None;
+            return;
+        }
+    }
 
     let (kind, anim_name, speed, stamina_cost) = if world.effective_stance == Stance::Run {
         if input.space_just_pressed && world.space_hold_secs.is_none() {
@@ -7784,6 +8151,11 @@ fn step_traversal_custom(
             |entity| {
                 if let Ok(t) = target_query.get(entity) {
                     if world.targets[t.index].is_dead {
+                        return false;
+                    }
+                }
+                if let Ok(mtn) = mountain_query.get(entity) {
+                    if mtn.id.starts_with("mtn_canyon_") {
                         return false;
                     }
                 }
@@ -8837,6 +9209,16 @@ fn shared_authoritative_react_system(
             )
         })
         .collect();
+    let all_hero_vision: Vec<(usize, TeamId, Vec3, f32)> = world
+        .players
+        .iter()
+        .filter(|p| !p.is_dead)
+        .map(|p| {
+            let h = config.active_hero(p.hero_index);
+            (p.slot_index, p.hero_team, p.soldier_pos, h.vision_range)
+        })
+        .collect();
+
     let num_slots = world.players.len().max(1);
     let has_slots = !world.players.is_empty();
 
@@ -8944,6 +9326,11 @@ fn shared_authoritative_react_system(
                 .update_for_hero(&config, hero_pos, hero, &allied_creep_positions);
             for (c_pos, c_range) in allied_courier_vision {
                 world.fog_of_war.reveal_from_source(&config, c_pos, c_range, 48);
+            }
+            for &(ally_slot, ally_team, ally_pos, ally_range) in &all_hero_vision {
+                if ally_team == my_team && ally_slot != world.active_slot {
+                    world.fog_of_war.reveal_from_source(&config, ally_pos, ally_range, 144);
+                }
             }
         }
         if let Some(ref mut active_input) = world.active_input {

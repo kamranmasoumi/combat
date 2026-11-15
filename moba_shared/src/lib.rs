@@ -345,6 +345,15 @@ impl GameConfig {
         assert!(self.camera.cursor_lead_lerp_speed > 0.0, "cursor_lead_lerp_speed باید بزرگ‌تر از صفر باشد");
         assert!(self.camera.edge_pan_margin_px > 0.0, "edge_pan_margin_px باید بزرگ‌تر از صفر باشد");
         assert!(self.camera.edge_pan_speed > 0.0, "edge_pan_speed باید بزرگ‌تر از صفر باشد");
+        assert!(self.camera.occlusion_fade_speed > 0.0, "occlusion_fade_speed باید بزرگ‌تر از صفر باشد");
+        assert!(self.camera.occlusion_edge_emissive >= 0.0, "occlusion_edge_emissive نباید منفی باشد");
+        assert!(self.camera.occlusion_edge_power > 0.0, "occlusion_edge_power باید بزرگ‌تر از صفر باشد");
+        assert!(
+            self.camera.occlusion_edge_threshold > 0.0 && self.camera.occlusion_edge_threshold < 1.0,
+            "occlusion_edge_threshold باید بین (0.0, 1.0) باشد"
+        );
+        assert!(self.camera.occlusion_terrain_cutout_radius > 0.0, "occlusion_terrain_cutout_radius باید بزرگ‌تر از صفر باشد");
+        assert!(self.camera.occlusion_terrain_rim_width > 0.0, "occlusion_terrain_rim_width باید بزرگ‌تر از صفر باشد");
     }
 
     pub fn validate_pause(&self) {
@@ -762,6 +771,13 @@ pub struct CameraConfig {
     pub cursor_lead_lerp_speed: f32,
     pub edge_pan_margin_px: f32,
     pub edge_pan_speed: f32,
+    pub occlusion_fade_speed: f32,
+    pub occlusion_edge_color_rgb: (f32, f32, f32),
+    pub occlusion_edge_emissive: f32,
+    pub occlusion_edge_power: f32,
+    pub occlusion_edge_threshold: f32,
+    pub occlusion_terrain_cutout_radius: f32,
+    pub occlusion_terrain_rim_width: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

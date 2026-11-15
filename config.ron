@@ -195,6 +195,13 @@ GameConfig(
         cursor_lead_lerp_speed: 6.0,
         edge_pan_margin_px: 28.0,
         edge_pan_speed: 44.0,
+        occlusion_fade_speed: 14.0,
+        occlusion_edge_color_rgb: (0.18, 0.92, 1.0),
+        occlusion_edge_emissive: 2.4,
+        occlusion_edge_power: 2.6,
+        occlusion_edge_threshold: 0.36,
+        occlusion_terrain_cutout_radius: 4.2,
+        occlusion_terrain_rim_width: 0.55,
     ),
     lighting: LightingConfig(
         directional_illuminance: 16500.0,

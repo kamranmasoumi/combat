@@ -8,7 +8,8 @@ use bevy::camera::Hdr;
 use bevy::math::Affine2;
 use bevy::post_process::bloom::Bloom;
 use bevy_hanabi::prelude::HanabiMainCamera;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat};
+use bevy::shader::ShaderRef;
 use bevy::gltf::Gltf;
 use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight, NotShadowCaster};
 use bevy::ecs::system::SystemParam;
@@ -248,6 +249,8 @@ fn main() {
             is_dragging_minimap: false,
         })
         .add_plugins(MobaVfxPlugin)
+        .add_plugins(MaterialPlugin::<OcclusionEdgeMaterial>::default())
+        .add_plugins(MaterialPlugin::<TerrainCutoutMaterial>::default())
         .insert_resource(bevy::winit::WinitSettings::game())
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .add_plugins(MobaSharedPhysicsPlugin {
@@ -671,11 +674,85 @@ struct VisionOccludable {
     is_faded: bool,
 }
 
+#[derive(ShaderType, Debug, Clone)]
+struct OcclusionEdgeUniforms {
+    base_color: Vec4,
+    edge_color: Vec4,
+    params: Vec4,
+    camera_pos: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+struct OcclusionEdgeMaterial {
+    #[uniform(0)]
+    uniforms: OcclusionEdgeUniforms,
+}
+
+impl Material for OcclusionEdgeMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/occlusion_edge.wesl".into()
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn enable_shadows() -> bool {
+        false
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+}
+
+#[derive(ShaderType, Debug, Clone)]
+struct TerrainCutoutUniforms {
+    camera_pos: Vec4,
+    hero_pos: Vec4,
+    edge_color: Vec4,
+    params: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+struct TerrainCutoutMaterial {
+    #[uniform(0)]
+    uniforms: TerrainCutoutUniforms,
+}
+
+impl Material for TerrainCutoutMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/terrain_cutout.wesl".into()
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn enable_shadows() -> bool {
+        false
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+}
+
+#[derive(Component)]
+struct CanyonTerrainVisualMarker;
+
+#[derive(Component)]
+struct CanyonTerrainCutoutState {
+    original_handle: Handle<StandardMaterial>,
+    cutout_handle: Handle<TerrainCutoutMaterial>,
+    progress: f32,
+}
+
 #[derive(Component)]
 struct OccludedMaterialState {
     original_handle: Handle<StandardMaterial>,
-    original_alpha: f32,
-    current_alpha: f32,
+    edge_handle: Handle<OcclusionEdgeMaterial>,
+    progress: f32,
 }
 
 #[derive(Resource)]
@@ -1011,6 +1088,7 @@ fn setup_scene(
             });
             ent_cmds.with_children(|parent| {
                 parent.spawn((
+                    CanyonTerrainVisualMarker,
                     Mesh3d(meshes.add(canyon_terrain_mesh)),
                     MeshMaterial3d(materials.add(StandardMaterial {
                         base_color: Color::WHITE,
@@ -1287,6 +1365,10 @@ fn setup_scene(
     let mut bridge_cmds = commands.spawn((
         center_bridge_physics_bundle(&config, bridge),
         Visibility::Visible,
+        VisionOccludable {
+            is_faded: false,
+            half_extents: Vec3::new(bridge.outer_radius, bridge.deck_thickness * 0.5, bridge.outer_radius),
+        },
     ));
 
     let bridge_ent = bridge_cmds.id();
@@ -1476,6 +1558,10 @@ fn setup_scene(
                             lane.thickness,
                         ),
                         Visibility::Visible,
+                        VisionOccludable {
+                            is_faded: false,
+                            half_extents: Vec3::new(lane.width * 0.5, lane.thickness * 0.5, len_3d * 0.5),
+                        },
                     ))
                     .with_children(|parent| {
                         // لبه‌های سنگی دو طرف جاده (Curbs)
@@ -6037,18 +6123,47 @@ fn occlusion_transparency_system(
     mut occludable_query: Query<(Entity, &GlobalTransform, &mut VisionOccludable, Has<RoshanPitVisualRoot>)>,
     children_query: Query<&Children>,
     mut mat_mesh_query: Query<(
-        &mut MeshMaterial3d<StandardMaterial>,
+        Option<&MeshMaterial3d<StandardMaterial>>,
+        Option<&MeshMaterial3d<OcclusionEdgeMaterial>>,
         Option<&mut OccludedMaterialState>,
     )>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    materials: Res<Assets<StandardMaterial>>,
+    mut edge_materials: ResMut<Assets<OcclusionEdgeMaterial>>,
+    mut terrain_cutout_query: Query<
+        (
+            Entity,
+            Option<&MeshMaterial3d<StandardMaterial>>,
+            Option<&mut CanyonTerrainCutoutState>,
+        ),
+        With<CanyonTerrainVisualMarker>,
+    >,
+    mut terrain_cutout_materials: ResMut<Assets<TerrainCutoutMaterial>>,
 ) {
     let Ok(cam_gtf) = camera_query.single() else {
         return;
     };
     let cam_pos = cam_gtf.translation();
     let hero_focus = render_state.soldier_pos + Vec3::Y * 1.1;
+    let cam_to_hero = hero_focus - cam_pos;
+    let cam_to_hero_dist = cam_to_hero.length();
+    // پرتو کمی پیش از بدن هیرو متوقف می‌شود تا وقتی هیرو جلوی آبجکت است هرگز محو نشود
+    let ray_end = if cam_to_hero_dist > 1.2 {
+        cam_pos + cam_to_hero * ((cam_to_hero_dist - 0.75) / cam_to_hero_dist)
+    } else {
+        hero_focus
+    };
+
     let dt = time.delta_secs();
-    let fade_speed = (10.0 * dt).clamp(0.05, 1.0);
+    let now_secs = time.elapsed_secs();
+    let fade_speed = (config.camera.occlusion_fade_speed * dt).clamp(0.08, 1.0);
+    let edge_rgb = config.camera.occlusion_edge_color_rgb;
+    let edge_emissive = config.camera.occlusion_edge_emissive;
+    let edge_color = Vec4::new(
+        edge_rgb.0 * edge_emissive,
+        edge_rgb.1 * edge_emissive,
+        edge_rgb.2 * edge_emissive,
+        config.camera.occlusion_edge_power,
+    );
 
     let hero_in_roshan_pit = is_point_in_roshan_pit_circle(
         &config.map.roshan_pit,
@@ -6059,60 +6174,86 @@ fn occlusion_transparency_system(
 
     for (root_entity, root_gtf, mut occ, is_roshan_pit) in &mut occludable_query {
         let (scale, rot, center) = root_gtf.to_scale_rotation_translation();
-        let padded_half = Vec3::new(
-            occ.half_extents.x * scale.x.abs() + 1.2,
-            occ.half_extents.y * scale.y.abs() + 0.6,
-            occ.half_extents.z * scale.z.abs() + 1.2,
+        let tight_half = Vec3::new(
+            occ.half_extents.x * scale.x.abs() * 0.88,
+            occ.half_extents.y * scale.y.abs() + 0.25,
+            occ.half_extents.z * scale.z.abs() * 0.88,
         );
 
         let is_blocking = if is_roshan_pit {
             hero_in_roshan_pit
         } else {
-            segment_intersects_aabb(cam_pos, hero_focus, center, padded_half, rot)
+            segment_intersects_aabb(cam_pos, ray_end, center, tight_half, rot)
         };
         if !is_blocking && !occ.is_faded {
             continue;
         }
 
-        let target_alpha = if is_blocking { 0.22_f32 } else { 1.0_f32 };
         let mut any_still_faded = false;
 
         let mut process_entity = |ent: Entity| {
-            let Ok((mut mat_comp, state_opt)) = mat_mesh_query.get_mut(ent) else {
+            let Ok((std_mat_opt, edge_mat_opt, state_opt)) = mat_mesh_query.get_mut(ent) else {
                 return;
             };
 
             if let Some(mut state) = state_opt {
-                let goal = if is_blocking { 0.22 } else { state.original_alpha };
-                state.current_alpha = state.current_alpha + (goal - state.current_alpha) * fade_speed;
+                let goal = if is_blocking { 1.0_f32 } else { 0.0_f32 };
+                state.progress = state.progress + (goal - state.progress) * fade_speed;
 
-                if !is_blocking && (state.current_alpha - state.original_alpha).abs() < 0.025 {
+                if !is_blocking && state.progress <= 0.025 {
                     // بازگردانی Handle اصلی اشتراکی برای حفظ کامل GPU Instancing
-                    mat_comp.0 = state.original_handle.clone();
-                    commands.entity(ent).remove::<OccludedMaterialState>();
+                    let orig = state.original_handle.clone();
+                    commands
+                        .entity(ent)
+                        .remove::<MeshMaterial3d<OcclusionEdgeMaterial>>()
+                        .remove::<OccludedMaterialState>()
+                        .insert(MeshMaterial3d(orig));
                 } else {
                     any_still_faded = true;
-                    if let Some(mut mat) = materials.get_mut(&mat_comp.0) {
-                        mat.base_color.set_alpha(state.current_alpha);
-                        mat.alpha_mode = AlphaMode::Blend;
+                    let _ = edge_mat_opt;
+                    if let Some(mut mat) = edge_materials.get_mut(&state.edge_handle) {
+                            mat.uniforms.edge_color = edge_color;
+                            mat.uniforms.params = Vec4::new(
+                                state.progress,
+                                config.camera.occlusion_edge_threshold,
+                                now_secs,
+                                0.0,
+                            );
+                        mat.uniforms.camera_pos = Vec4::new(cam_pos.x, cam_pos.y, cam_pos.z, 1.0);
                     }
                 }
             } else if is_blocking {
-                if let Some(orig_mat) = materials.get(&mat_comp.0).cloned() {
-                    let orig_handle = mat_comp.0.clone();
-                    let orig_alpha = orig_mat.base_color.alpha();
-                    let mut cloned = orig_mat;
-                    let new_alpha = orig_alpha + (target_alpha - orig_alpha) * fade_speed;
-                    cloned.base_color.set_alpha(new_alpha);
-                    cloned.alpha_mode = AlphaMode::Blend;
-                    let new_handle = materials.add(cloned);
-                    mat_comp.0 = new_handle;
-                    commands.entity(ent).insert(OccludedMaterialState {
-                        original_handle: orig_handle,
-                        original_alpha: orig_alpha,
-                        current_alpha: new_alpha,
-                    });
-                    any_still_faded = true;
+                if let Some(std_comp) = std_mat_opt {
+                    if let Some(orig_mat) = materials.get(&std_comp.0) {
+                        let lin = orig_mat.base_color.to_linear();
+                        let init_progress = fade_speed;
+                        let edge_handle = edge_materials.add(OcclusionEdgeMaterial {
+                            uniforms: OcclusionEdgeUniforms {
+                                base_color: Vec4::new(lin.red, lin.green, lin.blue, lin.alpha),
+                                edge_color,
+                                params: Vec4::new(
+                                    init_progress,
+                                    config.camera.occlusion_edge_threshold,
+                                    now_secs,
+                                    0.0,
+                                ),
+                                camera_pos: Vec4::new(cam_pos.x, cam_pos.y, cam_pos.z, 1.0),
+                            },
+                        });
+                        let orig_handle = std_comp.0.clone();
+                        commands
+                            .entity(ent)
+                            .remove::<MeshMaterial3d<StandardMaterial>>()
+                            .insert((
+                                MeshMaterial3d(edge_handle.clone()),
+                                OccludedMaterialState {
+                                    original_handle: orig_handle,
+                                    edge_handle,
+                                    progress: init_progress,
+                                },
+                            ));
+                        any_still_faded = true;
+                    }
                 }
             }
         };
@@ -6123,6 +6264,74 @@ fn occlusion_transparency_system(
         }
 
         occ.is_faded = is_blocking || any_still_faded;
+    }
+
+    // برش موضعی زمین بازی (دیواره دره) هنگام قرار گرفتن هیرو در دره پشت دیواره
+    let mut terrain_blocking = false;
+    if config.map.canyon.enabled && hero_focus.y < config.map.canyon.water_y + 3.5 {
+        for i in 2..=16 {
+            let t = (i as f32) / 16.0;
+            let p = cam_pos.lerp(ray_end, t);
+            let terrain_h = moba_shared::canyon_sample_height(&config.map.canyon, p.x, p.z);
+            if p.y < terrain_h - 0.15 {
+                terrain_blocking = true;
+                break;
+            }
+        }
+    }
+
+    for (t_ent, std_mat_opt, state_opt) in &mut terrain_cutout_query {
+        if let Some(mut state) = state_opt {
+            let goal = if terrain_blocking { 1.0_f32 } else { 0.0_f32 };
+            state.progress = state.progress + (goal - state.progress) * fade_speed;
+            if !terrain_blocking && state.progress <= 0.025 {
+                let orig = state.original_handle.clone();
+                commands
+                    .entity(t_ent)
+                    .remove::<MeshMaterial3d<TerrainCutoutMaterial>>()
+                    .remove::<CanyonTerrainCutoutState>()
+                    .insert(MeshMaterial3d(orig));
+            } else if let Some(mut mat) = terrain_cutout_materials.get_mut(&state.cutout_handle) {
+                mat.uniforms.camera_pos = Vec4::new(cam_pos.x, cam_pos.y, cam_pos.z, 1.0);
+                mat.uniforms.hero_pos = Vec4::new(hero_focus.x, hero_focus.y, hero_focus.z, 1.0);
+                mat.uniforms.edge_color = edge_color;
+                mat.uniforms.params = Vec4::new(
+                    state.progress,
+                    config.camera.occlusion_terrain_cutout_radius,
+                    now_secs,
+                    config.camera.occlusion_terrain_rim_width,
+                );
+            }
+        } else if terrain_blocking {
+            if let Some(std_comp) = std_mat_opt {
+                let orig_handle = std_comp.0.clone();
+                let init_progress = fade_speed;
+                let cutout_handle = terrain_cutout_materials.add(TerrainCutoutMaterial {
+                    uniforms: TerrainCutoutUniforms {
+                        camera_pos: Vec4::new(cam_pos.x, cam_pos.y, cam_pos.z, 1.0),
+                        hero_pos: Vec4::new(hero_focus.x, hero_focus.y, hero_focus.z, 1.0),
+                        edge_color,
+                        params: Vec4::new(
+                            init_progress,
+                            config.camera.occlusion_terrain_cutout_radius,
+                            now_secs,
+                            config.camera.occlusion_terrain_rim_width,
+                        ),
+                    },
+                });
+                commands
+                    .entity(t_ent)
+                    .remove::<MeshMaterial3d<StandardMaterial>>()
+                    .insert((
+                        MeshMaterial3d(cutout_handle.clone()),
+                        CanyonTerrainCutoutState {
+                            original_handle: orig_handle,
+                            cutout_handle,
+                            progress: init_progress,
+                        },
+                    ));
+            }
+        }
     }
 }
 

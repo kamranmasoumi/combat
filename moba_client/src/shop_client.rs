@@ -124,6 +124,66 @@ impl ShortcutInput {
             ShortcutInput::Mouse(m) => mouse.just_pressed(*m),
         }
     }
+
+    pub fn pressed(
+        &self,
+        keys: &ButtonInput<KeyCode>,
+        mouse: &ButtonInput<MouseButton>,
+    ) -> bool {
+        match self {
+            ShortcutInput::Key(k) => keys.pressed(*k),
+            ShortcutInput::Mouse(m) => mouse.pressed(*m),
+        }
+    }
+
+    pub fn from_config_str(raw: &str) -> Self {
+        let up = raw.trim().to_ascii_uppercase();
+        match up.as_str() {
+            "M1" => ShortcutInput::Mouse(MouseButton::Left),
+            "M2" => ShortcutInput::Mouse(MouseButton::Right),
+            "M3" => ShortcutInput::Mouse(MouseButton::Middle),
+            "M4" => ShortcutInput::Mouse(MouseButton::Back),
+            "M5" => ShortcutInput::Mouse(MouseButton::Forward),
+            "SPACE" => ShortcutInput::Key(KeyCode::Space),
+            "SHIFT" | "LSHIFT" => ShortcutInput::Key(KeyCode::ShiftLeft),
+            "RSHIFT" => ShortcutInput::Key(KeyCode::ShiftRight),
+            "CTRL" | "LCTRL" => ShortcutInput::Key(KeyCode::ControlLeft),
+            "RCTRL" => ShortcutInput::Key(KeyCode::ControlRight),
+            "ALT" | "LALT" => ShortcutInput::Key(KeyCode::AltLeft),
+            "RALT" => ShortcutInput::Key(KeyCode::AltRight),
+            "TAB" => ShortcutInput::Key(KeyCode::Tab),
+            "A" => ShortcutInput::Key(KeyCode::KeyA),
+            "B" => ShortcutInput::Key(KeyCode::KeyB),
+            "C" => ShortcutInput::Key(KeyCode::KeyC),
+            "D" => ShortcutInput::Key(KeyCode::KeyD),
+            "E" => ShortcutInput::Key(KeyCode::KeyE),
+            "F" => ShortcutInput::Key(KeyCode::KeyF),
+            "G" => ShortcutInput::Key(KeyCode::KeyG),
+            "H" => ShortcutInput::Key(KeyCode::KeyH),
+            "I" => ShortcutInput::Key(KeyCode::KeyI),
+            "J" => ShortcutInput::Key(KeyCode::KeyJ),
+            "K" => ShortcutInput::Key(KeyCode::KeyK),
+            "L" => ShortcutInput::Key(KeyCode::KeyL),
+            "M" => ShortcutInput::Key(KeyCode::KeyM),
+            "N" => ShortcutInput::Key(KeyCode::KeyN),
+            "O" => ShortcutInput::Key(KeyCode::KeyO),
+            "P" => ShortcutInput::Key(KeyCode::KeyP),
+            "Q" => ShortcutInput::Key(KeyCode::KeyQ),
+            "R" => ShortcutInput::Key(KeyCode::KeyR),
+            "S" => ShortcutInput::Key(KeyCode::KeyS),
+            "T" => ShortcutInput::Key(KeyCode::KeyT),
+            "U" => ShortcutInput::Key(KeyCode::KeyU),
+            "V" => ShortcutInput::Key(KeyCode::KeyV),
+            "W" => ShortcutInput::Key(KeyCode::KeyW),
+            "X" => ShortcutInput::Key(KeyCode::KeyX),
+            "Y" => ShortcutInput::Key(KeyCode::KeyY),
+            "Z" => ShortcutInput::Key(KeyCode::KeyZ),
+            _ => panic!(
+                "خطای بحرانی کانفیگ: کلید '{}' در config.ron معتبر نیست!",
+                raw
+            ),
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -131,10 +191,16 @@ pub struct InventoryShortcutsState {
     pub bindings: [Option<ShortcutInput>; 6],
 }
 
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct VerticalAimKeyState {
+    pub binding: ShortcutInput,
+}
+
 #[derive(Resource, Default)]
 pub struct SettingsUiState {
     pub is_open: bool,
     pub listening_slot: Option<usize>,
+    pub listening_vertical_aim: bool,
     pub just_started_listening: bool,
     pub status_message: Option<(String, bool)>,
     pub dirty: bool,
@@ -412,6 +478,15 @@ struct SettingsSlotBindBtn(usize);
 struct SettingsSlotClearBtn(usize);
 
 #[derive(Component)]
+struct SettingsVerticalAimContainer;
+
+#[derive(Component)]
+struct SettingsVerticalAimBindBtn;
+
+#[derive(Component)]
+struct SettingsVerticalAimResetBtn;
+
+#[derive(Component)]
 struct SettingsAudioContainer;
 
 #[derive(Component)]
@@ -472,7 +547,10 @@ struct ShopSellCourierBtn(usize);
 #[derive(Component)]
 struct ShopDeliverCourierBtn;
 
-fn spawn_shop_and_inventory_ui(mut commands: Commands) {
+fn spawn_shop_and_inventory_ui(mut commands: Commands, config: Res<GameConfig>) {
+    commands.insert_resource(VerticalAimKeyState {
+        binding: ShortcutInput::from_config_str(&config.soldier.vertical_aim_key),
+    });
     // ۱. نوار ۶ اسلاته اینونتوری + دکمه [B] SHOP در پایین صفحه
     commands
         .spawn((
@@ -1131,6 +1209,22 @@ fn spawn_shop_and_inventory_ui(mut commands: Commands) {
                             column_gap: px(8.0),
                             ..default()
                         },
+                    ));
+
+                    card.spawn((
+                        SettingsVerticalAimContainer,
+                        Node {
+                            width: percent(100),
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::SpaceBetween,
+                            align_items: AlignItems::Center,
+                            padding: UiRect::all(px(10.0)),
+                            border: UiRect::all(px(1.0)),
+                            border_radius: BorderRadius::all(px(8.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.28, 0.40, 0.54, 0.75)),
+                        BackgroundColor(Color::srgba(0.06, 0.09, 0.14, 0.90)),
                     ));
 
                     card.spawn((
@@ -2926,16 +3020,20 @@ struct SettingsInteractionParams<'w, 's> {
     close_btn_q: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<SettingsCloseBtn>)>,
     bind_btn_q: Query<'w, 's, (&'static Interaction, &'static SettingsSlotBindBtn), Changed<Interaction>>,
     clear_btn_q: Query<'w, 's, (&'static Interaction, &'static SettingsSlotClearBtn), Changed<Interaction>>,
+    vaim_bind_q: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<SettingsVerticalAimBindBtn>)>,
+    vaim_reset_q: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<SettingsVerticalAimResetBtn>)>,
     toggle_node_q: Query<'w, 's, &'static mut Node, With<SettingsToggleBtn>>,
     modal_node_q: Query<'w, 's, &'static mut Node, (With<SettingsModalRoot>, Without<SettingsToggleBtn>)>,
 }
 
 fn settings_modal_interaction_system(
+    config: Res<GameConfig>,
     ctx: Res<ShopContextSnapshot>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut settings_ui: ResMut<SettingsUiState>,
     mut shortcuts: ResMut<InventoryShortcutsState>,
+    mut vertical_aim_key: ResMut<VerticalAimKeyState>,
     mut p: SettingsInteractionParams,
 ) {
     if let Ok(mut tn) = p.toggle_node_q.single_mut() {
@@ -2948,6 +3046,7 @@ fn settings_modal_interaction_system(
     if !ctx.in_game {
         settings_ui.is_open = false;
         settings_ui.listening_slot = None;
+        settings_ui.listening_vertical_aim = false;
         if let Ok(mut mn) = p.modal_node_q.single_mut() {
             if mn.display != Display::None {
                 mn.display = Display::None;
@@ -2960,6 +3059,7 @@ fn settings_modal_interaction_system(
         if *inter == Interaction::Pressed {
             settings_ui.is_open = !settings_ui.is_open;
             settings_ui.listening_slot = None;
+            settings_ui.listening_vertical_aim = false;
             settings_ui.status_message = None;
             settings_ui.dirty = true;
         }
@@ -2968,6 +3068,7 @@ fn settings_modal_interaction_system(
         if *inter == Interaction::Pressed {
             settings_ui.is_open = false;
             settings_ui.listening_slot = None;
+            settings_ui.listening_vertical_aim = false;
             settings_ui.dirty = true;
         }
     }
@@ -2987,6 +3088,7 @@ fn settings_modal_interaction_system(
         for (inter, bbtn) in &p.bind_btn_q {
             if *inter == Interaction::Pressed {
                 settings_ui.listening_slot = Some(bbtn.0);
+                settings_ui.listening_vertical_aim = false;
                 settings_ui.just_started_listening = true;
                 settings_ui.status_message = Some((
                     format!("Listening for Slot {} — press ANY key or mouse button (ESC to cancel)...", bbtn.0 + 1),
@@ -2996,7 +3098,82 @@ fn settings_modal_interaction_system(
             }
         }
 
-        if let Some(target_slot) = settings_ui.listening_slot {
+        for inter in &p.vaim_bind_q {
+            if *inter == Interaction::Pressed {
+                settings_ui.listening_vertical_aim = true;
+                settings_ui.listening_slot = None;
+                settings_ui.just_started_listening = true;
+                settings_ui.status_message = Some((
+                    "Listening for 3D Elevation Aim — press ANY key or mouse button (ESC to cancel)...".to_string(),
+                    false,
+                ));
+                settings_ui.dirty = true;
+            }
+        }
+
+        for inter in &p.vaim_reset_q {
+            if *inter == Interaction::Pressed {
+                let def_key = ShortcutInput::from_config_str(&config.soldier.vertical_aim_key);
+                if let Some(dup_idx) = shortcuts.bindings.iter().position(|b| *b == Some(def_key)) {
+                    settings_ui.status_message = Some((
+                        format!("Cannot reset: [{}] is bound to Slot {}!", def_key.label(), dup_idx + 1),
+                        true,
+                    ));
+                } else {
+                    vertical_aim_key.binding = def_key;
+                    settings_ui.listening_vertical_aim = false;
+                    settings_ui.status_message = Some((
+                        format!("3D Elevation Aim reset to [{}].", def_key.label()),
+                        false,
+                    ));
+                }
+                settings_ui.dirty = true;
+            }
+        }
+
+        if settings_ui.listening_vertical_aim {
+            if settings_ui.just_started_listening {
+                settings_ui.just_started_listening = false;
+            } else if keys.just_pressed(KeyCode::Escape) {
+                settings_ui.listening_vertical_aim = false;
+                settings_ui.status_message = Some(("Binding cancelled.".to_string(), false));
+                settings_ui.dirty = true;
+            } else {
+                let captured = keys
+                    .get_just_pressed()
+                    .next()
+                    .copied()
+                    .map(ShortcutInput::Key)
+                    .or_else(|| {
+                        mouse
+                            .get_just_pressed()
+                            .next()
+                            .copied()
+                            .map(ShortcutInput::Mouse)
+                    });
+
+                if let Some(input) = captured {
+                    if let Some(dup_idx) = shortcuts
+                        .bindings
+                        .iter()
+                        .position(|b| *b == Some(input))
+                    {
+                        settings_ui.status_message = Some((
+                            format!("Duplicate blocked: [{}] is already bound to Slot {}!", input.label(), dup_idx + 1),
+                            true,
+                        ));
+                    } else {
+                        vertical_aim_key.binding = input;
+                        settings_ui.listening_vertical_aim = false;
+                        settings_ui.status_message = Some((
+                            format!("3D Elevation Aim bound to [{}].", input.label()),
+                            false,
+                        ));
+                    }
+                    settings_ui.dirty = true;
+                }
+            }
+        } else if let Some(target_slot) = settings_ui.listening_slot {
             if settings_ui.just_started_listening {
                 settings_ui.just_started_listening = false;
             } else if keys.just_pressed(KeyCode::Escape) {
@@ -3018,7 +3195,12 @@ fn settings_modal_interaction_system(
                     });
 
                 if let Some(input) = captured {
-                    if let Some(dup_idx) = shortcuts
+                    if vertical_aim_key.binding == input {
+                        settings_ui.status_message = Some((
+                            format!("Duplicate blocked: [{}] is already bound to 3D Elevation Aim!", input.label()),
+                            true,
+                        ));
+                    } else if let Some(dup_idx) = shortcuts
                         .bindings
                         .iter()
                         .enumerate()
@@ -3249,7 +3431,9 @@ fn rebuild_settings_modal_system(
     mut settings_ui: ResMut<SettingsUiState>,
     mut audio_settings: ResMut<AudioSettingsState>,
     shortcuts: Res<InventoryShortcutsState>,
+    vertical_aim_key: Res<VerticalAimKeyState>,
     container_q: Query<(Entity, Option<&Children>), With<SettingsSlotsContainer>>,
+    vaim_cont_q: Query<(Entity, Option<&Children>), With<SettingsVerticalAimContainer>>,
     audio_cont_q: Query<(Entity, Option<&Children>), With<SettingsAudioContainer>>,
     mut status_q: Query<(&mut Text, &mut TextColor), With<SettingsStatusText>>,
 ) {
@@ -3334,6 +3518,111 @@ fn rebuild_settings_modal_system(
     }
 
     if rebuild_slots {
+    if let Ok((vaim_ent, vaim_ch)) = vaim_cont_q.single() {
+        clear_children(&mut commands, vaim_ch);
+        let is_listening = settings_ui.listening_vertical_aim;
+        let key_lbl = if is_listening {
+            "PRESS KEY...".to_string()
+        } else {
+            vertical_aim_key.binding.label()
+        };
+        commands.entity(vaim_ent).with_children(|row| {
+            row.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: px(2.0),
+                ..default()
+            })
+            .with_children(|info| {
+                info.spawn((
+                    Text::new("3D ELEVATION AIM (HOLD)"),
+                    TextFont {
+                        font_size: FontSize::Px(12.5),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.88, 0.55)),
+                ));
+                info.spawn((
+                    Text::new("Hold to shoot at exact 3D cursor height; release for straight horizontal shots."),
+                    TextFont {
+                        font_size: FontSize::Px(10.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.68, 0.78, 0.88)),
+                ));
+            });
+
+            row.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(6.0),
+                ..default()
+            })
+            .with_children(|btns| {
+                btns.spawn((
+                    Interaction::default(),
+                    SettingsVerticalAimBindBtn,
+                    Node {
+                        min_width: px(78.0),
+                        padding: UiRect::axes(px(10.0), px(6.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(px(1.5)),
+                        border_radius: BorderRadius::all(px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(if is_listening {
+                        Color::srgb(1.0, 0.82, 0.25)
+                    } else {
+                        Color::srgb(0.38, 0.72, 0.95)
+                    }),
+                    BackgroundColor(if is_listening {
+                        Color::srgba(0.28, 0.22, 0.06, 0.95)
+                    } else {
+                        Color::srgba(0.08, 0.12, 0.18, 0.95)
+                    }),
+                ))
+                .with_children(|b| {
+                    b.spawn((
+                        Pickable::IGNORE,
+                        Text::new(key_lbl),
+                        TextFont {
+                            font_size: FontSize::Px(11.5),
+                            ..default()
+                        },
+                        TextColor(if is_listening {
+                            Color::srgb(1.0, 0.88, 0.35)
+                        } else {
+                            Color::srgb(0.45, 0.92, 1.0)
+                        }),
+                    ));
+                });
+
+                btns.spawn((
+                    Interaction::default(),
+                    SettingsVerticalAimResetBtn,
+                    Node {
+                        padding: UiRect::axes(px(8.0), px(6.0)),
+                        border: UiRect::all(px(1.0)),
+                        border_radius: BorderRadius::all(px(6.0)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.45, 0.60, 0.75, 0.75)),
+                    BackgroundColor(Color::srgba(0.10, 0.15, 0.22, 0.92)),
+                ))
+                .with_children(|rb| {
+                    rb.spawn((
+                        Pickable::IGNORE,
+                        Text::new("RESET"),
+                        TextFont {
+                            font_size: FontSize::Px(10.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.85, 0.92, 1.0)),
+                    ));
+                });
+            });
+        });
+    }
     if let Ok((cont_ent, ch)) = container_q.single() {
         clear_children(&mut commands, ch);
         commands.entity(cont_ent).with_children(|row| {

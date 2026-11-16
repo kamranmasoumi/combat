@@ -61,7 +61,9 @@ pub struct ScoreboardConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HeroWeaponAudioDef {
     pub primary_fire_sound: String,
+    pub primary_fire_volume: f32,
     pub pistol_fire_sound: String,
+    pub pistol_fire_volume: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -87,62 +89,110 @@ pub struct AudioConfig {
     pub max_hearing_distance: f32,
     pub hero_weapons: HashMap<String, HeroWeaponAudioDef>,
     pub run_to_dive_sound: String,
+    pub run_to_dive_volume: f32,
     pub running_slide_sound: String,
+    pub running_slide_volume: f32,
     pub grenade_countdown_beep_sound: String,
+    pub grenade_countdown_beep_volume: f32,
     pub grenade_explosion_sound: String,
+    pub grenade_explosion_volume: f32,
     pub grenade_water_explosion_sound: String,
+    pub grenade_water_explosion_volume: f32,
     pub footstep_sounds: Vec<String>,
+    pub footstep_volume: f32,
+    pub crouch_footstep_volume_multiplier: f32,
     pub footstep_interval_secs: f32,
     pub weapon_switch_sound: String,
+    pub weapon_switch_volume: f32,
     pub swim_stroke_sound: String,
+    pub swim_stroke_volume: f32,
     pub swim_interval_secs: f32,
     pub shallow_water_step_sound: String,
+    pub shallow_water_step_volume: f32,
     pub shallow_water_step_interval_secs: f32,
     pub quick_roll_to_run_sound: String,
+    pub quick_roll_to_run_volume: f32,
     pub grenade_throw_sound: String,
+    pub grenade_throw_volume: f32,
     pub running_dive_roll_sound: String,
+    pub running_dive_roll_volume: f32,
     pub hero_death_sound: String,
+    pub hero_death_volume: f32,
     pub jump_over_sound: String,
+    pub jump_over_volume: f32,
     pub obstacle_jump_sound: String,
+    pub obstacle_jump_volume: f32,
     pub primary_reload_sound: String,
+    pub primary_reload_volume: f32,
     pub pistol_reload_sound: String,
+    pub pistol_reload_volume: f32,
     pub impact_stone_wall_sound: String,
+    pub impact_stone_wall_volume: f32,
     pub impact_turret_sound: String,
+    pub impact_turret_volume: f32,
     pub impact_character_sound: String,
+    pub impact_character_volume: f32,
     pub impact_building_sound: String,
+    pub impact_building_volume: f32,
     pub impact_water_sound: String,
+    pub impact_water_volume: f32,
     pub creep_fire_sound: String,
+    pub creep_fire_volume: f32,
     pub creep_fire_max_concurrent: usize,
     pub creep_fire_crowd_ducking: f32,
     pub creep_run_loop_sound: String,
+    pub creep_run_loop_volume: f32,
     pub gold_gain_sound: String,
+    pub gold_gain_volume: f32,
     pub deny_sound: String,
+    pub deny_volume: f32,
     pub turret_destroy_sound: String,
+    pub turret_destroy_volume: f32,
     pub turret_fire_sound: String,
+    pub turret_fire_volume: f32,
     pub building_destroy_sound: String,
+    pub building_destroy_volume: f32,
     pub victory_sound: String,
+    pub victory_volume: f32,
     pub defeat_sound: String,
+    pub defeat_volume: f32,
     pub low_hp_threshold_ratio: f32,
     pub heartbeat_sound: String,
+    pub heartbeat_volume: f32,
     pub heartbeat_min_interval_secs: f32,
     pub heartbeat_max_interval_secs: f32,
     pub low_hp_world_duck_min_factor: f32,
     pub low_hp_vignette_max_alpha: f32,
     pub hero_respawn_sound: String,
+    pub hero_respawn_volume: f32,
     pub courier_death_sound: String,
+    pub courier_death_volume: f32,
     pub courier_respawn_sound: String,
+    pub courier_respawn_volume: f32,
     pub courier_fly_loop_sound: String,
+    pub courier_fly_loop_volume: f32,
     pub match_start_sound: String,
+    pub match_start_volume: f32,
     pub background_music_sound: String,
+    pub background_music_volume: f32,
     pub shop_add_cart_sound: String,
+    pub shop_add_cart_volume: f32,
     pub shop_buy_sound: String,
+    pub shop_buy_volume: f32,
     pub shop_sell_sound: String,
+    pub shop_sell_volume: f32,
     pub shop_combine_sound: String,
+    pub shop_combine_volume: f32,
     pub shop_open_sound: String,
+    pub shop_open_volume: f32,
     pub shop_close_sound: String,
+    pub shop_close_volume: f32,
     pub empty_gun_click_sound: String,
+    pub empty_gun_click_volume: f32,
     pub empty_grenade_click_sound: String,
+    pub empty_grenade_click_volume: f32,
     pub level_up_sound: String,
+    pub level_up_volume: f32,
     pub ambient_zones: Vec<AmbientZoneAudioDef>,
 }
 
@@ -247,6 +297,12 @@ impl GameConfig {
         assert!(self.soldier.cliff_dive_speed > 0.0, "soldier.cliff_dive_speed must be > 0");
         assert!(self.soldier.cliff_dive_arc_boost > 0.0, "soldier.cliff_dive_arc_boost must be > 0");
         assert!(self.soldier.fall_dive_arc_boost > 0.0, "soldier.fall_dive_arc_boost must be > 0");
+        assert!(self.soldier.cliff_edge_probe_step > 0.0, "soldier.cliff_edge_probe_step must be > 0");
+        assert!(self.soldier.cliff_edge_drop_threshold > 0.0, "soldier.cliff_edge_drop_threshold must be > 0");
+        assert!(self.soldier.cliff_edge_stop_margin >= 0.0, "soldier.cliff_edge_stop_margin must be >= 0");
+        assert!(self.soldier.cliff_chain_min_slide_dist >= 0.0, "soldier.cliff_chain_min_slide_dist must be >= 0");
+        assert!(self.soldier.cliff_edge_min_anim_duration_secs > 0.0, "soldier.cliff_edge_min_anim_duration_secs must be > 0");
+        assert!(!self.soldier.vertical_aim_key.trim().is_empty(), "soldier.vertical_aim_key cannot be empty");
         Self::validate_weapon_vfx_profile(&self.fx.creep_bullet_vfx, "fx.creep_bullet_vfx");
         Self::validate_weapon_vfx_profile(&self.fx.turret_bullet_vfx, "fx.turret_bullet_vfx");
         let bs = &self.fx.blood_splatter_vfx;
@@ -469,6 +525,10 @@ impl GameConfig {
         assert!(a.low_hp_threshold_ratio > 0.0 && a.low_hp_threshold_ratio < 1.0, "audio.low_hp_threshold_ratio باید بین 0 و 1 باشد");
         assert!(a.heartbeat_min_interval_secs > 0.1 && a.heartbeat_max_interval_secs >= a.heartbeat_min_interval_secs, "بازه ضربان قلب نامعتبر است");
         assert!(!a.grenade_water_explosion_sound.trim().is_empty(), "audio.grenade_water_explosion_sound نمی‌تواند خالی باشد");
+        for (hid, hw) in &a.hero_weapons {
+            assert!(hw.primary_fire_volume >= 0.0, "primary_fire_volume برای '{}' نمی‌تواند منفی باشد", hid);
+            assert!(hw.pistol_fire_volume >= 0.0, "pistol_fire_volume برای '{}' نمی‌تواند منفی باشد", hid);
+        }
         for hero in &self.heroes {
             assert!(
                 a.hero_weapons.contains_key(&hero.id),
@@ -1127,6 +1187,12 @@ pub struct SoldierConfig {
     pub cliff_dive_speed: f32,
     pub cliff_dive_arc_boost: f32,
     pub fall_dive_arc_boost: f32,
+    pub cliff_edge_probe_step: f32,
+    pub cliff_edge_drop_threshold: f32,
+    pub cliff_edge_stop_margin: f32,
+    pub cliff_chain_min_slide_dist: f32,
+    pub cliff_edge_min_anim_duration_secs: f32,
+    pub vertical_aim_key: String,
     pub quick_roll_speed: f32,
     pub vault_check_distance: f32,
     pub vault_travel_distance: f32,
@@ -1788,6 +1854,7 @@ pub struct ClientInputCommand {
     pub grenade_just_pressed: bool,
     pub space_just_pressed: bool,
     pub space_held: bool,
+    pub vertical_aim_held: bool,
     pub switch_weapon_just_pressed: bool,
     pub fire_just_pressed: bool,
     pub fire_held: bool,
@@ -1803,6 +1870,7 @@ impl ClientInputCommand {
         self.shift_held = newer.shift_held;
         self.fire_held = newer.fire_held;
         self.space_held = newer.space_held;
+        self.vertical_aim_held = newer.vertical_aim_held;
         self.aim_ray_origin = newer.aim_ray_origin;
         self.aim_ray_dir = newer.aim_ray_dir;
         self.has_aim_ray = newer.has_aim_ray;
@@ -5404,6 +5472,7 @@ pub struct SharedTraversalState {
     pub start_pos: Vec3,
     pub target_pos: Vec3,
     pub travel_dir: Vec3,
+    pub chain_dive_after: bool,
 }
 
 #[derive(Resource)]
@@ -5752,6 +5821,7 @@ impl AuthoritativeWorldState {
                 start_pos: spawn_pos,
                 target_pos: spawn_pos,
                 travel_dir: initial_aim_dir,
+                chain_dive_after: false,
             },
             targets_visible: vec![true; targets.len()],
             targets,
@@ -6370,6 +6440,7 @@ impl AuthoritativeWorldState {
                     start_pos: spawn_pos,
                     target_pos: spawn_pos,
                     travel_dir: facing_dir,
+                    chain_dive_after: false,
                 },
             });
         }
@@ -7882,41 +7953,48 @@ fn shared_drive_single_player(
                         resolved_hit = Some(hit.point);
                         locked_enemy = true;
                         hovered_turret = Some(pt.index);
-                    } else {
-                        resolved_hit = Some(hit.point);
                     }
                 } else if let Ok(pb) = barracks_query.get(hit_ent) {
                     if pb.team != world.hero_team && !world.barracks[pb.index].is_dead {
                         resolved_hit = Some(hit.point);
                         locked_enemy = true;
                         hovered_barracks = Some(pb.index);
-                    } else {
-                        resolved_hit = Some(hit.point);
                     }
                 } else if let Ok(pa) = ancient_query.get(hit_ent) {
                     if pa.team != world.hero_team && !world.ancients[pa.index].is_dead {
                         resolved_hit = Some(hit.point);
                         locked_enemy = true;
                         hovered_ancient = Some(pa.index);
-                    } else {
-                        resolved_hit = Some(hit.point);
                     }
                 } else if target_query.get(hit_ent).is_ok() {
                     resolved_hit = Some(hit.point);
                     locked_enemy = true;
-                } else if hit.normal.y > 0.7 {
-                    // تقاطع خود اشعه دوربین با صفحه ارتفاعی هم‌تراز سینه روی همان سطح زمین
-                    // تا انتهای خط لیزر دقیقاً روی پیکسل مرکز نشانه‌گر موس منطبق بماند
-                    let elevated_plane_y = hit.point.y + config.soldier.aim_plane_height_offset;
-                    let t_elevated = (elevated_plane_y - input.aim_ray_origin.y) / ray_dir.y;
-                    if t_elevated > 0.0 {
-                        resolved_hit = Some(input.aim_ray_origin + ray_dir * t_elevated);
+                }
+
+                if !locked_enemy {
+                    if input.vertical_aim_held {
+                        if hit.normal.y > 0.7 {
+                            // تقاطع خود اشعه دوربین با صفحه ارتفاعی هم‌تراز سینه روی همان سطح زمین
+                            // تا انتهای خط لیزر دقیقاً روی پیکسل مرکز نشانه‌گر موس منطبق بماند
+                            let elevated_plane_y = hit.point.y + config.soldier.aim_plane_height_offset;
+                            let t_elevated = (elevated_plane_y - input.aim_ray_origin.y) / ray_dir.y;
+                            if t_elevated > 0.0 {
+                                resolved_hit = Some(input.aim_ray_origin + ray_dir * t_elevated);
+                            } else {
+                                resolved_hit = Some(hit.point);
+                            }
+                        } else {
+                            // برخورد با دیواره عمودی، صخره یا مانع: خود نقطه برخورد روی اشعه موس است
+                            resolved_hit = Some(hit.point);
+                        }
                     } else {
-                        resolved_hit = Some(hit.point);
+                        // حالت پیش‌فرض بدون نگه داشتن X و بدون هدف: شلیک و خط لیزر کاملاً افقی در ارتفاع هیرو
+                        let aim_plane_y = world.soldier_pos.y + config.soldier.aim_plane_height_offset;
+                        let t = (aim_plane_y - input.aim_ray_origin.y) / ray_dir.y;
+                        if t > 0.0 {
+                            resolved_hit = Some(input.aim_ray_origin + ray_dir * t);
+                        }
                     }
-                } else {
-                    // برخورد با دیواره عمودی، صخره یا مانع: خود نقطه برخورد روی اشعه موس است
-                    resolved_hit = Some(hit.point);
                 }
             } else {
                 // ج) Fallback به صفحه افقی در صورت عدم برخورد با هندسه نقشه
@@ -8211,6 +8289,7 @@ fn step_wall_climb_custom(
                 start_pos,
                 target_pos,
                 travel_dir: into_plateau,
+                chain_dive_after: false,
             };
             world.soldier_facing_dir = into_plateau;
             controller.translation = None;
@@ -8260,6 +8339,80 @@ fn step_wall_climb_custom(
     }
 
     false
+}
+
+fn sample_ground_and_deep_water_at(
+    config: &GameConfig,
+    physics_world: &CustomPhysicsWorld,
+    world: &AuthoritativeWorldState,
+    target_query: &Query<&PhysicsTarget>,
+    mountain_query: &Query<&PhysicsMountain>,
+    elev_query: &Query<&ElevationSurface>,
+    probe_xz: Vec2,
+    ref_y: f32,
+) -> (Option<f32>, f32, bool) {
+    let query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
+    let canyon_bed = canyon_sample_height(&config.map.canyon, probe_xz.x, probe_xz.y);
+    let inside_canyon_carve = config.map.canyon.enabled && canyon_bed < -0.15;
+    let landing_ray_orig = Vec3::new(probe_xz.x, ref_y + 4.0, probe_xz.y);
+    let bridge_or_ground_hit = physics_world
+        .cast_ray(
+            landing_ray_orig,
+            Vec3::NEG_Y,
+            32.0,
+            query_groups,
+            |entity| {
+                if let Ok(t) = target_query.get(entity) {
+                    if world.targets[t.index].is_dead {
+                        return false;
+                    }
+                }
+                if let Ok(mtn) = mountain_query.get(entity) {
+                    if mtn.id.starts_with("mtn_canyon_") {
+                        return false;
+                    }
+                }
+                if inside_canyon_carve {
+                    if let Ok(elev) = elev_query.get(entity) {
+                        if elev.elevation_tier <= 0 {
+                            return false;
+                        }
+                    }
+                }
+                true
+            },
+        )
+        .filter(|(ent, hit)| {
+            *ent != Entity::PLACEHOLDER && hit.point.y >= config.map.canyon.water_y - 0.25
+        })
+        .map(|(_, hit)| hit.point.y);
+
+    let effective_landing_y = if let Some(hit_y) = bridge_or_ground_hit {
+        hit_y
+    } else if inside_canyon_carve {
+        let swim_floor = config.map.canyon.water_y - 1.15;
+        canyon_bed.max(swim_floor)
+    } else {
+        ref_y
+    };
+
+    let is_deep_water = if bridge_or_ground_hit.is_some() && inside_canyon_carve {
+        false
+    } else if let Some((water_y, _)) =
+        sample_water_surface_at(config, Vec3::new(probe_xz.x, effective_landing_y, probe_xz.y))
+    {
+        let extra_depth = sample_waterfall_depth_offset(config, probe_xz.x, probe_xz.y);
+        let effective_bed_y = if inside_canyon_carve {
+            canyon_bed
+        } else {
+            (effective_landing_y - extra_depth).max(-1.6)
+        };
+        (water_y - effective_bed_y) >= 0.85
+    } else {
+        false
+    };
+
+    (bridge_or_ground_hit, effective_landing_y, is_deep_water)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8390,9 +8543,77 @@ fn step_traversal_custom(
         }
 
         if world.traversal.elapsed >= world.traversal.duration {
+            let was_quick_roll = world.traversal.kind == TraversalKind::QuickRollToRun;
+            if world.traversal.chain_dive_after {
+                let dive_dir = world.traversal.travel_dir;
+                let dive_dur = config.exact_anim_duration("run_to_dive");
+                let dive_dist = config.soldier.cliff_dive_speed * dive_dur;
+                let query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
+                let shape_pos = Vec3::new(
+                    world.soldier_pos.x,
+                    world.soldier_pos.y + config.physics.soldier_capsule_center_y,
+                    world.soldier_pos.z,
+                );
+                let safe_dive_dist = physics_world.sweep_capsule_horizontal(
+                    shape_pos,
+                    config.physics.soldier_capsule_half_segment,
+                    config.soldier.player_radius,
+                    dive_dir,
+                    dive_dist,
+                    config.soldier.free_traversal_wall_padding,
+                    query_groups,
+                    |entity| {
+                        if let Ok(t) = target_query.get(entity) {
+                            !world.targets[t.index].is_dead
+                        } else {
+                            true
+                        }
+                    },
+                );
+                let dive_x = world.soldier_pos.x + dive_dir.x * safe_dive_dist;
+                let dive_z = world.soldier_pos.z + dive_dir.z * safe_dive_dist;
+                let dive_bed = canyon_sample_height(&config.map.canyon, dive_x, dive_z);
+                let inside_canyon_carve = config.map.canyon.enabled && dive_bed < -0.15;
+                let dive_end_y = if inside_canyon_carve {
+                    dive_bed.max(config.map.canyon.water_y - 1.15)
+                } else {
+                    let (_, eff_y, _) = sample_ground_and_deep_water_at(
+                        config,
+                        physics_world,
+                        world,
+                        target_query,
+                        mountain_query,
+                        elev_query,
+                        Vec2::new(dive_x, dive_z),
+                        world.soldier_pos.y,
+                    );
+                    eff_y
+                };
+
+                world.traversal.is_active = true;
+                world.traversal.kind = TraversalKind::RunningJump;
+                world.traversal.anim_name = "run_to_dive".to_string();
+                world.traversal.elapsed = 0.0;
+                world.traversal.duration = dive_dur;
+                world.traversal.start_pos = world.soldier_pos;
+                world.traversal.target_pos = Vec3::new(dive_x, dive_end_y, dive_z);
+                world.traversal.travel_dir = dive_dir;
+                world.traversal.chain_dive_after = false;
+                world.soldier_facing_dir = dive_dir;
+                world.firing_anim_remaining = None;
+                world.reload_remaining = None;
+                controller.translation = None;
+                if was_quick_roll {
+                    world.base_stance = Stance::Run;
+                    world.effective_stance = Stance::Run;
+                }
+                return;
+            }
+
             world.traversal.is_active = false;
+            world.traversal.chain_dive_after = false;
             controller.translation = None;
-            if world.traversal.kind == TraversalKind::QuickRollToRun {
+            if was_quick_roll {
                 world.base_stance = Stance::Run;
                 world.effective_stance = Stance::Run;
             }
@@ -8434,6 +8655,7 @@ fn step_traversal_custom(
                 world.traversal.start_pos = world.soldier_pos;
                 world.traversal.target_pos = target_pos;
                 world.traversal.travel_dir = inward_dir;
+                world.traversal.chain_dive_after = false;
                 world.soldier_facing_dir = inward_dir;
                 world.space_hold_secs = None;
                 world.firing_anim_remaining = None;
@@ -8578,6 +8800,7 @@ fn step_traversal_custom(
             world.traversal.start_pos = world.soldier_pos;
             world.traversal.target_pos = Vec3::new(dive_x, effective_landing_y, dive_z);
             world.traversal.travel_dir = travel_dir;
+            world.traversal.chain_dive_after = false;
             world.soldier_facing_dir = travel_dir;
             world.firing_anim_remaining = None;
             world.reload_remaining = None;
@@ -8610,6 +8833,7 @@ fn step_traversal_custom(
                     world.soldier_pos.z + travel_dir.z * config.soldier.vault_travel_distance,
                 );
                 world.traversal.travel_dir = travel_dir;
+                world.traversal.chain_dive_after = false;
                 world.soldier_facing_dir = travel_dir;
                 return;
             }
@@ -8671,6 +8895,7 @@ fn step_traversal_custom(
                 world.soldier_pos.z + travel_dir.z * config.soldier.vault_travel_distance,
             );
             world.traversal.travel_dir = travel_dir;
+            world.traversal.chain_dive_after = false;
             world.soldier_facing_dir = travel_dir;
             return;
         }
@@ -8733,94 +8958,78 @@ fn step_traversal_custom(
         world.soldier_pos.z + travel_dir.z * safe_dist,
     );
 
-    let canyon_bed = canyon_sample_height(&config.map.canyon, target_pos.x, target_pos.z);
-    let inside_canyon_carve = config.map.canyon.enabled && canyon_bed < -0.15;
-    let landing_ray_orig = Vec3::new(target_pos.x, target_pos.y + 4.0, target_pos.z);
-    let bridge_or_ground_hit = physics_world
-        .cast_ray(
-            landing_ray_orig,
-            Vec3::NEG_Y,
-            32.0,
-            query_groups,
-            |entity| {
-                if let Ok(t) = target_query.get(entity) {
-                    if world.targets[t.index].is_dead {
-                        return false;
-                    }
-                }
-                if let Ok(mtn) = mountain_query.get(entity) {
-                    if mtn.id.starts_with("mtn_canyon_") {
-                        return false;
-                    }
-                }
-                if inside_canyon_carve {
-                    if let Ok(elev) = elev_query.get(entity) {
-                        if elev.elevation_tier <= 0 {
-                            return false;
-                        }
-                    }
-                }
-                true
-            },
-        )
-        .filter(|(ent, hit)| {
-            *ent != Entity::PLACEHOLDER && hit.point.y >= config.map.canyon.water_y - 0.25
-        })
-        .map(|(_, hit)| hit.point.y);
-
-    let effective_landing_y = if let Some(hit_y) = bridge_or_ground_hit {
-        hit_y
-    } else if inside_canyon_carve {
-        let swim_floor = config.map.canyon.water_y - 1.15;
-        canyon_bed.max(swim_floor)
-    } else {
-        target_pos.y
-    };
-
-    let leads_to_deep_water = if bridge_or_ground_hit.is_some() && inside_canyon_carve {
-        // روی پل یا مسیر لاین بالای دره هستیم، بنابراین شیرجه داخل آب اجرا نمی‌شود
-        false
-    } else if let Some((water_y, _)) = sample_water_surface_at(config, Vec3::new(target_pos.x, effective_landing_y, target_pos.z)) {
-        let extra_depth = sample_waterfall_depth_offset(config, target_pos.x, target_pos.z);
-        let effective_bed_y = if inside_canyon_carve {
-            canyon_bed
-        } else {
-            (effective_landing_y - extra_depth).max(-1.6)
-        };
-        (water_y - effective_bed_y) >= 0.85
-    } else {
-        false
-    };
-
-    let final_anim_name = if leads_to_deep_water {
-        exact_duration = config.exact_anim_duration("run_to_dive");
-        distance = config.soldier.cliff_dive_speed.max(speed) * exact_duration;
-        safe_dist = physics_world.sweep_capsule_horizontal(
-            shape_pos,
-            config.physics.soldier_capsule_half_segment,
-            config.soldier.player_radius,
-            travel_dir,
-            distance,
-            config.soldier.free_traversal_wall_padding,
-            query_groups,
-            |entity| {
-                if let Ok(t) = target_query.get(entity) {
-                    !world.targets[t.index].is_dead
-                } else {
-                    true
-                }
-            },
+    let probe_step = config.soldier.cliff_edge_probe_step;
+    let mut first_cliff_drop_dist: Option<f32> = None;
+    let mut last_landing_y = world.soldier_pos.y;
+    let mut d = probe_step;
+    while d <= safe_dist + probe_step * 0.5 {
+        let sample_d = d.min(safe_dist);
+        let sx = world.soldier_pos.x + travel_dir.x * sample_d;
+        let sz = world.soldier_pos.z + travel_dir.z * sample_d;
+        let (_, eff_y, is_deep_water) = sample_ground_and_deep_water_at(
+            config,
+            physics_world,
+            world,
+            target_query,
+            mountain_query,
+            elev_query,
+            Vec2::new(sx, sz),
+            world.soldier_pos.y,
         );
-        let dive_x = world.soldier_pos.x + travel_dir.x * safe_dist;
-        let dive_z = world.soldier_pos.z + travel_dir.z * safe_dist;
-        let dive_bed = canyon_sample_height(&config.map.canyon, dive_x, dive_z);
-        let dive_end_y = if config.map.canyon.enabled && dive_bed < -0.15 {
-            dive_bed.max(config.map.canyon.water_y - 1.15)
+        last_landing_y = eff_y;
+        if is_deep_water && (world.soldier_pos.y - eff_y) >= config.soldier.cliff_edge_drop_threshold {
+            first_cliff_drop_dist = Some(sample_d);
+            break;
+        }
+        if sample_d >= safe_dist {
+            break;
+        }
+        d += probe_step;
+    }
+
+    let mut chain_dive_after = false;
+    let final_anim_name = if let Some(drop_d) = first_cliff_drop_dist {
+        let edge_dist = (drop_d - probe_step - config.soldier.cliff_edge_stop_margin).max(0.0);
+        if edge_dist >= config.soldier.cliff_chain_min_slide_dist {
+            target_pos = Vec3::new(
+                world.soldier_pos.x + travel_dir.x * edge_dist,
+                world.soldier_pos.y,
+                world.soldier_pos.z + travel_dir.z * edge_dist,
+            );
+            let frac = (edge_dist / distance.max(0.001)).clamp(0.0, 1.0);
+            exact_duration = (exact_duration * frac).max(config.soldier.cliff_edge_min_anim_duration_secs);
+            chain_dive_after = true;
+            anim_name
         } else {
-            effective_landing_y
-        };
-        target_pos = Vec3::new(dive_x, dive_end_y, dive_z);
-        "run_to_dive"
+            exact_duration = config.exact_anim_duration("run_to_dive");
+            distance = config.soldier.cliff_dive_speed.max(speed) * exact_duration;
+            safe_dist = physics_world.sweep_capsule_horizontal(
+                shape_pos,
+                config.physics.soldier_capsule_half_segment,
+                config.soldier.player_radius,
+                travel_dir,
+                distance,
+                config.soldier.free_traversal_wall_padding,
+                query_groups,
+                |entity| {
+                    if let Ok(t) = target_query.get(entity) {
+                        !world.targets[t.index].is_dead
+                    } else {
+                        true
+                    }
+                },
+            );
+            let dive_x = world.soldier_pos.x + travel_dir.x * safe_dist;
+            let dive_z = world.soldier_pos.z + travel_dir.z * safe_dist;
+            let dive_bed = canyon_sample_height(&config.map.canyon, dive_x, dive_z);
+            let dive_end_y = if config.map.canyon.enabled && dive_bed < -0.15 {
+                dive_bed.max(config.map.canyon.water_y - 1.15)
+            } else {
+                last_landing_y
+            };
+            target_pos = Vec3::new(dive_x, dive_end_y, dive_z);
+            "run_to_dive"
+        }
     } else {
         anim_name
     };
@@ -8833,6 +9042,7 @@ fn step_traversal_custom(
     world.traversal.start_pos = world.soldier_pos;
     world.traversal.target_pos = target_pos;
     world.traversal.travel_dir = travel_dir;
+    world.traversal.chain_dive_after = chain_dive_after;
     world.soldier_facing_dir = travel_dir;
 }
 
@@ -8921,7 +9131,14 @@ fn step_shooting_and_grenade_spawn(
 
         let muzzle_pos = resolve_muzzle_pos(world, input, config);
         let to_aim = world.aim_hit_pos - muzzle_pos;
-        let shot_dir = if to_aim.length_squared() > config.physics.muzzle_aim_min_dist_sq {
+        let shot_dir = if !world.aim_locked_on_enemy && !input.vertical_aim_held {
+            let flat = Vec3::new(to_aim.x, 0.0, to_aim.z);
+            if flat.length_squared() > config.physics.muzzle_aim_min_dist_sq {
+                flat.normalize()
+            } else {
+                world.aim_world_dir
+            }
+        } else if to_aim.length_squared() > config.physics.muzzle_aim_min_dist_sq {
             let mut dir = to_aim.normalize();
             // محدود کردن زاویه عمودی از روی کانفیگ تا تیر بین سطوح بالا و پایین روان حرکت کند
             let max_sin = config.combat.max_vertical_aim_pitch_sin;

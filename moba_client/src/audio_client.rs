@@ -393,10 +393,10 @@ fn process_audio_events_system(
             ClientAudioEvent::ShotFired { pos, source } => match source {
                 ShotAudioSource::Hero { hero_id, weapon_kind } => {
                     if let Some(hw) = a.hero_weapons.get(&hero_id) {
-                        let path = if weapon_kind == WeaponKind::Pistol {
-                            &hw.pistol_fire_sound
+                        let (path, base_vol) = if weapon_kind == WeaponKind::Pistol {
+                            (&hw.pistol_fire_sound, hw.pistol_fire_volume)
                         } else {
-                            &hw.primary_fire_sound
+                            (&hw.primary_fire_sound, hw.primary_fire_volume)
                         };
                         play_spatial_sound(
                             &mut commands,
@@ -409,7 +409,7 @@ fn process_audio_events_system(
                             duck,
                             AudioCategory::Weapons,
                             path,
-                            1.0,
+                            base_vol,
                         );
                     }
                 }
@@ -431,7 +431,7 @@ fn process_audio_events_system(
                             duck,
                             AudioCategory::Units,
                             &a.creep_fire_sound,
-                            crowd_scale,
+                            crowd_scale * a.creep_fire_volume,
                         );
                     }
                 }
@@ -448,16 +448,16 @@ fn process_audio_events_system(
                     duck,
                     AudioCategory::Units,
                     &a.turret_fire_sound,
-                    1.0,
+                    a.turret_fire_volume,
                 );
             }
             ClientAudioEvent::BulletImpact { pos, surface } => {
-                let path = match surface {
-                    ImpactSurface::StoneWall => &a.impact_stone_wall_sound,
-                    ImpactSurface::Turret => &a.impact_turret_sound,
-                    ImpactSurface::Character => &a.impact_character_sound,
-                    ImpactSurface::Building => &a.impact_building_sound,
-                    ImpactSurface::Water => &a.impact_water_sound,
+                let (path, vol) = match surface {
+                    ImpactSurface::StoneWall => (&a.impact_stone_wall_sound, a.impact_stone_wall_volume),
+                    ImpactSurface::Turret => (&a.impact_turret_sound, a.impact_turret_volume),
+                    ImpactSurface::Character => (&a.impact_character_sound, a.impact_character_volume),
+                    ImpactSurface::Building => (&a.impact_building_sound, a.impact_building_volume),
+                    ImpactSurface::Water => (&a.impact_water_sound, a.impact_water_volume),
                 };
                 play_spatial_sound(
                     &mut commands,
@@ -470,7 +470,7 @@ fn process_audio_events_system(
                     duck,
                     AudioCategory::Weapons,
                     path,
-                    0.85,
+                    vol,
                 );
             }
             ClientAudioEvent::GrenadeBeep { pos } => {
@@ -485,14 +485,14 @@ fn process_audio_events_system(
                     duck,
                     AudioCategory::Weapons,
                     &a.grenade_countdown_beep_sound,
-                    0.75,
+                    a.grenade_countdown_beep_volume,
                 );
             }
             ClientAudioEvent::GrenadeExploded { pos, in_water } => {
-                let sound_path = if in_water {
-                    &a.grenade_water_explosion_sound
+                let (sound_path, vol) = if in_water {
+                    (&a.grenade_water_explosion_sound, a.grenade_water_explosion_volume)
                 } else {
-                    &a.grenade_explosion_sound
+                    (&a.grenade_explosion_sound, a.grenade_explosion_volume)
                 };
                 play_spatial_sound(
                     &mut commands,
@@ -505,89 +505,89 @@ fn process_audio_events_system(
                     duck,
                     AudioCategory::Weapons,
                     sound_path,
-                    1.0,
+                    vol,
                 );
             }
             ClientAudioEvent::LastHitGold => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.gold_gain_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.gold_gain_sound, a.gold_gain_volume);
             }
             ClientAudioEvent::CreepDenied => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.deny_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.deny_sound, a.deny_volume);
             }
             ClientAudioEvent::HeroLeveledUp => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.level_up_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.level_up_sound, a.level_up_volume);
             }
             ClientAudioEvent::WeaponSwitch => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.weapon_switch_sound, 0.9);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.weapon_switch_sound, a.weapon_switch_volume);
             }
             ClientAudioEvent::EmptyGunClick => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.empty_gun_click_sound, 0.9);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.empty_gun_click_sound, a.empty_gun_click_volume);
             }
             ClientAudioEvent::EmptyGrenadeClick => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.empty_grenade_click_sound, 0.9);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.empty_grenade_click_sound, a.empty_grenade_click_volume);
             }
             ClientAudioEvent::PrimaryReload => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.primary_reload_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.primary_reload_sound, a.primary_reload_volume);
             }
             ClientAudioEvent::PistolReload => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.pistol_reload_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.pistol_reload_sound, a.pistol_reload_volume);
             }
             ClientAudioEvent::GrenadeThrow => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.grenade_throw_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Weapons, &a.grenade_throw_sound, a.grenade_throw_volume);
             }
             ClientAudioEvent::TraversalMove { anim_name } => {
-                let path = match anim_name.as_str() {
-                    "run_to_dive" => &a.run_to_dive_sound,
-                    "running_slide" => &a.running_slide_sound,
-                    "quick_roll_to_run" => &a.quick_roll_to_run_sound,
-                    "running_dive_roll" => &a.running_dive_roll_sound,
-                    "jump_over" => &a.jump_over_sound,
-                    _ => &a.obstacle_jump_sound,
+                let (path, vol) = match anim_name.as_str() {
+                    "run_to_dive" => (&a.run_to_dive_sound, a.run_to_dive_volume),
+                    "running_slide" => (&a.running_slide_sound, a.running_slide_volume),
+                    "quick_roll_to_run" => (&a.quick_roll_to_run_sound, a.quick_roll_to_run_volume),
+                    "running_dive_roll" => (&a.running_dive_roll_sound, a.running_dive_roll_volume),
+                    "jump_over" => (&a.jump_over_sound, a.jump_over_volume),
+                    _ => (&a.obstacle_jump_sound, a.obstacle_jump_volume),
                 };
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Movement, path, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Movement, path, vol);
             }
             ClientAudioEvent::HeroDeath => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.hero_death_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.hero_death_sound, a.hero_death_volume);
             }
             ClientAudioEvent::HeroRespawn => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.hero_respawn_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.hero_respawn_sound, a.hero_respawn_volume);
             }
             ClientAudioEvent::TurretDestroyed { pos } => {
-                play_spatial_sound(&mut commands, &asset_server, &mut cache, &settings, &config, ctx.listener_pos, pos, duck, AudioCategory::Units, &a.turret_destroy_sound, 1.0);
+                play_spatial_sound(&mut commands, &asset_server, &mut cache, &settings, &config, ctx.listener_pos, pos, duck, AudioCategory::Units, &a.turret_destroy_sound, a.turret_destroy_volume);
             }
             ClientAudioEvent::BuildingDestroyed { pos } => {
-                play_spatial_sound(&mut commands, &asset_server, &mut cache, &settings, &config, ctx.listener_pos, pos, duck, AudioCategory::Units, &a.building_destroy_sound, 1.0);
+                play_spatial_sound(&mut commands, &asset_server, &mut cache, &settings, &config, ctx.listener_pos, pos, duck, AudioCategory::Units, &a.building_destroy_sound, a.building_destroy_volume);
             }
             ClientAudioEvent::CourierDeath => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.courier_death_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.courier_death_sound, a.courier_death_volume);
             }
             ClientAudioEvent::CourierRespawn => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.courier_respawn_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.courier_respawn_sound, a.courier_respawn_volume);
             }
             ClientAudioEvent::MatchStarted => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.match_start_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.match_start_sound, a.match_start_volume);
             }
             ClientAudioEvent::MatchEnded { victory } => {
-                let path = if victory { &a.victory_sound } else { &a.defeat_sound };
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, path, 1.0);
+                let (path, vol) = if victory { (&a.victory_sound, a.victory_volume) } else { (&a.defeat_sound, a.defeat_volume) };
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, path, vol);
             }
             ClientAudioEvent::ShopOpen => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_open_sound, 0.9);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_open_sound, a.shop_open_volume);
             }
             ClientAudioEvent::ShopClose => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_close_sound, 0.9);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_close_sound, a.shop_close_volume);
             }
             ClientAudioEvent::ShopAddCart => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_add_cart_sound, 0.9);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_add_cart_sound, a.shop_add_cart_volume);
             }
             ClientAudioEvent::ShopBuy => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_buy_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_buy_sound, a.shop_buy_volume);
             }
             ClientAudioEvent::ShopCombine => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_combine_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_combine_sound, a.shop_combine_volume);
             }
             ClientAudioEvent::ShopSell => {
-                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_sell_sound, 1.0);
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_sell_sound, a.shop_sell_volume);
             }
         }
     }
@@ -629,7 +629,7 @@ fn update_locomotion_and_low_hp_audio_system(
                 1.0,
                 AudioCategory::Alerts,
                 &a.heartbeat_sound,
-                0.55 + severity * 0.45,
+                (0.55 + severity * 0.45) * a.heartbeat_volume,
             );
         }
 
@@ -669,7 +669,7 @@ fn update_locomotion_and_low_hp_audio_system(
                 timers.low_hp_duck_factor,
                 AudioCategory::Movement,
                 &a.swim_stroke_sound,
-                0.95,
+                a.swim_stroke_volume,
             );
         }
     } else if is_moving_ground && ctx.in_water {
@@ -684,7 +684,7 @@ fn update_locomotion_and_low_hp_audio_system(
                 timers.low_hp_duck_factor,
                 AudioCategory::Movement,
                 &a.shallow_water_step_sound,
-                0.9,
+                a.shallow_water_step_volume,
             );
         }
     } else if is_moving_ground {
@@ -703,7 +703,7 @@ fn update_locomotion_and_low_hp_audio_system(
                     timers.low_hp_duck_factor,
                     AudioCategory::Movement,
                     path,
-                    if loco.starts_with("walk_crouching") { 0.45 } else { 0.80 },
+                    if loco.starts_with("walk_crouching") { a.footstep_volume * a.crouch_footstep_volume_multiplier } else { a.footstep_volume },
                 );
             }
         }
@@ -752,12 +752,12 @@ fn update_loops_and_ambient_zones_system(
     // ۲. لوپ موزیک پس‌زمینه بازی
     if ctx.in_game && !timers.music_spawned {
         if let Some(handle) = cache.get_or_load(&a.background_music_sound, &asset_server) {
-            let vol = settings.effective_gain(AudioCategory::Music, duck);
+            let vol = settings.effective_gain(AudioCategory::Music, duck) * a.background_music_volume;
             commands.spawn((
                 BackgroundMusicLoop,
                 TaggedAudio {
                     category: AudioCategory::Music,
-                    base_gain: 1.0,
+                    base_gain: a.background_music_volume,
                 },
                 AudioPlayer::new(handle),
                 PlaybackSettings::LOOP.with_volume(Volume::Linear(vol)),
@@ -787,7 +787,7 @@ fn update_loops_and_ambient_zones_system(
             let dist = ctx.listener_pos.distance(c_pos);
             if dist < a.max_hearing_distance {
                 let atten = (1.0 - dist / a.max_hearing_distance).clamp(0.0, 1.0);
-                target_vol = settings.effective_gain(AudioCategory::Units, duck) * atten * 0.75;
+                target_vol = settings.effective_gain(AudioCategory::Units, duck) * atten * a.courier_fly_loop_volume;
             }
         }
         if let Some(mut sink) = sink_opt {
@@ -817,7 +817,7 @@ fn update_loops_and_ambient_zones_system(
             if dist < a.max_hearing_distance {
                 let atten = (1.0 - dist / a.max_hearing_distance).clamp(0.0, 1.0);
                 let count_factor = ((ctx.running_creeps_count as f32).sqrt() * 0.35).clamp(0.35, 1.0);
-                target_vol = settings.effective_gain(AudioCategory::Units, duck) * atten * count_factor * 0.65;
+                target_vol = settings.effective_gain(AudioCategory::Units, duck) * atten * count_factor * a.creep_run_loop_volume;
             }
         }
         if let Some(mut sink) = sink_opt {

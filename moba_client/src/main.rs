@@ -47,7 +47,7 @@ use pregame_ui::{AppScreenState, PendingMatchConnection, PreGamePlugin, PreGameS
 use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
 mod shop_client;
 use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
-use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
+use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, VerticalAimKeyState};
 
 
 #[cfg(not(debug_assertions))]
@@ -3298,6 +3298,7 @@ fn client_sample_input_system(
     chat_state: Res<ChatUiState>,
     shop_ui: Res<ShopUiState>,
     settings_ui: Res<SettingsUiState>,
+    vertical_aim_key: Res<VerticalAimKeyState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     camera_control: Res<CameraControlState>,
@@ -3318,6 +3319,7 @@ fn client_sample_input_system(
             grenade_just_pressed: false,
             space_just_pressed: false,
             space_held: false,
+            vertical_aim_held: false,
             switch_weapon_just_pressed: false,
             fire_just_pressed: false,
             fire_held: false,
@@ -3400,6 +3402,9 @@ fn client_sample_input_system(
         grenade_just_pressed: keyboard.just_pressed(KeyCode::KeyF),
         space_just_pressed: keyboard.just_pressed(KeyCode::Space),
         space_held: keyboard.pressed(KeyCode::Space),
+        vertical_aim_held: !shop_ui.is_open
+            && !settings_ui.is_open
+            && vertical_aim_key.binding.pressed(&keyboard, &mouse_button),
         switch_weapon_just_pressed: keyboard.just_pressed(KeyCode::KeyE),
         fire_just_pressed: !alt_held
             && !shop_ui.is_open
@@ -14672,7 +14677,8 @@ fn update_scoreboard_ui_system(
     let can_open = p.match_flow.is_in_game()
         && !p.chat_state.is_open
         && !p.shop_ui.search_focused
-        && p.settings_ui.listening_slot.is_none();
+        && p.settings_ui.listening_slot.is_none()
+        && !p.settings_ui.listening_vertical_aim;
     let is_open = can_open && p.keyboard.pressed(KeyCode::Backquote);
 
     if !is_open {

@@ -129,6 +129,9 @@ pub enum ClientAudioEvent {
     TraversalMove {
         anim_name: String,
     },
+    SwingStart,
+    SwingEnd,
+    SwingLand,
     HeroDeath,
     HeroRespawn,
     TurretDestroyed {
@@ -162,6 +165,8 @@ pub struct AudioFrameContext {
     pub hero_hp_ratio: f32,
     pub hero_is_dead: bool,
     pub current_locomotion: String,
+    pub traversal_active: bool,
+    pub swing_in_air: bool,
     pub in_water: bool,
     pub active_courier_pos: Option<Vec3>,
     pub running_creeps_nearest_pos: Option<Vec3>,
@@ -209,6 +214,9 @@ struct CourierFlyLoop;
 struct CreepMarchLoop;
 
 #[derive(Component)]
+struct SwingAirLoop;
+
+#[derive(Component)]
 struct AmbientZoneLoop {
     zone_index: usize,
     base_volume: f32,
@@ -232,6 +240,7 @@ struct AudioRuntimeTimers {
     music_spawned: bool,
     courier_loop_spawned: bool,
     creep_loop_spawned: bool,
+    swing_air_loop_spawned: bool,
     ambient_spawned: bool,
 }
 
@@ -546,6 +555,15 @@ fn process_audio_events_system(
                 };
                 play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Movement, path, vol);
             }
+            ClientAudioEvent::SwingStart => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Movement, &a.swing_start_sound, a.swing_start_volume);
+            }
+            ClientAudioEvent::SwingEnd => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Movement, &a.swing_end_sound, a.swing_end_volume);
+            }
+            ClientAudioEvent::SwingLand => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Movement, &a.swing_land_sound, a.swing_land_volume);
+            }
             ClientAudioEvent::HeroDeath => {
                 play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.hero_death_sound, a.hero_death_volume);
             }
@@ -654,8 +672,8 @@ fn update_locomotion_and_low_hp_audio_system(
 
     // ۲. صدای ردپا، دویدن در آب کم‌عمق و شنا
     let loco = ctx.current_locomotion.as_str();
-    let is_swimming = loco == "swimming";
-    let is_moving_ground = loco.starts_with("run_") || loco.starts_with("walk_");
+    let is_swimming = !ctx.traversal_active && loco == "swimming";
+    let is_moving_ground = !ctx.traversal_active && (loco.starts_with("run_") || loco.starts_with("walk_"));
 
     if is_swimming {
         timers.swim_timer -= dt;
@@ -728,7 +746,8 @@ fn update_loops_and_ambient_zones_system(
     mut listener_q: Query<&mut Transform, With<SpatialListener>>,
     mut courier_loop_q: Query<(&mut Transform, Option<&mut SpatialAudioSink>), (With<CourierFlyLoop>, Without<SpatialListener>, Without<CreepMarchLoop>)>,
     mut creep_loop_q: Query<(&mut Transform, Option<&mut SpatialAudioSink>), (With<CreepMarchLoop>, Without<SpatialListener>, Without<CourierFlyLoop>)>,
-    mut ambient_q: Query<(&AmbientZoneLoop, Option<&mut AudioSink>)>,
+    mut ambient_q: Query<(&AmbientZoneLoop, Option<&mut AudioSink>), Without<SwingAirLoop>>,
+    mut swing_air_q: Query<Option<&mut AudioSink>, (With<SwingAirLoop>, Without<AmbientZoneLoop>)>,
 ) {
     let a = &config.audio;
     let duck = if timers.low_hp_duck_factor > 0.0 {
@@ -747,6 +766,26 @@ fn update_loops_and_ambient_zones_system(
         timers.listener_spawned = true;
     } else if let Ok(mut ltf) = listener_q.single_mut() {
         ltf.translation = scaled_listener;
+    }
+
+    // ۱.۵. لوپ صدای هوا هنگام تاب‌خوردن (Swing)
+    if ctx.in_game && !timers.swing_air_loop_spawned {
+        if let Some(handle) = cache.get_or_load(&a.swing_air_loop_sound, &asset_server) {
+            commands.spawn((
+                SwingAirLoop,
+                AudioPlayer::new(handle),
+                PlaybackSettings::LOOP.with_volume(Volume::Linear(0.0)),
+            ));
+            timers.swing_air_loop_spawned = true;
+        }
+    }
+    if let Ok(Some(mut sink)) = swing_air_q.single_mut() {
+        let target_vol = if ctx.in_game && !ctx.hero_is_dead && ctx.swing_in_air {
+            settings.effective_gain(AudioCategory::Movement, duck) * a.swing_air_loop_volume
+        } else {
+            0.0
+        };
+        sink.set_volume(Volume::Linear(target_vol));
     }
 
     // ۲. لوپ موزیک پس‌زمینه بازی

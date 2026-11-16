@@ -311,6 +311,7 @@ fn main() {
                 client_receive_snapshot_and_sync_system,
                 target_visual_reaction_system,
                 environment_vfx_and_water_animation_system,
+                update_swing_rope_visual_system,
                 camera_follow_system,
                 soldier_animation_player_system,
                 laser_sight_gizmo_system,
@@ -548,6 +549,24 @@ struct WaterfallMistEmitter {
     base_pos: Vec3,
     width: f32,
     timer: Timer,
+}
+
+#[derive(Component)]
+struct SwingPulleyWheel {
+    spin_speed: f32,
+}
+
+#[derive(Component)]
+struct SwingRopeVisual {
+    mesh_handle: Handle<Mesh>,
+}
+
+#[derive(Component)]
+struct SwingRingIndicator {
+    pulse_speed: f32,
+    base_scale: f32,
+    emissive_rgb: (f32, f32, f32),
+    mat_handle: Handle<StandardMaterial>,
 }
 
 #[derive(Component)]
@@ -861,6 +880,8 @@ struct ClientRenderState {
     traversal_active: bool,
     traversal_anim_name: String,
     traversal_duration: f32,
+    swing_pulley_pos: Option<Vec3>,
+    swing_throw_progress: f32,
     is_dead: bool,
     death_anim_name: String,
     in_water: bool,
@@ -905,6 +926,8 @@ impl ClientRenderState {
             traversal_active: false,
             traversal_anim_name: String::new(),
             traversal_duration: 0.0,
+            swing_pulley_pos: None,
+            swing_throw_progress: 0.0,
             is_dead: false,
             death_anim_name: String::new(),
             in_water: false,
@@ -1538,6 +1561,105 @@ fn setup_scene(
             timer: Timer::from_seconds(wf.mist_particle_interval_secs.max(0.05), TimerMode::Repeating),
         });
         spawn_map_object_label(&mut commands, config.map.show_object_labels, wf_ent, &wf.id, size.y * 0.5 + 0.8);
+    }
+
+    // ۵-ب. نقاط Swing روی دره (قرقره معلق در هوا + طناب + حلقه چشمک‌زن دایره‌ای روی دو لبه پرتگاه)
+    if !config.map.swing_points.is_empty() {
+        let rope_rgb = config.map.swing_points[0].rope_color_rgb;
+        let rope_mesh_handle = meshes.add(Mesh::new(
+            bevy::mesh::PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::MAIN_WORLD | bevy::asset::RenderAssetUsages::RENDER_WORLD,
+        ));
+        let rope_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(rope_rgb.0, rope_rgb.1, rope_rgb.2),
+            perceptual_roughness: 0.92,
+            metallic: 0.0,
+            ..default()
+        });
+        commands.spawn((
+            SwingRopeVisual {
+                mesh_handle: rope_mesh_handle.clone(),
+            },
+            Mesh3d(rope_mesh_handle),
+            MeshMaterial3d(rope_mat),
+            Transform::IDENTITY,
+            Visibility::Hidden,
+        ));
+    }
+
+    for sp in &config.map.swing_points {
+        let pa = Vec3::new(sp.point_a.0, sp.point_a.1, sp.point_a.2);
+        let pb = Vec3::new(sp.point_b.0, sp.point_b.1, sp.point_b.2);
+        let pulley_p = Vec3::new(sp.pulley_pos.0, sp.pulley_pos.1, sp.pulley_pos.2);
+        let span_dir = Vec3::new(pb.x - pa.x, 0.0, pb.z - pa.z).normalize_or_zero();
+        let pulley_rot = if span_dir != Vec3::ZERO {
+            Transform::IDENTITY.looking_to(span_dir, Vec3::Y).rotation
+        } else {
+            Quat::IDENTITY
+        };
+        let pulley_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(sp.pulley_color_rgb.0, sp.pulley_color_rgb.1, sp.pulley_color_rgb.2),
+            metallic: 0.75,
+            perceptual_roughness: 0.35,
+            ..default()
+        });
+        let rope_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(sp.rope_color_rgb.0, sp.rope_color_rgb.1, sp.rope_color_rgb.2),
+            perceptual_roughness: 0.85,
+            ..default()
+        });
+
+        let p_ent = commands
+            .spawn((
+                MapObjectId(sp.id.clone()),
+                Transform::from_translation(pulley_p)
+                    .with_rotation(pulley_rot)
+                    .with_scale(Vec3::splat(sp.pulley_scale)),
+                Visibility::Visible,
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.45, 0.95, 0.95))),
+                    MeshMaterial3d(pulley_mat.clone()),
+                    Transform::from_xyz(0.0, 0.15, 0.0),
+                ));
+                parent.spawn((
+                    SwingPulleyWheel { spin_speed: 2.2 },
+                    Mesh3d(meshes.add(Cylinder::new(0.55, 0.24))),
+                    MeshMaterial3d(pulley_mat.clone()),
+                    Transform::IDENTITY.with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+                ));
+                let rope_len = (pulley_p.y - pa.y - 2.2).max(2.0);
+                parent.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(0.045, rope_len))),
+                    MeshMaterial3d(rope_mat.clone()),
+                    Transform::from_xyz(0.0, -rope_len * 0.5, 0.0),
+                ));
+            })
+            .id();
+        spawn_map_object_label(&mut commands, config.map.show_object_labels, p_ent, &sp.id, 1.4);
+
+        for ring_pos in [pa + Vec3::Y * 0.12, pb + Vec3::Y * 0.12, pulley_p] {
+            let ring_mat = materials.add(StandardMaterial {
+                base_color: Color::srgba(sp.ring_color_rgb.0, sp.ring_color_rgb.1, sp.ring_color_rgb.2, 0.85),
+                emissive: LinearRgba::new(sp.ring_emissive_rgb.0, sp.ring_emissive_rgb.1, sp.ring_emissive_rgb.2, 1.0),
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                ..default()
+            });
+            commands.spawn((
+                SwingRingIndicator {
+                    pulse_speed: sp.ring_pulse_speed,
+                    base_scale: sp.ring_radius,
+                    emissive_rgb: sp.ring_emissive_rgb,
+                    mat_handle: ring_mat.clone(),
+                },
+                Mesh3d(meshes.add(Torus::new(0.84, 1.0))),
+                MeshMaterial3d(ring_mat),
+                Transform::from_translation(ring_pos).with_scale(Vec3::splat(sp.ring_radius)),
+                NotShadowCaster,
+            ));
+        }
     }
 
     // ۶. میدان باستانی دایره‌ای مرکز نقشه (Center Ruined Colosseum Nexus)
@@ -2483,10 +2605,143 @@ fn setup_scene(
 // سیستم پویایی محیط، جریان آب، آبشارها، حلقه‌های موج آب و تعامل ورود بازیکن به آب
 // -----------------------------------------------------------------------------
 
+
+fn update_swing_rope_visual_system(
+    time: Res<Time>,
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    weapon_status: Res<WeaponAttachmentStatus>,
+    global_tfs: Query<&GlobalTransform>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut rope_q: Query<(&SwingRopeVisual, &mut Visibility)>,
+) {
+    let Ok((rope, mut vis)) = rope_q.single_mut() else {
+        return;
+    };
+    if !match_flow.is_in_game()
+        || !render_state.traversal_active
+        || render_state.traversal_anim_name != "start_swing"
+    {
+        *vis = Visibility::Hidden;
+        return;
+    }
+    let Some(pulley_pos) = render_state.swing_pulley_pos else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+
+    let hand_pos = weapon_status
+        .hand_entity
+        .and_then(|e| global_tfs.get(e).ok())
+        .map(|gt| gt.translation())
+        .unwrap_or_else(|| {
+            let fwd = render_state.soldier_facing_dir.normalize_or_zero();
+            let right = fwd.cross(Vec3::Y).normalize_or_zero();
+            render_state.soldier_pos + Vec3::Y * 1.42 + fwd * 0.32 + right * 0.22
+        });
+
+    let throw_t = render_state.swing_throw_progress.clamp(0.0, 1.0);
+    if throw_t <= 0.01 {
+        *vis = Visibility::Hidden;
+        return;
+    }
+
+    let tip_pos = hand_pos.lerp(pulley_pos, throw_t);
+    let chord = tip_pos - hand_pos;
+    let chord_len = chord.length();
+    if chord_len < 0.05 {
+        *vis = Visibility::Hidden;
+        return;
+    }
+    let dir = chord / chord_len;
+    let mut side = dir.cross(Vec3::Y).normalize_or_zero();
+    if side == Vec3::ZERO {
+        side = Vec3::X;
+    }
+    let up_perp = side.cross(dir).normalize_or_zero();
+    let t_sec = time.elapsed_secs();
+
+    const SEGMENTS: usize = 18;
+    const SIDES: usize = 6;
+    let rope_radius = 0.042_f32;
+
+    let mut spine = Vec::with_capacity(SEGMENTS + 1);
+    for i in 0..=SEGMENTS {
+        let u = i as f32 / SEGMENTS as f32;
+        let base = hand_pos.lerp(tip_pos, u);
+        let env = (u * std::f32::consts::PI).sin();
+
+        let offset = if throw_t < 0.999 {
+            let whip_amp = (1.0 - throw_t * 0.65) * 0.55 * env;
+            let wave = (u * 9.0 - t_sec * 20.0).sin();
+            let lift = (1.0 - throw_t) * 0.35 * env;
+            side * (whip_amp * wave) + up_perp * lift
+        } else {
+            let sag = 4.0 * u * (1.0 - u) * 0.52;
+            let sway = 0.09 * env * (t_sec * 5.2 + u * 3.0).sin();
+            Vec3::new(0.0, -sag, 0.0) + side * sway
+        };
+        spine.push(base + offset);
+    }
+
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity((SEGMENTS + 1) * SIDES);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity((SEGMENTS + 1) * SIDES);
+    let mut indices: Vec<u32> = Vec::with_capacity(SEGMENTS * SIDES * 6);
+
+    for (i, &p) in spine.iter().enumerate() {
+        let tangent = if i == 0 {
+            (spine[1] - spine[0]).normalize_or_zero()
+        } else if i == SEGMENTS {
+            (spine[SEGMENTS] - spine[SEGMENTS - 1]).normalize_or_zero()
+        } else {
+            (spine[i + 1] - spine[i - 1]).normalize_or_zero()
+        };
+        let t_dir = if tangent == Vec3::ZERO { dir } else { tangent };
+        let mut n1 = t_dir.cross(Vec3::Y).normalize_or_zero();
+        if n1 == Vec3::ZERO {
+            n1 = Vec3::X;
+        }
+        let n2 = n1.cross(t_dir).normalize_or_zero();
+        for s in 0..SIDES {
+            let ang = (s as f32 / SIDES as f32) * std::f32::consts::TAU;
+            let norm = (n1 * ang.cos() + n2 * ang.sin()).normalize_or_zero();
+            let vtx = p + norm * rope_radius;
+            positions.push([vtx.x, vtx.y, vtx.z]);
+            normals.push([norm.x, norm.y, norm.z]);
+        }
+    }
+
+    for i in 0..SEGMENTS {
+        let row_a = (i * SIDES) as u32;
+        let row_b = ((i + 1) * SIDES) as u32;
+        for s in 0..SIDES {
+            let s_next = ((s + 1) % SIDES) as u32;
+            let s_u32 = s as u32;
+            indices.push(row_a + s_u32);
+            indices.push(row_b + s_u32);
+            indices.push(row_b + s_next);
+
+            indices.push(row_a + s_u32);
+            indices.push(row_b + s_next);
+            indices.push(row_a + s_next);
+        }
+    }
+
+    if let Some(mut mesh) = meshes.get_mut(&rope.mesh_handle) {
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+        mesh.insert_indices(bevy::mesh::Indices::U32(indices));
+    }
+    *vis = Visibility::Visible;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn environment_vfx_and_water_animation_system(
     mut commands: Commands,
     time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut swing_wheel_q: Query<(&mut Transform, &SwingPulleyWheel), (Without<FlowingWaterStreak>, Without<CascadingWaterfallSheet>, Without<AnimatedCrystalCore>, Without<AmbientFloatingMote>, Without<WaterRippleRing>, Without<SwingRingIndicator>)>,
+    mut swing_ring_q: Query<(&mut Transform, &SwingRingIndicator), (Without<FlowingWaterStreak>, Without<CascadingWaterfallSheet>, Without<AnimatedCrystalCore>, Without<AmbientFloatingMote>, Without<WaterRippleRing>, Without<SwingPulleyWheel>)>,
     mut streak_query: Query<(&mut Transform, &FlowingWaterStreak), Without<CascadingWaterfallSheet>>,
     mut waterfall_query: Query<
         (&mut Transform, &CascadingWaterfallSheet),
@@ -2556,6 +2811,25 @@ fn environment_vfx_and_water_animation_system(
         tf.scale = Vec3::new(s, (1.0 - frac).max(0.05), s);
         if ripple.timer.is_finished() {
             commands.entity(entity).despawn();
+        }
+    }
+
+    for (mut tf, wheel) in &mut swing_wheel_q {
+        tf.rotate_local_y(wheel.spin_speed * time.delta_secs());
+    }
+    for (mut tf, ring) in &mut swing_ring_q {
+        let blink = (t * ring.pulse_speed).sin() * 0.5 + 0.5;
+        let scale = ring.base_scale * (0.85 + 0.25 * blink);
+        tf.scale = Vec3::new(scale, 1.0, scale);
+        if let Some(mut mat) = materials.get_mut(&ring.mat_handle) {
+            let mult = 0.25 + 1.15 * blink;
+            mat.emissive = LinearRgba::new(
+                ring.emissive_rgb.0 * mult,
+                ring.emissive_rgb.1 * mult,
+                ring.emissive_rgb.2 * mult,
+                1.0,
+            );
+            mat.base_color = mat.base_color.with_alpha(0.30 + 0.65 * blink);
         }
     }
 
@@ -3566,6 +3840,8 @@ fn client_receive_snapshot_and_sync_system(
         render_state.traversal_active = snap.traversal_active;
         render_state.traversal_anim_name = snap.traversal_anim_name;
         render_state.traversal_duration = snap.traversal_duration;
+        render_state.swing_pulley_pos = snap.swing_pulley_pos;
+        render_state.swing_throw_progress = snap.swing_throw_progress;
         render_state.is_dead = snap.is_dead;
         render_state.death_anim_name = snap.death_anim_name;
         render_state.in_water = snap.in_water;
@@ -5061,12 +5337,28 @@ fn soldier_animation_player_system(
             let server_dur = render_state.traversal_duration.max(0.05);
             let clip_dur = anim_assets.clip_duration(&trav_key).unwrap_or(server_dur);
             let speed = (clip_dur / server_dur).max(0.1);
+            let is_looping_trav = trav_key == "fall";
+
             let l_act = lower_trans.play(&mut lower_player, node, blend);
-            l_act.set_speed(speed);
-            l_act.replay();
+            l_act.resume();
+            if is_looping_trav {
+                l_act.repeat();
+            } else {
+                l_act.set_repeat(bevy::animation::RepeatAnimation::Never);
+                l_act.set_speed(speed);
+                l_act.replay();
+            }
+
             let u_act = upper_trans.play(&mut upper_player, node, blend);
-            u_act.set_speed(speed);
-            u_act.replay();
+            u_act.resume();
+            if is_looping_trav {
+                u_act.repeat();
+            } else {
+                u_act.set_repeat(bevy::animation::RepeatAnimation::Never);
+                u_act.set_speed(speed);
+                u_act.replay();
+            }
+
             render_state.previous_lower_anim = trav_key.clone();
             render_state.previous_upper_anim = trav_key;
         }
@@ -14773,6 +15065,7 @@ struct AudioTransitionTracker {
     prev_weapon: Option<ActiveWeaponSlot>,
     prev_upper: Option<UpperBodyAction>,
     prev_traversal: bool,
+    prev_traversal_anim: String,
     prev_winner: Option<TeamId>,
     prev_dead_turrets: Vec<bool>,
     prev_dead_barracks: Vec<bool>,
@@ -14793,6 +15086,11 @@ fn sync_audio_context_system(
     p.audio_ctx.hero_hp_ratio = (p.hero_hud.0.hp / p.hero_hud.0.max_hp.max(1.0)).clamp(0.0, 1.0);
     p.audio_ctx.hero_is_dead = p.render_state.is_dead;
     p.audio_ctx.current_locomotion = p.render_state.current_locomotion.clone();
+    p.audio_ctx.traversal_active = p.render_state.traversal_active;
+    p.audio_ctx.swing_in_air = p.render_state.traversal_active
+        && p.render_state.swing_pulley_pos.is_some()
+        && p.render_state.swing_throw_progress >= 0.99
+        && p.render_state.traversal_anim_name == "start_swing";
     p.audio_ctx.in_water = p.render_state.in_water;
 
     // نزدیک‌ترین Courier در حال پرواز و نزدیک‌ترین سرباز لاین در حال دویدن
@@ -14871,10 +15169,25 @@ fn sync_audio_context_system(
         tr.prev_upper = Some(p.render_state.upper_action);
     }
 
-    if p.render_state.traversal_active && !tr.prev_traversal {
-        p.audio_q.0.push(ClientAudioEvent::TraversalMove {
-            anim_name: p.render_state.traversal_anim_name.clone(),
-        });
+    if p.render_state.traversal_active {
+        let cur_anim = &p.render_state.traversal_anim_name;
+        if !tr.prev_traversal || tr.prev_traversal_anim != *cur_anim {
+            if cur_anim == "start_swing" {
+                p.audio_q.0.push(ClientAudioEvent::SwingStart);
+            } else if cur_anim == "end_swing" {
+                p.audio_q.0.push(ClientAudioEvent::SwingEnd);
+            } else if !tr.prev_traversal {
+                p.audio_q.0.push(ClientAudioEvent::TraversalMove {
+                    anim_name: cur_anim.clone(),
+                });
+            }
+        }
+        tr.prev_traversal_anim = cur_anim.clone();
+    } else if tr.prev_traversal {
+        if tr.prev_traversal_anim == "end_swing" {
+            p.audio_q.0.push(ClientAudioEvent::SwingLand);
+        }
+        tr.prev_traversal_anim.clear();
     }
     tr.prev_traversal = p.render_state.traversal_active;
 

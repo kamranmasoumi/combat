@@ -92,6 +92,14 @@ pub struct AudioConfig {
     pub run_to_dive_volume: f32,
     pub running_slide_sound: String,
     pub running_slide_volume: f32,
+    pub swing_start_sound: String,
+    pub swing_start_volume: f32,
+    pub swing_air_loop_sound: String,
+    pub swing_air_loop_volume: f32,
+    pub swing_end_sound: String,
+    pub swing_end_volume: f32,
+    pub swing_land_sound: String,
+    pub swing_land_volume: f32,
     pub grenade_countdown_beep_sound: String,
     pub grenade_countdown_beep_volume: f32,
     pub grenade_explosion_sound: String,
@@ -401,6 +409,19 @@ impl GameConfig {
             assert!(hero.grenade.throw_duration_secs > 0.0, "grenade.throw_duration_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.grenade.max_charges > 0, "grenade.max_charges هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
                         assert!(hero.grenade.recharge_secs > 0.0, "grenade.recharge_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.swing.swing_speed > 0.0, "swing.swing_speed هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.swing.launch_delay_secs >= 0.0, "swing.launch_delay_secs هیرو '{}' نمی‌تواند منفی باشد", hero.id);
+            assert!(hero.swing.stamina_cost >= 0.0, "swing.stamina_cost هیرو '{}' نمی‌تواند منفی باشد", hero.id);
+            assert!(!hero.swing.start_anim.trim().is_empty(), "swing.start_anim هیرو '{}' خالی است", hero.id);
+            assert!(!hero.swing.end_anim.trim().is_empty(), "swing.end_anim هیرو '{}' خالی است", hero.id);
+            assert!(!hero.swing.fall_anim.trim().is_empty(), "swing.fall_anim هیرو '{}' خالی است", hero.id);
+            assert!(
+                hero.swing.start_phase_fraction > 0.0 && hero.swing.end_phase_fraction > hero.swing.start_phase_fraction && hero.swing.end_phase_fraction < 1.0,
+                "بازه start_phase_fraction / end_phase_fraction هیرو '{}' نامعتبر است",
+                hero.id
+            );
+            assert!(hero.swing.fall_gravity > 0.0, "swing.fall_gravity هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.swing.fall_forward_momentum >= 0.0, "swing.fall_forward_momentum هیرو '{}' نمی‌تواند منفی باشد", hero.id);
             Self::validate_weapon_vfx_profile(&hero.bullet_vfx.primary, &format!("heroes[{}].bullet_vfx.primary", hero.id));
             Self::validate_weapon_vfx_profile(&hero.bullet_vfx.pistol, &format!("heroes[{}].bullet_vfx.pistol", hero.id));
         }
@@ -487,6 +508,13 @@ impl GameConfig {
         );
         assert!(self.camera.occlusion_terrain_cutout_radius > 0.0, "occlusion_terrain_cutout_radius باید بزرگ‌تر از صفر باشد");
         assert!(self.camera.occlusion_terrain_rim_width > 0.0, "occlusion_terrain_rim_width باید بزرگ‌تر از صفر باشد");
+        for sp in &self.map.swing_points {
+            assert!(sp.trigger_radius > 0.0, "swing_points[{}].trigger_radius باید بزرگ‌تر از صفر باشد", sp.id);
+            assert!(sp.arc_sag_depth >= 0.0, "swing_points[{}].arc_sag_depth نمی‌تواند منفی باشد", sp.id);
+            assert!(sp.pulley_scale > 0.0, "swing_points[{}].pulley_scale باید بزرگ‌تر از صفر باشد", sp.id);
+            assert!(sp.ring_radius > 0.0, "swing_points[{}].ring_radius باید بزرگ‌تر از صفر باشد", sp.id);
+            assert!(sp.ring_pulse_speed > 0.0, "swing_points[{}].ring_pulse_speed باید بزرگ‌تر از صفر باشد", sp.id);
+        }
         for hero in &self.heroes {
             assert!(hero.wall_climb.attach_distance > 0.0, "hero.wall_climb.attach_distance باید بزرگ‌تر از صفر باشد");
             assert!(hero.wall_climb.climb_up_speed > 0.0, "hero.wall_climb.climb_up_speed باید بزرگ‌تر از صفر باشد");
@@ -525,6 +553,10 @@ impl GameConfig {
         assert!(a.low_hp_threshold_ratio > 0.0 && a.low_hp_threshold_ratio < 1.0, "audio.low_hp_threshold_ratio باید بین 0 و 1 باشد");
         assert!(a.heartbeat_min_interval_secs > 0.1 && a.heartbeat_max_interval_secs >= a.heartbeat_min_interval_secs, "بازه ضربان قلب نامعتبر است");
         assert!(!a.grenade_water_explosion_sound.trim().is_empty(), "audio.grenade_water_explosion_sound نمی‌تواند خالی باشد");
+        assert!(a.swing_start_volume >= 0.0, "audio.swing_start_volume نمی‌تواند منفی باشد");
+        assert!(a.swing_air_loop_volume >= 0.0, "audio.swing_air_loop_volume نمی‌تواند منفی باشد");
+        assert!(a.swing_end_volume >= 0.0, "audio.swing_end_volume نمی‌تواند منفی باشد");
+        assert!(a.swing_land_volume >= 0.0, "audio.swing_land_volume نمی‌تواند منفی باشد");
         for (hid, hw) in &a.hero_weapons {
             assert!(hw.primary_fire_volume >= 0.0, "primary_fire_volume برای '{}' نمی‌تواند منفی باشد", hid);
             assert!(hw.pistol_fire_volume >= 0.0, "pistol_fire_volume برای '{}' نمی‌تواند منفی باشد", hid);
@@ -671,6 +703,9 @@ impl GameConfig {
             check_id(&item.id, "map.waterfalls");
         }
         check_id(&self.map.roshan_pit.id, "map.roshan_pit");
+        for item in &self.map.swing_points {
+            check_id(&item.id, "map.swing_points");
+        }
         check_id(&self.map.center_bridge.id, "map.center_bridge");
         for item in &self.map.fountains {
             check_id(&item.id, "map.fountains");
@@ -1137,6 +1172,7 @@ pub struct HeroDef {
     pub vision_range: f32,
     pub high_ground_vision_bonus: f32,
     pub wall_climb: WallClimbConfig,
+    pub swing: HeroSwingConfig,
     pub weapon: HeroWeaponDef,
     pub pistol: HeroWeaponDef,
     pub grenade: HeroGrenadeDef,
@@ -1155,6 +1191,37 @@ pub struct HeroLevelGrowth {
     pub hp_regen_per_level: f32,
     pub stamina_regen_per_level: f32,
     pub armor_per_level: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroSwingConfig {
+    pub swing_speed: f32,
+    pub launch_delay_secs: f32,
+    pub stamina_cost: f32,
+    pub start_anim: String,
+    pub end_anim: String,
+    pub fall_anim: String,
+    pub start_phase_fraction: f32,
+    pub end_phase_fraction: f32,
+    pub fall_gravity: f32,
+    pub fall_forward_momentum: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SwingPointDef {
+    pub id: String,
+    pub point_a: (f32, f32, f32),
+    pub point_b: (f32, f32, f32),
+    pub pulley_pos: (f32, f32, f32),
+    pub trigger_radius: f32,
+    pub arc_sag_depth: f32,
+    pub pulley_scale: f32,
+    pub pulley_color_rgb: (f32, f32, f32),
+    pub rope_color_rgb: (f32, f32, f32),
+    pub ring_color_rgb: (f32, f32, f32),
+    pub ring_emissive_rgb: (f32, f32, f32),
+    pub ring_radius: f32,
+    pub ring_pulse_speed: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1594,6 +1661,7 @@ pub struct MapConfig {
     pub river_segments: Vec<RiverSegmentDef>,
     pub waterfalls: Vec<WaterfallDef>,
     pub roshan_pit: RoshanPitConfig,
+    pub swing_points: Vec<SwingPointDef>,
     pub center_bridge: CenterBridgeDef,
     pub fountains: Vec<FountainDef>,
     pub ancients: Vec<AncientDef>,
@@ -1843,6 +1911,8 @@ pub enum TraversalKind {
     FallDive,
     PitClimb,
     ClimbToTop,
+    RopeSwing,
+    SwingFall,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2695,6 +2765,8 @@ pub struct ServerWorldSnapshot {
     pub traversal_active: bool,
     pub traversal_anim_name: String,
     pub traversal_duration: f32,
+    pub swing_pulley_pos: Option<Vec3>,
+    pub swing_throw_progress: f32,
     pub is_dead: bool,
     pub death_anim_name: String,
     pub in_water: bool,
@@ -5473,6 +5545,11 @@ pub struct SharedTraversalState {
     pub target_pos: Vec3,
     pub travel_dir: Vec3,
     pub chain_dive_after: bool,
+    pub swing_arc_sag: f32,
+    pub swing_total_duration: f32,
+    pub swing_pulley_pos: Option<Vec3>,
+    pub swing_throw_progress: f32,
+    pub fall_vel: Vec3,
 }
 
 #[derive(Resource)]
@@ -5822,6 +5899,11 @@ impl AuthoritativeWorldState {
                 target_pos: spawn_pos,
                 travel_dir: initial_aim_dir,
                 chain_dive_after: false,
+                swing_arc_sag: 0.0,
+                swing_total_duration: 0.0,
+                swing_pulley_pos: None,
+                swing_throw_progress: 0.0,
+                fall_vel: Vec3::ZERO,
             },
             targets_visible: vec![true; targets.len()],
             targets,
@@ -6441,6 +6523,11 @@ impl AuthoritativeWorldState {
                     target_pos: spawn_pos,
                     travel_dir: facing_dir,
                     chain_dive_after: false,
+                    swing_arc_sag: 0.0,
+                    swing_total_duration: 0.0,
+                    swing_pulley_pos: None,
+                    swing_throw_progress: 0.0,
+                    fall_vel: Vec3::ZERO,
                 },
             });
         }
@@ -6812,6 +6899,16 @@ impl AuthoritativeWorldState {
             traversal_active: self.traversal.is_active,
             traversal_anim_name: self.traversal.anim_name.clone(),
             traversal_duration: self.traversal.duration,
+            swing_pulley_pos: if self.traversal.is_active && self.traversal.kind == TraversalKind::RopeSwing {
+                self.traversal.swing_pulley_pos
+            } else {
+                None
+            },
+            swing_throw_progress: if self.traversal.is_active && self.traversal.kind == TraversalKind::RopeSwing {
+                self.traversal.swing_throw_progress
+            } else {
+                0.0
+            },
             is_dead: self.is_dead,
             death_anim_name: self.death_anim_name.clone(),
             in_water: self.in_water,
@@ -8290,6 +8387,11 @@ fn step_wall_climb_custom(
                 target_pos,
                 travel_dir: into_plateau,
                 chain_dive_after: false,
+                swing_arc_sag: 0.0,
+                swing_total_duration: 0.0,
+                swing_pulley_pos: None,
+                swing_throw_progress: 0.0,
+                fall_vel: Vec3::ZERO,
             };
             world.soldier_facing_dir = into_plateau;
             controller.translation = None;
@@ -8430,6 +8532,137 @@ fn step_traversal_custom(
     dt: f32,
 ) {
     if world.traversal.is_active {
+        if world.traversal.kind == TraversalKind::RopeSwing {
+            let swing_cfg = &config.active_hero(world.hero_index).swing;
+            let launch_delay = swing_cfg.launch_delay_secs.max(0.0);
+            let total_dur = world.traversal.swing_total_duration.max(0.05);
+            let start_anim_dur = (launch_delay + total_dur * swing_cfg.start_phase_fraction).max(0.05);
+
+            if !input.space_held {
+                world.traversal.swing_pulley_pos = None;
+                world.traversal.swing_throw_progress = 0.0;
+                if world.traversal.elapsed < launch_delay {
+                    world.traversal.is_active = false;
+                    world.traversal.chain_dive_after = false;
+                    controller.translation = None;
+                    return;
+                }
+                let speed = swing_cfg.swing_speed;
+                let fwd = world.traversal.travel_dir * (speed * swing_cfg.fall_forward_momentum);
+                world.traversal.kind = TraversalKind::SwingFall;
+                world.traversal.anim_name = swing_cfg.fall_anim.clone();
+                world.traversal.elapsed = 0.0;
+                world.traversal.duration = config.exact_anim_duration(&swing_cfg.fall_anim);
+                world.traversal.fall_vel = Vec3::new(fwd.x, 0.0, fwd.z);
+                world.traversal.chain_dive_after = false;
+                controller.translation = None;
+                return;
+            }
+
+            world.traversal.elapsed += dt;
+            if world.traversal.elapsed < launch_delay {
+                let pos = world.traversal.start_pos;
+                world.soldier_pos = pos;
+                world.soldier_facing_dir = world.traversal.travel_dir;
+                soldier_tf.translation = Vec3::new(
+                    pos.x,
+                    pos.y + config.physics.soldier_capsule_center_y * world.hero_scale,
+                    pos.z,
+                );
+                controller.translation = None;
+                world.traversal.anim_name = swing_cfg.start_anim.clone();
+                world.traversal.duration = start_anim_dur;
+                world.traversal.swing_throw_progress = (world.traversal.elapsed / launch_delay.max(0.001)).clamp(0.0, 1.0);
+                return;
+            }
+
+            world.traversal.swing_throw_progress = 1.0;
+            let air_elapsed = world.traversal.elapsed - launch_delay;
+            let frac = (air_elapsed / total_dur).clamp(0.0, 1.0);
+            let horiz = world.traversal.start_pos.lerp(world.traversal.target_pos, frac);
+            let sag = 4.0 * frac * (1.0 - frac) * world.traversal.swing_arc_sag;
+            let pos = Vec3::new(horiz.x, horiz.y - sag, horiz.z);
+
+            world.soldier_pos = pos;
+            world.soldier_facing_dir = world.traversal.travel_dir;
+            soldier_tf.translation = Vec3::new(
+                pos.x,
+                pos.y + config.physics.soldier_capsule_center_y * world.hero_scale,
+                pos.z,
+            );
+            controller.translation = None;
+
+            if frac < swing_cfg.end_phase_fraction {
+                world.traversal.anim_name = swing_cfg.start_anim.clone();
+                world.traversal.duration = start_anim_dur;
+            } else {
+                world.traversal.anim_name = swing_cfg.end_anim.clone();
+                world.traversal.duration = (total_dur * (1.0 - swing_cfg.end_phase_fraction)).max(0.05);
+            }
+
+            if air_elapsed >= total_dur {
+                world.traversal.is_active = false;
+                world.traversal.chain_dive_after = false;
+                world.traversal.swing_pulley_pos = None;
+                world.traversal.swing_throw_progress = 0.0;
+                world.soldier_pos = world.traversal.target_pos;
+                soldier_tf.translation = Vec3::new(
+                    world.traversal.target_pos.x,
+                    world.traversal.target_pos.y + config.physics.soldier_capsule_center_y * world.hero_scale,
+                    world.traversal.target_pos.z,
+                );
+            }
+            return;
+        }
+
+        if world.traversal.kind == TraversalKind::SwingFall {
+            let swing_cfg = &config.active_hero(world.hero_index).swing;
+            world.traversal.elapsed += dt;
+            world.traversal.fall_vel.y -= swing_cfg.fall_gravity * dt;
+            let next_pos = world.soldier_pos + world.traversal.fall_vel * dt;
+            let (_, eff_y, is_deep_water) = sample_ground_and_deep_water_at(
+                config,
+                physics_world,
+                world,
+                target_query,
+                mountain_query,
+                elev_query,
+                Vec2::new(next_pos.x, next_pos.z),
+                world.soldier_pos.y,
+            );
+
+            world.soldier_facing_dir = world.traversal.travel_dir;
+            controller.translation = None;
+
+            if next_pos.y <= eff_y + 0.05 {
+                let landed_pos = Vec3::new(next_pos.x, eff_y, next_pos.z);
+                world.soldier_pos = landed_pos;
+                soldier_tf.translation = Vec3::new(
+                    landed_pos.x,
+                    landed_pos.y + config.physics.soldier_capsule_center_y * world.hero_scale,
+                    landed_pos.z,
+                );
+                world.traversal.is_active = false;
+                world.traversal.chain_dive_after = false;
+                if is_deep_water {
+                    if let Some((water_y, _)) = sample_water_surface_at(config, landed_pos) {
+                        world.pending_fx.push(GameplayFxEvent::WaterSplash {
+                            pos: Vec3::new(landed_pos.x, water_y, landed_pos.z),
+                            intensity: 2.3,
+                        });
+                    }
+                }
+            } else {
+                world.soldier_pos = next_pos;
+                soldier_tf.translation = Vec3::new(
+                    next_pos.x,
+                    next_pos.y + config.physics.soldier_capsule_center_y * world.hero_scale,
+                    next_pos.z,
+                );
+            }
+            return;
+        }
+
         world.traversal.elapsed += dt;
         let frac = (world.traversal.elapsed / world.traversal.duration).clamp(0.0, 1.0);
         let current_pos = world
@@ -8669,6 +8902,57 @@ fn step_traversal_custom(
         if (water_y - world.soldier_pos.y) >= 0.85 {
             world.space_hold_secs = None;
             return;
+        }
+    }
+
+    // بررسی نقاط Swing در لبه دره: اگر بازیکن در محدوده یکی از دو طرف باشد و Space را نگه دارد، عمل Swing شروع می‌شود
+    if input.space_held {
+        let swing_cfg = &config.active_hero(world.hero_index).swing;
+        if world.hero_stamina >= swing_cfg.stamina_cost {
+            for sp in &config.map.swing_points {
+                let pa = Vec3::new(sp.point_a.0, sp.point_a.1, sp.point_a.2);
+                let pb = Vec3::new(sp.point_b.0, sp.point_b.1, sp.point_b.2);
+                let da = Vec2::new(world.soldier_pos.x - pa.x, world.soldier_pos.z - pa.z).length();
+                let db = Vec2::new(world.soldier_pos.x - pb.x, world.soldier_pos.z - pb.z).length();
+                let dest_opt = if da <= sp.trigger_radius && (world.soldier_pos.y - pa.y).abs() <= 2.5 {
+                    Some(pb)
+                } else if db <= sp.trigger_radius && (world.soldier_pos.y - pb.y).abs() <= 2.5 {
+                    Some(pa)
+                } else {
+                    None
+                };
+
+                if let Some(dest) = dest_opt {
+                    let delta_xz = Vec3::new(dest.x - world.soldier_pos.x, 0.0, dest.z - world.soldier_pos.z);
+                    let flat_dir = delta_xz.normalize_or_zero();
+                    if flat_dir != Vec3::ZERO {
+                        world.hero_stamina -= swing_cfg.stamina_cost;
+                        world.space_hold_secs = None;
+                        let total_dist = world.soldier_pos.distance(dest);
+                        let total_dur = (total_dist / swing_cfg.swing_speed).max(0.25);
+
+                        world.traversal.is_active = true;
+                        world.traversal.kind = TraversalKind::RopeSwing;
+                        world.traversal.anim_name = swing_cfg.start_anim.clone();
+                        world.traversal.elapsed = 0.0;
+                        world.traversal.duration = (swing_cfg.launch_delay_secs.max(0.0) + total_dur * swing_cfg.start_phase_fraction).max(0.05);
+                        world.traversal.swing_total_duration = total_dur;
+                        world.traversal.swing_arc_sag = sp.arc_sag_depth;
+                        world.traversal.swing_pulley_pos = Some(Vec3::from(sp.pulley_pos));
+                        world.traversal.swing_throw_progress = if swing_cfg.launch_delay_secs > 0.001 { 0.0 } else { 1.0 };
+                        world.traversal.start_pos = world.soldier_pos;
+                        world.traversal.target_pos = dest;
+                        world.traversal.travel_dir = flat_dir;
+                        world.traversal.chain_dive_after = false;
+                        world.traversal.fall_vel = Vec3::ZERO;
+                        world.soldier_facing_dir = flat_dir;
+                        world.firing_anim_remaining = None;
+                        world.reload_remaining = None;
+                        controller.translation = None;
+                        return;
+                    }
+                }
+            }
         }
     }
 

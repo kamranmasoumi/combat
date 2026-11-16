@@ -115,6 +115,7 @@ pub enum ClientAudioEvent {
     },
     GrenadeExploded {
         pos: Vec3,
+        in_water: bool,
     },
     LastHitGold,
     CreepDenied,
@@ -487,7 +488,12 @@ fn process_audio_events_system(
                     0.75,
                 );
             }
-            ClientAudioEvent::GrenadeExploded { pos } => {
+            ClientAudioEvent::GrenadeExploded { pos, in_water } => {
+                let sound_path = if in_water {
+                    &a.grenade_water_explosion_sound
+                } else {
+                    &a.grenade_explosion_sound
+                };
                 play_spatial_sound(
                     &mut commands,
                     &asset_server,
@@ -498,7 +504,7 @@ fn process_audio_events_system(
                     pos,
                     duck,
                     AudioCategory::Weapons,
-                    &a.grenade_explosion_sound,
+                    sound_path,
                     1.0,
                 );
             }

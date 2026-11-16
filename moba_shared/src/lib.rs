@@ -90,6 +90,7 @@ pub struct AudioConfig {
     pub running_slide_sound: String,
     pub grenade_countdown_beep_sound: String,
     pub grenade_explosion_sound: String,
+    pub grenade_water_explosion_sound: String,
     pub footstep_sounds: Vec<String>,
     pub footstep_interval_secs: f32,
     pub weapon_switch_sound: String,
@@ -198,6 +199,7 @@ impl GameConfig {
         cfg.validate_pause();
         cfg.validate_camera();
         cfg.validate_heroes();
+        cfg.validate_fx();
         cfg.validate_creeps();
         cfg.validate_neutral_camps();
         cfg
@@ -214,6 +216,65 @@ impl GameConfig {
                     anim_name
                 )
             })
+    }
+
+    pub fn validate_weapon_vfx_profile(p: &WeaponVfxProfile, label: &str) {
+        assert!(!p.shader_path.trim().is_empty(), "shader_path در '{}' خالی است", label);
+        assert!(p.bloom_intensity > 0.0, "bloom_intensity در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.projectile_radius > 0.0, "projectile_radius در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.projectile_length > 0.0, "projectile_length در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.trail_width > 0.0, "trail_width در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.trail_lifetime_secs > 0.0, "trail_lifetime_secs در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.trail_wave_freq >= 0.0, "trail_wave_freq در '{}' نمی‌تواند منفی باشد", label);
+        assert!(p.trail_wave_amp >= 0.0, "trail_wave_amp در '{}' نمی‌تواند منفی باشد", label);
+        assert!(p.muzzle_flash_scale > 0.0, "muzzle_flash_scale در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.muzzle_flash_lifetime_secs > 0.0, "muzzle_flash_lifetime_secs در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.muzzle_light_intensity >= 0.0, "muzzle_light_intensity در '{}' نمی‌تواند منفی باشد", label);
+        assert!(p.muzzle_light_range > 0.0, "muzzle_light_range در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.muzzle_ring_start_scale > 0.0, "muzzle_ring_start_scale در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.muzzle_ring_end_scale >= p.muzzle_ring_start_scale, "muzzle_ring_end_scale در '{}' نامعتبر است", label);
+        assert!(p.impact_ring_end_scale > 0.0, "impact_ring_end_scale در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.impact_ring_lifetime_secs > 0.0, "impact_ring_lifetime_secs در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.impact_light_intensity >= 0.0, "impact_light_intensity در '{}' نمی‌تواند منفی باشد", label);
+        assert!(p.impact_light_range > 0.0, "impact_light_range در '{}' باید بزرگ‌تر از صفر باشد", label);
+        assert!(p.pulse_speed > 0.0, "pulse_speed در '{}' باید بزرگ‌تر از صفر باشد", label);
+    }
+
+    pub fn validate_fx(&self) {
+        assert!(self.soldier.cliff_dive_speed > 0.0, "soldier.cliff_dive_speed must be > 0");
+        assert!(self.soldier.cliff_dive_arc_boost > 0.0, "soldier.cliff_dive_arc_boost must be > 0");
+        assert!(self.soldier.fall_dive_arc_boost > 0.0, "soldier.fall_dive_arc_boost must be > 0");
+        Self::validate_weapon_vfx_profile(&self.fx.creep_bullet_vfx, "fx.creep_bullet_vfx");
+        Self::validate_weapon_vfx_profile(&self.fx.turret_bullet_vfx, "fx.turret_bullet_vfx");
+        let bs = &self.fx.blood_splatter_vfx;
+        assert!(bs.decal_count_min > 0 && bs.decal_count_max >= bs.decal_count_min, "blood_splatter_vfx.decal_count نامعتبر است");
+        assert!(bs.decal_min_scale > 0.0 && bs.decal_max_scale >= bs.decal_min_scale, "blood_splatter_vfx.decal_scale نامعتبر است");
+        assert!(bs.decal_scatter_radius > 0.0, "blood_splatter_vfx.decal_scatter_radius باید بزرگ‌تر از صفر باشد");
+        assert!(bs.decal_lifetime_secs > 0.0, "blood_splatter_vfx.decal_lifetime_secs باید بزرگ‌تر از صفر باشد");
+        let ge = &self.fx.grenade_explosion_vfx;
+        assert!(ge.fireball_bloom_intensity > 0.0, "grenade_explosion_vfx.fireball_bloom_intensity باید بزرگ‌تر از صفر باشد");
+        assert!(ge.fireball_duration_secs > 0.0, "grenade_explosion_vfx.fireball_duration_secs باید بزرگ‌تر از صفر باشد");
+        assert!(ge.water_bloom_intensity > 0.0, "grenade_explosion_vfx.water_bloom_intensity باید بزرگ‌تر از صفر باشد");
+        assert!(ge.water_geyser_height > 0.0, "grenade_explosion_vfx.water_geyser_height باید بزرگ‌تر از صفر باشد");
+        assert!(ge.water_geyser_duration_secs > 0.0, "grenade_explosion_vfx.water_geyser_duration_secs باید بزرگ‌تر از صفر باشد");
+        assert!(ge.shockwave_duration_secs > 0.0, "grenade_explosion_vfx.shockwave_duration_secs باید بزرگ‌تر از صفر باشد");
+    }
+
+    pub fn resolve_bullet_vfx(&self, source: &BulletVfxSource) -> &WeaponVfxProfile {
+        match source {
+            BulletVfxSource::Hero { hero_id, weapon_kind } => {
+                let hero = self.heroes.iter().find(|h| &h.id == hero_id).unwrap_or_else(|| {
+                    panic!("خطای بحرانی کانفیگ: هیرو '{}' برای VFX تیر یافت نشد!", hero_id)
+                });
+                if *weapon_kind == WeaponKind::Pistol {
+                    &hero.bullet_vfx.pistol
+                } else {
+                    &hero.bullet_vfx.primary
+                }
+            }
+            BulletVfxSource::Creep => &self.fx.creep_bullet_vfx,
+            BulletVfxSource::Turret => &self.fx.turret_bullet_vfx,
+        }
     }
 
     pub fn validate_heroes(&self) {
@@ -280,7 +341,9 @@ impl GameConfig {
             assert!(hero.grenade.fuse_secs > 0.0, "grenade.fuse_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.grenade.throw_duration_secs > 0.0, "grenade.throw_duration_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.grenade.max_charges > 0, "grenade.max_charges هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
-            assert!(hero.grenade.recharge_secs > 0.0, "grenade.recharge_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+                        assert!(hero.grenade.recharge_secs > 0.0, "grenade.recharge_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            Self::validate_weapon_vfx_profile(&hero.bullet_vfx.primary, &format!("heroes[{}].bullet_vfx.primary", hero.id));
+            Self::validate_weapon_vfx_profile(&hero.bullet_vfx.pistol, &format!("heroes[{}].bullet_vfx.pistol", hero.id));
         }
     }
 
@@ -325,6 +388,17 @@ impl GameConfig {
         assert!(c.hitbox_height > 0.0, "hitbox_height سربازان لاین باید بزرگ‌تر از صفر باشد");
         assert!(c.wave_interval_secs > 0.0, "wave_interval_secs باید بزرگ‌تر از صفر باشد");
         assert!(c.creeps_per_wave > 0, "creeps_per_wave باید حداقل ۱ باشد");
+        assert!(c.count_upgrade_interval_secs > 0.0, "count_upgrade_interval_secs باید بزرگ‌تر از صفر باشد");
+        assert!(c.max_creeps_per_wave >= c.creeps_per_wave, "max_creeps_per_wave باید بزرگ‌تر یا مساوی creeps_per_wave باشد");
+        assert!(c.stat_upgrade_interval_secs > 0.0, "stat_upgrade_interval_secs باید بزرگ‌تر از صفر باشد");
+        assert!(c.hp_upgrade_per_step >= 0.0, "hp_upgrade_per_step نمی‌تواند منفی باشد");
+        assert!(c.damage_upgrade_per_step >= 0.0, "damage_upgrade_per_step نمی‌تواند منفی باشد");
+        assert!(c.armor_upgrade_per_step >= 0.0, "armor_upgrade_per_step نمی‌تواند منفی باشد");
+        assert!(
+            c.fire_rate_multiplier_per_step > 0.0 && c.fire_rate_multiplier_per_step <= 1.0,
+            "fire_rate_multiplier_per_step باید در بازه (0.0, 1.0] باشد"
+        );
+        assert!(c.min_fire_rate_secs > 0.0, "min_fire_rate_secs باید بزرگ‌تر از صفر باشد");
         assert!(c.max_hp > 0.0, "max_hp سربازان لاین باید بزرگ‌تر از صفر باشد");
         assert!(c.fire_rate_secs > 0.0, "fire_rate_secs سربازان لاین باید بزرگ‌تر از صفر باشد");
         assert!(c.projectile_speed > 0.0, "projectile_speed سربازان لاین باید بزرگ‌تر از صفر باشد");
@@ -391,6 +465,7 @@ impl GameConfig {
         assert!(a.creep_fire_max_concurrent > 0, "audio.creep_fire_max_concurrent باید حداقل 1 باشد");
         assert!(a.low_hp_threshold_ratio > 0.0 && a.low_hp_threshold_ratio < 1.0, "audio.low_hp_threshold_ratio باید بین 0 و 1 باشد");
         assert!(a.heartbeat_min_interval_secs > 0.1 && a.heartbeat_max_interval_secs >= a.heartbeat_min_interval_secs, "بازه ضربان قلب نامعتبر است");
+        assert!(!a.grenade_water_explosion_sound.trim().is_empty(), "audio.grenade_water_explosion_sound نمی‌تواند خالی باشد");
         for hero in &self.heroes {
             assert!(
                 a.hero_weapons.contains_key(&hero.id),
@@ -871,7 +946,7 @@ pub struct PhysicsConfig {
     pub water_splash_interval_secs: f32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum WeaponKind {
     AutomaticRifle,
     Sniper,
@@ -926,6 +1001,38 @@ pub struct HeroGrenadeDef {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WeaponVfxProfile {
+    pub shader_path: String,
+    pub core_color_rgb: (f32, f32, f32),
+    pub edge_color_rgb: (f32, f32, f32),
+    pub bloom_intensity: f32,
+    pub projectile_radius: f32,
+    pub projectile_length: f32,
+    pub trail_width: f32,
+    pub trail_lifetime_secs: f32,
+    pub trail_wave_freq: f32,
+    pub trail_wave_amp: f32,
+    pub trail_style_mode: f32,
+    pub muzzle_flash_scale: f32,
+    pub muzzle_flash_lifetime_secs: f32,
+    pub muzzle_light_intensity: f32,
+    pub muzzle_light_range: f32,
+    pub muzzle_ring_start_scale: f32,
+    pub muzzle_ring_end_scale: f32,
+    pub impact_ring_end_scale: f32,
+    pub impact_ring_lifetime_secs: f32,
+    pub impact_light_intensity: f32,
+    pub impact_light_range: f32,
+    pub pulse_speed: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroBulletVfxConfig {
+    pub primary: WeaponVfxProfile,
+    pub pistol: WeaponVfxProfile,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HeroDef {
     pub id: String,
     pub display_name: String,
@@ -953,6 +1060,7 @@ pub struct HeroDef {
     pub grenade: HeroGrenadeDef,
     pub level_growth: HeroLevelGrowth,
     pub courier: CourierConfig,
+    pub bullet_vfx: HeroBulletVfxConfig,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -994,6 +1102,9 @@ pub struct SoldierConfig {
     pub jump_over_clearance_height: f32,
     pub space_hold_threshold_secs: f32,
     pub dive_roll_speed: f32,
+    pub cliff_dive_speed: f32,
+    pub cliff_dive_arc_boost: f32,
+    pub fall_dive_arc_boost: f32,
     pub quick_roll_speed: f32,
     pub vault_check_distance: f32,
     pub vault_travel_distance: f32,
@@ -1091,6 +1202,15 @@ pub struct CreepConfig {
     pub first_wave_delay_secs: f32,
     pub wave_interval_secs: f32,
     pub creeps_per_wave: usize,
+    pub count_upgrade_interval_secs: f32,
+    pub count_upgrade_amount: usize,
+    pub max_creeps_per_wave: usize,
+    pub stat_upgrade_interval_secs: f32,
+    pub hp_upgrade_per_step: f32,
+    pub damage_upgrade_per_step: f32,
+    pub armor_upgrade_per_step: f32,
+    pub fire_rate_multiplier_per_step: f32,
+    pub min_fire_rate_secs: f32,
     pub wave_spawn_spacing: f32,
     pub move_speed: f32,
     pub fire_rate_secs: f32,
@@ -1174,6 +1294,34 @@ pub struct NeutralCampsConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BloodSplatterVfxConfig {
+    pub decal_count_min: u32,
+    pub decal_count_max: u32,
+    pub decal_min_scale: f32,
+    pub decal_max_scale: f32,
+    pub decal_scatter_radius: f32,
+    pub decal_lifetime_secs: f32,
+    pub core_color_rgb: (f32, f32, f32),
+    pub edge_color_rgb: (f32, f32, f32),
+    pub gloss_strength: f32,
+    pub air_droplet_count: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GrenadeExplosionVfxConfig {
+    pub fireball_core_rgb: (f32, f32, f32),
+    pub fireball_edge_rgb: (f32, f32, f32),
+    pub fireball_bloom_intensity: f32,
+    pub fireball_duration_secs: f32,
+    pub water_core_rgb: (f32, f32, f32),
+    pub water_foam_rgb: (f32, f32, f32),
+    pub water_bloom_intensity: f32,
+    pub water_geyser_height: f32,
+    pub water_geyser_duration_secs: f32,
+    pub shockwave_duration_secs: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FxConfig {
     pub trail_lifetime_secs: f32,
     pub muzzle_flash_lifetime_secs: f32,
@@ -1204,6 +1352,10 @@ pub struct FxConfig {
     pub turret_hovered_tint_emissive_rgb: (f32, f32, f32),
     pub turret_idle_anim: String,
     pub turret_yaw_offset_rad: f32,
+    pub creep_bullet_vfx: WeaponVfxProfile,
+    pub turret_bullet_vfx: WeaponVfxProfile,
+    pub blood_splatter_vfx: BloodSplatterVfxConfig,
+    pub grenade_explosion_vfx: GrenadeExplosionVfxConfig,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1661,6 +1813,16 @@ pub enum ImpactSurface {
     Water,
 }
 
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum BulletVfxSource {
+    Hero {
+        hero_id: String,
+        weapon_kind: WeaponKind,
+    },
+    Creep,
+    Turret,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ShotAudioSource {
     Hero {
@@ -1682,6 +1844,7 @@ pub enum GameplayFxEvent {
     BulletTrailSegment {
         start: Vec3,
         end: Vec3,
+        vfx_source: BulletVfxSource,
     },
     BulletImpact {
         impact_pos: Vec3,
@@ -1690,10 +1853,13 @@ pub enum GameplayFxEvent {
         target_destroyed: bool,
         trauma_add: f32,
         trauma_max: f32,
+        vfx_source: BulletVfxSource,
     },
     GrenadeExploded {
         pos: Vec3,
         aoe_radius: f32,
+        in_water: bool,
+        water_y: f32,
         trauma_add: f32,
         trauma_max: f32,
     },
@@ -1728,6 +1894,7 @@ pub struct BulletSnapshot {
     pub id: u64,
     pub translation: Vec3,
     pub velocity: Vec3,
+    pub vfx_source: BulletVfxSource,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3967,6 +4134,7 @@ pub struct PhysicsBullet {
     pub id: u64,
     pub owner_slot: Option<usize>,
     pub owner_team: TeamId,
+    pub vfx_source: BulletVfxSource,
     pub velocity: Vec3,
     pub damage: f32,
     pub remaining_range: f32,
@@ -6425,11 +6593,35 @@ impl AuthoritativeWorldState {
                         && c.team == self.hero_team
                         && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio,
                     move_speed: resolve_creep_stats(config, c.creep_type_id.as_deref()).move_speed,
-                    armor: resolve_creep_stats(config, c.creep_type_id.as_deref()).armor
-                        + lane_creep_buffs(config, &self.barracks, c.team, c.lane, c.camp_index.is_none()).2,
-                    damage: resolve_creep_stats(config, c.creep_type_id.as_deref()).bullet_damage,
+                    armor: {
+                        let base_stats = resolve_creep_stats(config, c.creep_type_id.as_deref());
+                        let is_lane = c.camp_index.is_none();
+                        let (_, time_armor_bonus, _, _) =
+                            lane_creep_time_scaling(config, self.match_elapsed_secs, is_lane);
+                        let (_, _, bar_armor_bonus, _, _) =
+                            lane_creep_buffs(config, &self.barracks, c.team, c.lane, is_lane);
+                        base_stats.armor + time_armor_bonus + bar_armor_bonus
+                    },
+                    damage: {
+                        let base_stats = resolve_creep_stats(config, c.creep_type_id.as_deref());
+                        let is_lane = c.camp_index.is_none();
+                        let (_, _, time_dmg_bonus, _) =
+                            lane_creep_time_scaling(config, self.match_elapsed_secs, is_lane);
+                        let (_, _, _, bar_dmg_mult, _) =
+                            lane_creep_buffs(config, &self.barracks, c.team, c.lane, is_lane);
+                        (base_stats.bullet_damage + time_dmg_bonus) * bar_dmg_mult
+                    },
                     attack_range: resolve_creep_stats(config, c.creep_type_id.as_deref()).attack_range,
-                    fire_rate_secs: resolve_creep_stats(config, c.creep_type_id.as_deref()).fire_rate_secs,
+                    fire_rate_secs: {
+                        let base_stats = resolve_creep_stats(config, c.creep_type_id.as_deref());
+                        let is_lane = c.camp_index.is_none();
+                        let (_, _, _, time_fr_mult) =
+                            lane_creep_time_scaling(config, self.match_elapsed_secs, is_lane);
+                        let (_, _, _, _, bar_fr_mult) =
+                            lane_creep_buffs(config, &self.barracks, c.team, c.lane, is_lane);
+                        (base_stats.fire_rate_secs * time_fr_mult * bar_fr_mult)
+                            .max(config.creeps.min_fire_rate_secs)
+                    },
                     is_visible: true,
                 })
             })
@@ -7854,23 +8046,17 @@ fn find_nearest_climbable_mountain(config: &GameConfig, attach_dist: f32, pos: V
         let hz = mtn.size.2 * 0.5 * tf.scale.z.abs();
         let inv_rot = tf.rotation.inverse();
         let local = inv_rot * (pos - tf.translation);
+        // فقط دیوار جلویی مکعب (-Z در فضای محلی کوه) قابل کوهنوردی است؛ دیواره‌های کناری قابل بالا رفتن نیستند
+        if local.x.abs() > hx || local.z > -hz + 0.35 {
+            continue;
+        }
         let cx = local.x.clamp(-hx, hx);
-        let cz = local.z.clamp(-hz, hz);
+        let cz = -hz;
         let dx = local.x - cx;
         let dz = local.z - cz;
         let dist = (dx * dx + dz * dz).sqrt();
         if dist <= attach_dist {
-            let local_normal = if dist > 1e-4 {
-                Vec3::new(dx / dist, 0.0, dz / dist)
-            } else {
-                let to_edge_x = hx - local.x.abs();
-                let to_edge_z = hz - local.z.abs();
-                if to_edge_x < to_edge_z {
-                    Vec3::new(local.x.signum(), 0.0, 0.0)
-                } else {
-                    Vec3::new(0.0, 0.0, local.z.signum())
-                }
-            };
+            let local_normal = Vec3::new(0.0, 0.0, -1.0);
             let world_normal = (tf.rotation * local_normal).xz().normalize_or_zero();
             let world_normal3 = Vec3::new(world_normal.x, 0.0, world_normal.y);
             let wall_pt = tf.translation + tf.rotation * Vec3::new(cx, 0.0, cz);
@@ -7914,15 +8100,8 @@ fn step_wall_climb_custom(
         let inv_rot = tf.rotation.inverse();
         let local = inv_rot * (world.soldier_pos - tf.translation);
         let cx = local.x.clamp(-hx, hx);
-        let cz = local.z.clamp(-hz, hz);
-        let dx = local.x - cx;
-        let dz = local.z - cz;
-        let dist = (dx * dx + dz * dz).sqrt();
-        let local_normal = if dist > 1e-4 {
-            Vec3::new(dx / dist, 0.0, dz / dist)
-        } else {
-            Vec3::new(-world.soldier_facing_dir.x, 0.0, -world.soldier_facing_dir.z)
-        };
+        let cz = -hz;
+        let local_normal = Vec3::new(0.0, 0.0, -1.0);
         let wall_normal_xz = (tf.rotation * local_normal).xz().normalize_or_zero();
         let wall_normal = Vec3::new(wall_normal_xz.x, 0.0, wall_normal_xz.y);
         let wall_pt = tf.translation + tf.rotation * Vec3::new(cx, 0.0, cz);
@@ -8056,9 +8235,9 @@ fn step_traversal_custom(
         if world.traversal.anim_name == "run_to_dive" {
             controller.translation = None;
             let arc_boost = if world.traversal.kind == TraversalKind::FallDive {
-                0.0
+                config.soldier.fall_dive_arc_boost
             } else {
-                2.2
+                config.soldier.cliff_dive_arc_boost
             };
             let arc_y = world.traversal.start_pos.y.lerp(world.traversal.target_pos.y, frac * frac)
                 + (frac * (1.0 - frac)) * arc_boost;
@@ -8090,8 +8269,8 @@ fn step_traversal_custom(
             if frac >= 0.85 && (world.traversal.elapsed - dt) / world.traversal.duration < 0.85 {
                 if let Some((water_y, _)) = sample_water_surface_at(config, world.traversal.target_pos) {
                     world.pending_fx.push(GameplayFxEvent::WaterSplash {
-                        pos: Vec3::new(current_pos.x, water_y, current_pos.z),
-                        intensity: 1.45,
+                        pos: Vec3::new(dive_x, water_y, dive_z),
+                        intensity: 2.4,
                     });
                 }
             }
@@ -8251,7 +8430,7 @@ fn step_traversal_custom(
         && world.space_hold_secs.is_none()
     {
         let dive_dur = config.exact_anim_duration("run_to_dive");
-        let fall_horiz_dist = config.soldier.walk_speed * dive_dur;
+        let fall_horiz_dist = config.soldier.cliff_dive_speed * dive_dur;
         let shape_pos = Vec3::new(
             world.soldier_pos.x,
             world.soldier_pos.y + config.physics.soldier_capsule_center_y,
@@ -8562,7 +8741,7 @@ fn step_traversal_custom(
 
     let final_anim_name = if leads_to_deep_water {
         exact_duration = config.exact_anim_duration("run_to_dive");
-        distance = speed * exact_duration;
+        distance = config.soldier.cliff_dive_speed.max(speed) * exact_duration;
         safe_dist = physics_world.sweep_capsule_horizontal(
             shape_pos,
             config.physics.soldier_capsule_half_segment,
@@ -8724,6 +8903,10 @@ fn step_shooting_and_grenade_spawn(
                     id,
                     owner_slot: Some(world.active_slot),
                     owner_team: world.hero_team,
+                    vfx_source: BulletVfxSource::Hero {
+                        hero_id: world.hero_id.clone(),
+                        weapon_kind: active_w.weapon_kind,
+                    },
                     velocity: final_dir * proj_speed,
                     damage: dmg,
                     remaining_range: max_range,
@@ -8921,7 +9104,12 @@ fn shared_authoritative_react_system(
                     world.creeps[c_idx].lane,
                     world.creeps[c_idx].camp_index.is_none(),
                 );
-                let eff_dmg = (dmg * dota2_armor_multiplier(c_stats.armor + armor_bonus)).max(1.0);
+                let (_, time_armor_bonus, _, _) = lane_creep_time_scaling(
+                    &config,
+                    world.match_elapsed_secs,
+                    world.creeps[c_idx].camp_index.is_none(),
+                );
+                let eff_dmg = (dmg * dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus)).max(1.0);
                 world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
                 if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
                     for c in &mut world.creeps {
@@ -8972,7 +9160,8 @@ fn shared_authoritative_react_system(
             }
         }
 
-        if let Some((water_y, _)) = sample_water_surface_at(&config, pos) {
+        let water_hit = sample_water_surface_at(&config, pos);
+        if let Some((water_y, _)) = water_hit {
             world.pending_fx.push(GameplayFxEvent::WaterSplash {
                 pos: Vec3::new(pos.x, water_y, pos.z),
                 intensity: 2.2,
@@ -8982,6 +9171,8 @@ fn shared_authoritative_react_system(
         world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
             pos,
             aoe_radius,
+            in_water: water_hit.is_some(),
+            water_y: water_hit.map(|(wy, _)| wy).unwrap_or(pos.y),
             trauma_add: config.combat.grenade_explosion_trauma_add,
             trauma_max: config.combat.grenade_explosion_trauma_max,
         });
@@ -9136,6 +9327,7 @@ fn shared_authoritative_react_system(
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
                 start: old_pos,
                 end: impact_pos,
+                vfx_source: bullet.vfx_source.clone(),
             });
             world.pending_fx.push(GameplayFxEvent::BulletImpact {
                 impact_pos,
@@ -9144,6 +9336,7 @@ fn shared_authoritative_react_system(
                 target_destroyed: enemy_killed,
                 trauma_add: config.combat.shot_fire_trauma_add,
                 trauma_max: config.combat.shot_fire_trauma_max,
+                vfx_source: bullet.vfx_source.clone(),
             });
             commands.entity(entity).despawn();
             continue;
@@ -9182,6 +9375,8 @@ fn shared_authoritative_react_system(
                 world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
                     pos: cour_pos,
                     aoe_radius: 3.5,
+                    in_water: false,
+                    water_y: cour_pos.y,
                     trauma_add: config.combat.shot_fire_trauma_add,
                     trauma_max: config.combat.shot_fire_trauma_max,
                 });
@@ -9189,6 +9384,7 @@ fn shared_authoritative_react_system(
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
                 start: old_pos,
                 end: impact_pos,
+                vfx_source: bullet.vfx_source.clone(),
             });
             world.pending_fx.push(GameplayFxEvent::BulletImpact {
                 impact_pos,
@@ -9197,6 +9393,7 @@ fn shared_authoritative_react_system(
                 target_destroyed: cour_killed,
                 trauma_add: config.combat.shot_fire_trauma_add,
                 trauma_max: config.combat.shot_fire_trauma_max,
+                vfx_source: bullet.vfx_source.clone(),
             });
             commands.entity(entity).despawn();
             continue;
@@ -9219,7 +9416,12 @@ fn shared_authoritative_react_system(
                 world.creeps[c_idx].lane,
                 world.creeps[c_idx].camp_index.is_none(),
             );
-            let dmg_mult = dota2_armor_multiplier(c_stats.armor + armor_bonus);
+            let (_, time_armor_bonus, _, _) = lane_creep_time_scaling(
+                &config,
+                world.match_elapsed_secs,
+                world.creeps[c_idx].camp_index.is_none(),
+            );
+            let dmg_mult = dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus);
             let effective_dmg = (bullet.damage * dmg_mult).max(1.0);
             world.creeps[c_idx].hp = (world.creeps[c_idx].hp - effective_dmg).max(0.0);
             if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
@@ -9315,6 +9517,7 @@ fn shared_authoritative_react_system(
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
                 start: old_pos,
                 end: impact_pos,
+                vfx_source: bullet.vfx_source.clone(),
             });
             world.pending_fx.push(GameplayFxEvent::BulletImpact {
                 impact_pos,
@@ -9323,6 +9526,7 @@ fn shared_authoritative_react_system(
                 target_destroyed: creep_killed,
                 trauma_add: config.combat.shot_fire_trauma_add * 0.5,
                 trauma_max: config.combat.shot_fire_trauma_max,
+                vfx_source: bullet.vfx_source.clone(),
             });
             commands.entity(entity).despawn();
             continue;
@@ -9454,6 +9658,8 @@ fn shared_authoritative_react_system(
                         world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
                             pos: anc_pos + Vec3::Y * 3.0,
                             aoe_radius: 9.0,
+                            in_water: false,
+                            water_y: anc_pos.y,
                             trauma_add: config.combat.grenade_explosion_trauma_add,
                             trauma_max: config.combat.grenade_explosion_trauma_max,
                         });
@@ -9492,6 +9698,7 @@ fn shared_authoritative_react_system(
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
                 start: old_pos,
                 end: impact_pos,
+                vfx_source: bullet.vfx_source.clone(),
             });
             world.pending_fx.push(GameplayFxEvent::BulletImpact {
                 impact_pos,
@@ -9500,6 +9707,7 @@ fn shared_authoritative_react_system(
                 target_destroyed,
                 trauma_add: config.combat.target_destroy_trauma_add,
                 trauma_max: config.combat.target_destroy_trauma_max,
+                vfx_source: bullet.vfx_source.clone(),
             });
             commands.entity(entity).despawn();
         } else {
@@ -9521,6 +9729,7 @@ fn shared_authoritative_react_system(
                         target_destroyed: false,
                         trauma_add: 0.0,
                         trauma_max: config.combat.shot_fire_trauma_max,
+                        vfx_source: bullet.vfx_source.clone(),
                     });
                 }
             }
@@ -9529,6 +9738,7 @@ fn shared_authoritative_react_system(
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
                 start: old_pos,
                 end: new_pos,
+                vfx_source: bullet.vfx_source.clone(),
             });
 
             if bullet.remaining_range <= 0.0 {
@@ -9538,6 +9748,7 @@ fn shared_authoritative_react_system(
                     id: bullet.id,
                     translation: tf.translation,
                     velocity: bullet.velocity,
+                    vfx_source: bullet.vfx_source.clone(),
                 });
             }
         }
@@ -9877,6 +10088,35 @@ fn resolve_creep_stats<'a>(config: &'a GameConfig, creep_type_id: Option<&str>) 
     }
 }
 
+/// محاسبه ارتقای زمان‌محور سربازان لاین (هر ۱۰ دقیقه تعداد، هر ۷ دقیقه ویژگی‌ها)
+/// بازگشت: (hp_bonus, armor_bonus, damage_bonus, fire_rate_mult)
+pub fn lane_creep_time_scaling(
+    config: &GameConfig,
+    match_elapsed_secs: f32,
+    is_lane_creep: bool,
+) -> (f32, f32, f32, f32) {
+    if !is_lane_creep {
+        return (0.0, 0.0, 0.0, 1.0);
+    }
+    let steps = (match_elapsed_secs.max(0.0) / config.creeps.stat_upgrade_interval_secs).floor() as i32;
+    if steps <= 0 {
+        return (0.0, 0.0, 0.0, 1.0);
+    }
+    let s = steps as f32;
+    let hp_bonus = s * config.creeps.hp_upgrade_per_step;
+    let armor_bonus = s * config.creeps.armor_upgrade_per_step;
+    let damage_bonus = s * config.creeps.damage_upgrade_per_step;
+    let fire_rate_mult = config.creeps.fire_rate_multiplier_per_step.powi(steps);
+    (hp_bonus, armor_bonus, damage_bonus, fire_rate_mult)
+}
+
+/// محاسبه تعداد سربازان هر موج در لاین بر اساس زمان بازی
+pub fn lane_creep_wave_count(config: &GameConfig, match_elapsed_secs: f32) -> usize {
+    let steps = (match_elapsed_secs.max(0.0) / config.creeps.count_upgrade_interval_secs).floor() as usize;
+    (config.creeps.creeps_per_wave + steps * config.creeps.count_upgrade_amount)
+        .min(config.creeps.max_creeps_per_wave)
+}
+
 /// محاسبه باف‌های سربازان یک لاین بر اساس باراکس‌های نابودشده حریف
 pub fn lane_creep_buffs(
     config: &GameConfig,
@@ -9934,7 +10174,9 @@ fn step_lane_creeps_system(
                 let dir = Vec3::new(p1.x - p0.x, 0.0, p1.z - p0.z).normalize_or_zero();
                 let side = dir.cross(Vec3::Y).normalize_or_zero();
 
-                let count = config.creeps.creeps_per_wave;
+                let count = lane_creep_wave_count(config, world.match_elapsed_secs);
+                let (time_hp_bonus, _, _, _) =
+                    lane_creep_time_scaling(config, world.match_elapsed_secs, true);
                 for i in 0..count {
                     let row = (i / 2) as f32;
                     let col = if i % 2 == 0 { -0.5 } else { 0.5 };
@@ -9950,7 +10192,7 @@ fn step_lane_creeps_system(
                         lane_def.lane,
                         true,
                     );
-                    let buffed_hp = config.creeps.max_hp * hp_mult;
+                    let buffed_hp = (config.creeps.max_hp + time_hp_bonus) * hp_mult;
                     world.creeps.push(LaneCreepState {
                         id,
                         team,
@@ -10265,6 +10507,11 @@ fn step_lane_creeps_system(
             if dist <= c_stats.attack_range {
                 fired_or_aiming = true;
                 if world.creeps[idx].fire_cooldown <= 0.0 {
+                    let (_, _, time_dmg_bonus, time_fr_mult) = lane_creep_time_scaling(
+                        config,
+                        world.match_elapsed_secs,
+                        !is_neutral,
+                    );
                     let (_, _, _, dmg_mult, fire_rate_mult) = lane_creep_buffs(
                         config,
                         &world.barracks,
@@ -10272,7 +10519,8 @@ fn step_lane_creeps_system(
                         my_lane,
                         !is_neutral,
                     );
-                    let eff_fire_rate = c_stats.fire_rate_secs * fire_rate_mult;
+                    let eff_fire_rate = (c_stats.fire_rate_secs * time_fr_mult * fire_rate_mult)
+                        .max(config.creeps.min_fire_rate_secs);
                     world.creeps[idx].fire_cooldown = eff_fire_rate;
                     world.creeps[idx].fire_anim_timer =
                         (eff_fire_rate * 0.45).min(0.35);
@@ -10290,8 +10538,9 @@ fn step_lane_creeps_system(
                             id: b_id,
                             owner_slot: None,
                             owner_team: my_team,
+                            vfx_source: BulletVfxSource::Creep,
                             velocity: shot_dir * c_stats.projectile_speed,
-                            damage: c_stats.bullet_damage * dmg_mult,
+                            damage: (c_stats.bullet_damage + time_dmg_bonus) * dmg_mult,
                             remaining_range: c_stats.bullet_max_range,
                         },
                         Transform::from_translation(muzzle_pos),
@@ -10661,6 +10910,7 @@ fn step_turrets_system(
                         id: b_id,
                         owner_slot: None,
                         owner_team: my_team,
+                        vfx_source: BulletVfxSource::Turret,
                         velocity: shot_dir * t_def.projectile_speed,
                         damage: t_def.bullet_damage,
                         remaining_range: t_def.bullet_max_range,

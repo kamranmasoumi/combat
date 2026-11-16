@@ -26,7 +26,7 @@ use moba_shared::{
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CourierOrder, CourierSnapshot, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
     ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerLobbyPacket, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
-    FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
+    BulletVfxSource, FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, ItemsConfig, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ScoreboardHeroInfo, ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
     CHANNEL_UNRELIABLE_STATE,
@@ -40,7 +40,7 @@ use std::time::Duration;
 
 mod audio_client;
 mod vfx_client;
-use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
+use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
 mod shop_client;
 use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
 use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState};
@@ -327,7 +327,12 @@ fn main() {
         .add_systems(Update, (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system))
         .add_systems(
             PostUpdate,
-            align_weapon_horizontally_system.before(TransformSystems::Propagate),
+            (
+                align_weapon_horizontally_system,
+                align_other_weapons_horizontally_system,
+            )
+                .after(bevy::app::AnimationSystems)
+                .before(TransformSystems::Propagate),
         )
         .run();
 }
@@ -2218,22 +2223,12 @@ fn setup_scene(
             radius: 0.028,
             height: 0.42,
         }),
-        bullet_mat: materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.92, 0.45),
-            emissive: LinearRgba::new(24.0, 15.0, 2.8, 1.0),
-            unlit: true,
-            ..default()
-        }),
+        bullet_mat: materials.add(StandardMaterial::default()),
         muzzle_flash_mesh: meshes.add(Cone {
             radius: 0.07,
             height: 0.28,
         }),
-        muzzle_flash_mat: materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.8, 0.2),
-            emissive: LinearRgba::new(16.0, 9.0, 1.5, 1.0),
-            unlit: true,
-            ..default()
-        }),
+        muzzle_flash_mat: materials.add(StandardMaterial::default()),
         shell_mesh: meshes.add(Cylinder::new(0.014, 0.055)),
         shell_mat: materials.add(StandardMaterial {
             base_color: Color::srgb(0.88, 0.72, 0.28),
@@ -2242,20 +2237,6 @@ fn setup_scene(
             ..default()
         }),
     };
-    for _ in 0..64 {
-        commands.spawn((
-            Mesh3d(shared_fx.bullet_mesh.clone()),
-            MeshMaterial3d(shared_fx.bullet_mat.clone()),
-            Transform::default(),
-            Visibility::Hidden,
-            NotShadowCaster,
-            NetworkBulletVisual {
-                server_id: 0,
-                visual_offset: Vec3::ZERO,
-                visual_offset_blend: 0.0,
-            },
-        ));
-    }
     commands.insert_resource(shared_fx);
     spawn_laser_and_reticle_visuals(
         &mut commands,
@@ -3022,6 +3003,39 @@ fn align_weapon_horizontally_system(
     weapon_tf.scale = Vec3::splat(tuner.scale);
 }
 
+#[derive(Component)]
+struct HorizontalWeaponAlign {
+    root_entity: Entity,
+    hand_entity: Entity,
+}
+
+fn align_other_weapons_horizontally_system(
+    tuner: Res<WeaponTuner>,
+    root_transforms: Query<&Transform, Without<HorizontalWeaponAlign>>,
+    global_transforms: Query<&GlobalTransform>,
+    mut weapon_query: Query<(&HorizontalWeaponAlign, &mut Transform)>,
+) {
+    let user_rot_offset = Quat::from_euler(
+        EulerRot::YXZ,
+        tuner.rotation.y.to_radians(),
+        tuner.rotation.x.to_radians(),
+        tuner.rotation.z.to_radians(),
+    );
+    for (align, mut weapon_tf) in &mut weapon_query {
+        let Ok(root_tf) = root_transforms.get(align.root_entity) else { continue };
+        let Ok(hand_gtf) = global_transforms.get(align.hand_entity) else { continue };
+        let hero_forward = Vec3::new(root_tf.back().x, 0.0, root_tf.back().z).normalize_or_zero();
+        if hero_forward.length_squared() < 0.001 {
+            continue;
+        }
+        let desired_world_rot = Transform::IDENTITY.looking_to(hero_forward, Vec3::Y).rotation;
+        let (_, hand_world_rot, _) = hand_gtf.to_scale_rotation_translation();
+        weapon_tf.translation = tuner.offset;
+        weapon_tf.rotation = hand_world_rot.inverse() * desired_world_rot * user_rot_offset;
+        weapon_tf.scale = Vec3::splat(tuner.scale);
+    }
+}
+
 fn weapon_live_calibration_system(
     time: Res<Time>,
     config: Res<GameConfig>,
@@ -3464,10 +3478,7 @@ fn client_receive_snapshot_and_sync_system(
         let bullet_map: HashMap<u64, _> = snap.bullets.iter().map(|b| (b.id, b)).collect();
         let mut seen_bullets = HashSet::new();
 
-        for (_entity, mut vis, mut tf, mut b_vis) in &mut bullet_query {
-            if vis.server_id == 0 {
-                continue;
-            }
+        for (entity, mut vis, mut tf, mut b_vis) in &mut bullet_query {
             if let Some(b_snap) = bullet_map.get(&vis.server_id) {
                 let dir = b_snap.velocity.normalize_or_zero();
                 if vis.visual_offset_blend > 0.0 {
@@ -3479,10 +3490,7 @@ fn client_receive_snapshot_and_sync_system(
                 *b_vis = Visibility::Visible;
                 seen_bullets.insert(vis.server_id);
             } else {
-                vis.server_id = 0;
-                vis.visual_offset = Vec3::ZERO;
-                vis.visual_offset_blend = 0.0;
-                *b_vis = Visibility::Hidden;
+                commands.entity(entity).despawn();
             }
         }
 
@@ -3501,39 +3509,20 @@ fn client_receive_snapshot_and_sync_system(
                 } else {
                     (Vec3::ZERO, 0.0)
                 };
-                let mut reused = false;
-                for (_e, mut vis, mut tf, mut b_vis) in &mut bullet_query {
-                    if vis.server_id == 0 {
-                        vis.server_id = b_snap.id;
-                        vis.visual_offset = vis_off;
-                        vis.visual_offset_blend = vis_blend;
-                        tf.translation = b_snap.translation + vis_off * vis_blend;
-                        tf.rotation = rot;
-                        *b_vis = Visibility::Visible;
-                        reused = true;
-                        break;
-                    }
-                }
-                if !reused {
-                    if let Some(ref sfx) = hud_sync.shared_fx {
-                        commands.spawn((
-                            Mesh3d(sfx.bullet_mesh.clone()),
-                            MeshMaterial3d(sfx.bullet_mat.clone()),
-                            Transform {
-                                translation: b_snap.translation + vis_off * vis_blend,
-                                rotation: rot,
-                                scale: Vec3::ONE,
-                            },
-                            Visibility::Visible,
-                            NotShadowCaster,
-                            NetworkBulletVisual {
-                                server_id: b_snap.id,
-                                visual_offset: vis_off,
-                                visual_offset_blend: vis_blend,
-                            },
-                        ));
-                    }
-                }
+                hud_sync.bullet_vfx_registry.spawn_bullet_entity(
+                    &mut commands,
+                    &b_snap.vfx_source,
+                    Transform {
+                        translation: b_snap.translation + vis_off * vis_blend,
+                        rotation: rot,
+                        scale: Vec3::ONE,
+                    },
+                    NetworkBulletVisual {
+                        server_id: b_snap.id,
+                        visual_offset: vis_off,
+                        visual_offset_blend: vis_blend,
+                    },
+                );
             }
         }
 
@@ -3687,45 +3676,29 @@ fn spawn_fx_from_server_event(
             trauma_add,
             trauma_max,
         } => {
-            if matches!(source, moba_shared::ShotAudioSource::Hero { .. }) {
-                vfx_q.0.push(ClientVfxEvent::MuzzleSmoke {
-                    pos: muzzle_pos,
-                    dir: shot_dir,
-                });
-            }
-            audio_q.0.push(ClientAudioEvent::ShotFired {
-                pos: muzzle_pos,
-                source,
-            });
             let muzzle_pos = match live_muzzle_opt {
                 Some(lm) if (lm - muzzle_pos).length_squared() <= 5.0 * 5.0 => lm,
                 _ => muzzle_pos,
             };
-            let bullet_rot = Quat::from_rotation_arc(Vec3::Y, shot_dir);
-            commands.spawn((
-                Mesh3d(meshes.add(Cone {
-                    radius: 0.07,
-                    height: 0.28,
-                })),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(1.0, 0.8, 0.2),
-                    emissive: LinearRgba::new(16.0, 9.0, 1.5, 1.0),
-                    unlit: true,
-                    ..default()
-                })),
-                NotShadowCaster,
-                Transform {
-                    translation: muzzle_pos + shot_dir * 0.1,
-                    rotation: bullet_rot,
-                    scale: Vec3::ONE,
+            let vfx_source = match &source {
+                moba_shared::ShotAudioSource::Hero {
+                    hero_id,
+                    weapon_kind,
+                } => BulletVfxSource::Hero {
+                    hero_id: hero_id.clone(),
+                    weapon_kind: *weapon_kind,
                 },
-                MuzzleFlash {
-                    timer: Timer::from_seconds(
-                        config.fx.muzzle_flash_lifetime_secs,
-                        TimerMode::Once,
-                    ),
-                },
-            ));
+                moba_shared::ShotAudioSource::Creep => BulletVfxSource::Creep,
+            };
+            vfx_q.0.push(ClientVfxEvent::MuzzleSmoke {
+                pos: muzzle_pos,
+                dir: shot_dir,
+                vfx_source,
+            });
+            audio_q.0.push(ClientAudioEvent::ShotFired {
+                pos: muzzle_pos,
+                source,
+            });
 
             let right_dir = shot_dir.cross(Vec3::Y).normalize_or_zero();
             let r1 = render_state.next_fx_rand();
@@ -3755,16 +3728,25 @@ fn spawn_fx_from_server_event(
 
             shake.trauma = (shake.trauma + trauma_add).min(trauma_max);
         }
-        GameplayFxEvent::BulletTrailSegment { start, end } => {
-            vfx_q.0.push(ClientVfxEvent::MagneticTrail { start, end });
+        GameplayFxEvent::BulletTrailSegment {
+            start,
+            end,
+            vfx_source,
+        } => {
+            vfx_q.0.push(ClientVfxEvent::MagneticTrail {
+                start,
+                end,
+                vfx_source,
+            });
         }
         GameplayFxEvent::BulletImpact {
             impact_pos,
-            bullet_dir: _,
+            bullet_dir,
             surface,
             target_destroyed,
             trauma_add,
             trauma_max,
+            vfx_source,
         } => {
             audio_q.0.push(ClientAudioEvent::BulletImpact {
                 pos: impact_pos,
@@ -3772,7 +3754,9 @@ fn spawn_fx_from_server_event(
             });
             vfx_q.0.push(ClientVfxEvent::BulletImpact {
                 pos: impact_pos,
+                bullet_dir,
                 surface,
+                vfx_source,
             });
 
             if target_destroyed {
@@ -3782,87 +3766,18 @@ fn spawn_fx_from_server_event(
         GameplayFxEvent::GrenadeExploded {
             pos,
             aoe_radius,
+            in_water,
+            water_y,
             trauma_add,
             trauma_max,
         } => {
-            audio_q.0.push(ClientAudioEvent::GrenadeExploded { pos });
-            let fire_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(1.0, 0.55, 0.1),
-                emissive: LinearRgba::new(16.0, 6.0, 0.8, 1.0),
-                unlit: true,
-                ..default()
+            audio_q.0.push(ClientAudioEvent::GrenadeExploded { pos, in_water });
+            vfx_q.0.push(ClientVfxEvent::GrenadeExploded {
+                pos,
+                aoe_radius,
+                in_water,
+                water_y,
             });
-            let smoke_mat = materials.add(StandardMaterial {
-                base_color: Color::srgba(0.32, 0.30, 0.28, 0.62),
-                alpha_mode: AlphaMode::Blend,
-                perceptual_roughness: 0.95,
-                ..default()
-            });
-            let dust_mat = materials.add(StandardMaterial {
-                base_color: Color::srgba(0.52, 0.46, 0.38, 0.52),
-                alpha_mode: AlphaMode::Blend,
-                perceptual_roughness: 0.98,
-                ..default()
-            });
-            let smoke_mesh = meshes.add(Sphere::new(0.45));
-            let cloud_count = ((aoe_radius * 3.0) as u32).clamp(12, 26);
-            for c_i in 0..cloud_count {
-                let rx = render_state.next_fx_rand() - 0.5;
-                let rz = render_state.next_fx_rand() - 0.5;
-                let ry = render_state.next_fx_rand();
-                let spread_r = aoe_radius * 0.55;
-                let spawn_p = pos + Vec3::new(rx * spread_r, 0.25 + ry * 0.45, rz * spread_r);
-                let is_dust = c_i % 3 == 0;
-                commands.spawn((
-                    Mesh3d(smoke_mesh.clone()),
-                    MeshMaterial3d(if is_dust { dust_mat.clone() } else { smoke_mat.clone() }),
-                    Transform::from_translation(spawn_p).with_scale(Vec3::splat(0.7)),
-                    ExplosionSmokeParticle {
-                        vel: Vec3::new(rx * 2.4, 1.8 + ry * 2.2, rz * 2.4),
-                        timer: Timer::from_seconds(1.5 + ry * 0.7, TimerMode::Once),
-                        start_scale: 0.65,
-                        end_scale: (aoe_radius * 0.42).clamp(1.6, 3.4),
-                    },
-                    NotShadowCaster,
-                ));
-            }
-
-            for _ in 0..config.fx.explosion_particle_count {
-                let rx = render_state.next_fx_rand();
-                let ry = render_state.next_fx_rand();
-                let rz = render_state.next_fx_rand();
-                let vel = Vec3::new((rx - 0.5) * 14.0, ry * 9.0 + 2.0, (rz - 0.5) * 14.0);
-
-                commands.spawn((
-                    Mesh3d(meshes.add(Sphere::new(0.09))),
-                    MeshMaterial3d(fire_mat.clone()),
-                    particle_physics_bundle(
-                        config,
-                        pos,
-                        vel,
-                        config.fx.explosion_particle_lifetime_secs,
-                        true,
-                    ),
-                ));
-            }
-
-            commands.spawn((
-                PointLight {
-                    color: Color::srgb(1.0, 0.65, 0.2),
-                    intensity: 250_000.0,
-                    range: 12.0,
-                    shadow_maps_enabled: false,
-                    ..default()
-                },
-                Transform::from_translation(pos + Vec3::Y * 0.5),
-                MuzzleFlash {
-                    timer: Timer::from_seconds(
-                        config.fx.explosion_flash_lifetime_secs,
-                        TimerMode::Once,
-                    ),
-                },
-            ));
-
             shake.trauma = (shake.trauma + trauma_add).min(trauma_max);
         }
         GameplayFxEvent::SlideDust { pos } => {
@@ -3896,6 +3811,9 @@ fn spawn_fx_from_server_event(
                 pos + Vec3::Y * 0.03,
                 intensity,
             );
+            if intensity >= 1.35 {
+                vfx_q.0.push(ClientVfxEvent::WaterSplash { pos, intensity });
+            }
         }
         GameplayFxEvent::HeroLeveledUp { pos, new_level: _ } => {
             audio_q.0.push(ClientAudioEvent::HeroLeveledUp);
@@ -4038,37 +3956,11 @@ fn spawn_fx_from_server_event(
                 let t_def = &config.map.turrets[turret_index];
                 t_def.model_transform.location_vec() + Vec3::Y * (t_def.height * 0.72)
             });
-            let rot = Quat::from_rotation_arc(Vec3::Y, shot_dir.normalize_or_zero());
-            commands.spawn((
-                Mesh3d(meshes.add(Cone {
-                    radius: 0.14,
-                    height: 0.45,
-                })),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(1.0, 0.85, 0.25),
-                    emissive: LinearRgba::new(18.0, 10.0, 1.8, 1.0),
-                    unlit: true,
-                    ..default()
-                })),
-                PointLight {
-                    color: Color::srgb(1.0, 0.82, 0.30),
-                    intensity: 140_000.0,
-                    range: 8.5,
-                    shadow_maps_enabled: false,
-                    ..default()
-                },
-                Transform {
-                    translation: flash_pos,
-                    rotation: rot,
-                    scale: Vec3::ONE,
-                },
-                MuzzleFlash {
-                    timer: Timer::from_seconds(
-                        config.fx.muzzle_flash_lifetime_secs,
-                        TimerMode::Once,
-                    ),
-                },
-            ));
+            vfx_q.0.push(ClientVfxEvent::MuzzleSmoke {
+                pos: flash_pos,
+                dir: shot_dir.normalize_or_zero(),
+                vfx_source: BulletVfxSource::Turret,
+            });
         }
         GameplayFxEvent::CreepDenied { pos } => {
             audio_q.0.push(ClientAudioEvent::CreepDenied);
@@ -7796,7 +7688,7 @@ struct SnapshotHudSyncParams<'w, 's> {
     pause_state: ResMut<'w, LatestPauseState>,
     muzzle_query: Query<'w, 's, &'static GlobalTransform, With<MuzzlePoint>>,
     telemetry: ResMut<'w, ClientTelemetryState>,
-    shared_fx: Option<Res<'w, SharedFxAssets>>,
+    bullet_vfx_registry: Res<'w, BulletVfxRegistry>,
     fixed_time: Res<'w, Time<Fixed>>,
     fixed_history: ResMut<'w, FixedSoldierTransformHistory>,
 }
@@ -8251,6 +8143,7 @@ fn client_lobby_sync_system(
 
 fn spawn_showcase_weapon_on_hand(
     commands: &mut Commands,
+    root_ent: Entity,
     hand_ent: Entity,
     weapon_kind: WeaponKind,
     tuner: &moba_shared::WeaponTunerConfig,
@@ -8292,7 +8185,14 @@ fn spawn_showcase_weapon_on_hand(
         .entity(hand_ent)
         .insert(ShowcaseWeaponAttached)
         .with_children(|parent| {
-            parent.spawn((root_tf, Visibility::Visible)).with_children(|w| {
+            parent.spawn((
+                HorizontalWeaponAlign {
+                    root_entity: root_ent,
+                    hand_entity: hand_ent,
+                },
+                root_tf,
+                Visibility::Visible,
+            )).with_children(|w| {
                 w.spawn((
                     Mesh3d(meshes.add(Cuboid::new(0.055, 0.085, body_len))),
                     MeshMaterial3d(body_mat.clone()),
@@ -8413,6 +8313,7 @@ fn hero_preview_system(
                     if is_hand && is_left && !is_finger {
                         spawn_showcase_weapon_on_hand(
                             &mut commands,
+                            root_ent,
                             h_ent,
                             prev_root.weapon_kind,
                             &config.weapon_tuner,
@@ -8459,7 +8360,7 @@ fn hero_preview_system(
                         .unwrap_or_else(|| config.active_hero(0));
                     let z_off = ((i as f32) - (count as f32 - 1.0) * 0.5) * 2.1;
                     let x_off = if team_idx == 0 { -2.8 - (i as f32) * 0.35 } else { 2.8 + (i as f32) * 0.35 };
-                    let yaw = if team_idx == 0 { -std::f32::consts::FRAC_PI_2 } else { std::f32::consts::FRAC_PI_2 };
+                    let yaw = if team_idx == 0 { std::f32::consts::FRAC_PI_2 } else { -std::f32::consts::FRAC_PI_2 };
                     let gltf_scene = sc.asset_server.load(format!("{}#Scene0", hero.model_path));
                     commands.spawn((
                         BattleShowcaseHero {
@@ -8516,6 +8417,7 @@ fn hero_preview_system(
                     if is_hand && is_left && !is_finger {
                         spawn_showcase_weapon_on_hand(
                             &mut commands,
+                            root_ent,
                             h_ent,
                             b_hero.weapon_kind,
                             &config.weapon_tuner,
@@ -9534,6 +9436,10 @@ fn sync_remote_players_system(
                                 });
                                 commands.entity(h_ent).insert(RemoteWeaponAttached).with_children(|parent| {
                                     parent.spawn((
+                                        HorizontalWeaponAlign {
+                                            root_entity: root_ent,
+                                            hand_entity: h_ent,
+                                        },
                                         Mesh3d(res.meshes.add(Cuboid::new(0.06, 0.09, 0.52))),
                                         MeshMaterial3d(w_mat),
                                         Transform::from_xyz(0.0, 0.03, -0.22)
@@ -10027,6 +9933,106 @@ struct CreepAnimPlayer {
 struct CreepSavedMaterial(Handle<StandardMaterial>);
 
 #[derive(Component)]
+struct CreepWeaponAttached;
+
+fn spawn_creep_rifle_on_hand(
+    commands: &mut Commands,
+    root_ent: Entity,
+    hand_ent: Entity,
+    team: TeamId,
+    tuner: &moba_shared::WeaponTunerConfig,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let (body_col, accent_col) = match team {
+        TeamId::Dawn => (Color::srgb(0.14, 0.16, 0.19), Color::srgb(0.18, 0.72, 0.58)),
+        TeamId::Dusk => (Color::srgb(0.17, 0.14, 0.16), Color::srgb(0.86, 0.28, 0.22)),
+        TeamId::Neutral => (Color::srgb(0.18, 0.15, 0.12), Color::srgb(0.92, 0.62, 0.18)),
+    };
+    let body_mat = materials.add(StandardMaterial {
+        base_color: body_col,
+        metallic: 0.85,
+        perceptual_roughness: 0.35,
+        ..default()
+    });
+    let accent_mat = materials.add(StandardMaterial {
+        base_color: accent_col,
+        metallic: 0.65,
+        perceptual_roughness: 0.42,
+        ..default()
+    });
+    let off = tuner.initial_offset;
+    let rot_d = tuner.initial_rotation_deg;
+    let root_tf = Transform::from_xyz(off.0, off.1, off.2)
+        .with_rotation(Quat::from_euler(
+            EulerRot::YXZ,
+            rot_d.1.to_radians(),
+            rot_d.0.to_radians(),
+            rot_d.2.to_radians(),
+        ))
+        .with_scale(Vec3::splat(tuner.initial_scale));
+
+    commands
+        .entity(hand_ent)
+        .insert(CreepWeaponAttached)
+        .with_children(|parent| {
+            parent.spawn((
+                HorizontalWeaponAlign {
+                    root_entity: root_ent,
+                    hand_entity: hand_ent,
+                },
+                root_tf,
+                Visibility::Visible,
+            )).with_children(|weapon| {
+                weapon.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.055, 0.10, 0.44))),
+                    MeshMaterial3d(body_mat.clone()),
+                    Transform::from_xyz(0.0, 0.03, -0.12),
+                ));
+                weapon.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.048, 0.075, 0.30))),
+                    MeshMaterial3d(accent_mat.clone()),
+                    Transform::from_xyz(0.0, 0.035, -0.42),
+                ));
+                weapon.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(0.013, 0.40))),
+                    MeshMaterial3d(body_mat.clone()),
+                    Transform::from_xyz(0.0, 0.045, -0.60)
+                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                ));
+                weapon.spawn((
+                    Mesh3d(meshes.add(Cylinder::new(0.019, 0.07))),
+                    MeshMaterial3d(accent_mat.clone()),
+                    Transform::from_xyz(0.0, 0.045, -0.80)
+                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                ));
+                weapon.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.048, 0.085, 0.22))),
+                    MeshMaterial3d(accent_mat.clone()),
+                    Transform::from_xyz(0.0, 0.02, 0.18),
+                ));
+                weapon.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.04, 0.19, 0.072))),
+                    MeshMaterial3d(accent_mat.clone()),
+                    Transform::from_xyz(0.0, -0.09, -0.24)
+                        .with_rotation(Quat::from_rotation_x(0.22)),
+                ));
+                weapon.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.042, 0.13, 0.055))),
+                    MeshMaterial3d(body_mat),
+                    Transform::from_xyz(0.0, -0.05, -0.02)
+                        .with_rotation(Quat::from_rotation_x(-0.25)),
+                ));
+                weapon.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(0.044, 0.05, 0.10))),
+                    MeshMaterial3d(accent_mat),
+                    Transform::from_xyz(0.0, 0.10, -0.14),
+                ));
+            });
+        });
+}
+
+#[derive(Component)]
 struct OverheadCreepBarRoot {
     creep_id: u64,
 }
@@ -10046,6 +10052,7 @@ struct CreepAssetParams<'w> {
     gltf_assets: Res<'w, Assets<Gltf>>,
     animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
     creep_anim_cache: ResMut<'w, CreepModelAnimCache>,
+    meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
 }
 
@@ -10055,6 +10062,7 @@ fn sync_lane_creeps_system(
     time: Res<Time>,
     mut res: CreepAssetParams,
     children_query: Query<&Children>,
+    hand_query: Query<(Entity, &Name), Without<CreepWeaponAttached>>,
     player_check_query: Query<(Option<&CreepAnimPlayer>, Option<&AnimationGraphHandle>), With<AnimationPlayer>>,
     mut anim_player_query: Query<(&CreepAnimPlayer, &mut AnimationPlayer, &mut AnimationTransitions)>,
     mut existing_query: Query<(Entity, &mut CreepVisual, &mut Transform, &mut Visibility)>,
@@ -10115,6 +10123,33 @@ fn sync_lane_creeps_system(
         } else {
             "lane_dawn"
         };
+
+        for desc in children_query.iter_descendants(root_ent) {
+            if let Ok((h_ent, h_name)) = hand_query.get(desc) {
+                let n = h_name.as_str().to_lowercase();
+                let is_left =
+                    n.contains("left") || n.contains("_l") || n.contains(".l") || n.contains("l_");
+                let is_hand = n.contains("hand") || n.contains("wrist") || n.contains("palm");
+                let is_finger = n.contains("thumb")
+                    || n.contains("index")
+                    || n.contains("middle")
+                    || n.contains("ring")
+                    || n.contains("pinky")
+                    || n.contains("finger")
+                    || n.contains("twist");
+                if is_hand && is_left && !is_finger {
+                    spawn_creep_rifle_on_hand(
+                        &mut commands,
+                        root_ent,
+                        h_ent,
+                        cs.team,
+                        &res.config.weapon_tuner,
+                        &mut res.meshes,
+                        &mut res.materials,
+                    );
+                }
+            }
+        }
 
         if let Some(team_anim) = res.creep_anim_cache.graphs.get(anim_key) {
             for desc in children_query.iter_descendants(root_ent) {

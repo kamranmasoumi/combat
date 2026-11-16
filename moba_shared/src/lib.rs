@@ -241,6 +241,9 @@ impl GameConfig {
     }
 
     pub fn validate_fx(&self) {
+        assert!(!self.network.backend_http_url.trim().is_empty(), "network.backend_http_url cannot be empty");
+        assert!(!self.network.backend_ws_url.trim().is_empty(), "network.backend_ws_url cannot be empty");
+        assert!(!self.network.redis_addr.trim().is_empty(), "network.redis_addr cannot be empty");
         assert!(self.soldier.cliff_dive_speed > 0.0, "soldier.cliff_dive_speed must be > 0");
         assert!(self.soldier.cliff_dive_arc_boost > 0.0, "soldier.cliff_dive_arc_boost must be > 0");
         assert!(self.soldier.fall_dive_arc_boost > 0.0, "soldier.fall_dive_arc_boost must be > 0");
@@ -643,26 +646,42 @@ pub const CHANNEL_UNRELIABLE_STATE: u8 = 0;
 pub const CHANNEL_RELIABLE_FX: u8 = 1;
 pub const CHANNEL_RELIABLE_LOBBY: u8 = 2;
 
-/// خواندن اجباری آرگومان‌های خط فرمان سرور: `<port> <required_players>` (بدون مقدار پیش‌فرض)
-pub fn parse_server_cli_args() -> (u16, usize) {
+/// خواندن اجباری آرگومان‌های خط فرمان سرور:
+/// حالت systemd (۳ آرگومان): `<port> <room_id> <required_players>`
+/// حالت تست محلی (۲ آرگومان): `<port> <required_players>`
+pub fn parse_server_cli_args() -> (u16, Option<String>, usize) {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         panic!(
-            "خطای بحرانی: پورت سرور و تعداد نفرات مجاز باید به کامند ارسال شوند! مثال:\n  cargo run -p moba_server -- 5000 2"
+            "خطای بحرانی: آرگومان‌های سرور ناقص است! مثال:\n  moba_server <port> <room_id> <required_players>"
         );
     }
     let port: u16 = args[1].parse().unwrap_or_else(|e| {
         panic!("خطای بحرانی: پورت '{}' معتبر نیست: {}", args[1], e)
     });
     assert!(port > 0, "خطای بحرانی: شماره پورت باید بزرگ‌تر از صفر باشد");
-    let required_players: usize = args[2].parse().unwrap_or_else(|e| {
-        panic!("خطای بحرانی: تعداد نفرات '{}' معتبر نیست: {}", args[2], e)
-    });
-    assert!(
-        required_players >= 1,
-        "خطای بحرانی: تعداد نفرات مجاز باید حداقل ۱ نفر باشد"
-    );
-    (port, required_players)
+
+    if args.len() >= 4 {
+        let room_id = args[2].trim().to_string();
+        assert!(!room_id.is_empty(), "خطای بحرانی: شناسه room_id نمی‌تواند خالی باشد");
+        let required_players: usize = args[3].parse().unwrap_or_else(|e| {
+            panic!("خطای بحرانی: تعداد نفرات '{}' معتبر نیست: {}", args[3], e)
+        });
+        assert!(
+            required_players >= 1,
+            "خطای بحرانی: تعداد نفرات مجاز باید حداقل ۱ نفر باشد"
+        );
+        (port, Some(room_id), required_players)
+    } else {
+        let required_players: usize = args[2].parse().unwrap_or_else(|e| {
+            panic!("خطای بحرانی: تعداد نفرات '{}' معتبر نیست: {}", args[2], e)
+        });
+        assert!(
+            required_players >= 1,
+            "خطای بحرانی: تعداد نفرات مجاز باید حداقل ۱ نفر باشد"
+        );
+        (port, None, required_players)
+    }
 }
 
 /// خواندن اختیاری پورت و client_id برای کلاینت جهت اتصال چند بازیکن هم‌زمان: `<port> <client_id>`
@@ -705,6 +724,9 @@ pub struct NetworkConfig {
     pub server_bind_addr: String,
     pub server_public_addr: String,
     pub client_bind_addr: String,
+    pub backend_http_url: String,
+    pub backend_ws_url: String,
+    pub redis_addr: String,
     pub server_tick_rate_hz: f64,
     pub protocol_id: u64,
     pub max_clients: usize,
@@ -1993,6 +2015,7 @@ pub enum MatchPhase {
 pub struct LobbyPlayerInfo {
     pub slot_index: usize,
     pub client_id: Option<u64>,
+    pub user_id: Option<String>,
     pub team: TeamId,
     pub connected: bool,
     pub selected_hero_id: Option<String>,
@@ -2061,6 +2084,7 @@ pub struct PingEntry {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ClientLobbyMessage {
+    Authenticate { ticket_id: String },
     SelectHero { hero_id: String },
     ReportMapLoaded,
     SendChat { all_chat: bool, text: String },
@@ -2112,6 +2136,7 @@ impl AuthoritativeMatchState {
             .map(|slot_index| LobbyPlayerInfo {
                 slot_index,
                 client_id: None,
+                user_id: None,
                 team: if slot_index % 2 == 0 {
                     TeamId::Dawn
                 } else {
@@ -2172,27 +2197,55 @@ impl AuthoritativeMatchState {
     }
 
     pub fn on_client_connected(&mut self, client_id: u64, config: &GameConfig) -> bool {
+        self.on_client_connected_with_user(client_id, None, config)
+            .is_some()
+    }
+
+    pub fn on_client_connected_with_user(
+        &mut self,
+        client_id: u64,
+        user_id: Option<&str>,
+        config: &GameConfig,
+    ) -> Option<usize> {
         if self.slot_for_client(client_id).is_some() {
-            return false;
+            return None;
         }
-        // اول بررسی کن آیا این بازیکن قبلاً در یکی از اسلات‌ها بوده و دیسکانکت شده است (Reconnect)
-        let reconnect_idx = self
-            .players
-            .iter()
-            .position(|p| !p.connected && p.client_id == Some(client_id));
+        if let Some(uid) = user_id {
+            if self.players.iter().any(|p| p.connected && p.user_id.as_deref() == Some(uid)) {
+                return None;
+            }
+        }
+        // اول بررسی کن آیا این بازیکن (بر اساس user_id یا client_id) قبلاً در یکی از اسلات‌ها بوده (Reconnect)
+        let reconnect_idx = user_id
+            .and_then(|uid| {
+                self.players
+                    .iter()
+                    .position(|p| !p.connected && p.user_id.as_deref() == Some(uid))
+            })
+            .or_else(|| {
+                self.players
+                    .iter()
+                    .position(|p| !p.connected && p.client_id == Some(client_id))
+            });
         let target_idx = reconnect_idx.or_else(|| {
             self.players
                 .iter()
-                .position(|p| !p.connected && p.client_id.is_none())
+                .position(|p| !p.connected && p.client_id.is_none() && p.user_id.is_none())
         }).or_else(|| {
-            self.players.iter().position(|p| !p.connected)
+            if user_id.is_none() {
+                self.players.iter().position(|p| !p.connected)
+            } else {
+                None
+            }
         });
-        let Some(idx) = target_idx else {
-            return false;
-        };
+        let idx = target_idx?;
         let slot = &mut self.players[idx];
+        let slot_index = slot.slot_index;
         slot.connected = true;
         slot.client_id = Some(client_id);
+        if let Some(uid) = user_id {
+            slot.user_id = Some(uid.to_string());
+        }
         if self.phase == MatchPhase::InGame {
             slot.map_loaded = true;
         }
@@ -2203,7 +2256,7 @@ impl AuthoritativeMatchState {
         {
             self.start_hero_select(config);
         }
-        true
+        Some(slot_index)
     }
 
     pub fn on_client_disconnected(&mut self, client_id: u64) -> Option<usize> {

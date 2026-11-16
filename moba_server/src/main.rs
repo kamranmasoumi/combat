@@ -7,11 +7,15 @@ use moba_shared::{
     AuthoritativeMatchState, AuthoritativeWorldState, ClientInputCommand, ClientLobbyMessage,
     GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase, MobaPhysicsSet,
     MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier, ServerLobbyPacket, ServerMatchMessage,
-    CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
+    TeamId, CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
 };
 use renet::{ClientId, RenetServer, ServerEvent};
 use renet_netcode::NetcodeServerTransport;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Resource)]
 struct ServerNetwork {
@@ -29,8 +33,26 @@ struct ServerScratchBuffers {
     serialize_buf: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+struct VerifiedTicketInfo {
+    user_id: String,
+    username: String,
+    ticket_id: String,
+    slot_index: usize,
+}
+
+/// وضعیت احراز هویت تیکت Redis و گزارش نتیجه به بک‌اند جنگو
+#[derive(Resource)]
+struct ServerAuthState {
+    room_id: Option<String>,
+    port: u16,
+    pending_auth: HashMap<ClientId, Instant>,
+    verified_clients: HashMap<ClientId, VerifiedTicketInfo>,
+    result_reported: bool,
+}
+
 fn main() {
-    let (cli_port, required_players) = parse_server_cli_args();
+    let (cli_port, room_id_opt, required_players) = parse_server_cli_args();
 
     let mut config = GameConfig::load_from_file("config.ron");
     let items_config = ItemsConfig::load_from_file("items.ron");
@@ -58,8 +80,8 @@ fn main() {
     let match_state = AuthoritativeMatchState::new(required_players);
 
     println!(
-        "سرور MOBA روی {} با ظرفیت {} بازیکن آماده اتصال است...",
-        config.network.server_bind_addr, required_players
+        "سرور MOBA روی {} (Room: {:?}) با ظرفیت {} بازیکن آماده اتصال است...",
+        config.network.server_bind_addr, room_id_opt, required_players
     );
 
     App::new()
@@ -75,6 +97,13 @@ fn main() {
         .insert_resource(items_config)
         .insert_resource(world_state)
         .insert_resource(match_state)
+        .insert_resource(ServerAuthState {
+            room_id: room_id_opt,
+            port: cli_port,
+            pending_auth: HashMap::new(),
+            verified_clients: HashMap::new(),
+            result_reported: false,
+        })
         .insert_resource(LobbyBroadcastTimer(Timer::from_seconds(
             0.2,
             TimerMode::Repeating,
@@ -95,6 +124,138 @@ fn main() {
         .run();
 }
 
+// =============================================================================
+// توابع بدون وابستگی خارجی برای استعلام تیکت از Redis (RESP2) و وب‌هوک جنگو
+// =============================================================================
+
+#[derive(Debug)]
+struct RedisTicketPayload {
+    room_id: String,
+    user_id: String,
+    username: String,
+}
+
+fn verify_ticket_in_redis(redis_addr: &str, ticket_id: &str) -> Option<RedisTicketPayload> {
+    if ticket_id.is_empty()
+        || ticket_id.len() > 128
+        || ticket_id.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+
+    let mut stream = TcpStream::connect(redis_addr).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1200)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(1200)));
+
+    let key = format!("ticket:{}", ticket_id);
+    let cmd = format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key.len(), key);
+    stream.write_all(cmd.as_bytes()).ok()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut header = String::new();
+    reader.read_line(&mut header).ok()?;
+    let header_trim = header.trim();
+    if !header_trim.starts_with('$') || header_trim == "$-1" {
+        return None;
+    }
+    let len: usize = header_trim[1..].parse().ok()?;
+    if len == 0 || len > 8192 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).ok()?;
+    let json_str = String::from_utf8(buf).ok()?;
+
+    let room_id = extract_json_str(&json_str, "room_id")?;
+    let user_id = extract_json_str(&json_str, "user_id")?;
+    let username = extract_json_str(&json_str, "username").unwrap_or_else(|| user_id.clone());
+    Some(RedisTicketPayload {
+        room_id,
+        user_id,
+        username,
+    })
+}
+
+fn extract_json_str(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\"", key);
+    let idx = json.find(&pattern)?;
+    let rest = &json[idx + pattern.len()..];
+    let colon = rest.find(':')?;
+    let after_colon = rest[colon + 1..].trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let inner = &after_colon[1..];
+    let end_quote = inner.find('"')?;
+    Some(inner[..end_quote].to_string())
+}
+
+fn post_json_to_django_async(base_http_url: &str, path: &str, json_body: String) {
+    let url = base_http_url.trim_end_matches('/').to_string();
+    let path = path.to_string();
+    thread::spawn(move || {
+        let addr = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"))
+            .unwrap_or(&url);
+        let host_port = addr.split('/').next().unwrap_or(addr);
+        if let Ok(mut stream) = TcpStream::connect(host_port) {
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            let req = format!(
+                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                path,
+                host_port,
+                json_body.len(),
+                json_body
+            );
+            let _ = stream.write_all(req.as_bytes());
+        }
+    });
+}
+
+fn notify_django_player_state(
+    config: &GameConfig,
+    room_id: &str,
+    port: u16,
+    user_id: &str,
+    ticket_id: &str,
+    slot_index: usize,
+    status: &str,
+) {
+    let body = format!(
+        "{{\"room_id\":\"{}\",\"port\":{},\"user_id\":\"{}\",\"ticket_id\":\"{}\",\"slot_index\":{},\"status\":\"{}\"}}",
+        room_id, port, user_id, ticket_id, slot_index, status
+    );
+    post_json_to_django_async(
+        &config.network.backend_http_url,
+        "/api/v1/match/player-state/",
+        body,
+    );
+}
+
+fn send_initial_configs_and_sync_world(
+    client_id: ClientId,
+    config: &GameConfig,
+    items_config: &ItemsConfig,
+    net_server: &mut RenetServer,
+    match_state: &AuthoritativeMatchState,
+    world: &mut AuthoritativeWorldState,
+    slot_idx: usize,
+) {
+    let mut safe_cfg = config.clone();
+    safe_cfg.network.private_key = [0; 32];
+    let sync_pkt = ServerLobbyPacket::SyncConfigs {
+        game_config: safe_cfg,
+        items_config: items_config.clone(),
+    };
+    if let Ok(bytes) = bincode::serialize(&sync_pkt) {
+        net_server.send_message(client_id, CHANNEL_RELIABLE_LOBBY, bytes);
+    }
+    if match_state.phase == MatchPhase::InGame {
+        world.set_slot_connected(slot_idx, true, config);
+    }
+}
+
 fn server_network_receive_system(
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
@@ -102,6 +263,7 @@ fn server_network_receive_system(
     mut net: ResMut<ServerNetwork>,
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
+    mut auth_state: ResMut<ServerAuthState>,
     mut scratch: ResMut<ServerScratchBuffers>,
 ) {
     let net_inner = &mut *net;
@@ -113,25 +275,25 @@ fn server_network_receive_system(
     while let Some(event) = net_inner.server.get_event() {
         match event {
             ServerEvent::ClientConnected { client_id } => {
-                if match_state.on_client_connected(client_id, &config) {
-                    let mut safe_cfg = config.clone();
-                    safe_cfg.network.private_key = [0; 32];
-                    let sync_pkt = ServerLobbyPacket::SyncConfigs {
-                        game_config: safe_cfg,
-                        items_config: items_config.clone(),
-                    };
-                    scratch.serialize_buf.clear();
-                    if bincode::serialize_into(&mut scratch.serialize_buf, &sync_pkt).is_ok() {
-                        net_inner.server.send_message(
+                if auth_state.room_id.is_some() {
+                    // حالت تولید (systemd): تا پیش از دریافت و تایید تیکت Redis هیچ جایگاهی اختصاص نمی‌یابد
+                    auth_state.pending_auth.insert(client_id, Instant::now());
+                    println!(
+                        "[AUTH PENDING] کلاینت {} متصل شد؛ در انتظار تیکت Redis...",
+                        client_id
+                    );
+                } else if match_state.on_client_connected(client_id, &config) {
+                    // حالت تست محلی ۲ آرگومانی
+                    if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                        send_initial_configs_and_sync_world(
                             client_id,
-                            CHANNEL_RELIABLE_LOBBY,
-                            scratch.serialize_buf.clone(),
+                            &config,
+                            &items_config,
+                            &mut net_inner.server,
+                            &match_state,
+                            &mut world,
+                            slot_idx,
                         );
-                    }
-                    if match_state.phase == MatchPhase::InGame {
-                        if let Some(slot_idx) = match_state.slot_for_client(client_id) {
-                            world.set_slot_connected(slot_idx, true, &config);
-                        }
                     }
                     println!(
                         "بازیکن {} متصل شد ({}/{}).",
@@ -145,6 +307,20 @@ fn server_network_receive_system(
             }
             ServerEvent::ClientDisconnected { client_id, reason } => {
                 println!("بازیکن {} قطع شد: {:?}", client_id, reason);
+                auth_state.pending_auth.remove(&client_id);
+                if let Some(vinfo) = auth_state.verified_clients.remove(&client_id) {
+                    if let Some(ref rid) = auth_state.room_id {
+                        notify_django_player_state(
+                            &config,
+                            rid,
+                            auth_state.port,
+                            &vinfo.user_id,
+                            &vinfo.ticket_id,
+                            vinfo.slot_index,
+                            "disconnected",
+                        );
+                    }
+                }
                 if let Some(slot_idx) = match_state.on_client_disconnected(client_id) {
                     if match_state.phase == MatchPhase::InGame {
                         world.set_slot_connected(slot_idx, false, &config);
@@ -154,15 +330,110 @@ fn server_network_receive_system(
         }
     }
 
+    // اخراج خودکار کلاینت‌هایی که ظرف ۱۰ ثانیه تیکت معتبر ارسال نکرده‌اند
+    if auth_state.room_id.is_some() && !auth_state.pending_auth.is_empty() {
+        let now = Instant::now();
+        let expired: Vec<ClientId> = auth_state
+            .pending_auth
+            .iter()
+            .filter(|(_, ts)| now.duration_since(**ts) > Duration::from_secs(10))
+            .map(|(cid, _)| *cid)
+            .collect();
+        for cid in expired {
+            auth_state.pending_auth.remove(&cid);
+            net_inner.server.disconnect(cid);
+            println!("[AUTH TIMEOUT] کلاینت {} بدون تیکت معتبر قطع شد.", cid);
+        }
+    }
+
     scratch.client_ids.clear();
     scratch.client_ids.extend(net_inner.server.clients_id());
     for &client_id in &scratch.client_ids {
+        let is_authenticated = auth_state.room_id.is_none()
+            || auth_state.verified_clients.contains_key(&client_id);
+
         while let Some(bytes) = net_inner
             .server
             .receive_message(client_id, CHANNEL_RELIABLE_LOBBY)
         {
             if let Ok(msg) = bincode::deserialize::<ClientLobbyMessage>(&bytes) {
                 match msg {
+                    ClientLobbyMessage::Authenticate { ticket_id } => {
+                        if let Some(ref expected_room) = auth_state.room_id.clone() {
+                            if auth_state.verified_clients.contains_key(&client_id) {
+                                continue;
+                            }
+                            let ticket_opt =
+                                verify_ticket_in_redis(&config.network.redis_addr, &ticket_id);
+                            let room_matches = ticket_opt.as_ref().is_some_and(|t| {
+                                t.room_id == *expected_room
+                                    || t.room_id.replace('_', "-") == expected_room.replace('_', "-")
+                            });
+
+                            if let (true, Some(t)) = (room_matches, ticket_opt) {
+                                if let Some(slot_idx) = match_state.on_client_connected_with_user(
+                                    client_id,
+                                    Some(&t.user_id),
+                                    &config,
+                                ) {
+                                    auth_state.pending_auth.remove(&client_id);
+                                    auth_state.verified_clients.insert(
+                                        client_id,
+                                        VerifiedTicketInfo {
+                                            user_id: t.user_id.clone(),
+                                            username: t.username.clone(),
+                                            ticket_id: ticket_id.clone(),
+                                            slot_index: slot_idx,
+                                        },
+                                    );
+                                    send_initial_configs_and_sync_world(
+                                        client_id,
+                                        &config,
+                                        &items_config,
+                                        &mut net_inner.server,
+                                        &match_state,
+                                        &mut world,
+                                        slot_idx,
+                                    );
+                                    notify_django_player_state(
+                                        &config,
+                                        expected_room,
+                                        auth_state.port,
+                                        &t.user_id,
+                                        &ticket_id,
+                                        slot_idx,
+                                        "connected",
+                                    );
+                                    println!(
+                                        "[AUTH OK] بازیکن {} ({}) با تیکت معتبر در جایگاه {} متصل شد ({}/{}).",
+                                        t.username,
+                                        t.user_id,
+                                        slot_idx,
+                                        match_state.connected_count(),
+                                        match_state.required_players
+                                    );
+                                } else {
+                                    println!(
+                                        "[AUTH REJECTED] ظرفیت پر یا ورود تکراری برای {}",
+                                        t.user_id
+                                    );
+                                    auth_state.pending_auth.remove(&client_id);
+                                    net_inner.server.disconnect(client_id);
+                                }
+                            } else {
+                                println!(
+                                    "[AUTH REJECTED] تیکت نامعتبر یا متعلق به اتاق دیگر از کلاینت {}",
+                                    client_id
+                                );
+                                auth_state.pending_auth.remove(&client_id);
+                                net_inner.server.disconnect(client_id);
+                            }
+                        }
+                    }
+                    _ if !is_authenticated => {
+                        // نادیده گرفتن هرگونه دستور لابی یا بازی از کلاینت احراز هویت نشده
+                        continue;
+                    }
                     ClientLobbyMessage::SelectHero { hero_id } => {
                         if match_state.try_select_hero(client_id, &hero_id, &config) {
                             println!("بازیکن {} هیروی '{}' را انتخاب کرد.", client_id, hero_id);
@@ -279,12 +550,12 @@ fn server_network_receive_system(
             }
         }
 
-        // ورودی هر بازیکن فقط به اسلات خودش در دنیای بازی اعمال میشود (عدم تداخل بازیکنها)
+        // ورودی هر بازیکن فقط پس از احراز هویت تیکت به اسلات خودش اعمال می‌شود
         while let Some(bytes) = net_inner
             .server
             .receive_message(client_id, CHANNEL_UNRELIABLE_STATE)
         {
-            if match_state.phase != MatchPhase::InGame {
+            if !is_authenticated || match_state.phase != MatchPhase::InGame {
                 continue;
             }
             if let Some(slot_idx) = match_state.slot_for_client(client_id) {
@@ -302,6 +573,7 @@ fn server_match_tick_system(
     config: Res<GameConfig>,
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
+    mut auth_state: ResMut<ServerAuthState>,
     existing_soldiers: Query<Entity, With<PhysicsSoldier>>,
 ) {
     if match_state.tick(time.delta_secs(), &config).is_some() {
@@ -311,6 +583,59 @@ fn server_match_tick_system(
             "همه {} بازیکن وارد زمین بازی شدند (تیم Dawn در غرب و تیم Dusk در شرق)!",
             world.players.len()
         );
+    }
+
+    // گزارش خودکار نتیجه نهایی مسابقه به بک‌اند جنگو در پایان بازی
+    if !auth_state.result_reported {
+        if let Some(winner) = world.winning_team {
+            auth_state.result_reported = true;
+            if let Some(ref rid) = auth_state.room_id {
+                let winner_team_num = match winner {
+                    TeamId::Dawn => 1,
+                    TeamId::Dusk => 2,
+                    TeamId::Neutral => 0,
+                };
+                let duration_sec = world.match_elapsed_secs.round() as i32;
+                let mut players_json = String::from("[");
+                for (i, p) in world.players.iter().enumerate() {
+                    if i > 0 {
+                        players_json.push(',');
+                    }
+                    let uid = match_state
+                        .players
+                        .get(p.slot_index)
+                        .and_then(|lp| lp.user_id.as_deref())
+                        .unwrap_or("");
+                    players_json.push_str(&format!(
+                        "{{\"user_id\":\"{}\",\"slot_index\":{},\"hero_id\":{},\"level\":{},\"kills\":{},\"deaths\":{},\"assists\":{},\"last_hits\":{},\"denies\":{},\"gold_coins\":{}}}",
+                        uid,
+                        p.slot_index,
+                        p.hero_index + 1,
+                        p.hero_level,
+                        p.kills,
+                        p.deaths,
+                        p.assists,
+                        p.last_hits,
+                        p.denies,
+                        p.hero_gold
+                    ));
+                }
+                players_json.push(']');
+                let payload = format!(
+                    "{{\"room_id\":\"{}\",\"port\":{},\"winner_team\":{},\"duration_sec\":{},\"players\":{}}}",
+                    rid, auth_state.port, winner_team_num, duration_sec, players_json
+                );
+                post_json_to_django_async(
+                    &config.network.backend_http_url,
+                    "/api/v1/match/report-result/",
+                    payload,
+                );
+                println!(
+                    "[MATCH RESULT REPORTED] Room: {} | Winner: {} | Duration: {}s",
+                    rid, winner_team_num, duration_sec
+                );
+            }
+        }
     }
 }
 

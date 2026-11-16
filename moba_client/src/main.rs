@@ -39,7 +39,11 @@ use std::path::Path;
 use std::time::Duration;
 
 mod audio_client;
+mod backend_client;
+mod pregame_ui;
 mod vfx_client;
+use backend_client::BackendClient;
+use pregame_ui::{AppScreenState, PendingMatchConnection, PreGamePlugin, PreGameSessionState};
 use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
 mod shop_client;
 use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
@@ -112,6 +116,11 @@ fn main() {
             .unwrap_or(101);
         config.network.client_id = (nanos % 900_000_000) + 1_000;
     }
+    let has_cli_server = std::env::args().nth(1).is_some();
+    let backend_client = BackendClient::new(
+        config.network.backend_http_url.clone(),
+        config.network.backend_ws_url.clone(),
+    );
     apply_client_cli_overrides(&mut config.network);
     let tick_hz = config.network.server_tick_rate_hz;
     let substeps = config.physics.substeps;
@@ -204,6 +213,13 @@ fn main() {
             has_local_config,
             has_local_items,
         })
+        .insert_state(if has_cli_server {
+            AppScreenState::InGame
+        } else {
+            AppScreenState::PreGame
+        })
+        .insert_resource(backend_client)
+        .add_plugins(PreGamePlugin)
         .add_plugins(ShopPlugin)
         .add_plugins(MobaAudioPlugin)
         .insert_resource(ClientNetwork { client, transport })
@@ -240,6 +256,8 @@ fn main() {
             spawned_preview_hero_index: None,
             map_loaded_reported: false,
             prev_phase: None,
+            active_ticket_id: None,
+            ticket_sent: false,
         })
         .insert_resource(CameraControlState {
             free_look_target: None,
@@ -258,21 +276,30 @@ fn main() {
             tick_rate_hz: tick_hz,
             substeps,
         })
-        .add_systems(Startup, setup_scene)
-        .add_systems(PreUpdate, client_sample_input_system)
+        .add_systems(
+            OnEnter(AppScreenState::InGame),
+            (on_enter_ingame_connect_system, setup_scene).chain(),
+        )
+        .add_systems(OnExit(AppScreenState::InGame), on_exit_ingame_system)
+        .add_systems(
+            PreUpdate,
+            client_sample_input_system.run_if(in_state(AppScreenState::InGame)),
+        )
         .add_systems(
             FixedUpdate,
             (
                 client_flush_input_to_server_system,
                 client_reconcile_fixed_system.after(moba_shared::MobaPhysicsSet::Simulate),
                 record_soldier_fixed_transform_system.after(client_reconcile_fixed_system),
-            ),
+            )
+                .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
             PostUpdate,
             compensate_upper_body_hips_twist_system
                 .after(bevy::app::AnimationSystems)
-                .before(bevy::transform::TransformSystems::Propagate),
+                .before(bevy::transform::TransformSystems::Propagate)
+                .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
             Update,
@@ -292,8 +319,11 @@ fn main() {
                 level_up_vfx_system,
                 floating_world_popup_system,
                 death_screen_overlay_system,
+                ingame_exit_button_system,
+                sync_hud_phase_visibility_system,
             )
-                .chain(),
+                .chain()
+                .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
             Update,
@@ -316,15 +346,21 @@ fn main() {
                 update_overhead_hero_bars_system,
             )
                 .chain()
-                .after(camera_follow_system),
+                .after(camera_follow_system)
+                .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
             Update,
             (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system, client_chat_input_system, update_chat_ui_system, client_ping_input_system, update_ping_visuals_system, client_pause_input_system, update_pause_overlay_ui_system, update_telemetry_hud_system, sync_shop_context_and_network_system)
                 .chain()
-                .after(sync_remote_players_system),
+                .after(sync_remote_players_system)
+                .run_if(in_state(AppScreenState::InGame)),
         )
-        .add_systems(Update, (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system))
+        .add_systems(
+            Update,
+            (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system)
+                .run_if(in_state(AppScreenState::InGame)),
+        )
         .add_systems(
             PostUpdate,
             (
@@ -332,7 +368,8 @@ fn main() {
                 align_other_weapons_horizontally_system,
             )
                 .after(bevy::app::AnimationSystems)
-                .before(TransformSystems::Propagate),
+                .before(TransformSystems::Propagate)
+                .run_if(in_state(AppScreenState::InGame)),
         )
         .run();
 }
@@ -959,8 +996,144 @@ fn spawn_map_object_label(
 // راه‌اندازی صحنه، نورپردازی سایه‌دار، برکه‌های طبیعی، آبشارها و جنگل انبوه
 // -----------------------------------------------------------------------------
 
+#[derive(Resource)]
+struct GameSceneInitialized;
+
+fn on_enter_ingame_connect_system(
+    mut config: ResMut<GameConfig>,
+    mut net: ResMut<ClientNetwork>,
+    mut pending: ResMut<PendingMatchConnection>,
+    mut match_flow: ResMut<ClientMatchFlow>,
+    mut match_result: ResMut<LatestMatchResult>,
+    mut cam_q: Query<&mut Camera, With<Camera3d>>,
+) {
+    for mut cam in &mut cam_q {
+        cam.is_active = true;
+    }
+    if let Some(info) = pending.0.take() {
+        config.network.server_public_addr = info.server_addr.clone();
+        config.network.server_bind_addr = info.server_addr;
+        let (client, transport) = create_shared_renet_client(&config.network);
+        net.client = client;
+        net.transport = transport;
+        match_flow.your_slot = None;
+        match_flow.snapshot = None;
+        match_flow.map_loaded_reported = false;
+        match_flow.prev_phase = None;
+        match_flow.active_ticket_id = Some(info.ticket_id);
+        match_flow.ticket_sent = false;
+        match_result.0 = None;
+    }
+}
+
+#[derive(Component)]
+struct InGameExitMenuBtn;
+
+fn spawn_ingame_exit_button_ui(commands: &mut Commands) {
+    commands
+        .spawn((
+            Interaction::default(),
+            InGameExitMenuBtn,
+            GlobalZIndex(210),
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(12.0),
+                left: px(136.0),
+                padding: UiRect::axes(px(12.0), px(6.0)),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(6.0),
+                border: UiRect::all(px(1.5)),
+                border_radius: BorderRadius::all(px(8.0)),
+                ..default()
+            },
+            BorderColor::all(Color::srgba(0.95, 0.34, 0.36, 0.85)),
+            BackgroundColor(Color::srgba(0.18, 0.05, 0.07, 0.88)),
+        ))
+        .with_children(|btn| {
+            btn.spawn((
+                Node {
+                    width: px(8.0),
+                    height: px(8.0),
+                    border_radius: BorderRadius::all(px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.96, 0.35, 0.38)),
+            ));
+            btn.spawn((
+                Text::new("EXIT"),
+                TextFont {
+                    font_size: FontSize::Px(12.0),
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+            ));
+        });
+}
+
+fn on_exit_ingame_system(
+    mut cam_q: Query<&mut Camera, With<Camera3d>>,
+    mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
+) {
+    for mut cam in &mut cam_q {
+        cam.is_active = false;
+    }
+    for mut copt in &mut cursor_q {
+        copt.visible = true;
+    }
+}
+
+fn sync_hud_phase_visibility_system(
+    match_flow: Res<ClientMatchFlow>,
+    mut hud_q: Query<&mut Visibility, Or<(With<MinimapRoot>, With<HeroHudRoot>)>>,
+) {
+    let want = if match_flow.is_in_game() {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut vis in &mut hud_q {
+        if *vis != want {
+            *vis = want;
+        }
+    }
+}
+
+fn ingame_exit_button_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    backend: Res<BackendClient>,
+    pregame_state: Res<PreGameSessionState>,
+    match_result: Res<LatestMatchResult>,
+    mut next_screen: ResMut<NextState<AppScreenState>>,
+    mut exit_btn_q: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<InGameExitMenuBtn>)>,
+) {
+    let mut want_exit = match_result.0.is_some() && keys.just_pressed(KeyCode::Escape);
+    for (inter, mut bg) in &mut exit_btn_q {
+        match *inter {
+            Interaction::Pressed => {
+                want_exit = true;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.32, 0.08, 0.11, 0.96);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.18, 0.05, 0.07, 0.88);
+            }
+        }
+    }
+    if want_exit {
+        if match_result.0.is_none() {
+            if let Some(ref tok) = pregame_state.access_token {
+                backend.disconnect_match(tok.clone());
+            }
+        }
+        next_screen.set(AppScreenState::PreGame);
+    }
+}
+
 fn setup_scene(
     mut commands: Commands,
+    initialized: Option<Res<GameSceneInitialized>>,
     config: Res<GameConfig>,
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -969,6 +1142,10 @@ fn setup_scene(
     mut water_materials: ResMut<Assets<WaterSurfaceMaterial>>,
     mut vfx_queue: ResMut<VfxEventQueue>,
 ) {
+    if initialized.is_some() {
+        return;
+    }
+    commands.insert_resource(GameSceneInitialized);
     let spawn_pos = Vec3::new(
         config.soldier.spawn_pos.0,
         config.soldier.spawn_pos.1,
@@ -2216,6 +2393,7 @@ fn setup_scene(
     spawn_chat_ui(&mut commands);
     spawn_pause_overlay_ui(&mut commands);
     spawn_telemetry_hud_ui(&mut commands);
+    spawn_ingame_exit_button_ui(&mut commands);
     spawn_match_overlay_ui(&mut commands, &config);
 
     let shared_fx = SharedFxAssets {
@@ -6626,9 +6804,13 @@ fn spawn_stat_chip(
     });
 }
 
+#[derive(Component)]
+struct HeroHudRoot;
+
 fn spawn_hero_hud_ui(commands: &mut Commands) {
     commands
         .spawn((
+            HeroHudRoot,
             Node {
                 position_type: PositionType::Absolute,
                 left: px(16.0),
@@ -7365,6 +7547,8 @@ struct ClientMatchFlow {
     spawned_preview_hero_index: Option<usize>,
     map_loaded_reported: bool,
     prev_phase: Option<MatchPhase>,
+    active_ticket_id: Option<String>,
+    ticket_sent: bool,
 }
 
 impl ClientMatchFlow {
@@ -8097,6 +8281,19 @@ fn client_lobby_sync_system(
     anim_assets: Option<Res<SoldierAnimationAssets>>,
     soldier_loaded: Query<(), With<SoldierMarker>>,
 ) {
+    if !match_flow.ticket_sent && net.client.is_connected() {
+        if let Some(ref ticket_id) = match_flow.active_ticket_id {
+            if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::Authenticate {
+                ticket_id: ticket_id.clone(),
+            }) {
+                net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
+                match_flow.ticket_sent = true;
+            }
+        } else {
+            match_flow.ticket_sent = true;
+        }
+    }
+
     while let Some(bytes) = net.client.receive_message(CHANNEL_RELIABLE_LOBBY) {
         if let Ok(pkt) = bincode::deserialize::<ServerLobbyPacket>(&bytes) {
             match pkt {

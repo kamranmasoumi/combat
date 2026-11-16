@@ -10,3 +10,7 @@ renet = { workspace = true }
 renet_netcode = { workspace = true }
 bincode = { workspace = true }
 bevy_hanabi = "0.20.0"
+
+ureq = { version = "2", features = ["json"] }
+tungstenite = "0.24"
+serde_json = "1"

@@ -1,13 +1,15 @@
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use moba_shared::{
-    create_shared_renet_server, parse_server_cli_args, try_buy_cart, try_buy_item,
-    step_couriers_system, try_courier_deliver, try_courier_move_to, try_courier_return_to_fountain, try_cycle_item_mode, try_sell_courier_item, try_sell_item, try_swap_inventory_slots, AuthoritativeMatchState, AuthoritativeWorldState,
-    ClientInputCommand, ClientLobbyMessage, GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase,
-    MobaPhysicsSet, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier, ServerLobbyPacket, ServerMatchMessage,
+    create_shared_renet_server, parse_server_cli_args, step_couriers_system, try_buy_cart,
+    try_buy_item, try_courier_deliver, try_courier_move_to, try_courier_return_to_fountain,
+    try_cycle_item_mode, try_sell_courier_item, try_sell_item, try_swap_inventory_slots,
+    AuthoritativeMatchState, AuthoritativeWorldState, ClientInputCommand, ClientLobbyMessage,
+    GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase, MobaPhysicsSet,
+    MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier, ServerLobbyPacket, ServerMatchMessage,
     CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
 };
-use renet::{RenetServer, ServerEvent};
+use renet::{ClientId, RenetServer, ServerEvent};
 use renet_netcode::NetcodeServerTransport;
 use std::time::Duration;
 
@@ -19,6 +21,13 @@ struct ServerNetwork {
 
 #[derive(Resource)]
 struct LobbyBroadcastTimer(Timer);
+
+/// بافرهای قابل استفاده مجدد برای جلوگیری از تخصیص حافظه تکراری در هر تیک ۶۰ هرتز سرور
+#[derive(Resource, Default)]
+struct ServerScratchBuffers {
+    client_ids: Vec<ClientId>,
+    serialize_buf: Vec<u8>,
+}
 
 fn main() {
     let (cli_port, required_players) = parse_server_cli_args();
@@ -71,6 +80,7 @@ fn main() {
             TimerMode::Repeating,
         )))
         .insert_resource(ServerNetwork { server, transport })
+        .init_resource::<ServerScratchBuffers>()
         .add_systems(
             FixedUpdate,
             (
@@ -92,6 +102,7 @@ fn server_network_receive_system(
     mut net: ResMut<ServerNetwork>,
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
+    mut scratch: ResMut<ServerScratchBuffers>,
 ) {
     let net_inner = &mut *net;
     net_inner.server.update(time.delta());
@@ -109,8 +120,13 @@ fn server_network_receive_system(
                         game_config: safe_cfg,
                         items_config: items_config.clone(),
                     };
-                    if let Ok(bytes) = bincode::serialize(&sync_pkt) {
-                        net_inner.server.send_message(client_id, CHANNEL_RELIABLE_LOBBY, bytes);
+                    scratch.serialize_buf.clear();
+                    if bincode::serialize_into(&mut scratch.serialize_buf, &sync_pkt).is_ok() {
+                        net_inner.server.send_message(
+                            client_id,
+                            CHANNEL_RELIABLE_LOBBY,
+                            scratch.serialize_buf.clone(),
+                        );
                     }
                     if match_state.phase == MatchPhase::InGame {
                         if let Some(slot_idx) = match_state.slot_for_client(client_id) {
@@ -138,8 +154,9 @@ fn server_network_receive_system(
         }
     }
 
-    let client_ids = net_inner.server.clients_id();
-    for client_id in client_ids {
+    scratch.client_ids.clear();
+    scratch.client_ids.extend(net_inner.server.clients_id());
+    for &client_id in &scratch.client_ids {
         while let Some(bytes) = net_inner
             .server
             .receive_message(client_id, CHANNEL_RELIABLE_LOBBY)
@@ -304,6 +321,7 @@ fn server_send_snapshot_system(
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
     mut lobby_timer: ResMut<LobbyBroadcastTimer>,
+    mut scratch: ResMut<ServerScratchBuffers>,
 ) {
     lobby_timer.0.tick(time.delta());
     let should_send_lobby =
@@ -317,8 +335,13 @@ fn server_send_snapshot_system(
                     your_slot: p.slot_index,
                     state: snap.clone(),
                 });
-                if let Ok(bytes) = bincode::serialize(&msg) {
-                    net.server.send_message(cid, CHANNEL_RELIABLE_LOBBY, bytes);
+                scratch.serialize_buf.clear();
+                if bincode::serialize_into(&mut scratch.serialize_buf, &msg).is_ok() {
+                    net.server.send_message(
+                        cid,
+                        CHANNEL_RELIABLE_LOBBY,
+                        scratch.serialize_buf.clone(),
+                    );
                 }
             }
         }
@@ -330,18 +353,23 @@ fn server_send_snapshot_system(
         for p in &match_state.players {
             if let (true, Some(cid)) = (p.connected, p.client_id) {
                 let snap = world.build_snapshot_for_slot(&config, p.slot_index);
-                if let Ok(snap_bytes) = bincode::serialize(&snap) {
-                    net.server
-                        .send_message(cid, CHANNEL_UNRELIABLE_STATE, snap_bytes);
+                scratch.serialize_buf.clear();
+                if bincode::serialize_into(&mut scratch.serialize_buf, &snap).is_ok() {
+                    net.server.send_message(
+                        cid,
+                        CHANNEL_UNRELIABLE_STATE,
+                        scratch.serialize_buf.clone(),
+                    );
                 }
             }
         }
 
         if !world.pending_fx.is_empty() {
+            scratch.serialize_buf.clear();
             let fx_batch: Vec<GameplayFxEvent> = world.pending_fx.drain(..).collect();
-            if let Ok(fx_bytes) = bincode::serialize(&fx_batch) {
+            if bincode::serialize_into(&mut scratch.serialize_buf, &fx_batch).is_ok() {
                 net.server
-                    .broadcast_message(CHANNEL_RELIABLE_FX, fx_bytes);
+                    .broadcast_message(CHANNEL_RELIABLE_FX, scratch.serialize_buf.clone());
             }
         }
     }

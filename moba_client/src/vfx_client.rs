@@ -1110,13 +1110,15 @@ fn init_hanabi_vfx_assets_system(
 }
 
 #[derive(SystemParam)]
-struct VfxProcessMaterials<'w> {
+struct VfxProcessMaterials<'w, 's> {
     trail_materials: ResMut<'w, Assets<BulletTrailMaterial>>,
     flash_materials: ResMut<'w, Assets<MuzzleFlashMaterial>>,
     shockwave_materials: ResMut<'w, Assets<ShockwaveRingMaterial>>,
     blood_materials: ResMut<'w, Assets<BloodSplatterMaterial>>,
     fireball_materials: ResMut<'w, Assets<ExplosionFireballMaterial>>,
     water_exp_materials: ResMut<'w, Assets<WaterExplosionMaterial>>,
+    cam_q: Query<'w, 's, &'static Transform, With<Camera3d>>,
+    active_lights_q: Query<'w, 's, (), With<OneShotLightFade>>,
 }
 
 fn next_vfx_rand(seed: &mut u32) -> f32 {
@@ -1144,6 +1146,13 @@ fn process_vfx_events_system(
         return;
     };
     let t = time.elapsed_secs();
+    let cam_pos = mats.cam_q.iter().next().map(|tf| tf.translation);
+    let mut active_lights = mats.active_lights_q.iter().count();
+    const MAX_ACTIVE_VFX_LIGHTS: usize = 10;
+    const MAX_VFX_CAMERA_DIST_SQ: f32 = 85.0 * 85.0;
+    let is_near_camera = |p: Vec3| -> bool {
+        cam_pos.map_or(true, |cp| cp.distance_squared(p) <= MAX_VFX_CAMERA_DIST_SQ)
+    };
 
     for ev in queue.0.drain(..) {
         match ev {
@@ -1152,6 +1161,9 @@ fn process_vfx_events_system(
                 dir,
                 vfx_source,
             } => {
+                if !is_near_camera(pos) {
+                    continue;
+                }
                 let profile = config.resolve_bullet_vfx(&vfx_source);
                 let forward = dir.normalize_or_zero();
                 let spawn_pos = pos + forward * 0.16;
@@ -1241,8 +1253,12 @@ fn process_vfx_events_system(
                     },
                 ));
 
-                // لایه ۴: نور دینامیک HDR سر لوله تفنگ
-                if profile.muzzle_light_intensity > 0.0 {
+                // لایه ۴: نور دینامیک HDR سر لوله تفنگ (فقط برای هیروها و با سقف همزمانی برای حفظ FPS)
+                if matches!(vfx_source, BulletVfxSource::Hero { .. })
+                    && profile.muzzle_light_intensity > 0.0
+                    && active_lights < MAX_ACTIVE_VFX_LIGHTS
+                {
+                    active_lights += 1;
                     commands.spawn((
                         PointLight {
                             color: Color::srgb(
@@ -1271,6 +1287,9 @@ fn process_vfx_events_system(
                 end,
                 vfx_source,
             } => {
+                if !is_near_camera(start) && !is_near_camera(end) {
+                    continue;
+                }
                 let delta = end - start;
                 let len = delta.length();
                 if len <= 0.08 {
@@ -1332,6 +1351,9 @@ fn process_vfx_events_system(
                 surface,
                 vfx_source,
             } => {
+                if !is_near_camera(pos) {
+                    continue;
+                }
                 let profile = config.resolve_bullet_vfx(&vfx_source);
                 let (effect_h, lifetime) = match surface {
                     ImpactSurface::Character => (handles.blood_burst.clone(), 0.70),
@@ -1386,8 +1408,12 @@ fn process_vfx_events_system(
                     },
                 ));
 
-                // نور لحظه‌ای برخورد با بلوم سینماتیک
-                if profile.impact_light_intensity > 0.0 {
+                // نور لحظه‌ای برخورد با بلوم سینماتیک (فقط برای هیروها و با سقف همزمانی)
+                if matches!(vfx_source, BulletVfxSource::Hero { .. })
+                    && profile.impact_light_intensity > 0.0
+                    && active_lights < MAX_ACTIVE_VFX_LIGHTS
+                {
+                    active_lights += 1;
                     commands.spawn((
                         PointLight {
                             color: Color::srgb(
@@ -1646,6 +1672,9 @@ fn process_vfx_events_system(
                 ));
             }
             ClientVfxEvent::WaterSplash { pos, intensity } => {
+                if !is_near_camera(pos) {
+                    continue;
+                }
                 let ge = &config.fx.grenade_explosion_vfx;
                 let seed = next_vfx_rand(&mut rng_seed) * 50.0;
                 let scale = intensity.clamp(1.0, 3.0);

@@ -10360,12 +10360,16 @@ fn step_lane_creeps_system(
         // الف) یافتن نزدیک‌ترین دشمن (سرباز یا هیرو) با رعایت کامل مه جنگ، برتری ارتفاع و خط دید موانع
         let mut best_target: Option<(Vec3, f32)> = None;
         if can_attack_now {
+            let vision_sq = c_stats.vision_range * c_stats.vision_range;
             for &(other_id, other_team, other_pos, other_dead, other_aggroed) in &creep_snap {
                 if other_id == my_id || other_team == my_team || other_dead {
                     continue;
                 }
                 // سرباز لاین به کمپ حمله نمی‌کند مگر اینکه کمپ در حالت تهاجمی (Aggro) باشد
                 if !is_neutral && other_team == TeamId::Neutral && !other_aggroed {
+                    continue;
+                }
+                if my_pos.distance_squared(other_pos) > vision_sq {
                     continue;
                 }
                 let d = my_pos.distance(other_pos);

@@ -1016,10 +1016,10 @@ fn setup_scene(
         },
         Transform::from_translation(light_pos).looking_at(Vec3::ZERO, Vec3::Y),
         CascadeShadowConfigBuilder {
-            num_cascades: 3,
+            num_cascades: 2,
             minimum_distance: 0.5,
-            maximum_distance: 130.0,
-            first_cascade_far_bound: 26.0,
+            maximum_distance: 85.0,
+            first_cascade_far_bound: 28.0,
             overlap_proportion: 0.15,
         }
         .build(),
@@ -2417,6 +2417,7 @@ fn spawn_water_ripple_and_droplets(
                 Mesh3d(drop_mesh.clone()),
                 MeshMaterial3d(drop_mat.clone()),
                 particle_physics_bundle(config, water_pos + Vec3::Y * 0.08, vel, 0.38, true),
+                NotShadowCaster,
             ));
         }
     }
@@ -3799,6 +3800,7 @@ fn spawn_fx_from_server_event(
                     config.fx.slide_dust_lifetime_secs,
                     true,
                 ),
+                NotShadowCaster,
             ));
         }
         GameplayFxEvent::WaterSplash { pos, intensity } => {
@@ -3869,6 +3871,7 @@ fn spawn_fx_from_server_event(
                     Mesh3d(spark_mesh.clone()),
                     MeshMaterial3d(spark_mat.clone()),
                     particle_physics_bundle(config, sp, vel, dur * 0.85, true),
+                    NotShadowCaster,
                 ));
             }
         }
@@ -9922,6 +9925,8 @@ struct CreepVisual {
     creep_id: u64,
     last_anim: Option<CreepAnimState>,
     is_highlighted: bool,
+    rig_bound: bool,
+    weapon_attached: bool,
 }
 
 #[derive(Component)]
@@ -10066,6 +10071,7 @@ fn sync_lane_creeps_system(
     player_check_query: Query<(Option<&CreepAnimPlayer>, Option<&AnimationGraphHandle>), With<AnimationPlayer>>,
     mut anim_player_query: Query<(&CreepAnimPlayer, &mut AnimationPlayer, &mut AnimationTransitions)>,
     mut existing_query: Query<(Entity, &mut CreepVisual, &mut Transform, &mut Visibility)>,
+    cam_query: Query<&Transform, (With<Camera3d>, Without<CreepVisual>)>,
     mut mat_mesh_query: Query<(
         &mut MeshMaterial3d<StandardMaterial>,
         Option<&CreepSavedMaterial>,
@@ -10082,7 +10088,11 @@ fn sync_lane_creeps_system(
     let dt = time.delta_secs();
     let creep_map: HashMap<u64, &CreepSnapshot> =
         res.latest_creeps.0.iter().map(|c| (c.id, c)).collect();
-    let mut seen_ids = HashSet::new();
+    let mut seen_ids = HashSet::with_capacity(res.latest_creeps.0.len());
+    let cam_pos = cam_query.iter().next().map(|c| c.translation);
+    const MAX_CREEP_ANIM_DIST_SQ: f32 = 75.0 * 75.0;
+    let mut anim_targets: HashMap<u64, (&str, CreepAnimState, bool)> =
+        HashMap::with_capacity(res.latest_creeps.0.len());
 
     for (root_ent, mut vis_comp, mut tf, mut vis) in &mut existing_query {
         let Some(&cs) = creep_map.get(&vis_comp.creep_id) else {
@@ -10124,72 +10134,66 @@ fn sync_lane_creeps_system(
             "lane_dawn"
         };
 
-        for desc in children_query.iter_descendants(root_ent) {
-            if let Ok((h_ent, h_name)) = hand_query.get(desc) {
-                let n = h_name.as_str().to_lowercase();
-                let is_left =
-                    n.contains("left") || n.contains("_l") || n.contains(".l") || n.contains("l_");
-                let is_hand = n.contains("hand") || n.contains("wrist") || n.contains("palm");
-                let is_finger = n.contains("thumb")
-                    || n.contains("index")
-                    || n.contains("middle")
-                    || n.contains("ring")
-                    || n.contains("pinky")
-                    || n.contains("finger")
-                    || n.contains("twist");
-                if is_hand && is_left && !is_finger {
-                    spawn_creep_rifle_on_hand(
-                        &mut commands,
-                        root_ent,
-                        h_ent,
-                        cs.team,
-                        &res.config.weapon_tuner,
-                        &mut res.meshes,
-                        &mut res.materials,
-                    );
+        if !vis_comp.weapon_attached {
+            for desc in children_query.iter_descendants(root_ent) {
+                if let Ok((h_ent, h_name)) = hand_query.get(desc) {
+                    let n = h_name.as_str().to_lowercase();
+                    let is_left =
+                        n.contains("left") || n.contains("_l") || n.contains(".l") || n.contains("l_");
+                    let is_hand = n.contains("hand") || n.contains("wrist") || n.contains("palm");
+                    let is_finger = n.contains("thumb")
+                        || n.contains("index")
+                        || n.contains("middle")
+                        || n.contains("ring")
+                        || n.contains("pinky")
+                        || n.contains("finger")
+                        || n.contains("twist");
+                    if is_hand && is_left && !is_finger {
+                        spawn_creep_rifle_on_hand(
+                            &mut commands,
+                            root_ent,
+                            h_ent,
+                            cs.team,
+                            &res.config.weapon_tuner,
+                            &mut res.meshes,
+                            &mut res.materials,
+                        );
+                        vis_comp.weapon_attached = true;
+                        break;
+                    }
                 }
             }
         }
 
         if let Some(team_anim) = res.creep_anim_cache.graphs.get(anim_key) {
-            for desc in children_query.iter_descendants(root_ent) {
-                if let Ok((cp_opt, graph_opt)) = player_check_query.get(desc) {
-                    let needs_bind = cp_opt.is_none()
-                        || graph_opt.map_or(true, |g| g.0 != team_anim.graph_handle);
-                    if needs_bind {
-                        commands.entity(desc).insert((
-                            AnimationGraphHandle(team_anim.graph_handle.clone()),
-                            AnimationTransitions::new(),
-                            CreepAnimPlayer { creep_id: cs.id },
-                        ));
+            if !vis_comp.rig_bound {
+                let mut found_player = false;
+                for desc in children_query.iter_descendants(root_ent) {
+                    if let Ok((cp_opt, graph_opt)) = player_check_query.get(desc) {
+                        found_player = true;
+                        let needs_bind = cp_opt.is_none()
+                            || graph_opt.map_or(true, |g| g.0 != team_anim.graph_handle);
+                        if needs_bind {
+                            commands.entity(desc).insert((
+                                AnimationGraphHandle(team_anim.graph_handle.clone()),
+                                AnimationTransitions::new(),
+                                CreepAnimPlayer { creep_id: cs.id },
+                            ));
+                        }
                     }
+                }
+                if found_player {
+                    vis_comp.rig_bound = true;
                 }
             }
 
-            let target_node = match cs.anim_state {
-                CreepAnimState::Run => team_anim.run_node,
-                CreepAnimState::Idle => team_anim.idle_node,
-                CreepAnimState::Fire => team_anim.fire_node,
-                CreepAnimState::Die => team_anim.die_node,
-            };
-            let is_looping = cs.anim_state != CreepAnimState::Die;
-            let mut played = false;
-            for (cp, mut player, mut trans) in &mut anim_player_query {
-                if cp.creep_id == cs.id {
-                    let needs_play = vis_comp.last_anim != Some(cs.anim_state)
-                        || (is_looping && !player.is_playing_animation(target_node));
-                    if needs_play {
-                        let active = trans.play(&mut player, target_node, Duration::from_millis(100));
-                        if is_looping {
-                            active.repeat();
-                        }
-                        played = true;
-                    }
-                }
-            }
-            if played {
+            let is_anim_active = cs.is_visible
+                && cam_pos.map_or(true, |cp| cp.distance_squared(cs.pos) <= MAX_CREEP_ANIM_DIST_SQ);
+            let state_changed = vis_comp.last_anim != Some(cs.anim_state);
+            if is_anim_active && state_changed {
                 vis_comp.last_anim = Some(cs.anim_state);
             }
+            anim_targets.insert(cs.id, (anim_key, cs.anim_state, is_anim_active));
         }
 
         // هایلایت قرمز ملایم روی سرباز هدف هنگام قرار گرفتن نشانه‌گر موس روی آن
@@ -10223,6 +10227,33 @@ fn sync_lane_creeps_system(
         }
     }
 
+    // اعمال انیمیشن سربازان در یک عبور O(N) و توقف استخوان‌سازی برای سربازان خارج از دید یا مه جنگ
+    for (cp, mut player, mut trans) in &mut anim_player_query {
+        let Some(&(anim_key, anim_state, is_anim_active)) = anim_targets.get(&cp.creep_id) else {
+            continue;
+        };
+        if !is_anim_active {
+            player.pause_all();
+            continue;
+        }
+        player.resume_all();
+        if let Some(team_anim) = res.creep_anim_cache.graphs.get(anim_key) {
+            let target_node = match anim_state {
+                CreepAnimState::Run => team_anim.run_node,
+                CreepAnimState::Idle => team_anim.idle_node,
+                CreepAnimState::Fire => team_anim.fire_node,
+                CreepAnimState::Die => team_anim.die_node,
+            };
+            let is_looping = anim_state != CreepAnimState::Die;
+            if !player.is_playing_animation(target_node) {
+                let active = trans.play(&mut player, target_node, Duration::from_millis(100));
+                if is_looping {
+                    active.repeat();
+                }
+            }
+        }
+    }
+
     // اسپاون مدل GLB سربازان جدید
     for cs in &res.latest_creeps.0 {
         if seen_ids.contains(&cs.id) {
@@ -10245,6 +10276,8 @@ fn sync_lane_creeps_system(
                 creep_id: cs.id,
                 last_anim: None,
                 is_highlighted: false,
+                rig_bound: false,
+                weapon_attached: false,
             },
             WorldAssetRoot(scene_h),
             Transform::from_translation(cs.pos).with_scale(Vec3::splat(c_scale * cs.scale_multiplier)),

@@ -1,13 +1,14 @@
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use moba_shared::{
-    create_shared_renet_server, parse_server_cli_args, step_couriers_system, try_buy_cart,
-    try_buy_item, try_courier_deliver, try_courier_move_to, try_courier_return_to_fountain,
-    try_cycle_item_mode, try_sell_courier_item, try_sell_item, try_swap_inventory_slots,
-    AuthoritativeMatchState, AuthoritativeWorldState, ClientInputCommand, ClientLobbyMessage,
-    GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase, MobaPhysicsSet,
-    MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier, ServerLobbyPacket, ServerMatchMessage,
-    TeamId, CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
+    create_shared_renet_server, parse_server_cli_args, step_couriers_system, step_shadow_blade_system, step_teleports_system,
+    try_buy_cart, try_buy_item, try_cancel_teleport, try_courier_deliver, try_courier_move_to,
+    try_courier_return_to_fountain, try_cycle_item_mode, try_sell_courier_item, try_sell_item,
+    try_activate_shadow_blade, try_start_teleport, try_swap_inventory_slots, AuthoritativeMatchState,
+    AuthoritativeWorldState, ClientInputCommand, ClientLobbyMessage, CustomPhysicsWorld,
+    GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase, MobaPhysicsSet, MobaSharedPhysicsPlugin,
+    PhysicsRole, PhysicsSoldier, ServerLobbyPacket, ServerMatchMessage, TeamId,
+    CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
 };
 use renet::{ClientId, RenetServer, ServerEvent};
 use renet_netcode::NetcodeServerTransport;
@@ -41,7 +42,7 @@ struct VerifiedTicketInfo {
     slot_index: usize,
 }
 
-/// وضعیت احراز هویت تیکت Redis و گزارش نتیجه به بک‌اند جنگو
+/// وضعیت احراز هویت تیکت Redis و گزارش نتیجه به بکاند جنگو
 #[derive(Resource)]
 struct ServerAuthState {
     room_id: Option<String>,
@@ -118,6 +119,12 @@ fn main() {
                 step_couriers_system
                     .after(MobaPhysicsSet::Drive)
                     .before(server_send_snapshot_system),
+                step_teleports_system
+                    .after(MobaPhysicsSet::Drive)
+                    .before(server_send_snapshot_system),
+                step_shadow_blade_system
+                    .after(MobaPhysicsSet::Drive)
+                    .before(server_send_snapshot_system),
                 server_send_snapshot_system.after(MobaPhysicsSet::React),
             ),
         )
@@ -125,7 +132,7 @@ fn main() {
 }
 
 // =============================================================================
-// توابع بدون وابستگی خارجی برای استعلام تیکت از Redis (RESP2) و وب‌هوک جنگو
+// توابع بدون وابستگی خارجی برای استعلام تیکت از Redis (RESP2) و وبهوک جنگو
 // =============================================================================
 
 #[derive(Debug)]
@@ -256,10 +263,12 @@ fn send_initial_configs_and_sync_world(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn server_network_receive_system(
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
     items_config: Res<ItemsConfig>,
+    physics_world: Res<CustomPhysicsWorld>,
     mut net: ResMut<ServerNetwork>,
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
@@ -276,14 +285,12 @@ fn server_network_receive_system(
         match event {
             ServerEvent::ClientConnected { client_id } => {
                 if auth_state.room_id.is_some() {
-                    // حالت تولید (systemd): تا پیش از دریافت و تایید تیکت Redis هیچ جایگاهی اختصاص نمی‌یابد
                     auth_state.pending_auth.insert(client_id, Instant::now());
                     println!(
                         "[AUTH PENDING] کلاینت {} متصل شد؛ در انتظار تیکت Redis...",
                         client_id
                     );
                 } else if match_state.on_client_connected(client_id, &config) {
-                    // حالت تست محلی ۲ آرگومانی
                     if let Some(slot_idx) = match_state.slot_for_client(client_id) {
                         send_initial_configs_and_sync_world(
                             client_id,
@@ -330,7 +337,6 @@ fn server_network_receive_system(
         }
     }
 
-    // اخراج خودکار کلاینت‌هایی که ظرف ۱۰ ثانیه تیکت معتبر ارسال نکرده‌اند
     if auth_state.room_id.is_some() && !auth_state.pending_auth.is_empty() {
         let now = Instant::now();
         let expired: Vec<ClientId> = auth_state
@@ -431,7 +437,6 @@ fn server_network_receive_system(
                         }
                     }
                     _ if !is_authenticated => {
-                        // نادیده گرفتن هرگونه دستور لابی یا بازی از کلاینت احراز هویت نشده
                         continue;
                     }
                     ClientLobbyMessage::SelectHero { hero_id } => {
@@ -546,11 +551,49 @@ fn server_network_receive_system(
                             }
                         }
                     }
+                    ClientLobbyMessage::StartTeleport {
+                        inv_index,
+                        target_pos,
+                        from_minimap,
+                    } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_start_teleport(
+                                    &mut world,
+                                    slot_idx,
+                                    inv_index,
+                                    target_pos,
+                                    from_minimap,
+                                    &config,
+                                    &items_config,
+                                    &physics_world,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::CancelTeleport => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_cancel_teleport(&mut world, slot_idx);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::ActivateShadowBlade { inv_index } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_activate_shadow_blade(
+                                    &mut world,
+                                    slot_idx,
+                                    inv_index,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // ورودی هر بازیکن فقط پس از احراز هویت تیکت به اسلات خودش اعمال می‌شود
         while let Some(bytes) = net_inner
             .server
             .receive_message(client_id, CHANNEL_UNRELIABLE_STATE)
@@ -585,7 +628,6 @@ fn server_match_tick_system(
         );
     }
 
-    // گزارش خودکار نتیجه نهایی مسابقه به بک‌اند جنگو در پایان بازی
     if !auth_state.result_reported {
         if let Some(winner) = world.winning_team {
             auth_state.result_reported = true;
@@ -642,6 +684,7 @@ fn server_match_tick_system(
 fn server_send_snapshot_system(
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
+    items_config: Res<ItemsConfig>,
     mut net: ResMut<ServerNetwork>,
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
@@ -674,10 +717,9 @@ fn server_send_snapshot_system(
     }
 
     if match_state.phase == MatchPhase::InGame {
-        // ارسال Snapshot اختصاصی برای هر بازیکن بر اساس جایگاه، هیرو و مه جنگ تیم خودش
         for p in &match_state.players {
             if let (true, Some(cid)) = (p.connected, p.client_id) {
-                let snap = world.build_snapshot_for_slot(&config, p.slot_index);
+                let snap = world.build_snapshot_for_slot(&config, &items_config, p.slot_index);
                 scratch.serialize_buf.clear();
                 if bincode::serialize_into(&mut scratch.serialize_buf, &snap).is_ok() {
                     net.server.send_message(

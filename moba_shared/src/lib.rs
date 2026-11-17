@@ -2091,6 +2091,28 @@ pub enum GameplayFxEvent {
         target_pos: Vec3,
         shot_dir: Vec3,
     },
+    TeleportStarted {
+        slot_index: usize,
+        origin_pos: Vec3,
+        dest_pos: Vec3,
+    },
+    TeleportCompleted {
+        slot_index: usize,
+        origin_pos: Vec3,
+        dest_pos: Vec3,
+    },
+    TeleportCanceled {
+        slot_index: usize,
+        origin_pos: Vec3,
+    },
+    ShadowBladeActivated {
+        slot_index: usize,
+        pos: Vec3,
+    },
+    ShadowBladeEnded {
+        slot_index: usize,
+        pos: Vec3,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2299,6 +2321,13 @@ pub enum ClientLobbyMessage {
     CourierDeliver,
     CourierReturnToFountain,
     CourierMoveTo { world_pos: Vec3 },
+    StartTeleport {
+        inv_index: usize,
+        target_pos: Vec3,
+        from_minimap: bool,
+    },
+    CancelTeleport,
+    ActivateShadowBlade { inv_index: usize },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2678,6 +2707,16 @@ pub struct CourierSnapshot {
     pub is_visible: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ActiveBuffSnapshot {
+    pub id: String,
+    pub item_id: String,
+    pub label: String,
+    pub remaining_secs: f32,
+    pub total_secs: f32,
+    pub color_rgb: (f32, f32, f32),
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HeroSnapshot {
     pub hero_id: String,
@@ -2720,6 +2759,7 @@ pub struct HeroSnapshot {
     pub deaths: u32,
     pub respawn_remaining: f32,
     pub inventory: Vec<InventoryItemState>,
+    pub tp_slot: Option<InventoryItemState>,
     pub courier_hp: f32,
     pub courier_max_hp: f32,
     pub courier_is_dead: bool,
@@ -2727,6 +2767,38 @@ pub struct HeroSnapshot {
     pub courier_order: CourierOrder,
     pub courier_in_fountain: bool,
     pub courier_inventory: Vec<InventoryItemState>,
+    pub teleport_cooldown_remaining: f32,
+    pub is_teleporting: bool,
+    pub teleport_progress: f32,
+    pub shadow_blade_cooldown_remaining: f32,
+    pub is_invisible: bool,
+    pub invisibility_remaining: f32,
+    pub active_buffs: Vec<ActiveBuffSnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ActiveTeleportSnapshot {
+    pub slot_index: usize,
+    pub team: TeamId,
+    pub hero_id: String,
+    pub model_path: String,
+    pub hero_scale: f32,
+    pub origin_pos: Vec3,
+    pub dest_pos: Vec3,
+    pub facing_dir: Vec3,
+    pub progress: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveTeleportState {
+    pub inv_index: usize,
+    pub origin_pos: Vec3,
+    pub dest_pos: Vec3,
+    pub facing_dir: Vec3,
+    pub elapsed_secs: f32,
+    pub total_secs: f32,
+    pub cancel_on_left_click: bool,
+    pub cancel_on_move: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -2802,6 +2874,8 @@ pub struct RemotePlayerSnapshot {
     pub fire_rate_secs: f32,
     pub weapon_max_range: f32,
     pub inventory: Vec<InventoryItemState>,
+    pub tp_slot: Option<InventoryItemState>,
+    pub is_invisible: bool,
     pub is_visible: bool,
 }
 
@@ -2841,6 +2915,7 @@ pub struct ServerWorldSnapshot {
     pub grenades: Vec<GrenadeSnapshot>,
     pub toxic_pools: Vec<ToxicPoolSnapshot>,
     pub electric_beams: Vec<ElectricBeamSnapshot>,
+    pub active_teleports: Vec<ActiveTeleportSnapshot>,
     pub targets: Vec<TargetSnapshot>,
     pub creeps: Vec<CreepSnapshot>,
     pub couriers: Vec<CourierSnapshot>,
@@ -5735,6 +5810,7 @@ pub struct PlayerSlotState {
     pub kills: u32,
     pub deaths: u32,
     pub inventory: Vec<InventoryItemState>,
+    pub tp_slot: Option<InventoryItemState>,
     pub courier_pos: Vec3,
     pub courier_facing_dir: Vec3,
     pub courier_hp: f32,
@@ -5747,6 +5823,13 @@ pub struct PlayerSlotState {
     pub fog_of_war: SharedFogOfWar,
     pub in_water: bool,
     pub water_splash_cooldown: f32,
+    pub teleport_cooldown_remaining: f32,
+    pub active_teleport: Option<ActiveTeleportState>,
+    pub shadow_blade_cooldown_remaining: f32,
+    pub invisibility_remaining: f32,
+    pub invisibility_total_secs: f32,
+    pub invis_move_speed_bonus_pct: f32,
+    pub is_revealed_by_turret: bool,
     pub traversal: SharedTraversalState,
 }
 
@@ -5830,9 +5913,17 @@ pub struct AuthoritativeWorldState {
     pub kills: u32,
     pub deaths: u32,
     pub inventory: Vec<InventoryItemState>,
+    pub tp_slot: Option<InventoryItemState>,
     pub fog_of_war: SharedFogOfWar,
     pub in_water: bool,
     pub water_splash_cooldown: f32,
+    pub teleport_cooldown_remaining: f32,
+    pub active_teleport: Option<ActiveTeleportState>,
+    pub shadow_blade_cooldown_remaining: f32,
+    pub invisibility_remaining: f32,
+    pub invisibility_total_secs: f32,
+    pub invis_move_speed_bonus_pct: f32,
+    pub is_revealed_by_turret: bool,
     pub traversal: SharedTraversalState,
     pub targets: Vec<SharedTarget>,
     pub targets_visible: Vec<bool>,
@@ -5994,9 +6085,17 @@ impl AuthoritativeWorldState {
             kills: 0,
             deaths: 0,
             inventory: Vec::new(),
+            tp_slot: None,
             fog_of_war,
             in_water: false,
             water_splash_cooldown: 0.0,
+            teleport_cooldown_remaining: 0.0,
+            active_teleport: None,
+            shadow_blade_cooldown_remaining: 0.0,
+            invisibility_remaining: 0.0,
+            invisibility_total_secs: 0.0,
+            invis_move_speed_bonus_pct: 0.0,
+            is_revealed_by_turret: false,
             traversal: SharedTraversalState {
                 is_active: false,
                 kind: TraversalKind::RunningJump,
@@ -6200,9 +6299,17 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.kills, &mut p.kills);
         std::mem::swap(&mut self.deaths, &mut p.deaths);
         std::mem::swap(&mut self.inventory, &mut p.inventory);
+        std::mem::swap(&mut self.tp_slot, &mut p.tp_slot);
         std::mem::swap(&mut self.fog_of_war, &mut p.fog_of_war);
         std::mem::swap(&mut self.in_water, &mut p.in_water);
         std::mem::swap(&mut self.water_splash_cooldown, &mut p.water_splash_cooldown);
+        std::mem::swap(&mut self.teleport_cooldown_remaining, &mut p.teleport_cooldown_remaining);
+        std::mem::swap(&mut self.active_teleport, &mut p.active_teleport);
+        std::mem::swap(&mut self.shadow_blade_cooldown_remaining, &mut p.shadow_blade_cooldown_remaining);
+        std::mem::swap(&mut self.invisibility_remaining, &mut p.invisibility_remaining);
+        std::mem::swap(&mut self.invisibility_total_secs, &mut p.invisibility_total_secs);
+        std::mem::swap(&mut self.invis_move_speed_bonus_pct, &mut p.invis_move_speed_bonus_pct);
+        std::mem::swap(&mut self.is_revealed_by_turret, &mut p.is_revealed_by_turret);
         std::mem::swap(&mut self.traversal, &mut p.traversal);
         self.active_slot = idx;
     }
@@ -6626,6 +6733,7 @@ impl AuthoritativeWorldState {
                 kills: 0,
                 deaths: 0,
                 inventory: Vec::new(),
+                tp_slot: None,
                 courier_pos: Vec3::new(spawn_pos.x, hero.courier.fly_height, spawn_pos.z),
                 courier_facing_dir: facing_dir,
                 courier_hp: hero.courier.max_hp,
@@ -6638,6 +6746,13 @@ impl AuthoritativeWorldState {
                 fog_of_war: SharedFogOfWar::from_config(config, lp.team),
                 in_water: false,
                 water_splash_cooldown: 0.0,
+                teleport_cooldown_remaining: 0.0,
+                active_teleport: None,
+                shadow_blade_cooldown_remaining: 0.0,
+                invisibility_remaining: 0.0,
+                invisibility_total_secs: 0.0,
+                invis_move_speed_bonus_pct: 0.0,
+                is_revealed_by_turret: false,
                 traversal: SharedTraversalState {
                     is_active: false,
                     kind: TraversalKind::RunningJump,
@@ -6658,9 +6773,9 @@ impl AuthoritativeWorldState {
         }
     }
 
-    pub fn build_snapshot_for_slot(&mut self, config: &GameConfig, slot_index: usize) -> ServerWorldSnapshot {
+    pub fn build_snapshot_for_slot(&mut self, config: &GameConfig, items_cfg: &ItemsConfig, slot_index: usize) -> ServerWorldSnapshot {
         if self.players.is_empty() {
-            return self.build_snapshot(config);
+            return self.build_snapshot(config, items_cfg);
         }
         // قبل از swap_slot_in، لیست کامل کارت‌های نوار بالا را از داده‌های واقعی تمام بازیکنان بساز
         let viewer_team = self.players[slot_index].hero_team;
@@ -6739,9 +6854,35 @@ impl AuthoritativeWorldState {
             })
             .collect();
 
+        let active_teleports: Vec<ActiveTeleportSnapshot> = self
+            .players
+            .iter()
+            .filter_map(|p| {
+                if p.hero_team != viewer_team
+                    && p.invisibility_remaining > 0.0
+                    && !p.is_revealed_by_turret
+                {
+                    return None;
+                }
+                let tp = p.active_teleport.as_ref()?;
+                Some(ActiveTeleportSnapshot {
+                    slot_index: p.slot_index,
+                    team: p.hero_team,
+                    hero_id: p.hero_id.clone(),
+                    model_path: p.hero_model_path.clone(),
+                    hero_scale: p.hero_scale,
+                    origin_pos: tp.origin_pos,
+                    dest_pos: tp.dest_pos,
+                    facing_dir: tp.facing_dir,
+                    progress: (tp.elapsed_secs / tp.total_secs.max(0.01)).clamp(0.0, 1.0),
+                })
+            })
+            .collect();
+
         self.swap_slot_in(slot_index);
-        let mut snap = self.build_snapshot(config);
+        let mut snap = self.build_snapshot(config, items_cfg);
         snap.scoreboard_heroes = scoreboard_heroes;
+        snap.active_teleports = active_teleports;
         if let Some(me) = self.players.get(slot_index) {
             snap.hero.courier_hp = me.courier_hp;
             snap.hero.courier_max_hp = me.courier_max_hp;
@@ -6780,8 +6921,12 @@ impl AuthoritativeWorldState {
             if p.slot_index == slot_index {
                 continue;
             }
-            let is_vis = p.hero_team == self.hero_team
-                || self.fog_of_war.is_world_point_visible(config, p.soldier_pos.x, p.soldier_pos.z);
+            let hidden_by_invis = p.hero_team != self.hero_team
+                && p.invisibility_remaining > 0.0
+                && !p.is_revealed_by_turret;
+            let is_vis = !hidden_by_invis
+                && (p.hero_team == self.hero_team
+                    || self.fog_of_war.is_world_point_visible(config, p.soldier_pos.x, p.soldier_pos.z));
             // Server Authority: اگر دشمن در مه جنگ باشد، مختصات و اطلاعات او اصلاً به کلاینت ارسال نمی‌شود!
             if !is_vis {
                 continue;
@@ -6852,6 +6997,8 @@ impl AuthoritativeWorldState {
                     p.hero_weapon.max_range
                 },
                 inventory: p.inventory.clone(),
+                tp_slot: p.tp_slot.clone(),
+                is_invisible: p.invisibility_remaining > 0.0,
                 is_visible: true,
             });
         }
@@ -7008,7 +7155,7 @@ impl AuthoritativeWorldState {
         self.fog_of_war = SharedFogOfWar::from_config(config, hero.team);
     }
 
-    pub fn build_snapshot(&mut self, config: &GameConfig) -> ServerWorldSnapshot {
+    pub fn build_snapshot(&mut self, config: &GameConfig, items_cfg: &ItemsConfig) -> ServerWorldSnapshot {
         self.tick += 1;
         ServerWorldSnapshot {
             tick: self.tick,
@@ -7132,6 +7279,7 @@ impl AuthoritativeWorldState {
                 deaths: self.deaths,
                 respawn_remaining: if self.is_dead { self.respawn_remaining.max(0.0) } else { 0.0 },
                 inventory: self.inventory.clone(),
+                tp_slot: self.tp_slot.clone(),
                 courier_hp: 0.0,
                 courier_max_hp: 1.0,
                 courier_is_dead: false,
@@ -7139,6 +7287,40 @@ impl AuthoritativeWorldState {
                 courier_order: CourierOrder::Idle,
                 courier_in_fountain: false,
                 courier_inventory: Vec::new(),
+                teleport_cooldown_remaining: self.teleport_cooldown_remaining.max(0.0),
+                is_teleporting: self.active_teleport.is_some(),
+                teleport_progress: self
+                    .active_teleport
+                    .as_ref()
+                    .map(|tp| (tp.elapsed_secs / tp.total_secs.max(0.01)).clamp(0.0, 1.0))
+                    .unwrap_or(0.0),
+                shadow_blade_cooldown_remaining: self.shadow_blade_cooldown_remaining.max(0.0),
+                is_invisible: self.invisibility_remaining > 0.0,
+                invisibility_remaining: self.invisibility_remaining.max(0.0),
+                active_buffs: {
+                    let mut buffs = Vec::new();
+                    if let Some(ref tp) = self.active_teleport {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "teleport".to_string(),
+                            item_id: items_cfg.teleport.item_id.clone(),
+                            label: "TELEPORTING".to_string(),
+                            remaining_secs: (tp.total_secs - tp.elapsed_secs).max(0.0),
+                            total_secs: tp.total_secs.max(0.01),
+                            color_rgb: items_cfg.teleport.portal_core_color_rgb,
+                        });
+                    }
+                    if self.invisibility_remaining > 0.0 {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "shadow_blade".to_string(),
+                            item_id: items_cfg.shadow_blade.item_id.clone(),
+                            label: "INVISIBLE".to_string(),
+                            remaining_secs: self.invisibility_remaining.max(0.0),
+                            total_secs: self.invisibility_total_secs.max(0.01),
+                            color_rgb: items_cfg.shadow_blade.buff_bar_color_rgb,
+                        });
+                    }
+                    buffs
+                },
             },
             other_players: Vec::new(),
             top_bar_heroes: Vec::new(),
@@ -7148,6 +7330,7 @@ impl AuthoritativeWorldState {
             grenades: self.grenades_snapshot.clone(),
             toxic_pools: self.toxic_pools_snapshot.clone(),
             electric_beams: self.electric_beams_snapshot.clone(),
+            active_teleports: Vec::new(),
             creeps: Vec::new(),
             couriers: Vec::new(),
             turrets: self
@@ -7397,6 +7580,22 @@ fn trigger_random_death(world: &mut AuthoritativeWorldState, config: &GameConfig
     world.deaths += 1;
     world.death_anim_name = chosen;
     world.respawn_remaining = dota_respawn_secs;
+    if world.invisibility_remaining > 0.0 {
+        world.invisibility_remaining = 0.0;
+        world.invisibility_total_secs = 0.0;
+        world.invis_move_speed_bonus_pct = 0.0;
+        world.is_revealed_by_turret = false;
+        world.pending_fx.push(GameplayFxEvent::ShadowBladeEnded {
+            slot_index: world.active_slot,
+            pos: world.soldier_pos,
+        });
+    }
+    if let Some(tp) = world.active_teleport.take() {
+        world.pending_fx.push(GameplayFxEvent::TeleportCanceled {
+            slot_index: world.active_slot,
+            origin_pos: tp.origin_pos,
+        });
+    }
     world.reload_remaining = None;
     world.grenade_elapsed_and_duration = None;
     world.firing_anim_remaining = None;
@@ -7714,13 +7913,14 @@ fn shared_authoritative_drive_system(
         .players
         .iter()
         .map(|p| {
+            let hidden_invis = p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret;
             (
                 p.slot_index,
                 p.hero_team,
                 p.soldier_pos,
                 p.hero_scale,
                 p.effective_stance,
-                p.is_dead,
+                p.is_dead || hidden_invis,
             )
         })
         .collect();
@@ -7874,6 +8074,32 @@ fn shared_drive_single_player(
 
     // تایمر زنده شدن مجدد در چشمه پایگاه
 
+    if !world.is_dead {
+      if let Some((c_click, c_move)) = world.active_teleport.as_ref().map(|tp| (tp.cancel_on_left_click, tp.cancel_on_move)) {
+        let flat_mv = Vec3::new(input.move_input.x, 0.0, input.move_input.z);
+        let cancel_click = c_click
+            && (input.fire_just_pressed || input.fire_held);
+        let cancel_move = c_move && flat_mv != Vec3::ZERO;
+        if cancel_click || cancel_move {
+            if let Some(tp) = world.active_teleport.take() {
+                world.pending_fx.push(GameplayFxEvent::TeleportCanceled {
+                    slot_index: world.active_slot,
+                    origin_pos: tp.origin_pos,
+                });
+            }
+        } else {
+            world.current_locomotion = "idle".to_string();
+            world.is_moving = false;
+            world.move_input = Vec3::ZERO;
+            world.firing_anim_remaining = None;
+            world.reload_remaining = None;
+            world.active_beam_request = None;
+            controller.translation = Some(Vec3::new(0.0, config.physics.character_gravity_step_y * dt, 0.0));
+            return;
+        }
+      }
+    }
+
     if world.is_dead {
         controller.translation = None;
         world.respawn_remaining -= dt;
@@ -7991,6 +8217,20 @@ fn shared_drive_single_player(
             world.grenade_spawned_for_throw = false;
             world.firing_anim_remaining = None;
             world.reload_remaining = None;
+        }
+
+        if world.invisibility_remaining > 0.0
+            && ((input.fire_just_pressed || input.fire_held) && world.ammo_in_mag > 0
+                || (input.grenade_just_pressed && world.grenade_charges > 0))
+        {
+            world.invisibility_remaining = 0.0;
+            world.invisibility_total_secs = 0.0;
+            world.invis_move_speed_bonus_pct = 0.0;
+            world.is_revealed_by_turret = false;
+            world.pending_fx.push(GameplayFxEvent::ShadowBladeEnded {
+                slot_index: world.active_slot,
+                pos: world.soldier_pos,
+            });
         }
 
         // ۴. تغییر وضعیت نشستن (Ctrl) و راه رفتن (Shift)
@@ -8335,7 +8575,7 @@ fn shared_drive_single_player(
             let is_deep_water = water_depth >= 0.85;
 
             let hero_cfg = config.active_hero(world.hero_index);
-            let hero_move_mult = world.hero_move_speed_multiplier * world.toxic_slow_multiplier;
+            let hero_move_mult = world.hero_move_speed_multiplier * world.toxic_slow_multiplier * if world.invisibility_remaining > 0.0 { 1.0 + world.invis_move_speed_bonus_pct } else { 1.0 };
             let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
             let deep_mult = hero_cfg.deep_water_speed_multiplier;
 
@@ -8394,7 +8634,7 @@ fn shared_drive_single_player(
         } else if !world.traversal.is_active && world.wall_climb_mountain_index.is_none() {
             let grav_y = config.physics.character_gravity_step_y * dt;
             if world.is_moving {
-                let hero_move_mult = world.hero_move_speed_multiplier * world.toxic_slow_multiplier;
+                let hero_move_mult = world.hero_move_speed_multiplier * world.toxic_slow_multiplier * if world.invisibility_remaining > 0.0 { 1.0 + world.invis_move_speed_bonus_pct } else { 1.0 };
                 let speed = match world.effective_stance {
                     Stance::Run => config.soldier.run_speed,
                     Stance::Walk => config.soldier.walk_speed,
@@ -11854,7 +12094,10 @@ fn step_lane_creeps_system(
     let hero_snap: Vec<(TeamId, Vec3, bool)> = world
         .players
         .iter()
-        .map(|p| (p.hero_team, p.soldier_pos, p.is_dead))
+        .map(|p| {
+            let hidden_invis = p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret;
+            (p.hero_team, p.soldier_pos, p.is_dead || hidden_invis)
+        })
         .collect();
     let courier_snap: Vec<(TeamId, Vec3, bool)> = world
         .players
@@ -12355,7 +12598,10 @@ fn step_turrets_system(
     let hero_snap: Vec<(TeamId, Vec3, bool)> = world
         .players
         .iter()
-        .map(|p| (p.hero_team, p.soldier_pos, p.is_dead))
+        .map(|p| {
+            let hidden_invis = p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret;
+            (p.hero_team, p.soldier_pos, p.is_dead || hidden_invis)
+        })
         .collect();
 
     let courier_snap: Vec<(TeamId, Vec3, bool)> = world

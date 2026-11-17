@@ -4,8 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 
 use crate::{
-    fountain_regen_bonus_for_pos, ActiveWeaponSlot, AuthoritativeWorldState, CourierOrder, GameConfig,
-    PlayerSlotState,
+    fountain_regen_bonus_for_pos, sample_camera_focus_y, soldier_collision_groups,
+    ActiveTeleportState, ActiveWeaponSlot, AncientSnapshot, AncientState, AuthoritativeWorldState,
+    BarracksSnapshot, BarracksState, CourierOrder, CustomPhysicsWorld, GameConfig, GameplayFxEvent,
+    PhysicsSoldier, PlayerSlotState, TeamId, TurretSnapshot, TurretState,
 };
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -169,6 +171,13 @@ pub struct ItemModeDef {
     pub stats: ItemStatsModifier,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ItemActiveAbility {
+    None,
+    Teleport,
+    ShadowBlade,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ItemDef {
     pub id: String,
@@ -181,14 +190,66 @@ pub struct ItemDef {
     pub cost: u32,
     pub description: String,
     pub recipe: Vec<String>,
+    pub stackable: bool,
+    pub dedicated_tp_slot: bool,
+    pub active_ability: ItemActiveAbility,
     pub stats: ItemStatsModifier,
     pub modes: Vec<ItemModeDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TeleportConfig {
+    pub item_id: String,
+    pub shortcut_key: String,
+    pub cooldown_secs: f32,
+    pub channel_duration_secs: f32,
+    pub building_teleport_radius: f32,
+    pub min_building_clearance: f32,
+    pub max_click_snap_distance: f32,
+    pub cancel_on_left_click: bool,
+    pub cancel_on_move: bool,
+    pub consume_on_use: bool,
+    pub portal_radius: f32,
+    pub portal_height: f32,
+    pub portal_core_color_rgb: (f32, f32, f32),
+    pub portal_edge_color_rgb: (f32, f32, f32),
+    pub portal_bloom_intensity: f32,
+    pub preview_valid_color_rgb: (f32, f32, f32),
+    pub preview_invalid_color_rgb: (f32, f32, f32),
+    pub illusion_color_rgba: (f32, f32, f32, f32),
+    pub illusion_emissive_rgb: (f32, f32, f32),
+    pub loop_sound: String,
+    pub loop_volume: f32,
+    pub complete_origin_sound: String,
+    pub complete_origin_volume: f32,
+    pub complete_dest_sound: String,
+    pub complete_dest_volume: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ShadowBladeConfig {
+    pub item_id: String,
+    pub duration_secs: f32,
+    pub cooldown_secs: f32,
+    pub invis_move_speed_bonus_pct: f32,
+    pub turret_true_sight_radius: f32,
+    pub water_glass_color_rgba: (f32, f32, f32, f32),
+    pub water_glass_emissive_rgb: (f32, f32, f32),
+    pub water_glass_metallic: f32,
+    pub water_glass_roughness: f32,
+    pub buff_bar_color_rgb: (f32, f32, f32),
+    pub activate_sound: String,
+    pub activate_volume: f32,
+    pub end_sound: String,
+    pub end_volume: f32,
 }
 
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct ItemsConfig {
     pub max_inventory_slots: usize,
     pub sell_refund_ratio: f32,
+    pub teleport: TeleportConfig,
+    pub shadow_blade: ShadowBladeConfig,
     pub items: Vec<ItemDef>,
 }
 
@@ -197,6 +258,7 @@ pub struct InventoryItemState {
     pub item_id: String,
     pub active_mode: usize,
     pub slot: usize,
+    pub count: u32,
 }
 
 impl ItemsConfig {
@@ -225,6 +287,32 @@ impl ItemsConfig {
             "sell_refund_ratio باید بین 0.0 و 1.0 باشد"
         );
         assert!(!self.items.is_empty(), "لیست items در items.ron نمی‌تواند خالی باشد");
+        let tp = &self.teleport;
+        assert!(!tp.item_id.trim().is_empty(), "teleport.item_id در items.ron خالی است");
+        assert!(!tp.shortcut_key.trim().is_empty(), "teleport.shortcut_key در items.ron خالی است");
+        assert!(tp.cooldown_secs >= 0.0, "teleport.cooldown_secs نامعتبر است");
+        assert!(tp.channel_duration_secs > 0.0, "teleport.channel_duration_secs باید مثبت باشد");
+        assert!(tp.building_teleport_radius > 0.0, "teleport.building_teleport_radius باید مثبت باشد");
+        assert!(tp.min_building_clearance >= 0.0, "teleport.min_building_clearance نامعتبر است");
+        assert!(tp.max_click_snap_distance > 0.0, "teleport.max_click_snap_distance باید مثبت باشد");
+        assert!(tp.portal_radius > 0.0, "teleport.portal_radius باید مثبت باشد");
+        assert!(tp.portal_height > 0.0, "teleport.portal_height باید مثبت باشد");
+        assert!(tp.portal_bloom_intensity >= 0.0, "teleport.portal_bloom_intensity نامعتبر است");
+        assert!(!tp.loop_sound.trim().is_empty(), "teleport.loop_sound خالی است");
+        assert!((0.0..=2.0).contains(&tp.loop_volume), "teleport.loop_volume نامعتبر است");
+        assert!(!tp.complete_origin_sound.trim().is_empty(), "teleport.complete_origin_sound خالی است");
+        assert!((0.0..=2.0).contains(&tp.complete_origin_volume), "teleport.complete_origin_volume نامعتبر است");
+        assert!(!tp.complete_dest_sound.trim().is_empty(), "teleport.complete_dest_sound خالی است");
+        assert!((0.0..=2.0).contains(&tp.complete_dest_volume), "teleport.complete_dest_volume نامعتبر است");
+        let sb = &self.shadow_blade;
+        assert!(!sb.item_id.trim().is_empty(), "shadow_blade.item_id خالی است");
+        assert!(sb.duration_secs > 0.0, "shadow_blade.duration_secs باید مثبت باشد");
+        assert!(sb.cooldown_secs >= 0.0, "shadow_blade.cooldown_secs نامعتبر است");
+        assert!(sb.turret_true_sight_radius > 0.0, "shadow_blade.turret_true_sight_radius باید مثبت باشد");
+        assert!(!sb.activate_sound.trim().is_empty(), "shadow_blade.activate_sound خالی است");
+        assert!((0.0..=2.0).contains(&sb.activate_volume), "shadow_blade.activate_volume نامعتبر است");
+        assert!(!sb.end_sound.trim().is_empty(), "shadow_blade.end_sound خالی است");
+        assert!((0.0..=2.0).contains(&sb.end_volume), "shadow_blade.end_volume نامعتبر است");
 
         let mut seen = HashSet::new();
         let mut cost_map = HashMap::new();
@@ -487,7 +575,46 @@ pub fn try_buy_item(
     let hero_cfg = config.active_hero(p.hero_index);
     let in_fountain = !p.is_dead && fountain_regen_bonus_for_pos(config, p.hero_team, p.soldier_pos) > 0.0;
 
+    let Some(item_def) = items_cfg.get_item(item_id) else {
+        return false;
+    };
+
     if in_fountain {
+        // اگر آیتم مخصوص اسلات دایره‌ای تلپورت است
+        if item_def.dedicated_tp_slot {
+            if p.hero_gold >= item_def.cost {
+                if let Some(ref mut tp_item) = p.tp_slot {
+                    if tp_item.item_id == item_id && item_def.stackable {
+                        p.hero_gold -= item_def.cost;
+                        tp_item.count = tp_item.count.saturating_add(1);
+                        return true;
+                    }
+                } else {
+                    p.hero_gold -= item_def.cost;
+                    p.tp_slot = Some(InventoryItemState {
+                        item_id: item_id.to_string(),
+                        active_mode: 0,
+                        slot: 0,
+                        count: 1,
+                    });
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // اگر آیتم معمولی استک‌پذیر است و قبلاً در اینونتوری وجود دارد
+        if item_def.stackable {
+            if let Some(existing) = p.inventory.iter_mut().find(|it| it.item_id == item_id) {
+                if p.hero_gold >= item_def.cost {
+                    p.hero_gold -= item_def.cost;
+                    existing.count = existing.count.saturating_add(1);
+                    return true;
+                }
+                return false;
+            }
+        }
+
         if let Some((cost_to_pay, mut consumed_indices)) =
             items_cfg.effective_purchase_cost(item_id, &p.inventory)
         {
@@ -505,6 +632,7 @@ pub fn try_buy_item(
                     item_id: item_id.to_string(),
                     active_mode: 0,
                     slot: free_slot,
+                    count: 1,
                 });
                 recompute_player_slot_stats(p, config, items_cfg);
                 return true;
@@ -513,6 +641,17 @@ pub fn try_buy_item(
     }
 
     // خرید از راه دور یا زمانی که اینونتوری هیرو پر است -> قرارگیری در اینونتوری Courier
+    if item_def.stackable {
+        if let Some(existing) = p.courier_inventory.iter_mut().find(|it| it.item_id == item_id) {
+            if p.hero_gold >= item_def.cost {
+                p.hero_gold -= item_def.cost;
+                existing.count = existing.count.saturating_add(1);
+                return true;
+            }
+            return false;
+        }
+    }
+
     let courier_max_slots = hero_cfg.courier.inventory_slots;
     let Some((cost_to_pay, mut consumed_indices)) =
         items_cfg.effective_purchase_cost(item_id, &p.courier_inventory)
@@ -539,6 +678,7 @@ pub fn try_buy_item(
         item_id: item_id.to_string(),
         active_mode: 0,
         slot: free_slot,
+        count: 1,
     });
     true
 }
@@ -577,11 +717,28 @@ pub fn try_sell_item(
     if p.is_dead || fountain_regen_bonus_for_pos(config, p.hero_team, p.soldier_pos) <= 0.0 {
         return false;
     }
+    if inv_index == usize::MAX {
+        let Some(ref mut tp_item) = p.tp_slot else {
+            return false;
+        };
+        let refund = items_cfg.sell_price(&tp_item.item_id);
+        if tp_item.count > 1 {
+            tp_item.count -= 1;
+        } else {
+            p.tp_slot = None;
+        }
+        p.hero_gold = p.hero_gold.saturating_add(refund);
+        return true;
+    }
     let Some(pos) = p.inventory.iter().position(|it| it.slot == inv_index) else {
         return false;
     };
-    let removed = p.inventory.remove(pos);
-    let refund = items_cfg.sell_price(&removed.item_id);
+    let refund = items_cfg.sell_price(&p.inventory[pos].item_id);
+    if p.inventory[pos].count > 1 {
+        p.inventory[pos].count -= 1;
+    } else {
+        p.inventory.remove(pos);
+    }
     p.hero_gold = p.hero_gold.saturating_add(refund);
     recompute_player_slot_stats(p, config, items_cfg);
     true
@@ -785,7 +942,36 @@ pub fn step_couriers_system(
                     let mut transferred_any = false;
                     let mut remaining = Vec::new();
                     for mut c_item in p.courier_inventory.drain(..) {
-                        if let Some(free_slot) = (0..items_cfg.max_inventory_slots)
+                        let def_opt = items_cfg.get_item(&c_item.item_id);
+                        let is_tp = def_opt.is_some_and(|d| d.dedicated_tp_slot);
+                        let is_stack = def_opt.is_some_and(|d| d.stackable);
+                        if is_tp {
+                            if let Some(ref mut tp_item) = p.tp_slot {
+                                if tp_item.item_id == c_item.item_id && is_stack {
+                                    tp_item.count = tp_item.count.saturating_add(c_item.count);
+                                    transferred_any = true;
+                                } else {
+                                    remaining.push(c_item);
+                                }
+                            } else {
+                                c_item.slot = 0;
+                                p.tp_slot = Some(c_item);
+                                transferred_any = true;
+                            }
+                        } else if is_stack {
+                            if let Some(existing) = p.inventory.iter_mut().find(|it| it.item_id == c_item.item_id) {
+                                existing.count = existing.count.saturating_add(c_item.count);
+                                transferred_any = true;
+                            } else if let Some(free_slot) = (0..items_cfg.max_inventory_slots)
+                                .find(|s| !p.inventory.iter().any(|it| it.slot == *s))
+                            {
+                                c_item.slot = free_slot;
+                                p.inventory.push(c_item);
+                                transferred_any = true;
+                            } else {
+                                remaining.push(c_item);
+                            }
+                        } else if let Some(free_slot) = (0..items_cfg.max_inventory_slots)
                             .find(|s| !p.inventory.iter().any(|it| it.slot == *s))
                         {
                             c_item.slot = free_slot;
@@ -812,5 +998,482 @@ pub fn step_couriers_system(
         } else {
             p.courier_pos.y = fly_y;
         }
+    }
+}
+
+/// پیدا کردن نقطه فرود معتبر تلپورت در شعاع مشخصی از آبجکت‌های تیم خودی (تاورها، باراکس، انشنت، چشمه)
+pub fn resolve_teleport_destination(
+    config: &GameConfig,
+    items_cfg: &ItemsConfig,
+    turrets: &[TurretState],
+    barracks: &[BarracksState],
+    ancients: &[AncientState],
+    team: TeamId,
+    requested_pos: Vec3,
+    from_minimap: bool,
+) -> Option<Vec3> {
+    if team == TeamId::Neutral {
+        return None;
+    }
+
+    let mut best: Option<(f32, Vec3, f32, bool)> = None;
+
+    for t in turrets {
+        if t.team != team || t.is_dead {
+            continue;
+        }
+        let t_def = &config.map.turrets[t.index];
+        let s = t_def.model_transform.scale_vec();
+        let rad = t_def.base_radius * s.x.max(s.z);
+        let d = Vec2::new(requested_pos.x - t.pos.x, requested_pos.z - t.pos.z).length();
+        if best.map_or(true, |(bd, _, _, _)| d < bd) {
+            best = Some((d, t.pos, rad, false));
+        }
+    }
+
+    for b in barracks {
+        if b.team != team || b.is_dead {
+            continue;
+        }
+        let b_def = &config.map.barracks[b.index];
+        let s = b_def.model_transform.scale_vec();
+        let rad = 0.5 * (b_def.size.0 * s.x).max(b_def.size.2 * s.z);
+        let d = Vec2::new(requested_pos.x - b.pos.x, requested_pos.z - b.pos.z).length();
+        if best.map_or(true, |(bd, _, _, _)| d < bd) {
+            best = Some((d, b.pos, rad, false));
+        }
+    }
+
+    for a in ancients {
+        if a.team != team || a.is_dead {
+            continue;
+        }
+        let a_def = &config.map.ancients[a.index];
+        let s = a_def.model_transform.scale_vec();
+        let rad = 0.5 * (a_def.base_size.0 * s.x).max(a_def.base_size.2 * s.z);
+        let d = Vec2::new(requested_pos.x - a.pos.x, requested_pos.z - a.pos.z).length();
+        if best.map_or(true, |(bd, _, _, _)| d < bd) {
+            best = Some((d, a.pos, rad, false));
+        }
+    }
+
+    for ftn in &config.map.fountains {
+        if ftn.team != team {
+            continue;
+        }
+        let f_pos = ftn.model_transform.location_vec();
+        let d = Vec2::new(requested_pos.x - f_pos.x, requested_pos.z - f_pos.z).length();
+        if best.map_or(true, |(bd, _, _, _)| d < bd) {
+            best = Some((d, f_pos, 0.0, true));
+        }
+    }
+
+    let (dist_xz, b_pos, b_rad, is_fountain) = best?;
+    if !from_minimap && dist_xz > items_cfg.teleport.max_click_snap_distance {
+        return None;
+    }
+
+    let raw_dir = Vec2::new(requested_pos.x - b_pos.x, requested_pos.z - b_pos.z);
+    let dir_xz = if raw_dir.length_squared() > 1e-4 {
+        raw_dir.normalize()
+    } else {
+        let to_center = Vec2::new(-b_pos.x, -b_pos.z);
+        if to_center.length_squared() > 1e-4 {
+            to_center.normalize()
+        } else {
+            Vec2::X
+        }
+    };
+
+    let min_clear = if is_fountain {
+        0.0
+    } else {
+        items_cfg
+            .teleport
+            .min_building_clearance
+            .max(b_rad + config.soldier.player_radius + 0.35)
+    };
+    let max_r = items_cfg.teleport.building_teleport_radius.max(min_clear);
+    let clamped_r = dist_xz.clamp(min_clear, max_r);
+    let final_x = b_pos.x + dir_xz.x * clamped_r;
+    let final_z = b_pos.z + dir_xz.y * clamped_r;
+    let final_y = sample_camera_focus_y(config, final_x, final_z);
+
+    Some(Vec3::new(final_x, final_y, final_z))
+}
+
+
+/// نسخه مشترک محاسبه مقصد تلپورت برای پیش‌نمایش کلاینت از روی Snapshotها (بدون تکرار منطق)
+pub fn resolve_teleport_destination_from_snapshots(
+    config: &GameConfig,
+    items_cfg: &ItemsConfig,
+    turrets: &[TurretSnapshot],
+    barracks: &[BarracksSnapshot],
+    ancients: &[AncientSnapshot],
+    team: TeamId,
+    requested_pos: Vec3,
+    from_minimap: bool,
+) -> Option<Vec3> {
+    if team == TeamId::Neutral {
+        return None;
+    }
+
+    let mut best: Option<(f32, Vec3, f32, bool)> = None;
+
+    for t in turrets {
+        if t.team != team || t.is_dead {
+            continue;
+        }
+        let Some(t_def) = config.map.turrets.get(t.index) else {
+            continue;
+        };
+        let t_pos = t_def.model_transform.location_vec();
+        let s = t_def.model_transform.scale_vec();
+        let rad = t_def.base_radius * s.x.max(s.z);
+        let d = Vec2::new(requested_pos.x - t_pos.x, requested_pos.z - t_pos.z).length();
+        if best.map_or(true, |(bd, _, _, _)| d < bd) {
+            best = Some((d, t_pos, rad, false));
+        }
+    }
+
+    for b in barracks {
+        if b.team != team || b.is_dead {
+            continue;
+        }
+        let Some(b_def) = config.map.barracks.get(b.index) else {
+            continue;
+        };
+        let b_pos = b_def.model_transform.location_vec();
+        let s = b_def.model_transform.scale_vec();
+        let rad = 0.5 * (b_def.size.0 * s.x).max(b_def.size.2 * s.z);
+        let d = Vec2::new(requested_pos.x - b_pos.x, requested_pos.z - b_pos.z).length();
+        if best.map_or(true, |(bd, _, _, _)| d < bd) {
+            best = Some((d, b_pos, rad, false));
+        }
+    }
+
+    for a in ancients {
+        if a.team != team || a.is_dead {
+            continue;
+        }
+        let Some(a_def) = config.map.ancients.get(a.index) else {
+            continue;
+        };
+        let a_pos = a_def.model_transform.location_vec();
+        let s = a_def.model_transform.scale_vec();
+        let rad = 0.5 * (a_def.base_size.0 * s.x).max(a_def.base_size.2 * s.z);
+        let d = Vec2::new(requested_pos.x - a_pos.x, requested_pos.z - a_pos.z).length();
+        if best.map_or(true, |(bd, _, _, _)| d < bd) {
+            best = Some((d, a_pos, rad, false));
+        }
+    }
+
+    for ftn in &config.map.fountains {
+        if ftn.team != team {
+            continue;
+        }
+        let f_pos = ftn.model_transform.location_vec();
+        let d = Vec2::new(requested_pos.x - f_pos.x, requested_pos.z - f_pos.z).length();
+        if best.map_or(true, |(bd, _, _, _)| d < bd) {
+            best = Some((d, f_pos, 0.0, true));
+        }
+    }
+
+    let (dist_xz, b_pos, b_rad, is_fountain) = best?;
+    if !from_minimap && dist_xz > items_cfg.teleport.max_click_snap_distance {
+        return None;
+    }
+
+    let raw_dir = Vec2::new(requested_pos.x - b_pos.x, requested_pos.z - b_pos.z);
+    let dir_xz = if raw_dir.length_squared() > 1e-4 {
+        raw_dir.normalize()
+    } else {
+        let to_center = Vec2::new(-b_pos.x, -b_pos.z);
+        if to_center.length_squared() > 1e-4 {
+            to_center.normalize()
+        } else {
+            Vec2::X
+        }
+    };
+
+    let min_clear = if is_fountain {
+        0.0
+    } else {
+        items_cfg
+            .teleport
+            .min_building_clearance
+            .max(b_rad + config.soldier.player_radius + 0.35)
+    };
+    let max_r = items_cfg.teleport.building_teleport_radius.max(min_clear);
+    let clamped_r = dist_xz.clamp(min_clear, max_r);
+    let final_x = b_pos.x + dir_xz.x * clamped_r;
+    let final_z = b_pos.z + dir_xz.y * clamped_r;
+    let final_y = sample_camera_focus_y(config, final_x, final_z);
+
+    Some(Vec3::new(final_x, final_y, final_z))
+}
+
+/// شروع تلپورت توسط سرور (بررسی مالکیت آیتم، کولدان ۶۰ ثانیه و اعتبار مقصد)
+pub fn try_start_teleport(
+    world: &mut AuthoritativeWorldState,
+    slot_index: usize,
+    inv_index: usize,
+    target_pos: Vec3,
+    from_minimap: bool,
+    config: &GameConfig,
+    items_cfg: &ItemsConfig,
+    physics_world: &CustomPhysicsWorld,
+) -> bool {
+    if world.winning_team.is_some() {
+        return false;
+    }
+    let Some(p) = world.players.get(slot_index) else {
+        return false;
+    };
+    if p.is_dead || p.traversal.is_active || p.wall_climb_mountain_index.is_some() {
+        return false;
+    }
+    if p.teleport_cooldown_remaining > 0.0 || p.active_teleport.is_some() {
+        return false;
+    }
+    let tp_item_opt = p
+        .tp_slot
+        .as_ref()
+        .filter(|it| it.count > 0)
+        .or_else(|| p.inventory.iter().find(|it| it.slot == inv_index && it.count > 0));
+    let Some(inv_item) = tp_item_opt else {
+        return false;
+    };
+    let Some(item_def) = items_cfg.get_item(&inv_item.item_id) else {
+        return false;
+    };
+    if item_def.active_ability != ItemActiveAbility::Teleport {
+        return false;
+    }
+
+    let Some(mut dest_pos) = resolve_teleport_destination(
+        config,
+        items_cfg,
+        &world.turrets,
+        &world.barracks,
+        &world.ancients,
+        p.hero_team,
+        target_pos,
+        from_minimap,
+    ) else {
+        return false;
+    };
+
+    if let Some((_, hit)) = physics_world.cast_ray(
+        Vec3::new(dest_pos.x, dest_pos.y + 12.0, dest_pos.z),
+        Vec3::NEG_Y,
+        24.0,
+        soldier_collision_groups(),
+        |_| true,
+    ) {
+        if hit.normal.y > 0.5 {
+            dest_pos.y = hit.point.y;
+        }
+    }
+
+    let origin_pos = p.soldier_pos;
+    let facing = Vec3::new(dest_pos.x - origin_pos.x, 0.0, dest_pos.z - origin_pos.z)
+        .normalize_or_zero();
+    let facing_dir = if facing == Vec3::ZERO {
+        p.soldier_facing_dir
+    } else {
+        facing
+    };
+
+    if let Some(p_mut) = world.players.get_mut(slot_index) {
+        p_mut.active_teleport = Some(ActiveTeleportState {
+            inv_index,
+            origin_pos,
+            dest_pos,
+            facing_dir,
+            elapsed_secs: 0.0,
+            total_secs: items_cfg.teleport.channel_duration_secs,
+            cancel_on_left_click: items_cfg.teleport.cancel_on_left_click,
+            cancel_on_move: items_cfg.teleport.cancel_on_move,
+        });
+        p_mut.reload_remaining = None;
+        p_mut.firing_anim_remaining = None;
+        p_mut.active_beam_request = None;
+    }
+
+    world.pending_fx.push(GameplayFxEvent::TeleportStarted {
+        slot_index,
+        origin_pos,
+        dest_pos,
+    });
+    true
+}
+
+/// لغو تلپورت فعال (مثلاً با کلیک چپ یا تیراندازی)
+pub fn try_cancel_teleport(world: &mut AuthoritativeWorldState, slot_index: usize) -> bool {
+    let Some(p) = world.players.get_mut(slot_index) else {
+        return false;
+    };
+    let Some(tp) = p.active_teleport.take() else {
+        return false;
+    };
+    world.pending_fx.push(GameplayFxEvent::TeleportCanceled {
+        slot_index,
+        origin_pos: tp.origin_pos,
+    });
+    true
+}
+
+/// به‌روزرسانی تایمر کولدان و چنلینگ تلپورت در سرور (۶۰ هرتز)
+pub fn step_teleports_system(
+    time: Res<Time<Fixed>>,
+    config: Res<GameConfig>,
+    items_cfg: Res<ItemsConfig>,
+    mut world: ResMut<AuthoritativeWorldState>,
+    mut soldier_q: Query<(&PhysicsSoldier, &mut Transform)>,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+
+    let mut completed_slots: Vec<(usize, Vec3, Vec3, usize)> = Vec::new();
+
+    for p in &mut world.players {
+        if p.teleport_cooldown_remaining > 0.0 {
+            p.teleport_cooldown_remaining = (p.teleport_cooldown_remaining - dt).max(0.0);
+        }
+
+        if let Some(ref mut tp) = p.active_teleport {
+            tp.elapsed_secs += dt;
+            if tp.elapsed_secs >= tp.total_secs {
+                let origin_pos = tp.origin_pos;
+                let dest_pos = tp.dest_pos;
+                let facing_dir = tp.facing_dir;
+                let inv_idx = tp.inv_index;
+                p.active_teleport = None;
+                p.teleport_cooldown_remaining = items_cfg.teleport.cooldown_secs;
+                p.soldier_pos = dest_pos;
+                p.soldier_facing_dir = facing_dir;
+
+                if items_cfg.teleport.consume_on_use {
+                    if let Some(ref mut tp_item) = p.tp_slot {
+                        if tp_item.count > 1 {
+                            tp_item.count -= 1;
+                        } else {
+                            p.tp_slot = None;
+                        }
+                    } else if let Some(pos) = p.inventory.iter().position(|it| it.slot == inv_idx) {
+                        if p.inventory[pos].count > 1 {
+                            p.inventory[pos].count -= 1;
+                        } else {
+                            p.inventory.remove(pos);
+                            recompute_player_slot_stats(p, &config, &items_cfg);
+                        }
+                    }
+                }
+                completed_slots.push((p.slot_index, origin_pos, dest_pos, inv_idx));
+            }
+        }
+    }
+
+    for (slot_idx, origin_pos, dest_pos, _) in completed_slots {
+        for (ps, mut tf) in &mut soldier_q {
+            if ps.slot_index == slot_idx {
+                let scale = world.players.get(slot_idx).map(|p| p.hero_scale).unwrap_or(1.0);
+                tf.translation = dest_pos
+                    + Vec3::Y * (config.physics.soldier_capsule_center_y * scale);
+                break;
+            }
+        }
+        world.pending_fx.push(GameplayFxEvent::TeleportCompleted {
+            slot_index: slot_idx,
+            origin_pos,
+            dest_pos,
+        });
+    }
+}
+
+
+/// فعال‌سازی آیتم Shadow Blade توسط سرور (غیب شدن هیرو + بونوس سرعت)
+pub fn try_activate_shadow_blade(
+    world: &mut AuthoritativeWorldState,
+    slot_index: usize,
+    inv_index: usize,
+    items_cfg: &ItemsConfig,
+) -> bool {
+    if world.winning_team.is_some() {
+        return false;
+    }
+    let Some(p) = world.players.get_mut(slot_index) else {
+        return false;
+    };
+    if p.is_dead || p.shadow_blade_cooldown_remaining > 0.0 || p.invisibility_remaining > 0.0 {
+        return false;
+    }
+    let Some(inv_item) = p.inventory.iter().find(|it| it.slot == inv_index) else {
+        return false;
+    };
+    let Some(def) = items_cfg.get_item(&inv_item.item_id) else {
+        return false;
+    };
+    if def.active_ability != ItemActiveAbility::ShadowBlade {
+        return false;
+    }
+    let sb = &items_cfg.shadow_blade;
+    p.invisibility_remaining = sb.duration_secs;
+    p.invisibility_total_secs = sb.duration_secs;
+    p.invis_move_speed_bonus_pct = sb.invis_move_speed_bonus_pct;
+    p.shadow_blade_cooldown_remaining = sb.cooldown_secs;
+    let pos = p.soldier_pos;
+    world.pending_fx.push(GameplayFxEvent::ShadowBladeActivated { slot_index, pos });
+    true
+}
+
+/// به‌روزرسانی تایمر غیبی، کولدان Shadow Blade و تشخیص دید واقعی (True Sight) توسط Turretهای دشمن
+pub fn step_shadow_blade_system(
+    time: Res<Time<Fixed>>,
+    items_cfg: Res<ItemsConfig>,
+    mut world: ResMut<AuthoritativeWorldState>,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 || world.winning_team.is_some() {
+        return;
+    }
+    let true_sight_r = items_cfg.shadow_blade.turret_true_sight_radius;
+    let mut ended_slots: Vec<(usize, Vec3)> = Vec::new();
+    let turrets_snapshot: Vec<(TeamId, Vec3, bool)> = world
+        .turrets
+        .iter()
+        .map(|t| (t.team, t.pos, t.is_dead))
+        .collect();
+
+    for p in &mut world.players {
+        if p.shadow_blade_cooldown_remaining > 0.0 {
+            p.shadow_blade_cooldown_remaining = (p.shadow_blade_cooldown_remaining - dt).max(0.0);
+        }
+        if p.invisibility_remaining > 0.0 {
+            p.is_revealed_by_turret = turrets_snapshot.iter().any(|&(t_team, t_pos, t_dead)| {
+                !t_dead
+                    && t_team != p.hero_team
+                    && Vec2::new(p.soldier_pos.x - t_pos.x, p.soldier_pos.z - t_pos.z).length()
+                        <= true_sight_r
+            });
+            p.invisibility_remaining = (p.invisibility_remaining - dt).max(0.0);
+            if p.invisibility_remaining <= 0.0 {
+                p.invisibility_total_secs = 0.0;
+                p.invis_move_speed_bonus_pct = 0.0;
+                p.is_revealed_by_turret = false;
+                ended_slots.push((p.slot_index, p.soldier_pos));
+            }
+        } else {
+            p.is_revealed_by_turret = false;
+        }
+    }
+
+    for (slot_index, pos) in ended_slots {
+        world
+            .pending_fx
+            .push(GameplayFxEvent::ShadowBladeEnded { slot_index, pos });
     }
 }

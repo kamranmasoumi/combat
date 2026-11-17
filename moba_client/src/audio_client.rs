@@ -1,6 +1,6 @@
 use bevy::audio::{SpatialListener, Volume};
 use bevy::prelude::*;
-use moba_shared::{GameConfig, ImpactSurface, ShotAudioSource, WeaponKind};
+use moba_shared::{GameConfig, ImpactSurface, ItemsConfig, ShotAudioSource, WeaponKind};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -152,6 +152,26 @@ pub enum ClientAudioEvent {
     ShopBuy,
     ShopCombine,
     ShopSell,
+    TeleportLoopStart {
+        slot_index: usize,
+        origin_pos: Vec3,
+        dest_pos: Vec3,
+    },
+    TeleportLoopStop {
+        slot_index: usize,
+    },
+    TeleportCompleteOrigin {
+        pos: Vec3,
+    },
+    TeleportCompleteDest {
+        pos: Vec3,
+    },
+    ShadowBladeActivate {
+        pos: Vec3,
+    },
+    ShadowBladeEnd {
+        pos: Vec3,
+    },
 }
 
 #[derive(Resource, Default)]
@@ -215,6 +235,13 @@ struct CreepMarchLoop;
 
 #[derive(Component)]
 struct SwingAirLoop;
+
+#[derive(Component)]
+struct TeleportLoopAudio {
+    slot_index: usize,
+    origin_pos: Vec3,
+    dest_pos: Vec3,
+}
 
 #[derive(Component)]
 struct AmbientZoneLoop {
@@ -373,12 +400,14 @@ fn process_audio_events_system(
     mut commands: Commands,
     time: Res<Time>,
     config: Res<GameConfig>,
+    items_cfg: Res<ItemsConfig>,
     asset_server: Res<AssetServer>,
     mut cache: ResMut<AudioAssetCache>,
     settings: Res<AudioSettingsState>,
     ctx: Res<AudioFrameContext>,
     mut queue: ResMut<AudioEventQueue>,
     mut timers: ResMut<AudioRuntimeTimers>,
+    teleport_loops_q: Query<(Entity, &TeleportLoopAudio)>,
 ) {
     timers.creep_window_timer += time.delta_secs();
     if timers.creep_window_timer >= 0.25 {
@@ -607,6 +636,118 @@ fn process_audio_events_system(
             ClientAudioEvent::ShopSell => {
                 play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_sell_sound, a.shop_sell_volume);
             }
+            ClientAudioEvent::TeleportLoopStart {
+                slot_index,
+                origin_pos,
+                dest_pos,
+            } => {
+                for (ent, tloop) in teleport_loops_q.iter() {
+                    if tloop.slot_index == slot_index {
+                        commands.entity(ent).despawn();
+                    }
+                }
+                let tp_cfg = &items_cfg.teleport;
+                if let Some(handle) = cache.get_or_load(&tp_cfg.loop_sound, &asset_server) {
+                    let d_orig = ctx.listener_pos.distance(origin_pos);
+                    let d_dest = ctx.listener_pos.distance(dest_pos);
+                    let (closest_pos, dist) = if d_orig <= d_dest {
+                        (origin_pos, d_orig)
+                    } else {
+                        (dest_pos, d_dest)
+                    };
+                    let atten = if dist < a.max_hearing_distance {
+                        (1.0 - dist / a.max_hearing_distance).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let vol = settings.effective_gain(AudioCategory::Units, duck)
+                        * atten
+                        * tp_cfg.loop_volume;
+                    commands.spawn((
+                        TeleportLoopAudio {
+                            slot_index,
+                            origin_pos,
+                            dest_pos,
+                        },
+                        AudioPlayer::new(handle),
+                        PlaybackSettings::LOOP
+                            .with_volume(Volume::Linear(vol))
+                            .with_spatial(true),
+                        Transform::from_translation(closest_pos * a.spatial_scale),
+                    ));
+                }
+            }
+            ClientAudioEvent::TeleportLoopStop { slot_index } => {
+                for (ent, tloop) in teleport_loops_q.iter() {
+                    if tloop.slot_index == slot_index {
+                        commands.entity(ent).despawn();
+                    }
+                }
+            }
+            ClientAudioEvent::TeleportCompleteOrigin { pos } => {
+                let tp_cfg = &items_cfg.teleport;
+                play_spatial_sound(
+                    &mut commands,
+                    &asset_server,
+                    &mut cache,
+                    &settings,
+                    &config,
+                    ctx.listener_pos,
+                    pos,
+                    duck,
+                    AudioCategory::Units,
+                    &tp_cfg.complete_origin_sound,
+                    tp_cfg.complete_origin_volume,
+                );
+            }
+            ClientAudioEvent::TeleportCompleteDest { pos } => {
+                let tp_cfg = &items_cfg.teleport;
+                play_spatial_sound(
+                    &mut commands,
+                    &asset_server,
+                    &mut cache,
+                    &settings,
+                    &config,
+                    ctx.listener_pos,
+                    pos,
+                    duck,
+                    AudioCategory::Units,
+                    &tp_cfg.complete_dest_sound,
+                    tp_cfg.complete_dest_volume,
+                );
+            }
+            ClientAudioEvent::ShadowBladeActivate { pos } => {
+                let sb_cfg = &items_cfg.shadow_blade;
+                play_spatial_sound(
+                    &mut commands,
+                    &asset_server,
+                    &mut cache,
+                    &settings,
+                    &config,
+                    ctx.listener_pos,
+                    pos,
+                    duck,
+                    AudioCategory::Units,
+                    &sb_cfg.activate_sound,
+                    sb_cfg.activate_volume,
+                );
+            }
+            ClientAudioEvent::ShadowBladeEnd { pos } => {
+                let sb_cfg = &items_cfg.shadow_blade;
+                play_spatial_sound(
+                    &mut commands,
+                    &asset_server,
+                    &mut cache,
+                    &settings,
+                    &config,
+                    ctx.listener_pos,
+                    pos,
+                    duck,
+                    AudioCategory::Units,
+                    &sb_cfg.end_sound,
+                    sb_cfg.end_volume,
+                );
+            }
         }
     }
 }
@@ -738,6 +879,7 @@ fn update_locomotion_and_low_hp_audio_system(
 fn update_loops_and_ambient_zones_system(
     mut commands: Commands,
     config: Res<GameConfig>,
+    items_cfg: Res<ItemsConfig>,
     asset_server: Res<AssetServer>,
     mut cache: ResMut<AudioAssetCache>,
     settings: Res<AudioSettingsState>,
@@ -747,7 +889,8 @@ fn update_loops_and_ambient_zones_system(
     mut courier_loop_q: Query<(&mut Transform, Option<&mut SpatialAudioSink>), (With<CourierFlyLoop>, Without<SpatialListener>, Without<CreepMarchLoop>)>,
     mut creep_loop_q: Query<(&mut Transform, Option<&mut SpatialAudioSink>), (With<CreepMarchLoop>, Without<SpatialListener>, Without<CourierFlyLoop>)>,
     mut ambient_q: Query<(&AmbientZoneLoop, Option<&mut AudioSink>), Without<SwingAirLoop>>,
-    mut swing_air_q: Query<Option<&mut AudioSink>, (With<SwingAirLoop>, Without<AmbientZoneLoop>)>,
+    mut swing_air_q: Query<Option<&mut AudioSink>, (With<SwingAirLoop>, Without<AmbientZoneLoop>, Without<TeleportLoopAudio>)>,
+    mut teleport_loop_q: Query<(&TeleportLoopAudio, &mut Transform, Option<&mut SpatialAudioSink>), (Without<SpatialListener>, Without<CourierFlyLoop>, Without<CreepMarchLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>)>,
 ) {
     let a = &config.audio;
     let duck = if timers.low_hp_duck_factor > 0.0 {
@@ -896,6 +1039,30 @@ fn update_loops_and_ambient_zones_system(
         };
         if let Some(mut sink) = sink_opt {
             sink.set_volume(Volume::Linear(vol));
+        }
+    }
+
+    // ۶. لوپ صدای در حال تلپورت بر اساس فاصله قاب دوربین از مبدا یا مقصد (هر کدام نزدیک‌تر است)
+    for (tloop, mut tf, sink_opt) in &mut teleport_loop_q {
+        let mut target_vol = 0.0_f32;
+        if ctx.in_game {
+            let d_orig = ctx.listener_pos.distance(tloop.origin_pos);
+            let d_dest = ctx.listener_pos.distance(tloop.dest_pos);
+            let (closest_pos, dist) = if d_orig <= d_dest {
+                (tloop.origin_pos, d_orig)
+            } else {
+                (tloop.dest_pos, d_dest)
+            };
+            tf.translation = closest_pos * a.spatial_scale;
+            if dist < a.max_hearing_distance {
+                let atten = (1.0 - dist / a.max_hearing_distance).clamp(0.0, 1.0);
+                target_vol = settings.effective_gain(AudioCategory::Units, duck)
+                    * atten
+                    * items_cfg.teleport.loop_volume;
+            }
+        }
+        if let Some(mut sink) = sink_opt {
+            sink.set_volume(Volume::Linear(target_vol));
         }
     }
 }

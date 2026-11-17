@@ -413,6 +413,34 @@ struct WaterExplosionUniforms {
     params: Vec4,
 }
 
+#[derive(ShaderType, Debug, Clone)]
+pub struct TeleportPortalUniforms {
+    pub core_color: Vec4,
+    pub edge_color: Vec4,
+    pub params: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct TeleportPortalMaterial {
+    #[uniform(0)]
+    pub uniforms: TeleportPortalUniforms,
+}
+
+impl Material for TeleportPortalMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/vfx_teleport_portal.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Add
+    }
+}
+
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 struct WaterExplosionMaterial {
     #[uniform(0)]
@@ -661,6 +689,7 @@ impl Plugin for MobaVfxPlugin {
             .add_plugins(MaterialPlugin::<BloodSplatterMaterial>::default())
             .add_plugins(MaterialPlugin::<ExplosionFireballMaterial>::default())
             .add_plugins(MaterialPlugin::<WaterExplosionMaterial>::default())
+            .add_plugins(MaterialPlugin::<TeleportPortalMaterial>::default())
             .init_resource::<VfxEventQueue>()
             .init_resource::<BulletVfxRegistry>()
             .add_systems(Startup, (init_hanabi_vfx_assets_system, init_bullet_vfx_registry_system))
@@ -1916,6 +1945,7 @@ struct VfxLifetimeMaterials<'w> {
     blood_materials: ResMut<'w, Assets<BloodSplatterMaterial>>,
     fireball_materials: ResMut<'w, Assets<ExplosionFireballMaterial>>,
     water_exp_materials: ResMut<'w, Assets<WaterExplosionMaterial>>,
+    teleport_portal_materials: ResMut<'w, Assets<TeleportPortalMaterial>>,
 }
 
 #[derive(SystemParam)]
@@ -1955,6 +1985,9 @@ fn update_vfx_lifetimes_system(
         mat.uniforms.params.x = t;
     }
     for (_, mut mat) in mats.kinetic_mats.iter_mut() {
+        mat.uniforms.params.x = t;
+    }
+    for (_, mut mat) in mats.teleport_portal_materials.iter_mut() {
         mat.uniforms.params.x = t;
     }
 

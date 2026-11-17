@@ -7,7 +7,8 @@ use bevy::ui::RelativeCursorPosition;
 use bevy::window::PrimaryWindow;
 use crate::audio_client::{AudioCategory, AudioEventQueue, AudioSettingsState, ClientAudioEvent};
 use moba_shared::{
-    ClientLobbyMessage, CourierOrder, InventoryItemState, ItemCategory, ItemDef, ItemsConfig,
+    ActiveBuffSnapshot, ClientLobbyMessage, CourierOrder, InventoryItemState, ItemActiveAbility,
+    ItemCategory, ItemDef, ItemsConfig,
 };
 use moba_shared::GameConfig;
 use std::path::Path;
@@ -63,6 +64,16 @@ pub struct CourierControlState {
 }
 
 #[derive(Resource, Default)]
+pub struct TeleportPreviewState {
+    pub active: bool,
+    pub wait_left_release_after_confirm: bool,
+    pub valid_dest: Option<Vec3>,
+    pub cursor_world_pos: Option<Vec3>,
+    pub from_minimap: bool,
+    pub suppress_fire_this_frame: bool,
+}
+
+#[derive(Resource, Default)]
 pub struct ShopContextSnapshot {
     pub in_game: bool,
     pub chat_open: bool,
@@ -70,6 +81,13 @@ pub struct ShopContextSnapshot {
     pub is_dead: bool,
     pub gold: u32,
     pub inventory: Vec<InventoryItemState>,
+    pub tp_slot: Option<InventoryItemState>,
+    pub teleport_cooldown_remaining: f32,
+    pub is_teleporting: bool,
+    pub teleport_progress: f32,
+    pub shadow_blade_cooldown_remaining: f32,
+    pub is_invisible: bool,
+    pub active_buffs: Vec<ActiveBuffSnapshot>,
     pub courier_hp: f32,
     pub courier_max_hp: f32,
     pub courier_is_dead: bool,
@@ -275,6 +293,7 @@ impl Plugin for ShopPlugin {
             .init_resource::<SettingsUiState>()
             .init_resource::<InventoryDragState>()
             .init_resource::<CourierControlState>()
+            .init_resource::<TeleportPreviewState>()
             .init_resource::<ItemIconCache>()
             .add_systems(Startup, spawn_shop_and_inventory_ui)
             .add_systems(
@@ -285,6 +304,7 @@ impl Plugin for ShopPlugin {
                     shop_scroll_system,
                     rebuild_shop_modal_system,
                     rebuild_hud_inventory_bar_system,
+                    update_hud_buffs_bar_system,
                 )
                     .chain(),
             )
@@ -369,6 +389,12 @@ struct HudInventoryRoot;
 
 #[derive(Component)]
 struct HudInventorySlotsRow;
+
+#[derive(Component)]
+struct HudTpSlotBtn;
+
+#[derive(Component)]
+struct HudBuffsContainer;
 
 #[derive(Component)]
 struct HudShopToggleBtn;
@@ -551,6 +577,23 @@ fn spawn_shop_and_inventory_ui(mut commands: Commands, config: Res<GameConfig>) 
     commands.insert_resource(VerticalAimKeyState {
         binding: ShortcutInput::from_config_str(&config.soldier.vertical_aim_key),
     });
+    // ۰. نوار نمایشگر مدت‌زمان باف‌ها و آیتم‌های فعال بالای اینونتوری
+    commands.spawn((
+        HudBuffsContainer,
+        Pickable::IGNORE,
+        GlobalZIndex(190),
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(565.0),
+            bottom: px(88.0),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::FlexStart,
+            row_gap: px(5.0),
+            display: Display::None,
+            ..default()
+        },
+    ));
+
     // ۱. نوار ۶ اسلاته اینونتوری + دکمه [B] SHOP در پایین صفحه
     commands
         .spawn((
@@ -581,6 +624,23 @@ fn spawn_shop_and_inventory_ui(mut commands: Commands, config: Res<GameConfig>) 
                     align_items: AlignItems::Center,
                     ..default()
                 },
+            ));
+
+            root.spawn((
+                Interaction::default(),
+                RelativeCursorPosition::default(),
+                HudTpSlotBtn,
+                Node {
+                    width: px(46.0),
+                    height: px(46.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(px(2.0)),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.28, 0.72, 0.95, 0.75)),
+                BackgroundColor(Color::srgba(0.05, 0.08, 0.14, 0.90)),
             ));
 
             root.spawn((
@@ -1369,6 +1429,7 @@ fn add_item_expanded_to_cart(
             item_id: existing.clone(),
             active_mode: 0,
             slot: 0,
+            count: 1,
         });
     }
     let expanded = items_cfg.expand_missing_recipe_items(item_id, &sim_inv);
@@ -2319,6 +2380,7 @@ fn rebuild_shop_modal_system(
                         item_id: cid.clone(),
                         active_mode: 0,
                         slot: 0,
+                        count: 1,
                     });
 
                     col.spawn((
@@ -2678,6 +2740,20 @@ fn rebuild_shop_modal_system(
     }
 }
 
+#[derive(Default)]
+struct HudBarRebuildCache {
+    last_inv: Option<Vec<InventoryItemState>>,
+    last_tp_slot: Option<Option<InventoryItemState>>,
+    last_cart_len: usize,
+    last_bindings: Option<[Option<ShortcutInput>; 6]>,
+    last_cour_sel: Option<bool>,
+    last_tp_cd: u32,
+    last_tp_preview: bool,
+    last_is_tp: bool,
+    last_sb_cd: u32,
+    last_is_invis: bool,
+}
+
 fn rebuild_hud_inventory_bar_system(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -2687,13 +2763,12 @@ fn rebuild_hud_inventory_bar_system(
     ui_state: Res<ShopUiState>,
     shortcuts: Res<InventoryShortcutsState>,
     courier_ctrl: Res<CourierControlState>,
+    teleport_preview: Res<TeleportPreviewState>,
     slots_q: Query<(Entity, Option<&Children>), With<HudInventorySlotsRow>>,
+    mut tp_slot_q: Query<(Entity, Option<&Children>, &mut BorderColor), (With<HudTpSlotBtn>, Without<HudInventoryRoot>)>,
     mut toggle_txt_q: Query<&mut Text, With<HudShopToggleText>>,
-    mut root_border_q: Query<&mut BorderColor, With<HudInventoryRoot>>,
-    mut last_inv: Local<Option<Vec<InventoryItemState>>>,
-    mut last_cart_len: Local<usize>,
-    mut last_bindings: Local<Option<[Option<ShortcutInput>; 6]>>,
-    mut last_cour_sel: Local<Option<bool>>,
+    mut root_border_q: Query<&mut BorderColor, (With<HudInventoryRoot>, Without<HudTpSlotBtn>)>,
+    mut cache: Local<HudBarRebuildCache>,
 ) {
     if !ctx.in_game {
         return;
@@ -2705,17 +2780,31 @@ fn rebuild_hud_inventory_bar_system(
     } else {
         &ctx.inventory
     };
-    let cart_changed = *last_cart_len != ui_state.cart.len();
-    let inv_changed = last_inv.as_ref() != Some(active_inv);
-    let bind_changed = last_bindings.as_ref() != Some(&shortcuts.bindings);
-    let sel_changed = *last_cour_sel != Some(courier_ctrl.selected);
-    if !cart_changed && !inv_changed && !bind_changed && !sel_changed {
+    let cart_changed = cache.last_cart_len != ui_state.cart.len();
+    let inv_changed = cache.last_inv.as_ref() != Some(active_inv);
+    let tp_slot_changed = cache.last_tp_slot.as_ref() != Some(&ctx.tp_slot);
+    let bind_changed = cache.last_bindings.as_ref() != Some(&shortcuts.bindings);
+    let sel_changed = cache.last_cour_sel != Some(courier_ctrl.selected);
+    let tp_cd_ceil = ctx.teleport_cooldown_remaining.ceil().max(0.0) as u32;
+    let sb_cd_ceil = ctx.shadow_blade_cooldown_remaining.ceil().max(0.0) as u32;
+    let tp_changed = cache.last_tp_cd != tp_cd_ceil
+        || cache.last_tp_preview != teleport_preview.active
+        || cache.last_is_tp != ctx.is_teleporting
+        || cache.last_sb_cd != sb_cd_ceil
+        || cache.last_is_invis != ctx.is_invisible;
+    if !cart_changed && !inv_changed && !tp_slot_changed && !bind_changed && !sel_changed && !tp_changed {
         return;
     }
-    *last_cart_len = ui_state.cart.len();
-    *last_inv = Some(active_inv.clone());
-    *last_bindings = Some(shortcuts.bindings);
-    *last_cour_sel = Some(courier_ctrl.selected);
+    cache.last_cart_len = ui_state.cart.len();
+    cache.last_inv = Some(active_inv.clone());
+    cache.last_tp_slot = Some(ctx.tp_slot.clone());
+    cache.last_bindings = Some(shortcuts.bindings);
+    cache.last_cour_sel = Some(courier_ctrl.selected);
+    cache.last_tp_cd = tp_cd_ceil;
+    cache.last_tp_preview = teleport_preview.active;
+    cache.last_is_tp = ctx.is_teleporting;
+    cache.last_sb_cd = sb_cd_ceil;
+    cache.last_is_invis = ctx.is_invisible;
 
     if let Ok(mut bc) = root_border_q.single_mut() {
         *bc = if courier_ctrl.selected {
@@ -2783,6 +2872,72 @@ fn rebuild_hud_inventory_bar_system(
                                     ));
                                 });
                             }
+                            if item.active_ability == ItemActiveAbility::ShadowBlade && !ctx.inspected_is_read_only && !courier_ctrl.selected {
+                                if ctx.is_invisible {
+                                    slot.spawn((
+                                        Pickable::IGNORE,
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            width: px(46.0),
+                                            height: px(46.0),
+                                            border: UiRect::all(px(2.0)),
+                                            border_radius: BorderRadius::all(px(6.0)),
+                                            ..default()
+                                        },
+                                        BorderColor::all(Color::srgb(0.45, 0.78, 1.0)),
+                                        BackgroundColor(Color::srgba(0.25, 0.55, 0.95, 0.18)),
+                                    ));
+                                }
+                                if sb_cd_ceil > 0 {
+                                    slot.spawn((
+                                        Pickable::IGNORE,
+                                        Node {
+                                            position_type: PositionType::Absolute,
+                                            width: px(44.0),
+                                            height: px(44.0),
+                                            justify_content: JustifyContent::Center,
+                                            align_items: AlignItems::Center,
+                                            border_radius: BorderRadius::all(px(5.0)),
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgba(0.02, 0.03, 0.06, 0.78)),
+                                    ))
+                                    .with_children(|cd| {
+                                        cd.spawn((
+                                            Text::new(format!("{}s", sb_cd_ceil)),
+                                            TextFont {
+                                                font_size: FontSize::Px(13.0),
+                                                ..default()
+                                            },
+                                            TextColor(Color::srgb(0.95, 0.85, 0.35)),
+                                        ));
+                                    });
+                                }
+                            }
+                            if inv_item.count > 1 {
+                                slot.spawn((
+                                    Pickable::IGNORE,
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        bottom: px(1.0),
+                                        right: px(2.0),
+                                        padding: UiRect::axes(px(3.0), px(0.5)),
+                                        border_radius: BorderRadius::all(px(3.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.02, 0.03, 0.05, 0.88)),
+                                ))
+                                .with_children(|cnt| {
+                                    cnt.spawn((
+                                        Text::new(format!("x{}", inv_item.count)),
+                                        TextFont {
+                                            font_size: FontSize::Px(9.0),
+                                            ..default()
+                                        },
+                                        TextColor(Color::srgb(0.95, 0.95, 0.98)),
+                                    ));
+                                });
+                            }
                             if !item.modes.is_empty() {
                                 let m_idx = inv_item.active_mode.min(item.modes.len() - 1);
                                 let mc = item.modes[m_idx].color_rgb;
@@ -2840,6 +2995,108 @@ fn rebuild_hud_inventory_bar_system(
                         TextColor(Color::srgba(0.60, 0.70, 0.80, 0.70)),
                     ));
                 });
+            }
+        });
+    }
+
+    if let Ok((tp_ent, tp_ch, mut tp_border)) = tp_slot_q.single_mut() {
+        clear_children(&mut commands, tp_ch);
+        let is_active = teleport_preview.active || ctx.is_teleporting;
+        *tp_border = if is_active {
+            BorderColor::all(Color::srgb(0.20, 0.95, 1.0))
+        } else if ctx.tp_slot.is_some() {
+            BorderColor::all(Color::srgb(0.32, 0.72, 0.95))
+        } else {
+            BorderColor::all(Color::srgba(0.24, 0.32, 0.42, 0.55))
+        };
+        let key_lbl = items_cfg.teleport.shortcut_key.to_ascii_uppercase();
+        commands.entity(tp_ent).with_children(|tp_btn| {
+            if let Some(ref tp_item) = ctx.tp_slot {
+                if let Some(def) = items_cfg.get_item(&tp_item.item_id) {
+                    spawn_item_icon_badge(tp_btn, &asset_server, &mut icon_cache, def, 34.0, 10.5);
+                }
+                tp_btn
+                    .spawn((
+                        Pickable::IGNORE,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            bottom: px(1.0),
+                            right: px(2.0),
+                            padding: UiRect::axes(px(4.0), px(0.5)),
+                            border_radius: BorderRadius::MAX,
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.02, 0.04, 0.08, 0.90)),
+                    ))
+                    .with_children(|cnt| {
+                        cnt.spawn((
+                            Text::new(format!("{}", tp_item.count)),
+                            TextFont {
+                                font_size: FontSize::Px(9.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.95, 0.98, 1.0)),
+                        ));
+                    });
+            } else {
+                tp_btn.spawn((
+                    Pickable::IGNORE,
+                    Text::new("TP"),
+                    TextFont {
+                        font_size: FontSize::Px(10.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgba(0.55, 0.70, 0.85, 0.65)),
+                ));
+            }
+            tp_btn
+                .spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        top: px(-2.0),
+                        left: px(1.0),
+                        padding: UiRect::axes(px(3.0), px(0.5)),
+                        border_radius: BorderRadius::all(px(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.02, 0.03, 0.05, 0.88)),
+                ))
+                .with_children(|kb| {
+                    kb.spawn((
+                        Text::new(key_lbl),
+                        TextFont {
+                            font_size: FontSize::Px(8.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.95, 0.85, 0.40)),
+                    ));
+                });
+            if tp_cd_ceil > 0 {
+                tp_btn
+                    .spawn((
+                        Pickable::IGNORE,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            width: px(42.0),
+                            height: px(42.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::MAX,
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.02, 0.03, 0.06, 0.80)),
+                    ))
+                    .with_children(|cd| {
+                        cd.spawn((
+                            Text::new(format!("{}s", tp_cd_ceil)),
+                            TextFont {
+                                font_size: FontSize::Px(12.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.95, 0.85, 0.35)),
+                        ));
+                    });
             }
         });
     }
@@ -3762,17 +4019,46 @@ fn inventory_shortcut_trigger_system(
     items_cfg: Res<ItemsConfig>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
+    mut teleport_preview: ResMut<TeleportPreviewState>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
 ) {
     if !ctx.in_game || ui_state.is_open || settings_ui.is_open || ctx.chat_open {
+        teleport_preview.active = false;
         return;
     }
+    if ctx.is_dead
+        || ctx.is_teleporting
+        || ctx.teleport_cooldown_remaining > 0.0
+        || ctx.tp_slot.is_none()
+    {
+        teleport_preview.active = false;
+    }
+
+    let tp_key = ShortcutInput::from_config_str(&items_cfg.teleport.shortcut_key);
+    if tp_key.just_pressed(&keys, &mouse)
+        && ctx.tp_slot.as_ref().is_some_and(|it| it.count > 0)
+        && !ctx.is_dead
+        && !ctx.is_teleporting
+        && ctx.teleport_cooldown_remaining <= 0.0
+    {
+        teleport_preview.active = !teleport_preview.active;
+    }
+
     for (slot_idx, binding) in shortcuts.bindings.iter().enumerate() {
         if let Some(input) = binding {
             if input.just_pressed(&keys, &mouse) {
                 if let Some(inv_item) = ctx.inventory.iter().find(|it| it.slot == slot_idx) {
                     if let Some(def) = items_cfg.get_item(&inv_item.item_id) {
-                        if !def.modes.is_empty() {
+                        if def.active_ability == ItemActiveAbility::ShadowBlade {
+                            if !ctx.is_dead
+                                && !ctx.is_invisible
+                                && ctx.shadow_blade_cooldown_remaining <= 0.0
+                            {
+                                outgoing.0.push(ClientLobbyMessage::ActivateShadowBlade {
+                                    inv_index: slot_idx,
+                                });
+                            }
+                        } else if !def.modes.is_empty() {
                             outgoing.0.push(ClientLobbyMessage::CycleItemMode {
                                 inv_index: slot_idx,
                             });
@@ -3790,8 +4076,10 @@ fn hud_inventory_drag_and_drop_system(
     mouse: Res<ButtonInput<MouseButton>>,
     window_q: Query<&Window, With<PrimaryWindow>>,
     slot_q: Query<(&HudInventorySlotBtn, &RelativeCursorPosition)>,
+    tp_btn_q: Query<&RelativeCursorPosition, With<HudTpSlotBtn>>,
     mut drag_state: ResMut<InventoryDragState>,
     mut ui_state: ResMut<ShopUiState>,
+    mut teleport_preview: ResMut<TeleportPreviewState>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
     mut ghost_q: Query<(&mut Node, &mut Visibility), With<DragGhostRoot>>,
     mut ghost_txt_q: Query<&mut Text, With<DragGhostLabelText>>,
@@ -3813,6 +4101,23 @@ fn hud_inventory_drag_and_drop_system(
             .is_some_and(|p| (-0.5..=0.5).contains(&p.x) && (-0.5..=0.5).contains(&p.y))
             .then_some(btn.inv_index)
     });
+
+    let hovered_tp = tp_btn_q.single().is_ok_and(|rel| {
+        rel.normalized
+            .is_some_and(|p| (-0.5..=0.5).contains(&p.x) && (-0.5..=0.5).contains(&p.y))
+    });
+    if mouse.just_pressed(MouseButton::Left) && hovered_tp {
+        if ctx.tp_slot.as_ref().is_some_and(|it| it.count > 0)
+            && !ctx.is_dead
+            && !ctx.is_teleporting
+            && ctx.teleport_cooldown_remaining <= 0.0
+        {
+            teleport_preview.active = !teleport_preview.active;
+            teleport_preview.wait_left_release_after_confirm = true;
+            teleport_preview.suppress_fire_this_frame = true;
+        }
+        return;
+    }
 
     if mouse.just_pressed(MouseButton::Left) {
         if let (Some(slot_idx), Some(cpos)) = (hovered_slot, cursor_pos) {
@@ -3863,7 +4168,18 @@ fn hud_inventory_drag_and_drop_system(
             if hovered_slot == Some(clicked_slot) {
                 if let Some(inv_item) = ctx.inventory.iter().find(|it| it.slot == clicked_slot) {
                     if let Some(def) = items_cfg.get_item(&inv_item.item_id) {
-                        if !def.modes.is_empty() {
+                        if def.active_ability == ItemActiveAbility::ShadowBlade {
+                            if !ctx.is_dead
+                                && !ctx.is_invisible
+                                && ctx.shadow_blade_cooldown_remaining <= 0.0
+                            {
+                                outgoing.0.push(ClientLobbyMessage::ActivateShadowBlade {
+                                    inv_index: clicked_slot,
+                                });
+                                teleport_preview.wait_left_release_after_confirm = true;
+                                teleport_preview.suppress_fire_this_frame = true;
+                            }
+                        } else if !def.modes.is_empty() {
                             outgoing.0.push(ClientLobbyMessage::CycleItemMode {
                                 inv_index: clicked_slot,
                             });
@@ -3990,3 +4306,116 @@ fn courier_hud_and_hotkey_system(
 }
 
 fn rebuild_hud_courier_bar_system() {}
+
+fn update_hud_buffs_bar_system(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut icon_cache: ResMut<ItemIconCache>,
+    items_cfg: Res<ItemsConfig>,
+    ctx: Res<ShopContextSnapshot>,
+    mut container_q: Query<(Entity, &mut Node, Option<&Children>), With<HudBuffsContainer>>,
+    mut last_buffs: Local<Vec<ActiveBuffSnapshot>>,
+    mut last_in_game: Local<bool>,
+) {
+    let Ok((ent, mut node, children_opt)) = container_q.single_mut() else {
+        return;
+    };
+    if !ctx.in_game || ctx.active_buffs.is_empty() {
+        if node.display != Display::None {
+            node.display = Display::None;
+            clear_children(&mut commands, children_opt);
+            last_buffs.clear();
+        }
+        *last_in_game = ctx.in_game;
+        return;
+    }
+
+    if *last_in_game == ctx.in_game && *last_buffs == ctx.active_buffs {
+        return;
+    }
+    *last_in_game = ctx.in_game;
+    *last_buffs = ctx.active_buffs.clone();
+
+    node.display = Display::Flex;
+    clear_children(&mut commands, children_opt);
+
+    commands.entity(ent).with_children(|col| {
+        for buff in &ctx.active_buffs {
+            let ratio = (buff.remaining_secs / buff.total_secs.max(0.01)).clamp(0.0, 1.0);
+            let bar_col = Color::srgb(buff.color_rgb.0, buff.color_rgb.1, buff.color_rgb.2);
+            col.spawn((
+                Pickable::IGNORE,
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: px(6.0),
+                    padding: UiRect::axes(px(6.0), px(3.0)),
+                    border_radius: BorderRadius::all(px(14.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.03, 0.05, 0.09, 0.88)),
+            ))
+            .with_children(|row| {
+                row.spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: px(28.0),
+                        height: px(28.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(px(1.5)),
+                        border_radius: BorderRadius::MAX,
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BorderColor::all(bar_col),
+                    BackgroundColor(Color::srgba(0.05, 0.08, 0.14, 0.95)),
+                ))
+                .with_children(|circle| {
+                    if let Some(def) = items_cfg.get_item(&buff.item_id) {
+                        spawn_item_icon_badge(circle, &asset_server, &mut icon_cache, def, 24.0, 9.0);
+                    }
+                });
+
+                row.spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: px(164.0),
+                        height: px(18.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(px(1.0)),
+                        border_radius: BorderRadius::all(px(5.0)),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BorderColor::all(Color::srgba(0.35, 0.48, 0.62, 0.65)),
+                    BackgroundColor(Color::srgba(0.06, 0.08, 0.12, 0.92)),
+                ))
+                .with_children(|bar| {
+                    bar.spawn((
+                        Pickable::IGNORE,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(0.0),
+                            top: px(0.0),
+                            width: percent(ratio * 100.0),
+                            height: percent(100),
+                            ..default()
+                        },
+                        BackgroundColor(bar_col.with_alpha(0.62)),
+                    ));
+                    bar.spawn((
+                        Pickable::IGNORE,
+                        Text::new(format!("{}  {:.1}s", buff.label, buff.remaining_secs)),
+                        TextFont {
+                            font_size: FontSize::Px(10.5),
+                            ..default()
+                        },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+            });
+        }
+    });
+}

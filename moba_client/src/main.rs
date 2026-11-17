@@ -25,7 +25,11 @@ use moba_shared::{
     terrain_platform_physics_bundle, tree_physics_bundle, turret_physics_bundle,
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CourierOrder, CourierSnapshot, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
-    ActiveWeaponSlot, AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind, CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig, RemotePlayerSnapshot, ServerLobbyPacket, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar, WeaponKind, CHANNEL_RELIABLE_LOBBY,
+    resolve_teleport_destination_from_snapshots, ActiveTeleportSnapshot, ActiveWeaponSlot,
+    AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind,
+    CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig,
+    RemotePlayerSnapshot, ServerLobbyPacket, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar,
+    WeaponKind, CHANNEL_RELIABLE_LOBBY,
     BulletVfxSource, FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, ItemsConfig, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ScoreboardHeroInfo, ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
@@ -44,10 +48,10 @@ mod pregame_ui;
 mod vfx_client;
 use backend_client::BackendClient;
 use pregame_ui::{AppScreenState, PendingMatchConnection, PreGamePlugin, PreGameSessionState};
-use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, MobaVfxPlugin, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
+use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, MobaVfxPlugin, TeleportPortalMaterial, TeleportPortalUniforms, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
 mod shop_client;
 use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
-use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, VerticalAimKeyState};
+use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, TeleportPreviewState, VerticalAimKeyState};
 
 
 #[cfg(not(debug_assertions))]
@@ -185,6 +189,7 @@ fn main() {
             deaths: 0,
             respawn_remaining: 0.0,
             inventory: Vec::new(),
+            tp_slot: None,
             courier_hp: h.courier.max_hp,
             courier_max_hp: h.courier.max_hp,
             courier_is_dead: false,
@@ -192,6 +197,13 @@ fn main() {
             courier_order: CourierOrder::Idle,
             courier_in_fountain: true,
             courier_inventory: Vec::new(),
+            teleport_cooldown_remaining: 0.0,
+            is_teleporting: false,
+            teleport_progress: 0.0,
+            shadow_blade_cooldown_remaining: 0.0,
+            is_invisible: false,
+            invisibility_remaining: 0.0,
+            active_buffs: Vec::new(),
         }
     };
 
@@ -242,6 +254,7 @@ fn main() {
         .insert_resource(LatestTurrets::default())
         .insert_resource(LatestBarracks::default())
         .insert_resource(LatestAncients::default())
+        .insert_resource(LatestActiveTeleports::default())
         .insert_resource(LatestMatchResult::default())
         .insert_resource(ChatUiState::default())
         .insert_resource(ClientPingState::default())
@@ -361,7 +374,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system)
+            (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system, teleport_preview_and_input_system.before(minimap_interaction_system), sync_active_teleports_visual_system, sync_invisibility_visual_system)
                 .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
@@ -3887,6 +3900,7 @@ struct SampleInputExtraParams<'w> {
     hero_hud: Res<'w, LatestHeroSnapshot>,
     audio_q: ResMut<'w, AudioEventQueue>,
     vfx_q: ResMut<'w, VfxEventQueue>,
+    teleport_preview: ResMut<'w, TeleportPreviewState>,
 }
 
 fn client_sample_input_system(
@@ -4009,12 +4023,18 @@ fn client_sample_input_system(
             && !settings_ui.is_open
             && !camera_control.is_pointer_over_minimap
             && !camera_control.is_dragging_minimap
+            && !ex.teleport_preview.active
+            && !ex.teleport_preview.suppress_fire_this_frame
+            && !ex.teleport_preview.wait_left_release_after_confirm
             && mouse_button.just_pressed(MouseButton::Left),
         fire_held: !alt_held
             && !shop_ui.is_open
             && !settings_ui.is_open
             && !camera_control.is_pointer_over_minimap
             && !camera_control.is_dragging_minimap
+            && !ex.teleport_preview.active
+            && !ex.teleport_preview.suppress_fire_this_frame
+            && !ex.teleport_preview.wait_left_release_after_confirm
             && mouse_button.pressed(MouseButton::Left),
         aim_ray_origin,
         aim_ray_dir,
@@ -4046,6 +4066,10 @@ fn client_sample_input_system(
         existing.accumulate_from(cmd);
     } else {
         ex.prediction.latest_input = Some(cmd);
+    }
+    ex.teleport_preview.suppress_fire_this_frame = false;
+    if !mouse_button.pressed(MouseButton::Left) {
+        ex.teleport_preview.wait_left_release_after_confirm = false;
     }
 }
 
@@ -4183,6 +4207,7 @@ fn client_receive_snapshot_and_sync_system(
         hud_sync.turrets.0 = snap.turrets.clone();
         hud_sync.barracks.0 = snap.barracks.clone();
         hud_sync.ancients.0 = snap.ancients.clone();
+        hud_sync.active_teleports.0 = snap.active_teleports.clone();
         hud_sync.match_result.0 = snap.winning_team;
         for msg in snap.recent_chat {
             if hud_sync.chat_state.seen_ids.insert(msg.id) {
@@ -4805,6 +4830,38 @@ fn spawn_fx_from_server_event(
                         TextColor(Color::srgb(0.45, 0.98, 1.0)),
                     ));
                 });
+        }
+        GameplayFxEvent::TeleportStarted {
+            slot_index,
+            origin_pos,
+            dest_pos,
+        } => {
+            audio_q.0.push(ClientAudioEvent::TeleportLoopStart {
+                slot_index,
+                origin_pos,
+                dest_pos,
+            });
+        }
+        GameplayFxEvent::TeleportCompleted {
+            slot_index,
+            origin_pos,
+            dest_pos,
+        } => {
+            audio_q.0.push(ClientAudioEvent::TeleportLoopStop { slot_index });
+            audio_q.0.push(ClientAudioEvent::TeleportCompleteOrigin { pos: origin_pos });
+            audio_q.0.push(ClientAudioEvent::TeleportCompleteDest { pos: dest_pos });
+        }
+        GameplayFxEvent::TeleportCanceled {
+            slot_index,
+            origin_pos: _,
+        } => {
+            audio_q.0.push(ClientAudioEvent::TeleportLoopStop { slot_index });
+        }
+        GameplayFxEvent::ShadowBladeActivated { slot_index: _, pos } => {
+            audio_q.0.push(ClientAudioEvent::ShadowBladeActivate { pos });
+        }
+        GameplayFxEvent::ShadowBladeEnded { slot_index: _, pos } => {
+            audio_q.0.push(ClientAudioEvent::ShadowBladeEnd { pos });
         }
     }
 }
@@ -6055,6 +6112,7 @@ fn minimap_interaction_system(
     courier_ctrl: Res<CourierControlState>,
     mut inspected: ResMut<InspectedUnit>,
     mut hero_move_target: ResMut<HeroClickMoveTarget>,
+    teleport_preview: Res<TeleportPreviewState>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
     mut camera_control: ResMut<CameraControlState>,
 ) {
@@ -6095,7 +6153,12 @@ fn minimap_interaction_system(
     camera_control.is_pointer_over_minimap = inside;
 
     let alt_held = keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight);
-    if inside && !alt_held && mouse_button.just_pressed(MouseButton::Left) {
+    if inside
+        && !alt_held
+        && !teleport_preview.active
+        && !teleport_preview.wait_left_release_after_confirm
+        && mouse_button.just_pressed(MouseButton::Left)
+    {
         camera_control.is_dragging_minimap = true;
     }
     if !mouse_button.pressed(MouseButton::Left) {
@@ -8502,6 +8565,9 @@ struct LatestBarracks(Vec<BarracksSnapshot>);
 struct LatestAncients(Vec<AncientSnapshot>);
 
 #[derive(Resource, Default)]
+struct LatestActiveTeleports(Vec<ActiveTeleportSnapshot>);
+
+#[derive(Resource, Default)]
 struct LatestMatchResult(Option<TeamId>);
 
 #[derive(SystemParam)]
@@ -8515,6 +8581,7 @@ struct SnapshotHudSyncParams<'w, 's> {
     turrets: ResMut<'w, LatestTurrets>,
     barracks: ResMut<'w, LatestBarracks>,
     ancients: ResMut<'w, LatestAncients>,
+    active_teleports: ResMut<'w, LatestActiveTeleports>,
     match_result: ResMut<'w, LatestMatchResult>,
     chat_state: ResMut<'w, ChatUiState>,
     ping_state: ResMut<'w, ClientPingState>,
@@ -14017,6 +14084,14 @@ fn sync_shop_context_and_network_system(
         || ctx.is_dead != render_state.is_dead
         || ctx.gold != hero_hud.0.gold
         || ctx.inventory != hero_hud.0.inventory
+        || ctx.tp_slot != hero_hud.0.tp_slot
+        || (ctx.teleport_cooldown_remaining > 0.0) != (hero_hud.0.teleport_cooldown_remaining > 0.0)
+        || (ctx.teleport_cooldown_remaining - hero_hud.0.teleport_cooldown_remaining).abs() > 0.1
+        || ctx.is_teleporting != hero_hud.0.is_teleporting
+        || (ctx.shadow_blade_cooldown_remaining > 0.0) != (hero_hud.0.shadow_blade_cooldown_remaining > 0.0)
+        || (ctx.shadow_blade_cooldown_remaining - hero_hud.0.shadow_blade_cooldown_remaining).abs() > 0.1
+        || ctx.is_invisible != hero_hud.0.is_invisible
+        || ctx.active_buffs != hero_hud.0.active_buffs
         || (ctx.courier_hp - hero_hud.0.courier_hp).abs() > 0.1
         || (ctx.courier_max_hp - hero_hud.0.courier_max_hp).abs() > 0.1
         || ctx.courier_is_dead != hero_hud.0.courier_is_dead
@@ -14033,6 +14108,13 @@ fn sync_shop_context_and_network_system(
         ctx.is_dead = render_state.is_dead;
         ctx.gold = hero_hud.0.gold;
         ctx.inventory = hero_hud.0.inventory.clone();
+        ctx.tp_slot = hero_hud.0.tp_slot.clone();
+        ctx.teleport_cooldown_remaining = hero_hud.0.teleport_cooldown_remaining;
+        ctx.is_teleporting = hero_hud.0.is_teleporting;
+        ctx.teleport_progress = hero_hud.0.teleport_progress;
+        ctx.shadow_blade_cooldown_remaining = hero_hud.0.shadow_blade_cooldown_remaining;
+        ctx.is_invisible = hero_hud.0.is_invisible;
+        ctx.active_buffs = hero_hud.0.active_buffs.clone();
         ctx.courier_hp = hero_hud.0.courier_hp;
         ctx.courier_max_hp = hero_hud.0.courier_max_hp;
         ctx.courier_is_dead = hero_hud.0.courier_is_dead;
@@ -15596,5 +15678,576 @@ fn sync_audio_context_system(
             }
             tr.prev_dead_ancients[i] = a.is_dead;
         }
+    }
+}
+
+// =============================================================================
+// سیستم پیش‌نمایش، ورودی مینی‌مپ و افکت‌های سه‌بعدی تلپورت (پورتال + استوانه + ایلوژن آبی شفاف)
+// =============================================================================
+
+#[derive(Component)]
+struct TeleportPreviewRingMarker {
+    mat_handle: Handle<TeleportPortalMaterial>,
+}
+
+#[derive(Component)]
+struct MinimapTeleportPreviewDot;
+
+#[derive(Component)]
+struct TeleportPortalVisual {
+    slot_index: usize,
+    is_dest: bool,
+    is_cylinder: bool,
+    mat_handle: Handle<TeleportPortalMaterial>,
+}
+
+#[derive(Component)]
+struct TeleportIllusionVisual {
+    slot_index: usize,
+    model_path: String,
+    styled: bool,
+    animated: bool,
+}
+
+#[derive(Component)]
+struct TeleportIllusionStyled;
+
+#[derive(SystemParam)]
+struct TeleportPreviewParams<'w, 's> {
+    config: Res<'w, GameConfig>,
+    items_cfg: Res<'w, ItemsConfig>,
+    match_flow: Res<'w, ClientMatchFlow>,
+    hero_hud: Res<'w, LatestHeroSnapshot>,
+    render_state: Res<'w, ClientRenderState>,
+    latest_turrets: Res<'w, LatestTurrets>,
+    latest_barracks: Res<'w, LatestBarracks>,
+    latest_ancients: Res<'w, LatestAncients>,
+    keyboard: Res<'w, ButtonInput<KeyCode>>,
+    mouse_button: Res<'w, ButtonInput<MouseButton>>,
+    window_q: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    camera_q: Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<MobaCamera>>,
+    minimap_root_q: Query<'w, 's, Entity, With<MinimapRoot>>,
+    preview_ring_q: Query<'w, 's, (Entity, &'static TeleportPreviewRingMarker, &'static mut Transform), Without<MinimapTeleportPreviewDot>>,
+    minimap_dot_q: Query<'w, 's, (Entity, &'static mut Node, &'static mut BackgroundColor), With<MinimapTeleportPreviewDot>>,
+}
+
+fn teleport_preview_and_input_system(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut portal_mats: ResMut<Assets<TeleportPortalMaterial>>,
+    mut teleport_preview: ResMut<TeleportPreviewState>,
+    mut outgoing: ResMut<ShopOutgoingQueue>,
+    mut p: TeleportPreviewParams,
+) {
+    if !teleport_preview.active {
+        for (ent, _, _) in &p.preview_ring_q {
+            commands.entity(ent).despawn();
+        }
+        for (ent, _, _) in &p.minimap_dot_q {
+            commands.entity(ent).despawn();
+        }
+        teleport_preview.valid_dest = None;
+        teleport_preview.cursor_world_pos = None;
+        return;
+    }
+
+    if !p.match_flow.is_in_game()
+        || p.render_state.is_dead
+        || p.hero_hud.0.is_teleporting
+        || p.hero_hud.0.teleport_cooldown_remaining > 0.0
+        || p.hero_hud.0.tp_slot.as_ref().map_or(true, |it| it.count == 0)
+    {
+        teleport_preview.active = false;
+        return;
+    }
+
+    if p.keyboard.just_pressed(KeyCode::Escape) || p.mouse_button.just_pressed(MouseButton::Right) {
+        teleport_preview.active = false;
+        return;
+    }
+
+    let Ok(window) = p.window_q.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+
+    let min_x = window.width() - MINIMAP_MARGIN_PX - MINIMAP_WIDTH_PX;
+    let max_x = window.width() - MINIMAP_MARGIN_PX;
+    let min_y = window.height() - MINIMAP_MARGIN_PX - MINIMAP_HEIGHT_PX;
+    let max_y = window.height() - MINIMAP_MARGIN_PX;
+
+    let inside_minimap =
+        cursor.x >= min_x && cursor.x <= max_x && cursor.y >= min_y && cursor.y <= max_y;
+
+    let mut requested_pos_opt: Option<Vec3> = None;
+    if inside_minimap {
+        let u = ((cursor.x - min_x) / MINIMAP_WIDTH_PX).clamp(0.0, 1.0);
+        let v = ((cursor.y - min_y) / MINIMAP_HEIGHT_PX).clamp(0.0, 1.0);
+        let world_x = (u - 0.5) * p.config.map.map_dimensions.0;
+        let world_z = (v - 0.5) * p.config.map.map_dimensions.1;
+        requested_pos_opt = Some(Vec3::new(world_x, 0.0, world_z));
+    } else if let Ok((cam, cam_tf)) = p.camera_q.single() {
+        if let Ok(ray) = cam.viewport_to_world(cam_tf, cursor) {
+            let plane_y = p.render_state.soldier_pos.y;
+            if ray.direction.y.abs() > 1e-4 {
+                let t = (plane_y - ray.origin.y) / ray.direction.y;
+                if t > 0.0 {
+                    requested_pos_opt = Some(ray.origin + *ray.direction * t);
+                }
+            }
+        }
+    }
+
+    let Some(requested_pos) = requested_pos_opt else {
+        return;
+    };
+
+    let valid_dest = resolve_teleport_destination_from_snapshots(
+        &p.config,
+        &p.items_cfg,
+        &p.latest_turrets.0,
+        &p.latest_barracks.0,
+        &p.latest_ancients.0,
+        p.hero_hud.0.team,
+        requested_pos,
+        inside_minimap,
+    );
+
+    teleport_preview.valid_dest = valid_dest;
+    teleport_preview.cursor_world_pos = Some(requested_pos);
+    teleport_preview.from_minimap = inside_minimap;
+
+    let mut display_pos = valid_dest.unwrap_or(requested_pos);
+    if valid_dest.is_none() {
+        display_pos.y = moba_shared::sample_camera_focus_y(&p.config, display_pos.x, display_pos.z);
+    }
+
+    let tp_cfg = &p.items_cfg.teleport;
+    let (ring_col, mode_val) = if valid_dest.is_some() {
+        (
+            Vec4::new(
+                tp_cfg.preview_valid_color_rgb.0,
+                tp_cfg.preview_valid_color_rgb.1,
+                tp_cfg.preview_valid_color_rgb.2,
+                1.0,
+            ),
+            1.0_f32,
+        )
+    } else {
+        (
+            Vec4::new(
+                tp_cfg.preview_invalid_color_rgb.0,
+                tp_cfg.preview_invalid_color_rgb.1,
+                tp_cfg.preview_invalid_color_rgb.2,
+                1.0,
+            ),
+            2.0_f32,
+        )
+    };
+
+    let world_ring_pos = display_pos + Vec3::Y * 0.45;
+    let ring_size = tp_cfg.portal_radius * 2.2;
+    if let Some((_, marker, mut tf)) = p.preview_ring_q.iter_mut().next() {
+        tf.translation = world_ring_pos;
+        if let Some(mut mat) = portal_mats.get_mut(&marker.mat_handle) {
+            mat.uniforms.core_color = ring_col;
+            mat.uniforms.edge_color = ring_col;
+            mat.uniforms.params.y = tp_cfg.portal_bloom_intensity;
+            mat.uniforms.params.w = mode_val;
+        }
+    } else {
+        let mesh = meshes.add(Plane3d::default().mesh().size(ring_size, ring_size));
+        let mat_handle = portal_mats.add(TeleportPortalMaterial {
+            uniforms: TeleportPortalUniforms {
+                core_color: ring_col,
+                edge_color: ring_col,
+                params: Vec4::new(0.0, tp_cfg.portal_bloom_intensity, 0.0, mode_val),
+            },
+        });
+        commands.spawn((
+            TeleportPreviewRingMarker {
+                mat_handle: mat_handle.clone(),
+            },
+            Mesh3d(mesh),
+            MeshMaterial3d(mat_handle),
+            Transform::from_translation(world_ring_pos),
+            NotShadowCaster,
+        ));
+    }
+
+    // نشانگر پیش‌نمایش روی مینی‌مپ
+    if let Ok(mm_root) = p.minimap_root_q.single() {
+        let uv = world_to_minimap_uv(&p.config, display_pos.x, display_pos.z);
+        let dot_color = if valid_dest.is_some() {
+            Color::srgb(
+                tp_cfg.preview_valid_color_rgb.0,
+                tp_cfg.preview_valid_color_rgb.1,
+                tp_cfg.preview_valid_color_rgb.2,
+            )
+        } else {
+            Color::srgb(
+                tp_cfg.preview_invalid_color_rgb.0,
+                tp_cfg.preview_invalid_color_rgb.1,
+                tp_cfg.preview_invalid_color_rgb.2,
+            )
+        };
+        if let Some((_, mut node, mut bg)) = p.minimap_dot_q.iter_mut().next() {
+            node.left = px((uv.x * MINIMAP_WIDTH_PX - 6.0).clamp(0.0, MINIMAP_WIDTH_PX - 12.0));
+            node.top = px((uv.y * MINIMAP_HEIGHT_PX - 6.0).clamp(0.0, MINIMAP_HEIGHT_PX - 12.0));
+            *bg = dot_color.into();
+        } else {
+            commands.entity(mm_root).with_children(|mm| {
+                mm.spawn((
+                    MinimapTeleportPreviewDot,
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px((uv.x * MINIMAP_WIDTH_PX - 6.0).clamp(0.0, MINIMAP_WIDTH_PX - 12.0)),
+                        top: px((uv.y * MINIMAP_HEIGHT_PX - 6.0).clamp(0.0, MINIMAP_HEIGHT_PX - 12.0)),
+                        width: px(12.0),
+                        height: px(12.0),
+                        border: UiRect::all(px(1.5)),
+                        border_radius: BorderRadius::MAX,
+                        ..default()
+                    },
+                    BorderColor::all(Color::WHITE),
+                    BackgroundColor(dot_color),
+                ));
+            });
+        }
+    }
+
+    if p.mouse_button.just_pressed(MouseButton::Left) && !teleport_preview.wait_left_release_after_confirm {
+        if let Some(dest) = valid_dest {
+            outgoing.0.push(ClientLobbyMessage::StartTeleport {
+                inv_index: 0,
+                target_pos: dest,
+                from_minimap: inside_minimap,
+            });
+            teleport_preview.active = false;
+            teleport_preview.wait_left_release_after_confirm = true;
+            teleport_preview.suppress_fire_this_frame = true;
+        }
+    }
+}
+
+#[derive(SystemParam)]
+struct TeleportVisualParams<'w, 's> {
+    items_cfg: Res<'w, ItemsConfig>,
+    match_flow: Res<'w, ClientMatchFlow>,
+    latest_teleports: Res<'w, LatestActiveTeleports>,
+    asset_server: Res<'w, AssetServer>,
+    gltf_assets: Res<'w, Assets<Gltf>>,
+    clip_assets: Res<'w, Assets<AnimationClip>>,
+    mut_meshes: ResMut<'w, Assets<Mesh>>,
+    portal_mats: ResMut<'w, Assets<TeleportPortalMaterial>>,
+    std_mats: ResMut<'w, Assets<StandardMaterial>>,
+    animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
+    hero_anim_cache: ResMut<'w, HeroModelAnimCache>,
+    portal_q: Query<'w, 's, (Entity, &'static TeleportPortalVisual, &'static mut Transform), Without<TeleportIllusionVisual>>,
+    illusion_q: Query<'w, 's, (Entity, &'static mut TeleportIllusionVisual, &'static mut Transform), Without<TeleportPortalVisual>>,
+    children_q: Query<'w, 's, &'static Children>,
+    mesh_mat_q: Query<'w, 's, Entity, (With<MeshMaterial3d<StandardMaterial>>, Without<TeleportIllusionStyled>)>,
+    anim_player_q: Query<'w, 's, (Option<&'static AnimationGraphHandle>, &'static mut AnimationPlayer, &'static mut AnimationTransitions)>,
+}
+
+fn sync_active_teleports_visual_system(
+    mut commands: Commands,
+    mut v: TeleportVisualParams,
+    mut cached_illusion_mat: Local<Option<Handle<StandardMaterial>>>,
+) {
+    if !v.match_flow.is_in_game() {
+        for (ent, _, _) in &v.portal_q {
+            commands.entity(ent).despawn();
+        }
+        for (ent, _, _) in &v.illusion_q {
+            commands.entity(ent).despawn();
+        }
+        return;
+    }
+
+    let tp_cfg = &v.items_cfg.teleport;
+    if cached_illusion_mat.is_none() {
+        let c = tp_cfg.illusion_color_rgba;
+        let e = tp_cfg.illusion_emissive_rgb;
+        *cached_illusion_mat = Some(v.std_mats.add(StandardMaterial {
+            base_color: Color::srgba(c.0, c.1, c.2, c.3),
+            emissive: LinearRgba::rgb(e.0, e.1, e.2),
+            alpha_mode: AlphaMode::Blend,
+            unlit: false,
+            ..default()
+        }));
+    }
+
+    for (ent, pv, _) in &v.portal_q {
+        if !v.latest_teleports.0.iter().any(|tp| tp.slot_index == pv.slot_index) {
+            commands.entity(ent).despawn();
+        }
+    }
+    for (ent, iv, _) in &v.illusion_q {
+        if !v.latest_teleports.0.iter().any(|tp| tp.slot_index == iv.slot_index) {
+            commands.entity(ent).despawn();
+        }
+    }
+
+    let core_col = Vec4::new(
+        tp_cfg.portal_core_color_rgb.0,
+        tp_cfg.portal_core_color_rgb.1,
+        tp_cfg.portal_core_color_rgb.2,
+        1.0,
+    );
+    let edge_col = Vec4::new(
+        tp_cfg.portal_edge_color_rgb.0,
+        tp_cfg.portal_edge_color_rgb.1,
+        tp_cfg.portal_edge_color_rgb.2,
+        1.0,
+    );
+    let ring_size = tp_cfg.portal_radius * 2.2;
+
+    for tp in &v.latest_teleports.0 {
+        for is_dest in [false, true] {
+            let base_pos = if is_dest { tp.dest_pos } else { tp.origin_pos };
+            for is_cylinder in [false, true] {
+                let pos = if is_cylinder {
+                    base_pos + Vec3::Y * (tp_cfg.portal_height * 0.5)
+                } else {
+                    base_pos + Vec3::Y * 0.40
+                };
+                let mut found = false;
+                for (_, pv, mut tf) in &mut v.portal_q {
+                    if pv.slot_index == tp.slot_index
+                        && pv.is_dest == is_dest
+                        && pv.is_cylinder == is_cylinder
+                    {
+                        found = true;
+                        tf.translation = pos;
+                        if let Some(mut mat) = v.portal_mats.get_mut(&pv.mat_handle) {
+                            mat.uniforms.params.z = tp.progress;
+                        }
+                        break;
+                    }
+                }
+                if !found {
+                    let mesh = if is_cylinder {
+                        v.mut_meshes.add(Cylinder::new(
+                            tp_cfg.portal_radius * 0.85,
+                            tp_cfg.portal_height,
+                        ))
+                    } else {
+                        v.mut_meshes
+                            .add(Plane3d::default().mesh().size(ring_size, ring_size))
+                    };
+                    let mode = if is_cylinder { 3.0 } else { 0.0 };
+                    let mat_handle = v.portal_mats.add(TeleportPortalMaterial {
+                        uniforms: TeleportPortalUniforms {
+                            core_color: core_col,
+                            edge_color: edge_col,
+                            params: Vec4::new(0.0, tp_cfg.portal_bloom_intensity, tp.progress, mode),
+                        },
+                    });
+                    let mut ec = commands.spawn((
+                        TeleportPortalVisual {
+                            slot_index: tp.slot_index,
+                            is_dest,
+                            is_cylinder,
+                            mat_handle: mat_handle.clone(),
+                        },
+                        Mesh3d(mesh),
+                        MeshMaterial3d(mat_handle),
+                        Transform::from_translation(pos),
+                        NotShadowCaster,
+                    ));
+                    if !is_cylinder {
+                        ec.with_children(|p_ent| {
+                            p_ent.spawn((
+                                PointLight {
+                                    color: Color::srgb(
+                                        tp_cfg.portal_core_color_rgb.0,
+                                        tp_cfg.portal_core_color_rgb.1,
+                                        tp_cfg.portal_core_color_rgb.2,
+                                    ),
+                                    intensity: 120_000.0,
+                                    range: 8.5,
+                                    shadow_maps_enabled: false,
+                                    ..default()
+                                },
+                                Transform::from_xyz(0.0, 1.2, 0.0),
+                                NotShadowCaster,
+                            ));
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut found_ill = false;
+        for (ill_ent, mut iv, mut tf) in &mut v.illusion_q {
+            if iv.slot_index == tp.slot_index {
+                found_ill = true;
+                tf.translation = tp.dest_pos;
+                tf.scale = Vec3::splat(tp.hero_scale);
+                let flat_dir = Vec3::new(tp.facing_dir.x, 0.0, tp.facing_dir.z);
+                if flat_dir.length_squared() > 1e-4 {
+                    tf.rotation = Transform::IDENTITY
+                        .looking_to(-flat_dir.normalize(), Vec3::Y)
+                        .rotation;
+                }
+
+                if !iv.styled {
+                    if let Some(ref ill_mat) = *cached_illusion_mat {
+                        let mut applied_any = false;
+                        for desc in v.children_q.iter_descendants(ill_ent) {
+                            if v.mesh_mat_q.get(desc).is_ok() {
+                                commands.entity(desc).insert((
+                                    MeshMaterial3d(ill_mat.clone()),
+                                    NotShadowCaster,
+                                    TeleportIllusionStyled,
+                                ));
+                                applied_any = true;
+                            }
+                        }
+                        if applied_any {
+                            iv.styled = true;
+                        }
+                    }
+                }
+
+                if !iv.animated {
+                    let cached_opt = v.hero_anim_cache.ensure_loaded(
+                        &iv.model_path,
+                        &v.asset_server,
+                        &v.gltf_assets,
+                        &v.clip_assets,
+                        &mut v.animation_graphs,
+                    );
+                    if let Some(assets) = cached_opt {
+                        let idle_node = assets.get_or_fallback("rifle_aiming_idle", "idle");
+                        for desc in v.children_q.iter_descendants(ill_ent) {
+                            if let Ok((graph_opt, mut player, mut trans)) =
+                                v.anim_player_q.get_mut(desc)
+                            {
+                                if graph_opt.map_or(true, |g| g.0 != assets.graph_handle) {
+                                    commands
+                                        .entity(desc)
+                                        .insert(AnimationGraphHandle(assets.graph_handle.clone()));
+                                }
+                                trans
+                                    .play(&mut player, idle_node, Duration::from_millis(80))
+                                    .repeat();
+                                iv.animated = true;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        if !found_ill {
+            let gltf_scene = v.asset_server.load(format!("{}#Scene0", tp.model_path));
+            let flat_dir = Vec3::new(tp.facing_dir.x, 0.0, tp.facing_dir.z);
+            let rot = if flat_dir.length_squared() > 1e-4 {
+                Transform::IDENTITY
+                    .looking_to(-flat_dir.normalize(), Vec3::Y)
+                    .rotation
+            } else {
+                Quat::IDENTITY
+            };
+            commands.spawn((
+                TeleportIllusionVisual {
+                    slot_index: tp.slot_index,
+                    model_path: tp.model_path.clone(),
+                    styled: false,
+                    animated: false,
+                },
+                WorldAssetRoot(gltf_scene),
+                Transform::from_translation(tp.dest_pos)
+                    .with_scale(Vec3::splat(tp.hero_scale))
+                    .with_rotation(rot),
+            ));
+        }
+    }
+}
+
+
+// =============================================================================
+// افکت بصری غیب شدن (متریال شفاف آینه‌ای قطره آب برای خود هیرو و هم‌تیمی‌ها)
+// =============================================================================
+
+#[derive(Component)]
+struct OriginalHeroMaterial(Handle<StandardMaterial>);
+
+fn sync_invisibility_visual_system(
+    mut commands: Commands,
+    items_cfg: Res<ItemsConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    remote_players: Res<LatestRemotePlayers>,
+    mut std_mats: ResMut<Assets<StandardMaterial>>,
+    soldier_q: Query<Entity, With<SoldierMarker>>,
+    remote_q: Query<(Entity, &RemotePlayerVisual)>,
+    children_q: Query<&Children>,
+    mesh_mat_q: Query<(&MeshMaterial3d<StandardMaterial>, Option<&OriginalHeroMaterial>)>,
+    mut cached_water_mat: Local<Option<Handle<StandardMaterial>>>,
+) {
+    if !match_flow.is_in_game() {
+        return;
+    }
+
+    let sb = &items_cfg.shadow_blade;
+    let water_mat = cached_water_mat
+        .get_or_insert_with(|| {
+            let c = sb.water_glass_color_rgba;
+            let e = sb.water_glass_emissive_rgb;
+            std_mats.add(StandardMaterial {
+                base_color: Color::srgba(c.0, c.1, c.2, c.3),
+                emissive: LinearRgba::rgb(e.0, e.1, e.2),
+                metallic: sb.water_glass_metallic,
+                perceptual_roughness: sb.water_glass_roughness,
+                reflectance: 1.0,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            })
+        })
+        .clone();
+
+    let apply_or_restore = |commands: &mut Commands, root_ent: Entity, invisible: bool| {
+        for desc in children_q.iter_descendants(root_ent) {
+            if let Ok((cur_mat, orig_opt)) = mesh_mat_q.get(desc) {
+                if invisible {
+                    if cur_mat.0 != water_mat {
+                        if orig_opt.is_none() {
+                            commands
+                                .entity(desc)
+                                .insert(OriginalHeroMaterial(cur_mat.0.clone()));
+                        }
+                        commands
+                            .entity(desc)
+                            .insert(MeshMaterial3d(water_mat.clone()));
+                    }
+                } else if let Some(orig) = orig_opt {
+                    if cur_mat.0 != orig.0 {
+                        commands
+                            .entity(desc)
+                            .insert(MeshMaterial3d(orig.0.clone()));
+                    }
+                }
+            }
+        }
+    };
+
+    if let Ok(local_ent) = soldier_q.single() {
+        apply_or_restore(&mut commands, local_ent, hero_hud.0.is_invisible);
+    }
+
+    for (rem_ent, rem_vis) in &remote_q {
+        let is_invis = remote_players
+            .0
+            .iter()
+            .find(|rp| rp.slot_index == rem_vis.slot_index)
+            .is_some_and(|rp| rp.is_invisible);
+        apply_or_restore(&mut commands, rem_ent, is_invis);
     }
 }

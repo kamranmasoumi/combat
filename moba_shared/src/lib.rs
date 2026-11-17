@@ -403,6 +403,28 @@ impl GameConfig {
             assert!(hero.weapon.projectile_speed > 0.0, "projectile_speed اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.max_range > 0.0, "max_range اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.weapon.pellets_per_shot > 0, "pellets_per_shot اسلحه هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.weapon.gravity >= 0.0, "weapon.gravity هیرو '{}' نمی‌تواند منفی باشد", hero.id);
+            assert!(hero.weapon.launch_up_boost >= 0.0, "weapon.launch_up_boost هیرو '{}' نمی‌تواند منفی باشد", hero.id);
+            assert!(hero.weapon.aoe_radius >= 0.0, "weapon.aoe_radius هیرو '{}' نمی‌تواند منفی باشد", hero.id);
+            if hero.weapon.weapon_kind == WeaponKind::Throwable {
+                assert!(hero.weapon.gravity > 0.0, "سلاح پرتابی هیرو '{}' باید gravity > 0 داشته باشد", hero.id);
+                assert!(hero.weapon.aoe_radius > 0.0, "سلاح پرتابی هیرو '{}' باید aoe_radius > 0 داشته باشد", hero.id);
+            }
+            assert!(hero.pistol.gravity >= 0.0 && hero.pistol.launch_up_boost >= 0.0 && hero.pistol.aoe_radius >= 0.0, "مقادیر پرتابی کلت هیرو '{}' نامعتبر است", hero.id);
+            assert!(hero.weapon.toxic_pool_duration_secs >= 0.0 && hero.weapon.toxic_pool_dps >= 0.0, "مقادیر سم سلاح هیرو '{}' نامعتبر است", hero.id);
+            assert!(hero.weapon.toxic_slow_ratio >= 0.0 && hero.weapon.toxic_slow_ratio < 0.95, "toxic_slow_ratio سلاح هیرو '{}' باید بین 0 و 0.95 باشد", hero.id);
+            assert!(hero.level_growth.toxic_dps_per_level >= 0.0 && hero.level_growth.toxic_slow_per_level >= 0.0 && hero.level_growth.toxic_duration_per_level >= 0.0, "ضرایب ارتقای سم هیرو '{}' نامعتبر است", hero.id);
+            assert!(hero.weapon.beam_max_charge >= 0.0 && hero.weapon.beam_drain_per_sec >= 0.0 && hero.weapon.beam_dps >= 0.0, "مقادیر سلاح برقی هیرو '{}' نامعتبر است", hero.id);
+            assert!(hero.weapon.beam_attack_speed_slow >= 0.0 && hero.weapon.beam_attack_speed_slow < 0.90, "beam_attack_speed_slow هیرو '{}' باید بین 0 و 0.90 باشد", hero.id);
+            assert!(hero.weapon.beam_slow_duration_secs >= 0.0, "beam_slow_duration_secs هیرو '{}' نمی‌تواند منفی باشد", hero.id);
+            if hero.weapon.weapon_kind == WeaponKind::ElectricBeam {
+                assert!(hero.weapon.beam_max_charge > 0.0 && hero.weapon.beam_drain_per_sec > 0.0 && hero.weapon.beam_dps > 0.0, "سلاح برقی هیرو '{}' باید beam_max_charge، beam_drain_per_sec و beam_dps بزرگ‌تر از صفر داشته باشد", hero.id);
+            }
+            assert!(hero.level_growth.beam_dps_per_level >= 0.0 && hero.level_growth.beam_attack_speed_slow_per_level >= 0.0, "ضرایب ارتقای برق هیرو '{}' نامعتبر است", hero.id);
+            assert!(hero.weapon.beam_armor_reduction >= 0.0 && hero.level_growth.beam_armor_reduction_per_level >= 0.0, "مقادیر کاهش آرمور هیرو '{}' نامعتبر است", hero.id);
+            if hero.weapon.weapon_kind == WeaponKind::FlameBeam {
+                assert!(hero.weapon.beam_max_charge > 0.0 && hero.weapon.beam_drain_per_sec > 0.0 && hero.weapon.beam_dps > 0.0 && hero.weapon.beam_armor_reduction > 0.0, "سلاح آتش هیرو '{}' باید مقادیر بزرگ‌تر از صفر داشته باشد", hero.id);
+            }
             assert!(hero.grenade.damage > 0.0, "grenade.damage هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.grenade.aoe_radius > 0.0, "grenade.aoe_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.grenade.fuse_secs > 0.0, "grenade.fuse_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -1070,6 +1092,9 @@ pub enum WeaponKind {
     Shotgun,
     Pistol,
     Throwable,
+    ElectricBeam,
+    FlameBeam,
+    SpinningBlade,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -1089,6 +1114,19 @@ pub struct HeroWeaponDef {
     pub max_range: f32,
     pub pellets_per_shot: u32,
     pub spread_rad: f32,
+    pub gravity: f32,
+    pub launch_up_boost: f32,
+    pub aoe_radius: f32,
+    pub toxic_pool_duration_secs: f32,
+    pub toxic_pool_dps: f32,
+    pub toxic_slow_ratio: f32,
+    pub beam_max_charge: f32,
+    pub beam_drain_per_sec: f32,
+    pub beam_dps: f32,
+    pub beam_attack_speed_slow: f32,
+    pub beam_slow_duration_secs: f32,
+    pub beam_armor_reduction: f32,
+    pub piercing: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1191,6 +1229,12 @@ pub struct HeroLevelGrowth {
     pub hp_regen_per_level: f32,
     pub stamina_regen_per_level: f32,
     pub armor_per_level: f32,
+    pub toxic_dps_per_level: f32,
+    pub toxic_slow_per_level: f32,
+    pub toxic_duration_per_level: f32,
+    pub beam_dps_per_level: f32,
+    pub beam_attack_speed_slow_per_level: f32,
+    pub beam_armor_reduction_per_level: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2058,6 +2102,24 @@ pub struct BulletSnapshot {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ElectricBeamSnapshot {
+    pub id: u64,
+    pub start_pos: Vec3,
+    pub end_pos: Vec3,
+    pub hit_target: bool,
+    pub is_flame: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ToxicPoolSnapshot {
+    pub id: u64,
+    pub pos: Vec3,
+    pub radius: f32,
+    pub remaining_secs: f32,
+    pub total_duration: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GrenadeSnapshot {
     pub id: u64,
     pub translation: Vec3,
@@ -2777,6 +2839,8 @@ pub struct ServerWorldSnapshot {
     pub fog_visible_mask: Vec<u8>,
     pub bullets: Vec<BulletSnapshot>,
     pub grenades: Vec<GrenadeSnapshot>,
+    pub toxic_pools: Vec<ToxicPoolSnapshot>,
+    pub electric_beams: Vec<ElectricBeamSnapshot>,
     pub targets: Vec<TargetSnapshot>,
     pub creeps: Vec<CreepSnapshot>,
     pub couriers: Vec<CourierSnapshot>,
@@ -4331,6 +4395,13 @@ pub struct PhysicsBullet {
     pub velocity: Vec3,
     pub damage: f32,
     pub remaining_range: f32,
+    pub gravity: f32,
+    pub aoe_radius: f32,
+    pub toxic_pool_duration_secs: f32,
+    pub toxic_pool_dps: f32,
+    pub toxic_slow_ratio: f32,
+    pub piercing: bool,
+    pub hit_entity_keys: Vec<u64>,
 }
 
 #[derive(Component)]
@@ -5639,6 +5710,13 @@ pub struct PlayerSlotState {
     pub hero_armor: f32,
     pub hero_scale: f32,
     pub hero_move_speed_multiplier: f32,
+    pub toxic_slow_multiplier: f32,
+    pub beam_charge: f32,
+    pub electric_fire_rate_slow_remaining: f32,
+    pub electric_fire_rate_slow_ratio: f32,
+    pub flame_armor_debuff_remaining: f32,
+    pub flame_armor_debuff_amount: f32,
+    pub active_beam_request: Option<(Vec3, Vec3, f32, f32, f32, f32, f32, bool)>,
     pub hero_shallow_water_speed_multiplier: f32,
     pub hero_deep_water_speed_multiplier: f32,
     pub hero_vision_range: f32,
@@ -5727,6 +5805,13 @@ pub struct AuthoritativeWorldState {
     pub hero_armor: f32,
     pub hero_scale: f32,
     pub hero_move_speed_multiplier: f32,
+    pub toxic_slow_multiplier: f32,
+    pub beam_charge: f32,
+    pub electric_fire_rate_slow_remaining: f32,
+    pub electric_fire_rate_slow_ratio: f32,
+    pub flame_armor_debuff_remaining: f32,
+    pub flame_armor_debuff_amount: f32,
+    pub active_beam_request: Option<(Vec3, Vec3, f32, f32, f32, f32, f32, bool)>,
     pub hero_shallow_water_speed_multiplier: f32,
     pub hero_deep_water_speed_multiplier: f32,
     pub hero_vision_range: f32,
@@ -5776,7 +5861,23 @@ pub struct AuthoritativeWorldState {
     pub next_creep_id: u64,
     pub bullets_snapshot: Vec<BulletSnapshot>,
     pub grenades_snapshot: Vec<GrenadeSnapshot>,
+    pub toxic_pools: Vec<ActiveToxicPool>,
+    pub toxic_pools_snapshot: Vec<ToxicPoolSnapshot>,
+    pub electric_beams_snapshot: Vec<ElectricBeamSnapshot>,
     pub pending_fx: Vec<GameplayFxEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveToxicPool {
+    pub id: u64,
+    pub pos: Vec3,
+    pub radius: f32,
+    pub remaining_secs: f32,
+    pub total_duration: f32,
+    pub dps: f32,
+    pub slow_ratio: f32,
+    pub owner_slot: Option<usize>,
+    pub owner_team: TeamId,
 }
 
 impl AuthoritativeWorldState {
@@ -5868,6 +5969,13 @@ impl AuthoritativeWorldState {
             hero_armor: hero.armor,
             hero_scale: hero.hero_scale,
             hero_move_speed_multiplier: hero.move_speed_multiplier,
+            toxic_slow_multiplier: 1.0,
+            beam_charge: hero.weapon.beam_max_charge,
+            electric_fire_rate_slow_remaining: 0.0,
+            electric_fire_rate_slow_ratio: 0.0,
+            flame_armor_debuff_remaining: 0.0,
+            flame_armor_debuff_amount: 0.0,
+            active_beam_request: None,
             hero_shallow_water_speed_multiplier: hero.shallow_water_speed_multiplier,
             hero_deep_water_speed_multiplier: hero.deep_water_speed_multiplier,
             hero_vision_range: hero.vision_range,
@@ -5990,6 +6098,9 @@ impl AuthoritativeWorldState {
             next_creep_id: 1,
             bullets_snapshot: Vec::new(),
             grenades_snapshot: Vec::new(),
+            toxic_pools: Vec::new(),
+            toxic_pools_snapshot: Vec::new(),
+            electric_beams_snapshot: Vec::new(),
             pending_fx: Vec::new(),
         }
     }
@@ -6064,6 +6175,13 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.hero_armor, &mut p.hero_armor);
         std::mem::swap(&mut self.hero_scale, &mut p.hero_scale);
         std::mem::swap(&mut self.hero_move_speed_multiplier, &mut p.hero_move_speed_multiplier);
+        std::mem::swap(&mut self.toxic_slow_multiplier, &mut p.toxic_slow_multiplier);
+        std::mem::swap(&mut self.beam_charge, &mut p.beam_charge);
+        std::mem::swap(&mut self.electric_fire_rate_slow_remaining, &mut p.electric_fire_rate_slow_remaining);
+        std::mem::swap(&mut self.electric_fire_rate_slow_ratio, &mut p.electric_fire_rate_slow_ratio);
+        std::mem::swap(&mut self.flame_armor_debuff_remaining, &mut p.flame_armor_debuff_remaining);
+        std::mem::swap(&mut self.flame_armor_debuff_amount, &mut p.flame_armor_debuff_amount);
+        std::mem::swap(&mut self.active_beam_request, &mut p.active_beam_request);
         std::mem::swap(&mut self.hero_shallow_water_speed_multiplier, &mut p.hero_shallow_water_speed_multiplier);
         std::mem::swap(&mut self.hero_deep_water_speed_multiplier, &mut p.hero_deep_water_speed_multiplier);
         std::mem::swap(&mut self.hero_vision_range, &mut p.hero_vision_range);
@@ -6483,6 +6601,13 @@ impl AuthoritativeWorldState {
                 hero_armor: hero.armor,
                 hero_scale: hero.hero_scale,
                 hero_move_speed_multiplier: hero.move_speed_multiplier,
+                toxic_slow_multiplier: 1.0,
+                beam_charge: hero.weapon.beam_max_charge,
+                electric_fire_rate_slow_remaining: 0.0,
+                electric_fire_rate_slow_ratio: 0.0,
+                flame_armor_debuff_remaining: 0.0,
+                flame_armor_debuff_amount: 0.0,
+                active_beam_request: None,
                 hero_shallow_water_speed_multiplier: hero.shallow_water_speed_multiplier,
                 hero_deep_water_speed_multiplier: hero.deep_water_speed_multiplier,
                 hero_vision_range: hero.vision_range,
@@ -6861,6 +6986,13 @@ impl AuthoritativeWorldState {
         self.hero_armor = hero.armor;
         self.hero_scale = hero.hero_scale;
         self.hero_move_speed_multiplier = hero.move_speed_multiplier;
+        self.toxic_slow_multiplier = 1.0;
+        self.beam_charge = hero.weapon.beam_max_charge;
+        self.electric_fire_rate_slow_remaining = 0.0;
+        self.electric_fire_rate_slow_ratio = 0.0;
+        self.flame_armor_debuff_remaining = 0.0;
+        self.flame_armor_debuff_amount = 0.0;
+        self.active_beam_request = None;
         self.hero_shallow_water_speed_multiplier = hero.shallow_water_speed_multiplier;
         self.hero_deep_water_speed_multiplier = hero.deep_water_speed_multiplier;
         self.hero_vision_range = hero.vision_range;
@@ -7014,6 +7146,8 @@ impl AuthoritativeWorldState {
             fog_visible_mask: self.fog_of_war.pack_visible_mask(),
             bullets: self.bullets_snapshot.clone(),
             grenades: self.grenades_snapshot.clone(),
+            toxic_pools: self.toxic_pools_snapshot.clone(),
+            electric_beams: self.electric_beams_snapshot.clone(),
             creeps: Vec::new(),
             couriers: Vec::new(),
             turrets: self
@@ -7226,6 +7360,18 @@ pub fn grant_xp_to_player_slot(
             p.hero_hp_regen_per_sec += growth.hp_regen_per_level;
             p.hero_stamina_regen_per_sec += growth.stamina_regen_per_level;
             p.hero_armor += growth.armor_per_level;
+            if p.hero_weapon.toxic_pool_duration_secs > 0.0 {
+                p.hero_weapon.toxic_pool_dps += growth.toxic_dps_per_level;
+                p.hero_weapon.toxic_slow_ratio =
+                    (p.hero_weapon.toxic_slow_ratio + growth.toxic_slow_per_level).clamp(0.0, 0.75);
+                p.hero_weapon.toxic_pool_duration_secs += growth.toxic_duration_per_level;
+            }
+            if p.hero_weapon.weapon_kind == WeaponKind::ElectricBeam || p.hero_weapon.weapon_kind == WeaponKind::FlameBeam {
+                p.hero_weapon.beam_dps += growth.beam_dps_per_level;
+                p.hero_weapon.beam_attack_speed_slow =
+                    (p.hero_weapon.beam_attack_speed_slow + growth.beam_attack_speed_slow_per_level).clamp(0.0, 0.75);
+                p.hero_weapon.beam_armor_reduction += growth.beam_armor_reduction_per_level;
+            }
 
             pending_fx.push(GameplayFxEvent::HeroLeveledUp {
                 pos: p.soldier_pos,
@@ -7781,7 +7927,12 @@ fn shared_drive_single_player(
             *rem -= dt;
             if *rem <= 0.0 {
                 world.reload_remaining = None;
-                world.ammo_in_mag = active_w.magazine_size;
+                if active_w.weapon_kind == WeaponKind::ElectricBeam || active_w.weapon_kind == WeaponKind::FlameBeam {
+                    world.beam_charge = active_w.beam_max_charge;
+                    world.ammo_in_mag = world.beam_charge.ceil() as u32;
+                } else {
+                    world.ammo_in_mag = active_w.magazine_size;
+                }
             }
         }
 
@@ -8184,7 +8335,7 @@ fn shared_drive_single_player(
             let is_deep_water = water_depth >= 0.85;
 
             let hero_cfg = config.active_hero(world.hero_index);
-            let hero_move_mult = world.hero_move_speed_multiplier;
+            let hero_move_mult = world.hero_move_speed_multiplier * world.toxic_slow_multiplier;
             let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
             let deep_mult = hero_cfg.deep_water_speed_multiplier;
 
@@ -8243,7 +8394,7 @@ fn shared_drive_single_player(
         } else if !world.traversal.is_active && world.wall_climb_mountain_index.is_none() {
             let grav_y = config.physics.character_gravity_step_y * dt;
             if world.is_moving {
-                let hero_move_mult = world.hero_move_speed_multiplier;
+                let hero_move_mult = world.hero_move_speed_multiplier * world.toxic_slow_multiplier;
                 let speed = match world.effective_stance {
                     Stance::Run => config.soldier.run_speed,
                     Stance::Walk => config.soldier.walk_speed,
@@ -8597,7 +8748,7 @@ fn step_traversal_custom(
                 world.traversal.duration = start_anim_dur;
             } else {
                 world.traversal.anim_name = swing_cfg.end_anim.clone();
-                world.traversal.duration = (total_dur * (1.0 - swing_cfg.end_phase_fraction)).max(0.05);
+                world.traversal.duration = config.exact_anim_duration(&swing_cfg.end_anim);
             }
 
             if air_elapsed >= total_dur {
@@ -9338,6 +9489,18 @@ fn step_shooting_and_grenade_spawn(
     dt: f32,
 ) {
     world.fire_cooldown_remaining = (world.fire_cooldown_remaining - dt).max(0.0);
+    if world.electric_fire_rate_slow_remaining > 0.0 {
+        world.electric_fire_rate_slow_remaining = (world.electric_fire_rate_slow_remaining - dt).max(0.0);
+        if world.electric_fire_rate_slow_remaining <= 0.0 {
+            world.electric_fire_rate_slow_ratio = 0.0;
+        }
+    }
+    if world.flame_armor_debuff_remaining > 0.0 {
+        world.flame_armor_debuff_remaining = (world.flame_armor_debuff_remaining - dt).max(0.0);
+        if world.flame_armor_debuff_remaining <= 0.0 {
+            world.flame_armor_debuff_amount = 0.0;
+        }
+    }
 
     if world.is_dead || world.traversal.is_active || world.current_locomotion == "swimming" {
         return;
@@ -9386,17 +9549,73 @@ fn step_shooting_and_grenade_spawn(
     }
 
     if world.reload_remaining.is_some() {
+        world.active_beam_request = None;
         return;
     }
-
-    let wants_fire =
-        (input.fire_just_pressed || input.fire_held) && world.fire_cooldown_remaining <= 0.0;
 
     let active_w = if world.active_weapon == ActiveWeaponSlot::Pistol {
         world.hero_pistol
     } else {
         world.hero_weapon
     };
+
+    if active_w.weapon_kind == WeaponKind::ElectricBeam || active_w.weapon_kind == WeaponKind::FlameBeam {
+        let is_flame_beam = active_w.weapon_kind == WeaponKind::FlameBeam;
+        if input.fire_held && !world.is_dead && !world.traversal.is_active && world.wall_climb_mountain_index.is_none() {
+            if world.beam_charge <= 0.0 {
+                world.ammo_in_mag = 0;
+                world.reload_remaining = Some(active_w.reload_duration_secs);
+                world.firing_anim_remaining = None;
+                world.active_beam_request = None;
+                return;
+            }
+            world.beam_charge = (world.beam_charge - active_w.beam_drain_per_sec * dt).max(0.0);
+            world.ammo_in_mag = world.beam_charge.ceil() as u32;
+            let dur = config.exact_anim_duration("firing_rifle");
+            world.firing_anim_remaining = Some(dur);
+            let muzzle_pos = resolve_muzzle_pos(world, input, config);
+            let to_aim = world.aim_hit_pos - muzzle_pos;
+            let beam_dir = if !world.aim_locked_on_enemy && !input.vertical_aim_held {
+                let flat = Vec3::new(to_aim.x, 0.0, to_aim.z);
+                if flat.length_squared() > config.physics.muzzle_aim_min_dist_sq {
+                    flat.normalize()
+                } else {
+                    world.aim_world_dir
+                }
+            } else if to_aim.length_squared() > config.physics.muzzle_aim_min_dist_sq {
+                let mut dir = to_aim.normalize();
+                let max_sin = config.combat.max_vertical_aim_pitch_sin;
+                dir.y = dir.y.clamp(-max_sin, max_sin);
+                dir.normalize()
+            } else {
+                world.aim_world_dir
+            };
+            world.active_beam_request = Some((
+                muzzle_pos,
+                beam_dir,
+                active_w.max_range,
+                active_w.beam_dps,
+                active_w.beam_attack_speed_slow,
+                active_w.beam_armor_reduction,
+                active_w.beam_slow_duration_secs,
+                is_flame_beam,
+            ));
+            if world.beam_charge <= 0.0 {
+                world.ammo_in_mag = 0;
+                world.reload_remaining = Some(active_w.reload_duration_secs);
+                world.active_beam_request = None;
+            }
+        } else {
+            world.active_beam_request = None;
+        }
+        return;
+    } else {
+        world.active_beam_request = None;
+    }
+
+    let wants_fire =
+        (input.fire_just_pressed || input.fire_held) && world.fire_cooldown_remaining <= 0.0;
+
     if wants_fire {
         if world.ammo_in_mag == 0 {
             world.reload_remaining = Some(active_w.reload_duration_secs);
@@ -9405,7 +9624,12 @@ fn step_shooting_and_grenade_spawn(
         }
 
         world.ammo_in_mag -= 1;
-        world.fire_cooldown_remaining = active_w.fire_rate_secs;
+        let slow_div = if world.electric_fire_rate_slow_remaining > 0.0 {
+            (1.0 - world.electric_fire_rate_slow_ratio).clamp(0.25, 1.0)
+        } else {
+            1.0
+        };
+        world.fire_cooldown_remaining = active_w.fire_rate_secs / slow_div;
         if world.active_weapon == ActiveWeaponSlot::Primary {
             let dur = config.exact_anim_duration("firing_rifle");
             world.firing_anim_remaining = Some(dur);
@@ -9452,6 +9676,36 @@ fn step_shooting_and_grenade_spawn(
             }
             let id = world.next_entity_id;
             world.next_entity_id += 1;
+            let (init_vel, bullet_range) = if active_w.gravity > 0.0 {
+                let target_y = if !world.aim_locked_on_enemy && !input.vertical_aim_held {
+                    world.soldier_pos.y
+                } else {
+                    world.aim_hit_pos.y
+                };
+                let raw_horiz = Vec3::new(
+                    world.aim_hit_pos.x - muzzle_pos.x,
+                    0.0,
+                    world.aim_hit_pos.z - muzzle_pos.z,
+                );
+                let raw_dist = raw_horiz.length();
+                let horiz_dir = if raw_dist > 0.05 {
+                    Quat::from_rotation_y(spread) * (raw_horiz / raw_dist)
+                } else {
+                    Vec3::new(final_dir.x, 0.0, final_dir.z).normalize_or_zero()
+                };
+                let clamped_dist = raw_dist.clamp(1.0, max_range);
+                let flight_time = (clamped_dist / proj_speed.max(1.0)).max(0.28);
+                let horiz_vel = horiz_dir * (clamped_dist / flight_time);
+                let dy = target_y - muzzle_pos.y;
+                let vy = (dy + 0.5 * active_w.gravity * flight_time * flight_time) / flight_time
+                    + active_w.launch_up_boost;
+                (
+                    Vec3::new(horiz_vel.x, vy, horiz_vel.z),
+                    max_range * 1.8,
+                )
+            } else {
+                (final_dir * proj_speed, max_range)
+            };
             commands.spawn((
                 PhysicsBullet {
                     id,
@@ -9461,9 +9715,16 @@ fn step_shooting_and_grenade_spawn(
                         hero_id: world.hero_id.clone(),
                         weapon_kind: active_w.weapon_kind,
                     },
-                    velocity: final_dir * proj_speed,
+                    velocity: init_vel,
                     damage: dmg,
-                    remaining_range: max_range,
+                    remaining_range: bullet_range,
+                    gravity: active_w.gravity,
+                    aoe_radius: active_w.aoe_radius,
+                    toxic_pool_duration_secs: active_w.toxic_pool_duration_secs,
+                    toxic_pool_dps: active_w.toxic_pool_dps,
+                    toxic_slow_ratio: active_w.toxic_slow_ratio,
+                    piercing: active_w.piercing || active_w.weapon_kind == WeaponKind::SpinningBlade,
+                    hit_entity_keys: Vec::new(),
                 },
                 Transform::from_translation(muzzle_pos),
             ));
@@ -9480,6 +9741,172 @@ fn step_shooting_and_grenade_spawn(
             trauma_max: config.combat.shot_fire_trauma_max,
         });
     }
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn apply_aoe_explosion(
+    commands: &mut Commands,
+    config: &GameConfig,
+    world: &mut AuthoritativeWorldState,
+    target_entity_by_idx: &HashMap<usize, Entity>,
+    pos: Vec3,
+    owner_slot: Option<usize>,
+    owner_team: TeamId,
+    dmg: f32,
+    aoe_radius: f32,
+) {
+    // ۱. صدمه به اهداف تمرینی داخل شعاع AOE
+    for idx in 0..world.targets.len() {
+        let target_dead = world.targets[idx].is_dead;
+        let t_pos = world.targets[idx].base_pos;
+        if !target_dead && t_pos.distance(pos) <= aoe_radius {
+            world.targets[idx].hp -= dmg;
+            world.targets[idx].hit_flash_timer = config.fx.target_hit_flash_secs;
+            if world.targets[idx].hp <= 0.0 {
+                world.targets[idx].hp = 0.0;
+                world.targets[idx].is_dead = true;
+                world.targets[idx].respawn_remaining = world.targets[idx].respawn_duration;
+                if let Some(&t_ent) = target_entity_by_idx.get(&idx) {
+                    commands.entity(t_ent).insert(ColliderDisabled);
+                }
+                if let Some(o_slot) = owner_slot {
+                    if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == o_slot) {
+                        attacker.last_hits += 1;
+                        attacker.hero_gold += 35;
+                        if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
+                            grant_xp_to_player_slot(attacker, 45, config, &mut world.pending_fx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ۲. صدمه AOE به هیروهای دشمن داخل شعاع انفجار
+    for p_idx in 0..world.players.len() {
+        if world.players[p_idx].is_dead || world.players[p_idx].hero_team == owner_team {
+            continue;
+        }
+        let h_pos = world.players[p_idx].soldier_pos + Vec3::Y * 0.9;
+        if h_pos.distance(pos) <= aoe_radius {
+            let armor = world.players[p_idx].hero_armor - if world.players[p_idx].flame_armor_debuff_remaining > 0.0 { world.players[p_idx].flame_armor_debuff_amount } else { 0.0 };
+            let eff_dmg = (dmg * dota2_armor_multiplier(armor)).max(1.0);
+            world.players[p_idx].hero_hp = (world.players[p_idx].hero_hp - eff_dmg).max(0.0);
+            if world.players[p_idx].hero_hp <= 0.0 && !world.players[p_idx].is_dead {
+                world.swap_slot_in(p_idx);
+                trigger_random_death(world, config);
+                world.swap_slot_in(p_idx);
+
+                if let Some(o_slot) = owner_slot {
+                    if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == o_slot) {
+                        attacker.kills += 1;
+                        attacker.hero_gold += 225;
+                        grant_xp_to_player_slot(attacker, 150, config, &mut world.pending_fx);
+                    }
+                }
+            }
+        }
+    }
+
+    // ۳. صدمه AOE به سربازان لاین و کمپ‌های دشمن
+    for c_idx in 0..world.creeps.len() {
+        if world.creeps[c_idx].is_dead || world.creeps[c_idx].team == owner_team {
+            continue;
+        }
+        let c_pos = world.creeps[c_idx].pos;
+        if (c_pos + Vec3::Y * 0.8).distance(pos) <= aoe_radius {
+            let c_stats = resolve_creep_stats(config, world.creeps[c_idx].creep_type_id.as_deref());
+            let (_, _, armor_bonus, _, _) = lane_creep_buffs(
+                config,
+                &world.barracks,
+                world.creeps[c_idx].team,
+                world.creeps[c_idx].lane,
+                world.creeps[c_idx].camp_index.is_none(),
+            );
+            let (_, time_armor_bonus, _, _) = lane_creep_time_scaling(
+                config,
+                world.match_elapsed_secs,
+                world.creeps[c_idx].camp_index.is_none(),
+            );
+            let eff_dmg = (dmg * dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus)).max(1.0);
+            world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
+            if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
+                for c in &mut world.creeps {
+                    if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
+                        c.is_aggroed = true;
+                    }
+                }
+            }
+            if world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead {
+                world.creeps[c_idx].is_dead = true;
+                world.creeps[c_idx].anim_state = CreepAnimState::Die;
+                world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
+                let gold_bounty = c_stats.gold_bounty;
+                let xp_bounty = c_stats.xp_bounty;
+                if let Some(o_slot) = owner_slot {
+                    if let Some(killer) = world.players.iter_mut().find(|p| p.slot_index == o_slot) {
+                        killer.last_hits += 1;
+                        killer.hero_gold += gold_bounty;
+                        world.pending_fx.push(GameplayFxEvent::LastHitGold {
+                            pos: c_pos,
+                            gold: gold_bounty,
+                        });
+                    }
+                }
+                let eligible_indices: Vec<usize> = world
+                    .players
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        !p.is_dead
+                            && p.hero_team == owner_team
+                            && p.soldier_pos.distance(c_pos) <= p.hero_xp_gain_radius
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if !eligible_indices.is_empty() {
+                    let share = xp_bounty / (eligible_indices.len() as u32);
+                    for idx in eligible_indices {
+                        let p = &mut world.players[idx];
+                        grant_xp_to_player_slot(p, share, config, &mut world.pending_fx);
+                    }
+                }
+            }
+        }
+    }
+
+    let water_hit = sample_water_surface_at(config, pos);
+    if let Some((water_y, _)) = water_hit {
+        world.pending_fx.push(GameplayFxEvent::WaterSplash {
+            pos: Vec3::new(pos.x, water_y, pos.z),
+            intensity: 2.2,
+        });
+    }
+
+    world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
+        pos,
+        aoe_radius,
+        in_water: water_hit.is_some(),
+        water_y: water_hit.map(|(wy, _)| wy).unwrap_or(pos.y),
+        trauma_add: config.combat.grenade_explosion_trauma_add,
+        trauma_max: config.combat.grenade_explosion_trauma_max,
+    });
+}
+
+
+fn creep_toxic_slow_at(pools: &[ActiveToxicPool], pos: Vec3, team: TeamId) -> f32 {
+    let mut mult = 1.0_f32;
+    for pool in pools {
+        if pool.owner_team != team
+            && pool.remaining_secs > 0.0
+            && Vec2::new(pos.x - pool.pos.x, pos.z - pool.pos.z).length() <= pool.radius
+            && (pos.y - pool.pos.y).abs() <= 3.5
+        {
+            mult = mult.min((1.0 - pool.slow_ratio).clamp(0.20, 1.0));
+        }
+    }
+    mult
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9592,151 +10019,29 @@ fn shared_authoritative_react_system(
     }
 
     for (pos, owner_slot, owner_team, dmg, aoe_radius) in exploded_grenades {
-        // ۱. صدمه به اهداف تمرینی داخل شعاع AOE
-        for idx in 0..world.targets.len() {
-            let target_dead = world.targets[idx].is_dead;
-            let t_pos = world.targets[idx].base_pos;
-            if !target_dead && t_pos.distance(pos) <= aoe_radius {
-                world.targets[idx].hp -= dmg;
-                world.targets[idx].hit_flash_timer = config.fx.target_hit_flash_secs;
-                if world.targets[idx].hp <= 0.0 {
-                    world.targets[idx].hp = 0.0;
-                    world.targets[idx].is_dead = true;
-                    world.targets[idx].respawn_remaining = world.targets[idx].respawn_duration;
-                    if let Some(&t_ent) = target_entity_by_idx.get(&idx) {
-                        commands.entity(t_ent).insert(ColliderDisabled);
-                    }
-                    let world_inner = &mut *world;
-                    if let Some(attacker) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
-                        attacker.last_hits += 1;
-                        attacker.hero_gold += 35;
-                        if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
-                            grant_xp_to_player_slot(attacker, 45, &config, &mut world_inner.pending_fx);
-                        }
-                    }
-                }
-            }
-        }
-
-        // ۲. صدمه AOE به هیروهای دشمن داخل شعاع انفجار
-        for p_idx in 0..world.players.len() {
-            if world.players[p_idx].is_dead || world.players[p_idx].hero_team == owner_team {
-                continue;
-            }
-            let h_pos = world.players[p_idx].soldier_pos + Vec3::Y * 0.9;
-            if h_pos.distance(pos) <= aoe_radius {
-                let armor = world.players[p_idx].hero_armor;
-                let eff_dmg = (dmg * dota2_armor_multiplier(armor)).max(1.0);
-                world.players[p_idx].hero_hp = (world.players[p_idx].hero_hp - eff_dmg).max(0.0);
-                if world.players[p_idx].hero_hp <= 0.0 && !world.players[p_idx].is_dead {
-                    world.swap_slot_in(p_idx);
-                    trigger_random_death(&mut world, &config);
-                    world.swap_slot_in(p_idx);
-
-                    let world_inner = &mut *world;
-                    if let Some(attacker) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
-                        attacker.kills += 1;
-                        attacker.hero_gold += 225;
-                        grant_xp_to_player_slot(attacker, 150, &config, &mut world_inner.pending_fx);
-                    }
-                }
-            }
-        }
-
-        // ۳. صدمه AOE به سربازان لاین و کمپ‌های دشمن
-        for c_idx in 0..world.creeps.len() {
-            if world.creeps[c_idx].is_dead || world.creeps[c_idx].team == owner_team {
-                continue;
-            }
-            let c_pos = world.creeps[c_idx].pos;
-            if (c_pos + Vec3::Y * 0.8).distance(pos) <= aoe_radius {
-                let c_stats = resolve_creep_stats(&config, world.creeps[c_idx].creep_type_id.as_deref());
-                let (_, _, armor_bonus, _, _) = lane_creep_buffs(
-                    &config,
-                    &world.barracks,
-                    world.creeps[c_idx].team,
-                    world.creeps[c_idx].lane,
-                    world.creeps[c_idx].camp_index.is_none(),
-                );
-                let (_, time_armor_bonus, _, _) = lane_creep_time_scaling(
-                    &config,
-                    world.match_elapsed_secs,
-                    world.creeps[c_idx].camp_index.is_none(),
-                );
-                let eff_dmg = (dmg * dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus)).max(1.0);
-                world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
-                if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
-                    for c in &mut world.creeps {
-                        if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
-                            c.is_aggroed = true;
-                        }
-                    }
-                }
-                if world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead {
-                    world.creeps[c_idx].is_dead = true;
-                    world.creeps[c_idx].anim_state = CreepAnimState::Die;
-                    world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
-                    let gold_bounty = c_stats.gold_bounty;
-                    let xp_bounty = c_stats.xp_bounty;
-                    let world_inner = &mut *world;
-                    if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
-                        killer.last_hits += 1;
-                        killer.hero_gold += gold_bounty;
-                        world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
-                            pos: c_pos,
-                            gold: gold_bounty,
-                        });
-                    }
-                    let eligible_indices: Vec<usize> = world
-                        .players
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, p)| {
-                            !p.is_dead
-                                && p.hero_team == owner_team
-                                && p.soldier_pos.distance(c_pos) <= p.hero_xp_gain_radius
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                    if !eligible_indices.is_empty() {
-                        let share = xp_bounty / (eligible_indices.len() as u32);
-                        let world_inner = &mut *world;
-                        for idx in eligible_indices {
-                            grant_xp_to_player_slot(
-                                &mut world_inner.players[idx],
-                                share,
-                                &config,
-                                &mut world_inner.pending_fx,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        let water_hit = sample_water_surface_at(&config, pos);
-        if let Some((water_y, _)) = water_hit {
-            world.pending_fx.push(GameplayFxEvent::WaterSplash {
-                pos: Vec3::new(pos.x, water_y, pos.z),
-                intensity: 2.2,
-            });
-        }
-
-        world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
+        apply_aoe_explosion(
+            &mut commands,
+            &config,
+            &mut world,
+            &target_entity_by_idx,
             pos,
+            Some(owner_slot),
+            owner_team,
+            dmg,
             aoe_radius,
-            in_water: water_hit.is_some(),
-            water_y: water_hit.map(|(wy, _)| wy).unwrap_or(pos.y),
-            trauma_add: config.combat.grenade_explosion_trauma_add,
-            trauma_max: config.combat.grenade_explosion_trauma_max,
-        });
+        );
     }
 
+    let mut aoe_bullet_explosions: Vec<(Vec3, Option<usize>, TeamId, f32, f32)> = Vec::new();
+    let mut spawned_toxic_pools: Vec<ActiveToxicPool> = Vec::new();
     world.bullets_snapshot.clear();
     let bullet_query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
 
     for (entity, mut bullet, mut tf) in &mut bullet_query {
         let old_pos = tf.translation;
+        if bullet.gravity > 0.0 {
+            bullet.velocity.y -= bullet.gravity * dt;
+        }
         let step_vec = bullet.velocity * dt;
         let step_dist = step_vec.length();
         let step_dir = step_vec.normalize_or_zero();
@@ -9853,8 +10158,59 @@ fn shared_authoritative_react_system(
 
         if hero_wins {
             let (enemy_idx, h_toi) = best_hero_hit.unwrap();
+            let hit_key = 1_000_000_u64 + world.players[enemy_idx].slot_index as u64;
+            if bullet.piercing && bullet.hit_entity_keys.contains(&hit_key) {
+                tf.translation = new_pos;
+                world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
+                    start: old_pos,
+                    end: new_pos,
+                    vfx_source: bullet.vfx_source.clone(),
+                });
+                if bullet.remaining_range <= 0.0 {
+                    commands.entity(entity).despawn();
+                } else {
+                    world.bullets_snapshot.push(BulletSnapshot {
+                        id: bullet.id,
+                        translation: tf.translation,
+                        velocity: bullet.velocity,
+                        vfx_source: bullet.vfx_source.clone(),
+                    });
+                }
+                continue;
+            }
             let impact_pos = old_pos + step_dir * h_toi;
-            let armor = world.players[enemy_idx].hero_armor;
+            if bullet.aoe_radius > 0.0 {
+                world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
+                    start: old_pos,
+                    end: impact_pos,
+                    vfx_source: bullet.vfx_source.clone(),
+                });
+                aoe_bullet_explosions.push((
+                    impact_pos,
+                    bullet.owner_slot,
+                    bullet.owner_team,
+                    bullet.damage,
+                    bullet.aoe_radius,
+                ));
+                if bullet.toxic_pool_duration_secs > 0.0 {
+                    let pool_id = world.next_entity_id;
+                    world.next_entity_id += 1;
+                    spawned_toxic_pools.push(ActiveToxicPool {
+                        id: pool_id,
+                        pos: impact_pos,
+                        radius: bullet.aoe_radius,
+                        remaining_secs: bullet.toxic_pool_duration_secs,
+                        total_duration: bullet.toxic_pool_duration_secs,
+                        dps: bullet.toxic_pool_dps,
+                        slow_ratio: bullet.toxic_slow_ratio,
+                        owner_slot: bullet.owner_slot,
+                        owner_team: bullet.owner_team,
+                    });
+                }
+                commands.entity(entity).despawn();
+                continue;
+            }
+            let armor = world.players[enemy_idx].hero_armor - if world.players[enemy_idx].flame_armor_debuff_remaining > 0.0 { world.players[enemy_idx].flame_armor_debuff_amount } else { 0.0 };
             let dmg_mult = dota2_armor_multiplier(armor);
             let effective_dmg = (bullet.damage * dmg_mult).max(1.0);
 
@@ -9892,7 +10248,22 @@ fn shared_authoritative_react_system(
                 trauma_max: config.combat.shot_fire_trauma_max,
                 vfx_source: bullet.vfx_source.clone(),
             });
-            commands.entity(entity).despawn();
+            if bullet.piercing {
+                bullet.hit_entity_keys.push(1_000_000_u64 + world.players[enemy_idx].slot_index as u64);
+                tf.translation = new_pos;
+                if bullet.remaining_range <= 0.0 {
+                    commands.entity(entity).despawn();
+                } else {
+                    world.bullets_snapshot.push(BulletSnapshot {
+                        id: bullet.id,
+                        translation: tf.translation,
+                        velocity: bullet.velocity,
+                        vfx_source: bullet.vfx_source.clone(),
+                    });
+                }
+            } else {
+                commands.entity(entity).despawn();
+            }
             continue;
         }
 
@@ -9905,6 +10276,30 @@ fn shared_authoritative_react_system(
         if courier_wins {
             let (cour_p_idx, cour_toi) = best_courier_hit.unwrap();
             let impact_pos = old_pos + step_dir * cour_toi;
+            if bullet.aoe_radius > 0.0 {
+                aoe_bullet_explosions.push((
+                    impact_pos,
+                    bullet.owner_slot,
+                    bullet.owner_team,
+                    bullet.damage,
+                    bullet.aoe_radius,
+                ));
+                if bullet.toxic_pool_duration_secs > 0.0 {
+                    let pool_id = world.next_entity_id;
+                    world.next_entity_id += 1;
+                    spawned_toxic_pools.push(ActiveToxicPool {
+                        id: pool_id,
+                        pos: impact_pos,
+                        radius: bullet.aoe_radius,
+                        remaining_secs: bullet.toxic_pool_duration_secs,
+                        total_duration: bullet.toxic_pool_duration_secs,
+                        dps: bullet.toxic_pool_dps,
+                        slow_ratio: bullet.toxic_slow_ratio,
+                        owner_slot: bullet.owner_slot,
+                        owner_team: bullet.owner_team,
+                    });
+                }
+            }
             let h_cfg = config.active_hero(world.players[cour_p_idx].hero_index).clone();
             world.players[cour_p_idx].courier_hp =
                 (world.players[cour_p_idx].courier_hp - bullet.damage).max(0.0);
@@ -9961,7 +10356,58 @@ fn shared_authoritative_react_system(
 
         if creep_wins {
             let (c_idx, c_toi) = best_creep_hit.unwrap();
+            let hit_key = 3_000_000_u64 + world.creeps[c_idx].id;
+            if bullet.piercing && bullet.hit_entity_keys.contains(&hit_key) {
+                tf.translation = new_pos;
+                world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
+                    start: old_pos,
+                    end: new_pos,
+                    vfx_source: bullet.vfx_source.clone(),
+                });
+                if bullet.remaining_range <= 0.0 {
+                    commands.entity(entity).despawn();
+                } else {
+                    world.bullets_snapshot.push(BulletSnapshot {
+                        id: bullet.id,
+                        translation: tf.translation,
+                        velocity: bullet.velocity,
+                        vfx_source: bullet.vfx_source.clone(),
+                    });
+                }
+                continue;
+            }
             let impact_pos = old_pos + step_dir * c_toi;
+            if bullet.aoe_radius > 0.0 {
+                world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
+                    start: old_pos,
+                    end: impact_pos,
+                    vfx_source: bullet.vfx_source.clone(),
+                });
+                aoe_bullet_explosions.push((
+                    impact_pos,
+                    bullet.owner_slot,
+                    bullet.owner_team,
+                    bullet.damage,
+                    bullet.aoe_radius,
+                ));
+                if bullet.toxic_pool_duration_secs > 0.0 {
+                    let pool_id = world.next_entity_id;
+                    world.next_entity_id += 1;
+                    spawned_toxic_pools.push(ActiveToxicPool {
+                        id: pool_id,
+                        pos: impact_pos,
+                        radius: bullet.aoe_radius,
+                        remaining_secs: bullet.toxic_pool_duration_secs,
+                        total_duration: bullet.toxic_pool_duration_secs,
+                        dps: bullet.toxic_pool_dps,
+                        slow_ratio: bullet.toxic_slow_ratio,
+                        owner_slot: bullet.owner_slot,
+                        owner_team: bullet.owner_team,
+                    });
+                }
+                commands.entity(entity).despawn();
+                continue;
+            }
             let c_stats = resolve_creep_stats(&config, world.creeps[c_idx].creep_type_id.as_deref());
             let (_, _, armor_bonus, _, _) = lane_creep_buffs(
                 &config,
@@ -10082,7 +10528,22 @@ fn shared_authoritative_react_system(
                 trauma_max: config.combat.shot_fire_trauma_max,
                 vfx_source: bullet.vfx_source.clone(),
             });
-            commands.entity(entity).despawn();
+            if bullet.piercing {
+                bullet.hit_entity_keys.push(3_000_000_u64 + world.creeps[c_idx].id);
+                tf.translation = new_pos;
+                if bullet.remaining_range <= 0.0 {
+                    commands.entity(entity).despawn();
+                } else {
+                    world.bullets_snapshot.push(BulletSnapshot {
+                        id: bullet.id,
+                        translation: tf.translation,
+                        velocity: bullet.velocity,
+                        vfx_source: bullet.vfx_source.clone(),
+                    });
+                }
+            } else {
+                commands.entity(entity).despawn();
+            }
             continue;
         }
 
@@ -10220,6 +10681,24 @@ fn shared_authoritative_react_system(
                     }
                 }
             } else if let Some(&t_idx) = target_idx_by_entity.get(&hit_entity) {
+                let t_key = 4_000_000_u64 + t_idx as u64;
+                if bullet.piercing && bullet.hit_entity_keys.contains(&t_key) {
+                    tf.translation = new_pos;
+                    if bullet.remaining_range <= 0.0 {
+                        commands.entity(entity).despawn();
+                    } else {
+                        world.bullets_snapshot.push(BulletSnapshot {
+                            id: bullet.id,
+                            translation: tf.translation,
+                            velocity: bullet.velocity,
+                            vfx_source: bullet.vfx_source.clone(),
+                        });
+                    }
+                    continue;
+                }
+                if bullet.piercing {
+                    bullet.hit_entity_keys.push(t_key);
+                }
                 impact_surface = ImpactSurface::Character;
                 let target = &mut world.targets[t_idx];
                 target.hp -= bullet.damage;
@@ -10254,16 +10733,51 @@ fn shared_authoritative_react_system(
                 end: impact_pos,
                 vfx_source: bullet.vfx_source.clone(),
             });
-            world.pending_fx.push(GameplayFxEvent::BulletImpact {
-                impact_pos,
-                bullet_dir: step_dir,
-                surface: impact_surface,
-                target_destroyed,
-                trauma_add: config.combat.target_destroy_trauma_add,
-                trauma_max: config.combat.target_destroy_trauma_max,
-                vfx_source: bullet.vfx_source.clone(),
-            });
-            commands.entity(entity).despawn();
+            if bullet.aoe_radius > 0.0 {
+                aoe_bullet_explosions.push((
+                    impact_pos,
+                    bullet.owner_slot,
+                    bullet.owner_team,
+                    bullet.damage,
+                    bullet.aoe_radius,
+                ));
+                if bullet.toxic_pool_duration_secs > 0.0 {
+                    let pool_id = world.next_entity_id;
+                    world.next_entity_id += 1;
+                    spawned_toxic_pools.push(ActiveToxicPool {
+                        id: pool_id,
+                        pos: impact_pos,
+                        radius: bullet.aoe_radius,
+                        remaining_secs: bullet.toxic_pool_duration_secs,
+                        total_duration: bullet.toxic_pool_duration_secs,
+                        dps: bullet.toxic_pool_dps,
+                        slow_ratio: bullet.toxic_slow_ratio,
+                        owner_slot: bullet.owner_slot,
+                        owner_team: bullet.owner_team,
+                    });
+                }
+            } else {
+                world.pending_fx.push(GameplayFxEvent::BulletImpact {
+                    impact_pos,
+                    bullet_dir: step_dir,
+                    surface: impact_surface,
+                    target_destroyed,
+                    trauma_add: config.combat.target_destroy_trauma_add,
+                    trauma_max: config.combat.target_destroy_trauma_max,
+                    vfx_source: bullet.vfx_source.clone(),
+                });
+            }
+            if bullet.piercing && target_idx_by_entity.contains_key(&hit_entity) && bullet.remaining_range > 0.0 {
+                tf.translation = new_pos;
+                world.bullets_snapshot.push(BulletSnapshot {
+                    id: bullet.id,
+                    translation: tf.translation,
+                    velocity: bullet.velocity,
+                    vfx_source: bullet.vfx_source.clone(),
+                });
+            } else {
+                commands.entity(entity).despawn();
+            }
         } else {
             // بررسی برخورد گلوله با سطح آب برکه‌ها و رودخانه‌ها
             let mid_pos = (old_pos + new_pos) * 0.5;
@@ -10272,6 +10786,37 @@ fn shared_authoritative_react_system(
                     || (mid_pos.y - water_y).abs() <= 0.35;
                 if crossed_water {
                     let wp = Vec3::new(mid_pos.x, water_y, mid_pos.z);
+                    if bullet.aoe_radius > 0.0 {
+                        world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
+                            start: old_pos,
+                            end: wp,
+                            vfx_source: bullet.vfx_source.clone(),
+                        });
+                        aoe_bullet_explosions.push((
+                            wp,
+                            bullet.owner_slot,
+                            bullet.owner_team,
+                            bullet.damage,
+                            bullet.aoe_radius,
+                        ));
+                        if bullet.toxic_pool_duration_secs > 0.0 {
+                            let pool_id = world.next_entity_id;
+                            world.next_entity_id += 1;
+                            spawned_toxic_pools.push(ActiveToxicPool {
+                                id: pool_id,
+                                pos: wp,
+                                radius: bullet.aoe_radius,
+                                remaining_secs: bullet.toxic_pool_duration_secs,
+                                total_duration: bullet.toxic_pool_duration_secs,
+                                dps: bullet.toxic_pool_dps,
+                                slow_ratio: bullet.toxic_slow_ratio,
+                                owner_slot: bullet.owner_slot,
+                                owner_team: bullet.owner_team,
+                            });
+                        }
+                        commands.entity(entity).despawn();
+                        continue;
+                    }
                     world.pending_fx.push(GameplayFxEvent::WaterSplash {
                         pos: wp,
                         intensity: 1.15,
@@ -10296,6 +10841,30 @@ fn shared_authoritative_react_system(
             });
 
             if bullet.remaining_range <= 0.0 {
+                if bullet.aoe_radius > 0.0 {
+                    aoe_bullet_explosions.push((
+                        new_pos,
+                        bullet.owner_slot,
+                        bullet.owner_team,
+                        bullet.damage,
+                        bullet.aoe_radius,
+                    ));
+                    if bullet.toxic_pool_duration_secs > 0.0 {
+                        let pool_id = world.next_entity_id;
+                        world.next_entity_id += 1;
+                        spawned_toxic_pools.push(ActiveToxicPool {
+                            id: pool_id,
+                            pos: new_pos,
+                            radius: bullet.aoe_radius,
+                            remaining_secs: bullet.toxic_pool_duration_secs,
+                            total_duration: bullet.toxic_pool_duration_secs,
+                            dps: bullet.toxic_pool_dps,
+                            slow_ratio: bullet.toxic_slow_ratio,
+                            owner_slot: bullet.owner_slot,
+                            owner_team: bullet.owner_team,
+                        });
+                    }
+                }
                 commands.entity(entity).despawn();
             } else {
                 world.bullets_snapshot.push(BulletSnapshot {
@@ -10307,6 +10876,446 @@ fn shared_authoritative_react_system(
             }
         }
     }
+
+    for (pos, owner_slot, owner_team, dmg, aoe_radius) in aoe_bullet_explosions {
+        apply_aoe_explosion(
+            &mut commands,
+            &config,
+            &mut world,
+            &target_entity_by_idx,
+            pos,
+            owner_slot,
+            owner_team,
+            dmg,
+            aoe_radius,
+        );
+    }
+
+
+    world.electric_beams_snapshot.clear();
+    let beam_requests: Vec<(usize, TeamId, Vec3, Vec3, f32, f32, f32, f32, f32, bool)> = if !world.players.is_empty() {
+        world
+            .players
+            .iter()
+            .filter_map(|p| {
+                p.active_beam_request.map(|(mpos, bdir, mrange, bdps, bslow, barm, bdur, bflame)| {
+                    (p.slot_index, p.hero_team, mpos, bdir, mrange, bdps, bslow, barm, bdur, bflame)
+                })
+            })
+            .collect()
+    } else if let Some((mpos, bdir, mrange, bdps, bslow, barm, bdur, bflame)) = world.active_beam_request {
+        vec![(world.active_slot, world.hero_team, mpos, bdir, mrange, bdps, bslow, barm, bdur, bflame)]
+    } else {
+        Vec::new()
+    };
+
+    for (owner_slot, owner_team, muzzle_pos, beam_dir, max_range, beam_dps, slow_ratio, armor_red, debuff_dur, is_flame) in beam_requests {
+        let mut best_toi = max_range;
+        let mut hit_hero: Option<usize> = None;
+        let mut hit_creep: Option<usize> = None;
+        let mut hit_courier: Option<usize> = None;
+        let mut hit_world_ent: Option<Entity> = None;
+
+        for (p_idx, p) in world.players.iter().enumerate() {
+            if p.slot_index == owner_slot || p.hero_team == owner_team || p.is_dead {
+                continue;
+            }
+            let h_rad = config.soldier.player_radius
+                * p.hero_scale
+                * config.combat.hero_hitbox_radius_multiplier
+                + config.combat.bullet_hit_forgiveness_radius;
+            let h_height = if p.effective_stance == Stance::Crouch {
+                config.combat.hero_crouch_hitbox_height * p.hero_scale
+            } else {
+                config.combat.hero_stand_hitbox_height * p.hero_scale
+            };
+            if let Some(toi) = segment_hits_hero_capsule(
+                muzzle_pos,
+                beam_dir,
+                best_toi,
+                p.soldier_pos,
+                h_rad,
+                h_height,
+                config.combat.bullet_hit_forgiveness_height_bottom,
+                config.combat.bullet_hit_forgiveness_height_top,
+            ) {
+                if toi < best_toi {
+                    best_toi = toi;
+                    hit_hero = Some(p_idx);
+                    hit_creep = None;
+                    hit_courier = None;
+                }
+            }
+        }
+
+        for (p_idx, p) in world.players.iter().enumerate() {
+            if p.hero_team == owner_team || p.courier_is_dead {
+                continue;
+            }
+            let h_cfg = config.active_hero(p.hero_index);
+            let c_rad = h_cfg.courier.hit_radius + config.combat.bullet_hit_forgiveness_radius;
+            if let Some(toi) = segment_hits_hero_capsule(
+                muzzle_pos,
+                beam_dir,
+                best_toi,
+                p.courier_pos - Vec3::Y * c_rad,
+                c_rad,
+                c_rad * 2.0,
+                0.2,
+                0.2,
+            ) {
+                if toi < best_toi {
+                    best_toi = toi;
+                    hit_courier = Some(p_idx);
+                    hit_hero = None;
+                    hit_creep = None;
+                }
+            }
+        }
+
+        for (c_idx, c) in world.creeps.iter().enumerate() {
+            if c.is_dead {
+                continue;
+            }
+            let is_enemy = c.team != owner_team;
+            let is_deniable = c.team == owner_team
+                && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio;
+            if !is_enemy && !is_deniable {
+                continue;
+            }
+            let c_stats = resolve_creep_stats(&config, c.creep_type_id.as_deref());
+            let c_rad = c_stats.collider_radius + config.combat.bullet_hit_forgiveness_radius;
+            if let Some(toi) = segment_hits_hero_capsule(
+                muzzle_pos,
+                beam_dir,
+                best_toi,
+                c.pos,
+                c_rad,
+                c_stats.hitbox_height,
+                config.combat.bullet_hit_forgiveness_height_bottom,
+                config.combat.bullet_hit_forgiveness_height_top,
+            ) {
+                if toi < best_toi {
+                    best_toi = toi;
+                    hit_creep = Some(c_idx);
+                    hit_hero = None;
+                    hit_courier = None;
+                }
+            }
+        }
+
+        if let Some((hit_ent, hit)) = physics_world.cast_ray(
+            muzzle_pos,
+            beam_dir,
+            best_toi,
+            bullet_query_groups,
+            |ent| {
+                if let Some(&t_idx) = target_idx_by_entity.get(&ent) {
+                    !world.targets[t_idx].is_dead
+                } else {
+                    true
+                }
+            },
+        ) {
+            if hit.toi < best_toi {
+                best_toi = hit.toi;
+                hit_world_ent = Some(hit_ent);
+                hit_hero = None;
+                hit_creep = None;
+                hit_courier = None;
+            }
+        }
+
+        let end_pos = muzzle_pos + beam_dir * best_toi;
+        let tick_dmg = beam_dps * dt;
+        let mut hit_any_target = false;
+
+        if let Some(enemy_idx) = hit_hero {
+            hit_any_target = true;
+            if is_flame {
+                world.players[enemy_idx].flame_armor_debuff_remaining = debuff_dur;
+                world.players[enemy_idx].flame_armor_debuff_amount = armor_red;
+                if world.players[enemy_idx].slot_index == world.active_slot {
+                    world.flame_armor_debuff_remaining = debuff_dur;
+                    world.flame_armor_debuff_amount = armor_red;
+                }
+            } else {
+                world.players[enemy_idx].electric_fire_rate_slow_remaining = debuff_dur;
+                world.players[enemy_idx].electric_fire_rate_slow_ratio = slow_ratio;
+                if world.players[enemy_idx].slot_index == world.active_slot {
+                    world.electric_fire_rate_slow_remaining = debuff_dur;
+                    world.electric_fire_rate_slow_ratio = slow_ratio;
+                }
+            }
+            let armor_debuff = if world.players[enemy_idx].flame_armor_debuff_remaining > 0.0 {
+                world.players[enemy_idx].flame_armor_debuff_amount
+            } else {
+                0.0
+            };
+            let armor = world.players[enemy_idx].hero_armor - armor_debuff;
+            let eff_dmg = tick_dmg * dota2_armor_multiplier(armor);
+            world.players[enemy_idx].hero_hp = (world.players[enemy_idx].hero_hp - eff_dmg).max(0.0);
+            if world.players[enemy_idx].hero_hp <= 0.0 && !world.players[enemy_idx].is_dead {
+                world.swap_slot_in(enemy_idx);
+                trigger_random_death(&mut world, &config);
+                world.swap_slot_in(enemy_idx);
+                let w_inner = &mut *world;
+                if let Some(attacker) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                    attacker.kills += 1;
+                    attacker.hero_gold += 225;
+                    grant_xp_to_player_slot(attacker, 150, &config, &mut w_inner.pending_fx);
+                }
+            }
+        } else if let Some(cour_idx) = hit_courier {
+            hit_any_target = true;
+            let h_cfg = config.active_hero(world.players[cour_idx].hero_index).clone();
+            world.players[cour_idx].courier_hp = (world.players[cour_idx].courier_hp - tick_dmg).max(0.0);
+            if world.players[cour_idx].courier_hp <= 0.0 && !world.players[cour_idx].courier_is_dead {
+                world.players[cour_idx].courier_is_dead = true;
+                world.players[cour_idx].courier_respawn_remaining = h_cfg.courier.respawn_secs;
+                world.players[cour_idx].courier_order = CourierOrder::Idle;
+                let cpos = world.players[cour_idx].courier_pos;
+                let w_inner = &mut *world;
+                if let Some(killer) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                    killer.last_hits += 1;
+                    killer.hero_gold = killer.hero_gold.saturating_add(h_cfg.courier.bounty_gold);
+                    w_inner.pending_fx.push(GameplayFxEvent::LastHitGold { pos: cpos, gold: h_cfg.courier.bounty_gold });
+                }
+            }
+        } else if let Some(c_idx) = hit_creep {
+            hit_any_target = true;
+            let c_stats = resolve_creep_stats(&config, world.creeps[c_idx].creep_type_id.as_deref());
+            let (_, _, armor_bonus, _, _) = lane_creep_buffs(&config, &world.barracks, world.creeps[c_idx].team, world.creeps[c_idx].lane, world.creeps[c_idx].camp_index.is_none());
+            let (_, time_armor_bonus, _, _) = lane_creep_time_scaling(&config, world.match_elapsed_secs, world.creeps[c_idx].camp_index.is_none());
+            let eff_dmg = tick_dmg * dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus);
+            world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
+            if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
+                for c in &mut world.creeps {
+                    if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
+                        c.is_aggroed = true;
+                    }
+                }
+            }
+            if world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead {
+                world.creeps[c_idx].is_dead = true;
+                world.creeps[c_idx].anim_state = CreepAnimState::Die;
+                world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
+                let cpos = world.creeps[c_idx].pos;
+                let gb = c_stats.gold_bounty;
+                let xb = c_stats.xp_bounty;
+                let w_inner = &mut *world;
+                if let Some(killer) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                    killer.last_hits += 1;
+                    killer.hero_gold += gb;
+                    w_inner.pending_fx.push(GameplayFxEvent::LastHitGold { pos: cpos, gold: gb });
+                }
+                let eligible: Vec<usize> = world.players.iter().enumerate().filter(|(_, p)| !p.is_dead && p.hero_team == owner_team && p.soldier_pos.distance(cpos) <= p.hero_xp_gain_radius).map(|(i, _)| i).collect();
+                if !eligible.is_empty() {
+                    let share = xb / (eligible.len() as u32);
+                    let w_inner = &mut *world;
+                    for idx in eligible {
+                        grant_xp_to_player_slot(&mut w_inner.players[idx], share, &config, &mut w_inner.pending_fx);
+                    }
+                }
+            }
+        } else if let Some(hit_ent) = hit_world_ent {
+            if let Some(&t_idx) = target_idx_by_entity.get(&hit_ent) {
+                hit_any_target = true;
+                world.targets[t_idx].hp -= tick_dmg;
+                world.targets[t_idx].hit_flash_timer = config.fx.target_hit_flash_secs;
+                if world.targets[t_idx].hp <= 0.0 && !world.targets[t_idx].is_dead {
+                    world.targets[t_idx].hp = 0.0;
+                    world.targets[t_idx].is_dead = true;
+                    world.targets[t_idx].respawn_remaining = world.targets[t_idx].respawn_duration;
+                    let tpos = world.targets[t_idx].base_pos;
+                    commands.entity(hit_ent).insert(ColliderDisabled);
+                    let w_inner = &mut *world;
+                    if let Some(attacker) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        attacker.last_hits += 1;
+                        attacker.hero_gold += 35;
+                        if attacker.soldier_pos.distance(tpos) <= attacker.hero_xp_gain_radius {
+                            grant_xp_to_player_slot(attacker, 45, &config, &mut w_inner.pending_fx);
+                        }
+                    }
+                }
+            } else if let Some(&tur_idx) = turret_idx_by_entity.get(&hit_ent) {
+                if world.turrets[tur_idx].team != owner_team && !world.turrets[tur_idx].is_invulnerable && !world.turrets[tur_idx].is_dead {
+                    hit_any_target = true;
+                    let eff_dmg = tick_dmg * dota2_armor_multiplier(world.turrets[tur_idx].armor);
+                    world.turrets[tur_idx].hp = (world.turrets[tur_idx].hp - eff_dmg).max(0.0);
+                    if world.turrets[tur_idx].hp <= 0.0 && !world.turrets[tur_idx].is_dead {
+                        world.turrets[tur_idx].is_dead = true;
+                        world.turrets[tur_idx].aim_target_pos = None;
+                        commands.entity(hit_ent).insert(ColliderDisabled);
+                    }
+                }
+            }
+        }
+
+        world.electric_beams_snapshot.push(ElectricBeamSnapshot {
+            id: owner_slot as u64,
+            start_pos: muzzle_pos,
+            end_pos,
+            hit_target: hit_any_target,
+            is_flame,
+        });
+    }
+
+    world.toxic_pools.extend(spawned_toxic_pools);
+    world.toxic_slow_multiplier = 1.0;
+    for p in &mut world.players {
+        p.toxic_slow_multiplier = 1.0;
+    }
+
+    let mut active_pools = std::mem::take(&mut world.toxic_pools);
+    for pool in &mut active_pools {
+        pool.remaining_secs -= dt;
+        if pool.remaining_secs <= 0.0 {
+            continue;
+        }
+        let tick_dmg = pool.dps * dt;
+        let slow_mult = (1.0 - pool.slow_ratio).clamp(0.20, 1.0);
+
+        for idx in 0..world.targets.len() {
+            if world.targets[idx].is_dead {
+                continue;
+            }
+            let t_pos = world.targets[idx].base_pos;
+            let flat_d = Vec2::new(t_pos.x - pool.pos.x, t_pos.z - pool.pos.z).length();
+            if flat_d <= pool.radius && (t_pos.y - pool.pos.y).abs() <= 3.5 {
+                world.targets[idx].hp -= tick_dmg;
+                if world.targets[idx].hp <= 0.0 {
+                    world.targets[idx].hp = 0.0;
+                    world.targets[idx].is_dead = true;
+                    world.targets[idx].respawn_remaining = world.targets[idx].respawn_duration;
+                    if let Some(&t_ent) = target_entity_by_idx.get(&idx) {
+                        commands.entity(t_ent).insert(ColliderDisabled);
+                    }
+                    if let Some(o_slot) = pool.owner_slot {
+                        let w_inner = &mut *world;
+                        if let Some(attacker) = w_inner.players.iter_mut().find(|p| p.slot_index == o_slot) {
+                            attacker.last_hits += 1;
+                            attacker.hero_gold += 35;
+                            if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
+                                grant_xp_to_player_slot(attacker, 45, &config, &mut w_inner.pending_fx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for p_idx in 0..world.players.len() {
+            if world.players[p_idx].is_dead || world.players[p_idx].hero_team == pool.owner_team {
+                continue;
+            }
+            let h_pos = world.players[p_idx].soldier_pos;
+            let flat_d = Vec2::new(h_pos.x - pool.pos.x, h_pos.z - pool.pos.z).length();
+            if flat_d <= pool.radius && (h_pos.y - pool.pos.y).abs() <= 3.5 {
+                world.players[p_idx].toxic_slow_multiplier =
+                    world.players[p_idx].toxic_slow_multiplier.min(slow_mult);
+                if world.players[p_idx].slot_index == world.active_slot {
+                    world.toxic_slow_multiplier = world.toxic_slow_multiplier.min(slow_mult);
+                }
+                let armor = world.players[p_idx].hero_armor - if world.players[p_idx].flame_armor_debuff_remaining > 0.0 { world.players[p_idx].flame_armor_debuff_amount } else { 0.0 };
+                let eff_dmg = tick_dmg * dota2_armor_multiplier(armor);
+                world.players[p_idx].hero_hp = (world.players[p_idx].hero_hp - eff_dmg).max(0.0);
+                if world.players[p_idx].hero_hp <= 0.0 && !world.players[p_idx].is_dead {
+                    world.swap_slot_in(p_idx);
+                    trigger_random_death(&mut world, &config);
+                    world.swap_slot_in(p_idx);
+                    if let Some(o_slot) = pool.owner_slot {
+                        let w_inner = &mut *world;
+                        if let Some(attacker) = w_inner.players.iter_mut().find(|p| p.slot_index == o_slot) {
+                            attacker.kills += 1;
+                            attacker.hero_gold += 225;
+                            grant_xp_to_player_slot(attacker, 150, &config, &mut w_inner.pending_fx);
+                        }
+                    }
+                }
+            }
+        }
+
+        for c_idx in 0..world.creeps.len() {
+            if world.creeps[c_idx].is_dead || world.creeps[c_idx].team == pool.owner_team {
+                continue;
+            }
+            let c_pos = world.creeps[c_idx].pos;
+            let flat_d = Vec2::new(c_pos.x - pool.pos.x, c_pos.z - pool.pos.z).length();
+            if flat_d <= pool.radius && (c_pos.y - pool.pos.y).abs() <= 3.5 {
+                let c_stats = resolve_creep_stats(&config, world.creeps[c_idx].creep_type_id.as_deref());
+                let (_, _, armor_bonus, _, _) = lane_creep_buffs(
+                    &config,
+                    &world.barracks,
+                    world.creeps[c_idx].team,
+                    world.creeps[c_idx].lane,
+                    world.creeps[c_idx].camp_index.is_none(),
+                );
+                let (_, time_armor_bonus, _, _) = lane_creep_time_scaling(
+                    &config,
+                    world.match_elapsed_secs,
+                    world.creeps[c_idx].camp_index.is_none(),
+                );
+                let eff_dmg = tick_dmg * dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus);
+                world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
+                if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
+                    for c in &mut world.creeps {
+                        if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
+                            c.is_aggroed = true;
+                        }
+                    }
+                }
+                if world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead {
+                    world.creeps[c_idx].is_dead = true;
+                    world.creeps[c_idx].anim_state = CreepAnimState::Die;
+                    world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
+                    let gold_bounty = c_stats.gold_bounty;
+                    let xp_bounty = c_stats.xp_bounty;
+                    if let Some(o_slot) = pool.owner_slot {
+                        if let Some(killer) = world.players.iter_mut().find(|p| p.slot_index == o_slot) {
+                            killer.last_hits += 1;
+                            killer.hero_gold += gold_bounty;
+                            world.pending_fx.push(GameplayFxEvent::LastHitGold {
+                                pos: c_pos,
+                                gold: gold_bounty,
+                            });
+                        }
+                    }
+                    let eligible_indices: Vec<usize> = world
+                        .players
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            !p.is_dead
+                                && p.hero_team == pool.owner_team
+                                && p.soldier_pos.distance(c_pos) <= p.hero_xp_gain_radius
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !eligible_indices.is_empty() {
+                        let share = xp_bounty / (eligible_indices.len() as u32);
+                        let w_inner = &mut *world;
+                        for idx in eligible_indices {
+                            let p = &mut w_inner.players[idx];
+                            grant_xp_to_player_slot(p, share, &config, &mut w_inner.pending_fx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    active_pools.retain(|p| p.remaining_secs > 0.0);
+    world.toxic_pools_snapshot = active_pools
+        .iter()
+        .map(|p| ToxicPoolSnapshot {
+            id: p.id,
+            pos: p.pos,
+            radius: p.radius,
+            remaining_secs: p.remaining_secs,
+            total_duration: p.total_duration,
+        })
+        .collect();
+    world.toxic_pools = active_pools;
 
     for (idx, target) in world.targets.iter_mut().enumerate() {
         if target.is_dead {
@@ -11100,6 +12109,13 @@ fn step_lane_creeps_system(
                             velocity: shot_dir * c_stats.projectile_speed,
                             damage: (c_stats.bullet_damage + time_dmg_bonus) * dmg_mult,
                             remaining_range: c_stats.bullet_max_range,
+                            gravity: 0.0,
+                            aoe_radius: 0.0,
+                            toxic_pool_duration_secs: 0.0,
+                            toxic_pool_dps: 0.0,
+                            toxic_slow_ratio: 0.0,
+                            piercing: false,
+                            hit_entity_keys: Vec::new(),
                         },
                         Transform::from_translation(muzzle_pos),
                     ));
@@ -11112,7 +12128,7 @@ fn step_lane_creeps_system(
                     });
                 }
             } else {
-                let step = world.creeps[idx].facing_dir * c_stats.move_speed * dt;
+                let step = world.creeps[idx].facing_dir * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt;
                 world.creeps[idx].pos.x += step.x;
                 world.creeps[idx].pos.z += step.z;
                 moved = true;
@@ -11123,7 +12139,7 @@ fn step_lane_creeps_system(
             if to_home.length() > 0.35 {
                 let dir = to_home.normalize();
                 world.creeps[idx].facing_dir = dir;
-                let step = dir * c_stats.move_speed * dt;
+                let step = dir * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt;
                 world.creeps[idx].pos.x += step.x;
                 world.creeps[idx].pos.z += step.z;
                 moved = true;
@@ -11204,7 +12220,7 @@ fn step_lane_creeps_system(
                         }
                     }
                     world.creeps[idx].facing_dir = dir;
-                    let step = dir * c_stats.move_speed * dt;
+                    let step = dir * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt;
                     world.creeps[idx].pos.x += step.x;
                     world.creeps[idx].pos.z += step.z;
                     moved = true;
@@ -11262,7 +12278,7 @@ fn step_lane_creeps_system(
                     let f = Vec2::new(world.creeps[idx].facing_dir.x, world.creeps[idx].facing_dir.z);
                     let t1 = Vec2::new(-push.y, push.x);
                     let tangent = if t1.dot(f) >= 0.0 { t1 } else { -t1 };
-                    let slide = tangent * c_stats.move_speed * dt * 0.85;
+                    let slide = tangent * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt * 0.85;
                     world.creeps[idx].pos.x += slide.x;
                     world.creeps[idx].pos.z += slide.y;
                 }
@@ -11472,6 +12488,13 @@ fn step_turrets_system(
                         velocity: shot_dir * t_def.projectile_speed,
                         damage: t_def.bullet_damage,
                         remaining_range: t_def.bullet_max_range,
+                        gravity: 0.0,
+                        aoe_radius: 0.0,
+                        toxic_pool_duration_secs: 0.0,
+                        toxic_pool_dps: 0.0,
+                        toxic_slow_ratio: 0.0,
+                        piercing: false,
+                        hit_entity_keys: Vec::new(),
                     },
                     Transform::from_translation(muzzle_origin + shot_dir * (t_world_radius + 0.55)),
                 ));

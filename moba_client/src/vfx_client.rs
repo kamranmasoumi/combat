@@ -140,6 +140,90 @@ impl Material for PyroBulletMaterial {
 }
 
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct VenomBulletMaterial {
+    #[uniform(0)]
+    pub uniforms: BulletShaderUniforms,
+}
+
+impl Material for VenomBulletMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/vfx_venom_bullet.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Add
+    }
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct ElectricBulletMaterial {
+    #[uniform(0)]
+    pub uniforms: BulletShaderUniforms,
+}
+
+impl Material for ElectricBulletMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/vfx_electric_bullet.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Add
+    }
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct FlameBulletMaterial {
+    #[uniform(0)]
+    pub uniforms: BulletShaderUniforms,
+}
+
+impl Material for FlameBulletMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/vfx_flame_bullet.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Add
+    }
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct BladeBulletMaterial {
+    #[uniform(0)]
+    pub uniforms: BulletShaderUniforms,
+}
+
+impl Material for BladeBulletMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/vfx_blade_bullet.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Add
+    }
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct PistolBulletMaterial {
     #[uniform(0)]
     pub uniforms: BulletShaderUniforms,
@@ -360,6 +444,10 @@ pub enum BulletMaterialHandle {
     Frost(Handle<FrostBulletMaterial>),
     Iron(Handle<IronBulletMaterial>),
     Pyro(Handle<PyroBulletMaterial>),
+    Venom(Handle<VenomBulletMaterial>),
+    Electric(Handle<ElectricBulletMaterial>),
+    Flame(Handle<FlameBulletMaterial>),
+    Blade(Handle<BladeBulletMaterial>),
     Pistol(Handle<PistolBulletMaterial>),
     Kinetic(Handle<KineticBulletMaterial>),
 }
@@ -407,6 +495,18 @@ impl BulletVfxRegistry {
                 ent.insert(MeshMaterial3d(h.clone()));
             }
             BulletMaterialHandle::Pyro(h) => {
+                ent.insert(MeshMaterial3d(h.clone()));
+            }
+            BulletMaterialHandle::Venom(h) => {
+                ent.insert(MeshMaterial3d(h.clone()));
+            }
+            BulletMaterialHandle::Electric(h) => {
+                ent.insert(MeshMaterial3d(h.clone()));
+            }
+            BulletMaterialHandle::Flame(h) => {
+                ent.insert(MeshMaterial3d(h.clone()));
+            }
+            BulletMaterialHandle::Blade(h) => {
                 ent.insert(MeshMaterial3d(h.clone()));
             }
             BulletMaterialHandle::Pistol(h) => {
@@ -549,6 +649,10 @@ impl Plugin for MobaVfxPlugin {
             .add_plugins(MaterialPlugin::<FrostBulletMaterial>::default())
             .add_plugins(MaterialPlugin::<IronBulletMaterial>::default())
             .add_plugins(MaterialPlugin::<PyroBulletMaterial>::default())
+            .add_plugins(MaterialPlugin::<VenomBulletMaterial>::default())
+            .add_plugins(MaterialPlugin::<ElectricBulletMaterial>::default())
+            .add_plugins(MaterialPlugin::<FlameBulletMaterial>::default())
+            .add_plugins(MaterialPlugin::<BladeBulletMaterial>::default())
             .add_plugins(MaterialPlugin::<PistolBulletMaterial>::default())
             .add_plugins(MaterialPlugin::<KineticBulletMaterial>::default())
             .add_plugins(MaterialPlugin::<BulletTrailMaterial>::default())
@@ -581,6 +685,10 @@ fn register_bullet_profile(
     frost_mats: &mut Assets<FrostBulletMaterial>,
     iron_mats: &mut Assets<IronBulletMaterial>,
     pyro_mats: &mut Assets<PyroBulletMaterial>,
+    venom_mats: &mut Assets<VenomBulletMaterial>,
+    electric_mats: &mut Assets<ElectricBulletMaterial>,
+    flame_mats: &mut Assets<FlameBulletMaterial>,
+    blade_mats: &mut Assets<BladeBulletMaterial>,
     pistol_mats: &mut Assets<PistolBulletMaterial>,
     kinetic_mats: &mut Assets<KineticBulletMaterial>,
 ) {
@@ -600,10 +708,23 @@ fn register_bullet_profile(
         params: Vec4::new(0.0, profile.bloom_intensity, profile.pulse_speed, 0.0),
     };
 
-    let mesh = meshes.add(Capsule3d::new(
-        profile.projectile_radius,
-        profile.projectile_length,
-    ));
+    let mesh = if matches!(
+        source,
+        BulletVfxSource::Hero {
+            weapon_kind: moba_shared::WeaponKind::SpinningBlade,
+            ..
+        }
+    ) {
+        meshes.add(Cylinder::new(
+            profile.projectile_radius,
+            profile.projectile_length,
+        ))
+    } else {
+        meshes.add(Capsule3d::new(
+            profile.projectile_radius,
+            profile.projectile_length,
+        ))
+    };
 
     let material = match profile.shader_path.as_str() {
         "shaders/vfx_vanguard_bullet.wesl" => {
@@ -617,6 +738,18 @@ fn register_bullet_profile(
         }
         "shaders/vfx_pyro_bullet.wesl" => {
             BulletMaterialHandle::Pyro(pyro_mats.add(PyroBulletMaterial { uniforms }))
+        }
+        "shaders/vfx_venom_bullet.wesl" => {
+            BulletMaterialHandle::Venom(venom_mats.add(VenomBulletMaterial { uniforms }))
+        }
+        "shaders/vfx_electric_bullet.wesl" => {
+            BulletMaterialHandle::Electric(electric_mats.add(ElectricBulletMaterial { uniforms }))
+        }
+        "shaders/vfx_flame_bullet.wesl" => {
+            BulletMaterialHandle::Flame(flame_mats.add(FlameBulletMaterial { uniforms }))
+        }
+        "shaders/vfx_blade_bullet.wesl" => {
+            BulletMaterialHandle::Blade(blade_mats.add(BladeBulletMaterial { uniforms }))
         }
         "shaders/vfx_pistol_bullet.wesl" => {
             BulletMaterialHandle::Pistol(pistol_mats.add(PistolBulletMaterial { uniforms }))
@@ -644,6 +777,10 @@ fn init_bullet_vfx_registry_system(
     mut frost_mats: ResMut<Assets<FrostBulletMaterial>>,
     mut iron_mats: ResMut<Assets<IronBulletMaterial>>,
     mut pyro_mats: ResMut<Assets<PyroBulletMaterial>>,
+    mut venom_mats: ResMut<Assets<VenomBulletMaterial>>,
+    mut electric_mats: ResMut<Assets<ElectricBulletMaterial>>,
+    mut flame_mats: ResMut<Assets<FlameBulletMaterial>>,
+    mut blade_mats: ResMut<Assets<BladeBulletMaterial>>,
     mut pistol_mats: ResMut<Assets<PistolBulletMaterial>>,
     mut kinetic_mats: ResMut<Assets<KineticBulletMaterial>>,
 ) {
@@ -660,6 +797,10 @@ fn init_bullet_vfx_registry_system(
             &mut frost_mats,
             &mut iron_mats,
             &mut pyro_mats,
+        &mut venom_mats,
+        &mut electric_mats,
+        &mut flame_mats,
+        &mut blade_mats,
             &mut pistol_mats,
             &mut kinetic_mats,
         );
@@ -675,6 +816,10 @@ fn init_bullet_vfx_registry_system(
             &mut frost_mats,
             &mut iron_mats,
             &mut pyro_mats,
+        &mut venom_mats,
+        &mut electric_mats,
+        &mut flame_mats,
+        &mut blade_mats,
             &mut pistol_mats,
             &mut kinetic_mats,
         );
@@ -689,6 +834,10 @@ fn init_bullet_vfx_registry_system(
         &mut frost_mats,
         &mut iron_mats,
         &mut pyro_mats,
+        &mut venom_mats,
+        &mut electric_mats,
+        &mut flame_mats,
+        &mut blade_mats,
         &mut pistol_mats,
         &mut kinetic_mats,
     );
@@ -702,6 +851,10 @@ fn init_bullet_vfx_registry_system(
         &mut frost_mats,
         &mut iron_mats,
         &mut pyro_mats,
+        &mut venom_mats,
+        &mut electric_mats,
+        &mut flame_mats,
+        &mut blade_mats,
         &mut pistol_mats,
         &mut kinetic_mats,
     );
@@ -1751,6 +1904,10 @@ struct VfxLifetimeMaterials<'w> {
     frost_mats: ResMut<'w, Assets<FrostBulletMaterial>>,
     iron_mats: ResMut<'w, Assets<IronBulletMaterial>>,
     pyro_mats: ResMut<'w, Assets<PyroBulletMaterial>>,
+    venom_mats: ResMut<'w, Assets<VenomBulletMaterial>>,
+    electric_mats: ResMut<'w, Assets<ElectricBulletMaterial>>,
+    flame_mats: ResMut<'w, Assets<FlameBulletMaterial>>,
+    blade_mats: ResMut<'w, Assets<BladeBulletMaterial>>,
     pistol_mats: ResMut<'w, Assets<PistolBulletMaterial>>,
     kinetic_mats: ResMut<'w, Assets<KineticBulletMaterial>>,
     trail_materials: ResMut<'w, Assets<BulletTrailMaterial>>,

@@ -312,6 +312,8 @@ fn main() {
                 target_visual_reaction_system,
                 environment_vfx_and_water_animation_system,
                 update_swing_rope_visual_system,
+                sync_toxic_pools_visual_system,
+                sync_electric_beams_visual_system,
                 camera_follow_system,
                 soldier_animation_player_system,
                 laser_sight_gizmo_system,
@@ -554,6 +556,25 @@ struct WaterfallMistEmitter {
 #[derive(Component)]
 struct SwingPulleyWheel {
     spin_speed: f32,
+}
+
+#[derive(Component)]
+struct ToxicPoolVisual {
+    id: u64,
+    mat_handle: Handle<StandardMaterial>,
+    bubble_timer: f32,
+}
+
+#[derive(Component)]
+struct ToxicBubbleParticle {
+    vel: Vec3,
+    timer: Timer,
+}
+
+#[derive(Component)]
+struct ElectricBeamVisual {
+    id: u64,
+    mesh_handle: Handle<Mesh>,
 }
 
 #[derive(Component)]
@@ -882,6 +903,8 @@ struct ClientRenderState {
     traversal_duration: f32,
     swing_pulley_pos: Option<Vec3>,
     swing_throw_progress: f32,
+    toxic_pools: Vec<moba_shared::ToxicPoolSnapshot>,
+    electric_beams: Vec<moba_shared::ElectricBeamSnapshot>,
     is_dead: bool,
     death_anim_name: String,
     in_water: bool,
@@ -928,6 +951,8 @@ impl ClientRenderState {
             traversal_duration: 0.0,
             swing_pulley_pos: None,
             swing_throw_progress: 0.0,
+            toxic_pools: Vec::new(),
+            electric_beams: Vec::new(),
             is_dead: false,
             death_anim_name: String::new(),
             in_water: false,
@@ -2735,6 +2760,249 @@ fn update_swing_rope_visual_system(
     *vis = Visibility::Visible;
 }
 
+
+fn sync_toxic_pools_visual_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    match_flow: Res<ClientMatchFlow>,
+    mut render_state: ResMut<ClientRenderState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut pool_q: Query<(Entity, &mut ToxicPoolVisual, &mut Transform)>,
+    mut bubble_q: Query<(Entity, &mut ToxicBubbleParticle, &mut Transform), Without<ToxicPoolVisual>>,
+) {
+    let dt = time.delta_secs();
+    let t_secs = time.elapsed_secs();
+
+    for (ent, mut b, mut tf) in &mut bubble_q {
+        b.timer.tick(time.delta());
+        if b.timer.is_finished() {
+            commands.entity(ent).despawn();
+            continue;
+        }
+        tf.translation += b.vel * dt;
+        let rem = 1.0 - b.timer.fraction();
+        tf.scale = Vec3::splat(rem.max(0.15));
+    }
+
+    if !match_flow.is_in_game() {
+        for (ent, _, _) in &pool_q {
+            commands.entity(ent).despawn();
+        }
+        return;
+    }
+
+    let mut existing_ids = Vec::new();
+    for (ent, mut pool_vis, mut tf) in &mut pool_q {
+        if let Some(snap) = render_state.toxic_pools.iter().find(|p| p.id == pool_vis.id).cloned() {
+            existing_ids.push(pool_vis.id);
+            let frac = (snap.remaining_secs / snap.total_duration.max(0.1)).clamp(0.0, 1.0);
+            let pulse = 0.94 + 0.06 * (t_secs * 5.5 + snap.id as f32).sin();
+            tf.translation = snap.pos + Vec3::Y * 0.06;
+            tf.scale = Vec3::new(snap.radius * pulse, 1.0, snap.radius * pulse);
+            if let Some(mut mat) = materials.get_mut(&pool_vis.mat_handle) {
+                mat.base_color = Color::srgba(0.16, 0.95, 0.24, 0.42 * frac);
+                mat.emissive = LinearRgba::new(0.45 * frac, 3.8 * frac, 0.55 * frac, 1.0);
+            }
+            pool_vis.bubble_timer -= dt;
+            if pool_vis.bubble_timer <= 0.0 {
+                pool_vis.bubble_timer = 0.14;
+                let ang = render_state.next_fx_rand() * std::f32::consts::TAU;
+                let r = render_state.next_fx_rand().sqrt() * snap.radius * 0.85;
+                let bx = snap.pos.x + ang.cos() * r;
+                let bz = snap.pos.z + ang.sin() * r;
+                let b_mat = materials.add(StandardMaterial {
+                    base_color: Color::srgba(0.45, 1.0, 0.25, 0.82),
+                    emissive: LinearRgba::new(0.8, 5.2, 0.7, 1.0),
+                    alpha_mode: AlphaMode::Blend,
+                    unlit: true,
+                    ..default()
+                });
+                commands.spawn((
+                    ToxicBubbleParticle {
+                        vel: Vec3::new(0.0, 1.25 + render_state.next_fx_rand() * 0.9, 0.0),
+                        timer: Timer::from_seconds(0.65, TimerMode::Once),
+                    },
+                    Mesh3d(meshes.add(Sphere::new(0.14))),
+                    MeshMaterial3d(b_mat),
+                    Transform::from_xyz(bx, snap.pos.y + 0.12, bz),
+                    NotShadowCaster,
+                ));
+            }
+        } else {
+            commands.entity(ent).despawn();
+        }
+    }
+
+    for snap in &render_state.toxic_pools {
+        if !existing_ids.contains(&snap.id) {
+            let mat_handle = materials.add(StandardMaterial {
+                base_color: Color::srgba(0.16, 0.95, 0.24, 0.42),
+                emissive: LinearRgba::new(0.45, 3.8, 0.55, 1.0),
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                ..default()
+            });
+            commands.spawn((
+                ToxicPoolVisual {
+                    id: snap.id,
+                    mat_handle: mat_handle.clone(),
+                    bubble_timer: 0.05,
+                },
+                Mesh3d(meshes.add(Cylinder::new(1.0, 0.05))),
+                MeshMaterial3d(mat_handle),
+                Transform::from_translation(snap.pos + Vec3::Y * 0.06)
+                    .with_scale(Vec3::new(snap.radius, 1.0, snap.radius)),
+                NotShadowCaster,
+            ));
+        }
+    }
+}
+
+
+fn sync_electric_beams_visual_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut beam_q: Query<(Entity, &ElectricBeamVisual, &mut Visibility)>,
+) {
+    if !match_flow.is_in_game() {
+        for (ent, _, _) in &beam_q {
+            commands.entity(ent).despawn();
+        }
+        return;
+    }
+
+    let t_sec = time.elapsed_secs();
+    let mut existing = Vec::new();
+
+    for (ent, beam_vis, mut vis) in &mut beam_q {
+        if let Some(snap) = render_state.electric_beams.iter().find(|b| b.id == beam_vis.id) {
+            existing.push(beam_vis.id);
+            let chord = snap.end_pos - snap.start_pos;
+            let len = chord.length();
+            if len < 0.05 {
+                *vis = Visibility::Hidden;
+                continue;
+            }
+            let dir = chord / len;
+            let mut side = dir.cross(Vec3::Y).normalize_or_zero();
+            if side == Vec3::ZERO {
+                side = Vec3::X;
+            }
+            let up_p = side.cross(dir).normalize_or_zero();
+
+            const SEGS: usize = 14;
+            const SIDES: usize = 5;
+            let mut spine = Vec::with_capacity(SEGS + 1);
+            for i in 0..=SEGS {
+                let u = i as f32 / SEGS as f32;
+                let base = snap.start_pos.lerp(snap.end_pos, u);
+                let env = (u * std::f32::consts::PI).sin();
+                let jitter = if snap.is_flame {
+                    let w1 = (u * 12.0 - t_sec * 28.0 + snap.id as f32 * 2.1).sin();
+                    let w2 = (u * 16.0 - t_sec * 22.0).cos();
+                    (side * w1 + up_p * (w2 + 0.35)) * (0.38 * u.sqrt())
+                } else {
+                    let j1 = (u * 23.0 + t_sec * 65.0 + snap.id as f32 * 3.1).sin();
+                    let j2 = (u * 31.0 - t_sec * 52.0 + snap.id as f32 * 1.7).cos();
+                    (side * j1 + up_p * j2) * (0.28 * env)
+                };
+                spine.push(base + jitter);
+            }
+
+            let mut positions = Vec::with_capacity((SEGS + 1) * SIDES);
+            let mut normals = Vec::with_capacity((SEGS + 1) * SIDES);
+            let mut indices = Vec::with_capacity(SEGS * SIDES * 6);
+            for (i, &p) in spine.iter().enumerate() {
+                let tang = if i == 0 {
+                    (spine[1] - spine[0]).normalize_or_zero()
+                } else if i == SEGS {
+                    (spine[SEGS] - spine[SEGS - 1]).normalize_or_zero()
+                } else {
+                    (spine[i + 1] - spine[i - 1]).normalize_or_zero()
+                };
+                let td = if tang == Vec3::ZERO { dir } else { tang };
+                let mut n1 = td.cross(Vec3::Y).normalize_or_zero();
+                if n1 == Vec3::ZERO {
+                    n1 = Vec3::X;
+                }
+                let n2 = n1.cross(td).normalize_or_zero();
+                for s in 0..SIDES {
+                    let ang = (s as f32 / SIDES as f32) * std::f32::consts::TAU;
+                    let norm = (n1 * ang.cos() + n2 * ang.sin()).normalize_or_zero();
+                    let r_here = if snap.is_flame { 0.08 + (i as f32 / SEGS as f32) * 0.42 } else { 0.055 };
+                    let v = p + norm * r_here;
+                    positions.push([v.x, v.y, v.z]);
+                    normals.push([norm.x, norm.y, norm.z]);
+                }
+            }
+            for i in 0..SEGS {
+                let ra = (i * SIDES) as u32;
+                let rb = ((i + 1) * SIDES) as u32;
+                for s in 0..SIDES {
+                    let sn = ((s + 1) % SIDES) as u32;
+                    let su = s as u32;
+                    indices.push(ra + su);
+                    indices.push(rb + su);
+                    indices.push(rb + sn);
+                    indices.push(ra + su);
+                    indices.push(rb + sn);
+                    indices.push(ra + sn);
+                }
+            }
+            if let Some(mut mesh) = meshes.get_mut(&beam_vis.mesh_handle) {
+                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+                mesh.insert_indices(bevy::mesh::Indices::U32(indices));
+            }
+            *vis = Visibility::Visible;
+        } else {
+            commands.entity(ent).despawn();
+        }
+    }
+
+    for snap in &render_state.electric_beams {
+        if !existing.contains(&snap.id) {
+            let mesh_handle = meshes.add(Mesh::new(
+                bevy::mesh::PrimitiveTopology::TriangleList,
+                bevy::asset::RenderAssetUsages::MAIN_WORLD | bevy::asset::RenderAssetUsages::RENDER_WORLD,
+            ));
+            let mat = if snap.is_flame {
+                materials.add(StandardMaterial {
+                    base_color: Color::srgba(1.0, 0.45, 0.08, 0.92),
+                    emissive: LinearRgba::new(14.0, 4.5, 0.5, 1.0),
+                    alpha_mode: AlphaMode::Add,
+                    unlit: true,
+                    ..default()
+                })
+            } else {
+                materials.add(StandardMaterial {
+                    base_color: Color::srgba(0.55, 0.92, 1.0, 0.95),
+                    emissive: LinearRgba::new(1.5, 7.5, 16.0, 1.0),
+                    alpha_mode: AlphaMode::Add,
+                    unlit: true,
+                    ..default()
+                })
+            };
+            commands.spawn((
+                ElectricBeamVisual {
+                    id: snap.id,
+                    mesh_handle: mesh_handle.clone(),
+                },
+                Mesh3d(mesh_handle),
+                MeshMaterial3d(mat),
+                Transform::IDENTITY,
+                Visibility::Hidden,
+                NotShadowCaster,
+            ));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn environment_vfx_and_water_animation_system(
     mut commands: Commands,
@@ -3203,6 +3471,9 @@ fn attach_weapon_to_left_hand(
                     WeaponKind::Shotgun => Color::srgb(0.18, 0.16, 0.14),
                     WeaponKind::Throwable => Color::srgb(0.24, 0.16, 0.12),
                     WeaponKind::Pistol => Color::srgb(0.18, 0.20, 0.24),
+                    WeaponKind::ElectricBeam => Color::srgb(0.14, 0.22, 0.30),
+                    WeaponKind::FlameBeam => Color::srgb(0.28, 0.14, 0.10),
+                    WeaponKind::SpinningBlade => Color::srgb(0.20, 0.22, 0.28),
                 },
                 metallic: 0.85,
                 perceptual_roughness: 0.35,
@@ -3215,6 +3486,9 @@ fn attach_weapon_to_left_hand(
                     WeaponKind::Shotgun => Color::srgb(0.46, 0.28, 0.14),
                     WeaponKind::Throwable => Color::srgb(0.85, 0.42, 0.10),
                     WeaponKind::Pistol => Color::srgb(0.55, 0.60, 0.68),
+                    WeaponKind::ElectricBeam => Color::srgb(0.20, 0.78, 1.00),
+                    WeaponKind::FlameBeam => Color::srgb(1.00, 0.42, 0.10),
+                    WeaponKind::SpinningBlade => Color::srgb(0.95, 0.22, 0.45),
                 },
                 metallic: if weapon_kind == WeaponKind::Shotgun { 0.25 } else { 0.65 },
                 perceptual_roughness: 0.45,
@@ -3397,6 +3671,56 @@ fn attach_weapon_to_left_hand(
                                     MeshMaterial3d(body_mat),
                                     Transform::from_xyz(0.0, 0.045, -0.24)
                                         .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                            }
+                            WeaponKind::SpinningBlade => {
+                                // پرتابگر تیغه دایره‌ای با ریل باز و دیسک برش
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.065, 0.095, 0.42))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.03, -0.10),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.11, 0.025))),
+                                    MeshMaterial3d(accent_mat),
+                                    Transform::from_xyz(0.0, 0.04, -0.34),
+                                ));
+                            }
+                            WeaponKind::FlameBeam => {
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.080, 0.12, 0.46))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.03, -0.10),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.042, 0.26))),
+                                    MeshMaterial3d(accent_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.04, -0.38)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.048, 0.18))),
+                                    MeshMaterial3d(accent_mat),
+                                    Transform::from_xyz(0.0, -0.07, -0.12),
+                                ));
+                            }
+                            WeaponKind::ElectricBeam => {
+                                // بدنه تفنگ برقی تسلا با سیم‌پیچ‌های رسانای آبی
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.070, 0.11, 0.44))),
+                                    MeshMaterial3d(body_mat.clone()),
+                                    Transform::from_xyz(0.0, 0.03, -0.10),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cylinder::new(0.032, 0.34))),
+                                    MeshMaterial3d(accent_mat),
+                                    Transform::from_xyz(0.0, 0.04, -0.36)
+                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
+                                ));
+                                weapon.spawn((
+                                    Mesh3d(meshes.add(Cuboid::new(0.050, 0.14, 0.07))),
+                                    MeshMaterial3d(body_mat),
+                                    Transform::from_xyz(0.0, -0.06, -0.02),
                                 ));
                             }
                         }
@@ -3842,6 +4166,8 @@ fn client_receive_snapshot_and_sync_system(
         render_state.traversal_duration = snap.traversal_duration;
         render_state.swing_pulley_pos = snap.swing_pulley_pos;
         render_state.swing_throw_progress = snap.swing_throw_progress;
+        render_state.toxic_pools = snap.toxic_pools;
+        render_state.electric_beams = snap.electric_beams;
         render_state.is_dead = snap.is_dead;
         render_state.death_anim_name = snap.death_anim_name;
         render_state.in_water = snap.in_water;
@@ -3946,7 +4272,17 @@ fn client_receive_snapshot_and_sync_system(
                         (vis.visual_offset_blend - time.delta_secs() * 14.0).max(0.0);
                 }
                 tf.translation = b_snap.translation + vis.visual_offset * vis.visual_offset_blend;
-                tf.rotation = Quat::from_rotation_arc(Vec3::Y, dir);
+                tf.rotation = if matches!(
+                    b_snap.vfx_source,
+                    BulletVfxSource::Hero {
+                        weapon_kind: WeaponKind::SpinningBlade,
+                        ..
+                    }
+                ) {
+                    Quat::from_rotation_y(time.elapsed_secs() * 32.0 + b_snap.id as f32)
+                } else {
+                    Quat::from_rotation_arc(Vec3::Y, dir)
+                };
                 *b_vis = Visibility::Visible;
                 seen_bullets.insert(vis.server_id);
             } else {
@@ -3958,7 +4294,17 @@ fn client_receive_snapshot_and_sync_system(
         for b_snap in &snap.bullets {
             if !seen_bullets.contains(&b_snap.id) {
                 let dir = b_snap.velocity.normalize_or_zero();
-                let rot = Quat::from_rotation_arc(Vec3::Y, dir);
+                let rot = if matches!(
+                    b_snap.vfx_source,
+                    BulletVfxSource::Hero {
+                        weapon_kind: WeaponKind::SpinningBlade,
+                        ..
+                    }
+                ) {
+                    Quat::from_rotation_y(time.elapsed_secs() * 32.0 + b_snap.id as f32)
+                } else {
+                    Quat::from_rotation_arc(Vec3::Y, dir)
+                };
                 let (vis_off, vis_blend) = if let Some(muzzle) = live_muzzle_opt {
                     let diff = muzzle - b_snap.translation;
                     if diff.length_squared() <= 5.0 * 5.0 {
@@ -5336,7 +5682,11 @@ fn soldier_animation_player_system(
             let blend = Duration::from_millis(config.animations.traversal_blend_ms);
             let server_dur = render_state.traversal_duration.max(0.05);
             let clip_dur = anim_assets.clip_duration(&trav_key).unwrap_or(server_dur);
-            let speed = (clip_dur / server_dur).max(0.1);
+            let speed = if trav_key == "end_swing" {
+                1.0
+            } else {
+                (clip_dur / server_dur).max(0.1)
+            };
             let is_looping_trav = trav_key == "fall";
 
             let l_act = lower_trans.play(&mut lower_player, node, blend);
@@ -8184,6 +8534,9 @@ fn weapon_kind_short_badge(wk: WeaponKind) -> (&'static str, Color) {
         WeaponKind::Shotgun => ("SHT", Color::srgb(0.95, 0.58, 0.22)),
         WeaponKind::Throwable => ("GRN", Color::srgb(0.95, 0.35, 0.35)),
         WeaponKind::Pistol => ("PST", Color::srgb(0.75, 0.78, 0.92)),
+        WeaponKind::ElectricBeam => ("ELC", Color::srgb(0.32, 0.88, 1.0)),
+        WeaponKind::FlameBeam => ("FLM", Color::srgb(1.0, 0.48, 0.15)),
+        WeaponKind::SpinningBlade => ("BLD", Color::srgb(0.95, 0.25, 0.48)),
     }
 }
 
@@ -8653,6 +9006,9 @@ fn spawn_showcase_weapon_on_hand(
         WeaponKind::Shotgun => (Color::srgb(0.22, 0.17, 0.13), Color::srgb(0.92, 0.54, 0.22), 0.36, 0.36),
         WeaponKind::Throwable => (Color::srgb(0.26, 0.15, 0.12), Color::srgb(0.95, 0.32, 0.28), 0.24, 0.28),
         WeaponKind::Pistol => (Color::srgb(0.18, 0.20, 0.24), Color::srgb(0.75, 0.78, 0.92), 0.18, 0.22),
+        WeaponKind::ElectricBeam => (Color::srgb(0.14, 0.22, 0.30), Color::srgb(0.32, 0.88, 1.0), 0.34, 0.38),
+        WeaponKind::FlameBeam => (Color::srgb(0.28, 0.14, 0.10), Color::srgb(1.0, 0.48, 0.15), 0.36, 0.40),
+        WeaponKind::SpinningBlade => (Color::srgb(0.20, 0.22, 0.28), Color::srgb(0.95, 0.25, 0.48), 0.32, 0.36),
     };
     let body_mat = materials.add(StandardMaterial {
         base_color: body_col,
@@ -9926,6 +10282,9 @@ fn sync_remote_players_system(
                                         WeaponKind::Shotgun => Color::srgb(0.35, 0.22, 0.14),
                                         WeaponKind::Throwable => Color::srgb(0.80, 0.38, 0.10),
                                         WeaponKind::Pistol => Color::srgb(0.24, 0.26, 0.30),
+                                        WeaponKind::ElectricBeam => Color::srgb(0.20, 0.78, 1.00),
+                                        WeaponKind::FlameBeam => Color::srgb(1.00, 0.42, 0.10),
+                                        WeaponKind::SpinningBlade => Color::srgb(0.95, 0.22, 0.45),
                                     },
                                     metallic: 0.75,
                                     perceptual_roughness: 0.35,

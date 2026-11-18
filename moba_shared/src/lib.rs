@@ -204,8 +204,43 @@ pub struct AudioConfig {
     pub ambient_zones: Vec<AmbientZoneAudioDef>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DayNightConfig {
+    pub phase_duration_secs: f32,
+    pub transition_duration_secs: f32,
+    pub night_creep_vision_multiplier: f32,
+    pub night_courier_vision_multiplier: f32,
+    pub night_turret_vision_multiplier: f32,
+    pub night_directional_illuminance: f32,
+    pub night_directional_color_rgb: (f32, f32, f32),
+    pub night_ambient_color_rgb: (f32, f32, f32),
+    pub night_ambient_brightness: f32,
+    pub day_fog_color_rgb: (f32, f32, f32),
+    pub day_fog_start: f32,
+    pub day_fog_end: f32,
+    pub night_fog_color_rgb: (f32, f32, f32),
+    pub night_fog_start: f32,
+    pub night_fog_end: f32,
+    pub day_start_sound: String,
+    pub day_start_volume: f32,
+    pub night_start_sound: String,
+    pub night_start_volume: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TelemetryConfig {
+    pub show_detailed_render_stats: bool,
+    pub refresh_interval_secs: f32,
+    pub low_fps_warning_threshold: u32,
+    pub low_fps_critical_threshold: u32,
+    pub high_ping_warning_ms: u32,
+    pub high_ping_critical_ms: u32,
+}
+
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
+    pub day_night: DayNightConfig,
+    pub telemetry: TelemetryConfig,
     pub pause: PauseConfig,
     pub ping: PingConfig,
     pub chat: ChatConfig,
@@ -253,6 +288,8 @@ impl GameConfig {
         cfg.validate_chat();
         cfg.validate_scoreboard();
         cfg.validate_audio();
+        cfg.validate_day_night();
+        cfg.validate_telemetry();
         cfg.validate_ping();
         cfg.validate_pause();
         cfg.validate_camera();
@@ -386,6 +423,8 @@ impl GameConfig {
             assert!(hero.courier.deliver_radius > 0.0, "courier.deliver_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.courier.fountain_radius > 0.0, "courier.fountain_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.courier.hit_radius > 0.0, "courier.hit_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.vision_range > 0.0, "vision_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.night_vision_range > 0.0, "night_vision_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.courier.vision_range > 0.0, "courier.vision_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.pistol.damage > 0.0, "pistol.damage هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.pistol.projectile_speed > 0.0, "pistol.projectile_speed هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -554,6 +593,95 @@ impl GameConfig {
         assert!(self.pause.manual_unpause_lock_secs >= 0.0, "pause.manual_unpause_lock_secs نمی‌تواند منفی باشد");
         assert!(self.pause.disconnect_unpause_lock_secs >= 0.0, "pause.disconnect_unpause_lock_secs نمی‌تواند منفی باشد");
         assert!(self.pause.unpause_countdown_secs > 0.0, "pause.unpause_countdown_secs باید بزرگ‌تر از صفر باشد");
+    }
+
+    pub fn is_night_at(&self, match_elapsed_secs: f32) -> bool {
+        let dur = self.day_night.phase_duration_secs.max(1.0);
+        let phase_idx = (match_elapsed_secs.max(0.0) / dur).floor() as u64;
+        phase_idx % 2 == 1
+    }
+
+    pub fn day_night_blend_at(&self, match_elapsed_secs: f32) -> f32 {
+        let dur = self.day_night.phase_duration_secs.max(1.0);
+        let trans = self.day_night.transition_duration_secs.clamp(0.1, dur * 0.45);
+        let t = match_elapsed_secs.max(0.0);
+        let phase_idx = (t / dur).floor() as u64;
+        let phase_elapsed = t - (phase_idx as f32) * dur;
+        let in_night = phase_idx % 2 == 1;
+        if phase_idx == 0 {
+            return 0.0;
+        }
+        let ramp = (phase_elapsed / trans).clamp(0.0, 1.0);
+        let smooth = ramp * ramp * (3.0 - 2.0 * ramp);
+        if in_night { smooth } else { 1.0 - smooth }
+    }
+
+    pub fn hero_effective_vision(&self, hero: &HeroDef, match_elapsed_secs: f32) -> f32 {
+        if self.is_night_at(match_elapsed_secs) {
+            hero.night_vision_range
+        } else {
+            hero.vision_range
+        }
+    }
+
+    pub fn effective_vision_multiplier(&self, match_elapsed_secs: f32, night_mult: f32) -> f32 {
+        if self.is_night_at(match_elapsed_secs) {
+            night_mult
+        } else {
+            1.0
+        }
+    }
+
+    pub fn validate_day_night(&self) {
+        let dn = &self.day_night;
+        assert!(dn.phase_duration_secs >= 10.0, "day_night.phase_duration_secs باید حداقل 10 ثانیه باشد");
+        assert!(dn.transition_duration_secs > 0.0 && dn.transition_duration_secs < dn.phase_duration_secs * 0.5, "day_night.transition_duration_secs نامعتبر است");
+        assert!(dn.night_creep_vision_multiplier > 0.1 && dn.night_creep_vision_multiplier <= 1.0, "night_creep_vision_multiplier نامعتبر است");
+        assert!(dn.night_courier_vision_multiplier > 0.1 && dn.night_courier_vision_multiplier <= 1.0, "night_courier_vision_multiplier نامعتبر است");
+        assert!(dn.night_turret_vision_multiplier > 0.1 && dn.night_turret_vision_multiplier <= 1.0, "night_turret_vision_multiplier نامعتبر است");
+        assert!(dn.day_fog_end > dn.day_fog_start && dn.night_fog_end > dn.night_fog_start, "فواصل مه روز و شب نامعتبر است");
+        assert!(!dn.day_start_sound.trim().is_empty() && !dn.night_start_sound.trim().is_empty(), "مسیر صدای شب و روز نباید خالی باشد");
+        assert!((0.0..=2.0).contains(&dn.day_start_volume) && (0.0..=2.0).contains(&dn.night_start_volume), "حجم صدای شب و روز باید بین 0 تا 2 باشد");
+    }
+
+    pub fn validate_telemetry(&self) {
+        assert!(
+            self.telemetry.refresh_interval_secs > 0.0 && self.telemetry.refresh_interval_secs <= 5.0,
+            "telemetry.refresh_interval_secs باید بین 0 و 5 ثانیه باشد"
+        );
+        assert!(
+            self.telemetry.low_fps_critical_threshold > 0
+                && self.telemetry.low_fps_critical_threshold < self.telemetry.low_fps_warning_threshold,
+            "telemetry.low_fps_critical_threshold باید مثبت و کمتر از low_fps_warning_threshold باشد"
+        );
+        assert!(
+            self.telemetry.high_ping_warning_ms > 0
+                && self.telemetry.high_ping_warning_ms < self.telemetry.high_ping_critical_ms,
+            "telemetry.high_ping_warning_ms باید مثبت و کمتر از high_ping_critical_ms باشد"
+        );
+        assert!(
+            matches!(self.lighting.msaa_samples, 1 | 2 | 4 | 8),
+            "lighting.msaa_samples باید یکی از مقادیر 1، 2، 4 یا 8 باشد"
+        );
+        assert!(
+            self.lighting.shadow_map_size >= 256
+                && self.lighting.shadow_map_size <= 4096
+                && self.lighting.shadow_map_size.is_power_of_two(),
+            "lighting.shadow_map_size باید توان 2 بین 256 تا 4096 باشد"
+        );
+        assert!(
+            self.map.fog_fade_speed > 0.0 && self.map.fog_fade_speed <= 30.0,
+            "map.fog_fade_speed باید بین 0 و 30 باشد"
+        );
+        assert!(
+            self.map.fog_blur_passes <= 6,
+            "map.fog_blur_passes باید بین 0 تا 6 باشد"
+        );
+        assert!(
+            (0.0..=1.0).contains(&self.map.fog_explored_alpha)
+                && (0.0..=1.0).contains(&self.map.fog_unexplored_alpha),
+            "map.fog_explored_alpha و fog_unexplored_alpha باید بین 0 و 1 باشند"
+        );
     }
 
     pub fn validate_ping(&self) {
@@ -1008,6 +1136,9 @@ pub struct CameraConfig {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LightingConfig {
+    pub msaa_samples: u32,
+    pub bloom_enabled: bool,
+    pub shadow_map_size: usize,
     pub directional_illuminance: f32,
     pub directional_pos: (f32, f32, f32),
     pub directional_shadow_depth_bias: f32,
@@ -1208,6 +1339,7 @@ pub struct HeroDef {
     pub shallow_water_speed_multiplier: f32,
     pub deep_water_speed_multiplier: f32,
     pub vision_range: f32,
+    pub night_vision_range: f32,
     pub high_ground_vision_bonus: f32,
     pub wall_climb: WallClimbConfig,
     pub swing: HeroSwingConfig,
@@ -1701,6 +1833,10 @@ pub struct MapConfig {
     pub base_vision_range: f32,
     pub high_ground_vision_bonus: f32,
     pub high_ground_occlusion_min_diff: f32,
+    pub fog_fade_speed: f32,
+    pub fog_blur_passes: u32,
+    pub fog_explored_alpha: f32,
+    pub fog_unexplored_alpha: f32,
     pub canyon: CanyonConfig,
     pub terrains: Vec<TerrainPlatformDef>,
     pub ramps: Vec<RampDef>,
@@ -5732,8 +5868,11 @@ impl SharedFogOfWar {
         }
     }
 
-    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, allied_creeps: &[Vec3]) {
+    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, allied_creeps: &[Vec3], match_elapsed_secs: f32) {
         self.visible_now.fill(false);
+
+        let struct_mult = config.effective_vision_multiplier(match_elapsed_secs, config.day_night.night_turret_vision_multiplier);
+        let creep_mult = config.effective_vision_multiplier(match_elapsed_secs, config.day_night.night_creep_vision_multiplier);
 
         let hero_ground_y = hero_pos.y.max(
             Self::world_to_cell(config, hero_pos.x, hero_pos.z)
@@ -5741,7 +5880,8 @@ impl SharedFogOfWar {
                 .unwrap_or(hero_pos.y),
         );
 
-        let hero_range = hero.vision_range
+        let base_hero_vision = config.hero_effective_vision(hero, match_elapsed_secs);
+        let hero_range = base_hero_vision
             + if hero_ground_y >= config.map.high_ground_occlusion_min_diff {
                 hero.high_ground_vision_bonus
             } else {
@@ -5752,10 +5892,11 @@ impl SharedFogOfWar {
 
         let allied = self.allied_sources.clone();
         for (src_pos, src_range) in allied {
-            self.reveal_from_source(config, src_pos, src_range, 72);
+            self.reveal_from_source(config, src_pos, src_range * struct_mult, 72);
         }
+        let creep_range = config.creeps.vision_range * creep_mult;
         for &c_pos in allied_creeps {
-            self.reveal_from_source(config, c_pos, config.creeps.vision_range, 64);
+            self.reveal_from_source(config, c_pos, creep_range, 64);
         }
     }
 
@@ -11698,7 +11839,7 @@ fn shared_authoritative_react_system(
         .filter(|p| !p.is_dead)
         .map(|p| {
             let h = config.active_hero(p.hero_index);
-            (p.slot_index, p.hero_team, p.soldier_pos, h.vision_range)
+            (p.slot_index, p.hero_team, p.soldier_pos, config.hero_effective_vision(h, world.match_elapsed_secs))
         })
         .collect();
 
@@ -11804,11 +11945,14 @@ fn shared_authoritative_react_system(
                 .filter(|p| !p.courier_is_dead && p.hero_team == my_team)
                 .map(|p| (p.courier_pos, config.active_hero(p.hero_index).courier.vision_range))
                 .collect();
+            let elapsed_secs = world.match_elapsed_secs;
+            let courier_mult = config.effective_vision_multiplier(elapsed_secs, config.day_night.night_courier_vision_multiplier);
+            world.hero_vision_range = config.hero_effective_vision(hero, elapsed_secs);
             world
                 .fog_of_war
-                .update_for_hero(&config, hero_pos, hero, &allied_creep_positions);
+                .update_for_hero(&config, hero_pos, hero, &allied_creep_positions, elapsed_secs);
             for (c_pos, c_range) in allied_courier_vision {
-                world.fog_of_war.reveal_from_source(&config, c_pos, c_range, 48);
+                world.fog_of_war.reveal_from_source(&config, c_pos, c_range * courier_mult, 48);
             }
             for &(ally_slot, ally_team, ally_pos, ally_range) in &all_hero_vision {
                 if ally_team == my_team && ally_slot != world.active_slot {
@@ -12268,9 +12412,14 @@ fn step_lane_creeps_system(
         let can_attack_now = !is_neutral || (world.creeps[idx].is_aggroed && !leashed_back);
 
         // الف) یافتن نزدیک‌ترین دشمن (سرباز یا هیرو) با رعایت کامل مه جنگ، برتری ارتفاع و خط دید موانع
+        let eff_creep_vision = c_stats.vision_range
+            * config.effective_vision_multiplier(
+                world.match_elapsed_secs,
+                config.day_night.night_creep_vision_multiplier,
+            );
         let mut best_target: Option<(Vec3, f32)> = None;
         if can_attack_now {
-            let vision_sq = c_stats.vision_range * c_stats.vision_range;
+            let vision_sq = eff_creep_vision * eff_creep_vision;
             for &(other_id, other_team, other_pos, other_dead, other_aggroed) in &creep_snap {
                 if other_id == my_id || other_team == my_team || other_dead {
                     continue;
@@ -12283,7 +12432,7 @@ fn step_lane_creeps_system(
                     continue;
                 }
                 let d = my_pos.distance(other_pos);
-                if d <= c_stats.vision_range
+                if d <= eff_creep_vision
                     && best_target.map_or(true, |(_, bd)| d < bd)
                     && can_observer_see_point_with_range(
                         physics_world,
@@ -12291,7 +12440,7 @@ fn step_lane_creeps_system(
                         my_pos,
                         other_pos,
                         c_stats.aim_chest_height,
-                        c_stats.vision_range,
+                        eff_creep_vision,
                         0.0,
                     )
                 {
@@ -12303,7 +12452,7 @@ fn step_lane_creeps_system(
                     continue;
                 }
                 let d = my_pos.distance(h_pos);
-                if d <= c_stats.vision_range
+                if d <= eff_creep_vision
                     && best_target.map_or(true, |(_, bd)| d < bd)
                     && can_observer_see_point_with_range(
                         physics_world,
@@ -12311,7 +12460,7 @@ fn step_lane_creeps_system(
                         my_pos,
                         h_pos,
                         c_stats.aim_chest_height,
-                        c_stats.vision_range,
+                        eff_creep_vision,
                         0.0,
                     )
                 {
@@ -12324,7 +12473,7 @@ fn step_lane_creeps_system(
                         continue;
                     }
                     let edge_dist = (my_pos.distance(t_pos) - t_rad).max(0.0);
-                    if edge_dist <= c_stats.vision_range
+                    if edge_dist <= eff_creep_vision
                         && best_target.map_or(true, |(_, bd)| edge_dist < bd)
                     {
                         let to_tur = Vec3::new(my_pos.x - t_pos.x, 0.0, my_pos.z - t_pos.z).normalize_or_zero();
@@ -12335,7 +12484,7 @@ fn step_lane_creeps_system(
                             my_pos,
                             tur_edge_pos,
                             c_stats.aim_chest_height,
-                            c_stats.vision_range,
+                            eff_creep_vision,
                             0.0,
                         ) {
                             best_target = Some((Vec3::new(t_pos.x, t_pos.y + t_height * 0.5, t_pos.z), edge_dist));
@@ -12350,7 +12499,7 @@ fn step_lane_creeps_system(
                         continue;
                     }
                     let edge_dist = (my_pos.distance(b_pos) - b_rad).max(0.0);
-                    if edge_dist <= c_stats.vision_range
+                    if edge_dist <= eff_creep_vision
                         && best_target.map_or(true, |(_, bd)| edge_dist < bd)
                     {
                         let to_bar = Vec3::new(my_pos.x - b_pos.x, 0.0, my_pos.z - b_pos.z).normalize_or_zero();
@@ -12361,7 +12510,7 @@ fn step_lane_creeps_system(
                             my_pos,
                             bar_edge_pos,
                             c_stats.aim_chest_height,
-                            c_stats.vision_range,
+                            eff_creep_vision,
                             0.0,
                         ) {
                             best_target = Some((Vec3::new(b_pos.x, b_pos.y + b_height * 0.5, b_pos.z), edge_dist));
@@ -12375,7 +12524,7 @@ fn step_lane_creeps_system(
                         continue;
                     }
                     let d_xz = Vec2::new(my_pos.x, my_pos.z).distance(Vec2::new(cour_pos.x, cour_pos.z));
-                    if d_xz <= c_stats.vision_range && best_target.map_or(true, |(_, bd)| d_xz < bd) {
+                    if d_xz <= eff_creep_vision && best_target.map_or(true, |(_, bd)| d_xz < bd) {
                         best_target = Some((cour_pos, d_xz));
                     }
                 }
@@ -12386,7 +12535,7 @@ fn step_lane_creeps_system(
                         continue;
                     }
                     let edge_dist = (my_pos.distance(a_pos) - a_rad).max(0.0);
-                    if edge_dist <= c_stats.vision_range
+                    if edge_dist <= eff_creep_vision
                         && best_target.map_or(true, |(_, bd)| edge_dist < bd)
                     {
                         let to_anc = Vec3::new(my_pos.x - a_pos.x, 0.0, my_pos.z - a_pos.z).normalize_or_zero();
@@ -12397,7 +12546,7 @@ fn step_lane_creeps_system(
                             my_pos,
                             anc_edge_pos,
                             c_stats.aim_chest_height,
-                            c_stats.vision_range,
+                            eff_creep_vision,
                             0.0,
                         ) {
                             best_target = Some((Vec3::new(a_pos.x, a_pos.y + 1.5, a_pos.z), edge_dist));
@@ -12765,7 +12914,11 @@ fn step_turrets_system(
                     ray_start,
                     c_pos,
                     1.15,
-                    t_def.vision_range,
+                    t_def.vision_range
+                        * config.effective_vision_multiplier(
+                            world.match_elapsed_secs,
+                            config.day_night.night_turret_vision_multiplier,
+                        ),
                     0.0,
                 )
             {
@@ -12790,7 +12943,11 @@ fn step_turrets_system(
                         ray_start,
                         h_pos,
                         1.15,
-                        t_def.vision_range,
+                        t_def.vision_range
+                            * config.effective_vision_multiplier(
+                                world.match_elapsed_secs,
+                                config.day_night.night_turret_vision_multiplier,
+                            ),
                         0.0,
                     )
                 {

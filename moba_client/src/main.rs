@@ -12,7 +12,9 @@ use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDi
 use bevy::shader::ShaderRef;
 use bevy::gltf::Gltf;
 use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight, NotShadowCaster};
+use bevy::diagnostic::{DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::SystemParam;
+use bevy::render::diagnostic::RenderDiagnosticsPlugin;
 use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use bevy::window::{CursorOptions, MonitorSelection, PresentMode, PrimaryWindow, WindowMode, WindowResolution};
@@ -212,13 +214,15 @@ fn main() {
             primary_window: Some(Window {
                 title: config.window.title.clone(),
                 resolution: WindowResolution::new(config.window.width, config.window.height),
-                present_mode: PresentMode::AutoNoVsync,
+                present_mode: PresentMode::AutoVsync,
                 mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
                 ..default()
             }),
             ..default()
         }))
-        .insert_resource(DirectionalLightShadowMap { size: 2048 })
+        .insert_resource(DirectionalLightShadowMap {
+            size: config.lighting.shadow_map_size,
+        })
         .insert_resource(config)
         .insert_resource(items_config)
         .insert_resource(LocalConfigOverride {
@@ -234,6 +238,11 @@ fn main() {
         .add_plugins(PreGamePlugin)
         .add_plugins(ShopPlugin)
         .add_plugins(MobaAudioPlugin)
+        .add_plugins((
+            FrameTimeDiagnosticsPlugin::default(),
+            EntityCountDiagnosticsPlugin::default(),
+            RenderDiagnosticsPlugin,
+        ))
         .insert_resource(ClientNetwork { client, transport })
         .insert_resource(render_state)
         .insert_resource(ClientPhysicsPredictionState::new())
@@ -317,58 +326,81 @@ fn main() {
         .add_systems(
             Update,
             (
-                load_gltf_and_build_graph,
-                attach_split_body_animation_graphs,
-                attach_weapon_to_left_hand,
-                weapon_live_calibration_system,
-                client_receive_snapshot_and_sync_system,
-                target_visual_reaction_system,
-                environment_vfx_and_water_animation_system,
-                update_swing_rope_visual_system,
-                sync_toxic_pools_visual_system,
-                sync_electric_beams_visual_system,
-                camera_follow_system,
-                soldier_animation_player_system,
-                laser_sight_gizmo_system,
-                cursor_reticle_system,
-                gameplay_fx_system,
-                level_up_vfx_system,
-                floating_world_popup_system,
-                death_screen_overlay_system,
-                ingame_exit_button_system,
-                sync_hud_phase_visibility_system,
+                (
+                    load_gltf_and_build_graph,
+                    attach_split_body_animation_graphs,
+                    attach_weapon_to_left_hand,
+                    weapon_live_calibration_system,
+                    client_receive_snapshot_and_sync_system,
+                    camera_follow_system,
+                    soldier_animation_player_system,
+                    laser_sight_gizmo_system,
+                    cursor_reticle_system,
+                )
+                    .chain(),
+                (
+                    target_visual_reaction_system,
+                    environment_vfx_and_water_animation_system,
+                    update_swing_rope_visual_system,
+                    sync_toxic_pools_visual_system,
+                    sync_electric_beams_visual_system,
+                    gameplay_fx_system,
+                    level_up_vfx_system,
+                    floating_world_popup_system,
+                    death_screen_overlay_system,
+                    ingame_exit_button_system,
+                    sync_hud_phase_visibility_system,
+                ),
             )
-                .chain()
                 .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
             Update,
             (
-                update_map_object_labels_system,
-                minimap_interaction_system,
-                minimap_overlay_update_system,
-                fog_of_war_update_system,
-                occlusion_transparency_system,
-                optimize_tree_shadows_system,
-                water_shader_update_system,
-                waterfall_mist_particle_system,
-                animate_glb_waterfall_materials_system,
-                update_hero_hud_system,
-                update_hero_stamina_hud_system,
-                client_lobby_sync_system,
-                hero_preview_system,
-                match_overlay_ui_system,
-                sync_remote_players_system,
-                update_overhead_hero_bars_system,
+                (
+                    sync_remote_players_system,
+                    update_overhead_hero_bars_system,
+                )
+                    .chain(),
+                (
+                    update_map_object_labels_system,
+                    minimap_interaction_system,
+                    minimap_overlay_update_system,
+                    fog_of_war_update_system,
+                    occlusion_transparency_system,
+                    optimize_tree_shadows_system,
+                    water_shader_update_system,
+                    waterfall_mist_particle_system,
+                    animate_glb_waterfall_materials_system,
+                    update_hero_hud_system,
+                    update_hero_stamina_hud_system,
+                    client_lobby_sync_system,
+                    hero_preview_system,
+                    match_overlay_ui_system,
+                ),
             )
-                .chain()
                 .after(camera_follow_system)
                 .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
             Update,
-            (sync_lane_creeps_system, update_overhead_creep_bars_system, update_top_match_hud_system, sync_turrets_system, update_overhead_turret_bars_system, sync_barracks_system, update_overhead_barracks_bars_system, sync_ancients_system, update_overhead_ancients_bars_system, end_of_match_overlay_system, client_chat_input_system, update_chat_ui_system, client_ping_input_system, update_ping_visuals_system, client_pause_input_system, update_pause_overlay_ui_system, update_telemetry_hud_system, sync_shop_context_and_network_system)
-                .chain()
+            (
+                (sync_lane_creeps_system, update_overhead_creep_bars_system).chain(),
+                (sync_turrets_system, update_overhead_turret_bars_system).chain(),
+                (sync_barracks_system, update_overhead_barracks_bars_system).chain(),
+                (sync_ancients_system, update_overhead_ancients_bars_system).chain(),
+                update_top_match_hud_system,
+                day_night_cycle_system,
+                end_of_match_overlay_system,
+                client_chat_input_system,
+                update_chat_ui_system,
+                client_ping_input_system,
+                update_ping_visuals_system,
+                client_pause_input_system,
+                update_pause_overlay_ui_system,
+                update_telemetry_hud_system,
+                sync_shop_context_and_network_system,
+            )
                 .after(sync_remote_players_system)
                 .run_if(in_state(AppScreenState::InGame)),
         )
@@ -506,6 +538,32 @@ struct SharedFxAssets {
     muzzle_flash_mat: Handle<StandardMaterial>,
     shell_mesh: Handle<Mesh>,
     shell_mat: Handle<StandardMaterial>,
+    dust_mesh: Handle<Mesh>,
+    dust_mat: Handle<StandardMaterial>,
+    water_droplet_mesh: Handle<Mesh>,
+    water_droplet_mat: Handle<StandardMaterial>,
+    level_up_pillar_mesh: Handle<Mesh>,
+    level_up_ring_mesh: Handle<Mesh>,
+    level_up_spark_mesh: Handle<Mesh>,
+    level_up_pillar_mat: Handle<StandardMaterial>,
+    level_up_spark_mat: Handle<StandardMaterial>,
+    coin_mesh: Handle<Mesh>,
+    coin_mat: Handle<StandardMaterial>,
+    grenade_mesh: Handle<Mesh>,
+    grenade_mat: Handle<StandardMaterial>,
+    grenade_led_mesh: Handle<Mesh>,
+    creep_rifle_parts: Vec<(Handle<Mesh>, Transform, bool)>,
+    creep_rifle_body_dawn: Handle<StandardMaterial>,
+    creep_rifle_accent_dawn: Handle<StandardMaterial>,
+    creep_rifle_body_dusk: Handle<StandardMaterial>,
+    creep_rifle_accent_dusk: Handle<StandardMaterial>,
+    creep_rifle_body_neutral: Handle<StandardMaterial>,
+    creep_rifle_accent_neutral: Handle<StandardMaterial>,
+}
+
+#[derive(Component)]
+struct MountainVisualMarker {
+    shadows_optimized: bool,
 }
 
 #[derive(Component)]
@@ -854,6 +912,9 @@ struct OccludedMaterialState {
 struct FogOfWarState {
     shared: SharedFogOfWar,
     alpha_grid: Vec<f32>,
+    blurred_target: Vec<f32>,
+    blur_scratch: Vec<f32>,
+    target_dirty: bool,
     fog_image: Handle<Image>,
 }
 
@@ -1219,10 +1280,17 @@ fn setup_scene(
         config.camera.offset.1,
         config.camera.offset.2,
     );
-    commands.spawn((
+    let msaa = match config.lighting.msaa_samples {
+        1 => Msaa::Off,
+        2 => Msaa::Sample2,
+        4 => Msaa::Sample4,
+        8 => Msaa::Sample8,
+        other => panic!("lighting.msaa_samples نامعتبر است: {}", other),
+    };
+    let mut cam_cmds = commands.spawn((
         Camera3d::default(),
+        msaa,
         Hdr,
-        Bloom::NATURAL,
         HanabiMainCamera,
         MobaCamera,
         DistanceFog {
@@ -1236,6 +1304,9 @@ fn setup_scene(
         },
         Transform::from_translation(spawn_pos + cam_offset).looking_at(spawn_pos, Vec3::Y),
     ));
+    if config.lighting.bloom_enabled {
+        cam_cmds.insert(Bloom::NATURAL);
+    }
 
     // خورشید طلایی-کوهستانی همراه با سایه‌های واقعی ۴ آبشاری (Cascaded Shadow Maps) و Contact Shadows
     let light_pos = Vec3::new(
@@ -2271,6 +2342,9 @@ fn setup_scene(
         let mut mtn_cmds = commands.spawn((
             mountain_physics_bundle(&config, mtn),
             Visibility::Visible,
+            MountainVisualMarker {
+                shadows_optimized: false,
+            },
         ));
 
         if mtn.occlusion_fade_enabled {
@@ -2589,11 +2663,104 @@ fn setup_scene(
             height: 0.28,
         }),
         muzzle_flash_mat: materials.add(StandardMaterial::default()),
-        shell_mesh: meshes.add(Cylinder::new(0.014, 0.055)),
+        shell_mesh: meshes.add(Cylinder::new(
+            config.physics.shell_collider_radius,
+            config.physics.shell_collider_half_height * 2.0,
+        )),
         shell_mat: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.88, 0.72, 0.28),
+            base_color: Color::srgb(0.95, 0.78, 0.25),
             metallic: 0.9,
             perceptual_roughness: 0.25,
+            ..default()
+        }),
+        dust_mesh: meshes.add(Cuboid::new(0.08, 0.08, 0.08)),
+        dust_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.55, 0.5, 0.45),
+            ..default()
+        }),
+        water_droplet_mesh: meshes.add(Sphere::new(0.045)),
+        water_droplet_mat: materials.add(StandardMaterial {
+            base_color: Color::srgba(0.75, 0.88, 0.92, 0.55),
+            alpha_mode: AlphaMode::Blend,
+            perceptual_roughness: 0.15,
+            ..default()
+        }),
+        level_up_pillar_mesh: meshes.add(Cylinder::new(0.85, 6.8)),
+        level_up_ring_mesh: meshes.add(Torus::new(0.95, 1.15)),
+        level_up_spark_mesh: meshes.add(Sphere::new(0.06)),
+        level_up_pillar_mat: materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 0.86, 0.25, 0.42),
+            emissive: LinearRgba::new(6.5, 4.8, 0.8, 0.42),
+            alpha_mode: AlphaMode::Add,
+            unlit: true,
+            ..default()
+        }),
+        level_up_spark_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.90, 0.35),
+            emissive: LinearRgba::new(10.0, 7.2, 1.2, 1.0),
+            unlit: true,
+            ..default()
+        }),
+        coin_mesh: meshes.add(Cylinder::new(0.11, 0.03)),
+        coin_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.84, 0.16),
+            emissive: LinearRgba::new(5.5, 4.0, 0.4, 1.0),
+            metallic: 0.85,
+            perceptual_roughness: 0.25,
+            ..default()
+        }),
+        grenade_mesh: meshes.add(Sphere::new(config.physics.grenade_collider_radius)),
+        grenade_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.2, 0.38, 0.18),
+            metallic: 0.6,
+            perceptual_roughness: 0.4,
+            ..default()
+        }),
+        grenade_led_mesh: meshes.add(Sphere::new(config.physics.grenade_collider_radius * 0.45)),
+        creep_rifle_parts: vec![
+            (meshes.add(Cuboid::new(0.055, 0.10, 0.44)), Transform::from_xyz(0.0, 0.03, -0.12), false),
+            (meshes.add(Cuboid::new(0.048, 0.075, 0.30)), Transform::from_xyz(0.0, 0.035, -0.42), true),
+            (meshes.add(Cylinder::new(0.013, 0.40)), Transform::from_xyz(0.0, 0.045, -0.60).with_rotation(Quat::from_rotation_x(PI * 0.5)), false),
+            (meshes.add(Cylinder::new(0.019, 0.07)), Transform::from_xyz(0.0, 0.045, -0.80).with_rotation(Quat::from_rotation_x(PI * 0.5)), true),
+            (meshes.add(Cuboid::new(0.048, 0.085, 0.22)), Transform::from_xyz(0.0, 0.02, 0.18), true),
+            (meshes.add(Cuboid::new(0.04, 0.19, 0.072)), Transform::from_xyz(0.0, -0.09, -0.24).with_rotation(Quat::from_rotation_x(0.22)), true),
+            (meshes.add(Cuboid::new(0.042, 0.13, 0.055)), Transform::from_xyz(0.0, -0.05, -0.02).with_rotation(Quat::from_rotation_x(-0.25)), false),
+            (meshes.add(Cuboid::new(0.044, 0.05, 0.10)), Transform::from_xyz(0.0, 0.10, -0.14), true),
+        ],
+        creep_rifle_body_dawn: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.14, 0.16, 0.19),
+            metallic: 0.85,
+            perceptual_roughness: 0.35,
+            ..default()
+        }),
+        creep_rifle_accent_dawn: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.18, 0.72, 0.58),
+            metallic: 0.65,
+            perceptual_roughness: 0.42,
+            ..default()
+        }),
+        creep_rifle_body_dusk: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.17, 0.14, 0.16),
+            metallic: 0.85,
+            perceptual_roughness: 0.35,
+            ..default()
+        }),
+        creep_rifle_accent_dusk: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.86, 0.28, 0.22),
+            metallic: 0.65,
+            perceptual_roughness: 0.42,
+            ..default()
+        }),
+        creep_rifle_body_neutral: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.18, 0.15, 0.12),
+            metallic: 0.85,
+            perceptual_roughness: 0.35,
+            ..default()
+        }),
+        creep_rifle_accent_neutral: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.92, 0.62, 0.18),
+            metallic: 0.65,
+            perceptual_roughness: 0.42,
             ..default()
         }),
     };
@@ -3143,21 +3310,15 @@ fn spawn_water_ripple_and_droplets(
     commands: &mut Commands,
     config: &GameConfig,
     render_state: &mut ClientRenderState,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    shared_fx: &SharedFxAssets,
     water_pos: Vec3,
     intensity: f32,
 ) {
     // فقط ذرات ظریف پاشش آب (بدون حلقه‌ها و دایره‌های مزاحم دور کاراکتر)
     if intensity >= 0.9 {
         let drop_count = ((intensity * 9.0) as u32).clamp(6, 18);
-        let drop_mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(0.75, 0.88, 0.92, 0.55),
-            alpha_mode: AlphaMode::Blend,
-            perceptual_roughness: 0.15,
-            ..default()
-        });
-        let drop_mesh = meshes.add(Sphere::new(0.045));
+        let drop_mat = shared_fx.water_droplet_mat.clone();
+        let drop_mesh = shared_fx.water_droplet_mesh.clone();
 
         for _ in 0..drop_count {
             let rx = render_state.next_fx_rand();
@@ -4130,6 +4291,7 @@ fn client_flush_input_to_server_system(
 
 #[derive(SystemParam)]
 struct TurretFxResources<'w, 's> {
+    shared_fx: Res<'w, SharedFxAssets>,
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     audio_q: ResMut<'w, AudioEventQueue>,
@@ -4278,6 +4440,7 @@ fn client_receive_snapshot_and_sync_system(
         }
         if let Some(ref mut fow_state) = fow {
             fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
+            fow_state.target_dirty = true;
         }
 
         prediction.traversal_active = snap.traversal_active;
@@ -4421,13 +4584,8 @@ fn client_receive_snapshot_and_sync_system(
                 });
                 commands
                     .spawn((
-                        Mesh3d(fx_res.meshes.add(Sphere::new(config.physics.grenade_collider_radius))),
-                        MeshMaterial3d(fx_res.materials.add(StandardMaterial {
-                            base_color: Color::srgb(0.2, 0.38, 0.18),
-                            metallic: 0.6,
-                            perceptual_roughness: 0.4,
-                            ..default()
-                        })),
+                        Mesh3d(fx_res.shared_fx.grenade_mesh.clone()),
+                        MeshMaterial3d(fx_res.shared_fx.grenade_mat.clone()),
                         NetworkGrenadeVisual {
                             server_id: g_snap.id,
                             spawn_time: time.elapsed_secs(),
@@ -4449,7 +4607,7 @@ fn client_receive_snapshot_and_sync_system(
                     .with_children(|g| {
                         g.spawn((
                             GrenadeBlinkLed { mat: led_mat.clone(), was_on: false },
-                            Mesh3d(fx_res.meshes.add(Sphere::new(config.physics.grenade_collider_radius * 0.45))),
+                            Mesh3d(fx_res.shared_fx.grenade_led_mesh.clone()),
                             MeshMaterial3d(led_mat),
                             Transform::from_xyz(0.0, config.physics.grenade_collider_radius * 0.9, 0.0),
                             PointLight {
@@ -4473,8 +4631,7 @@ fn client_receive_snapshot_and_sync_system(
             &config,
             &mut render_state,
             &mut shake,
-            &mut fx_res.meshes,
-            &mut fx_res.materials,
+            &fx_res.shared_fx,
             &mut fx_res.audio_q,
             &mut fx_res.vfx_q,
             &mut fx_res.turret_gun_q,
@@ -4529,8 +4686,7 @@ fn spawn_fx_from_server_event(
     config: &GameConfig,
     render_state: &mut ClientRenderState,
     shake: &mut CameraShake,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    shared_fx: &SharedFxAssets,
     audio_q: &mut AudioEventQueue,
     vfx_q: &mut VfxEventQueue,
     turret_gun_q: &mut Query<&mut TurretGunBone>,
@@ -4583,17 +4739,10 @@ fn spawn_fx_from_server_event(
             let shell_ang_vel = Vec3::new(rx * 18.0, ry * 18.0, rz * 18.0);
 
             commands.spawn((
-                Mesh3d(meshes.add(Cylinder::new(
-                    config.physics.shell_collider_radius,
-                    config.physics.shell_collider_half_height * 2.0,
-                ))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.95, 0.78, 0.25),
-                    metallic: 0.9,
-                    perceptual_roughness: 0.25,
-                    ..default()
-                })),
+                Mesh3d(shared_fx.shell_mesh.clone()),
+                MeshMaterial3d(shared_fx.shell_mat.clone()),
                 shell_casing_physics_bundle(config, shell_pos, shell_lin_vel, shell_ang_vel),
+                NotShadowCaster,
             ));
 
             shake.trauma = (shake.trauma + trauma_add).min(trauma_max);
@@ -4657,11 +4806,8 @@ fn spawn_fx_from_server_event(
             let vel = Vec3::new((rx - 0.5) * 1.5, 0.8 + ry * 1.2, (rz - 0.5) * 1.5);
 
             commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.08, 0.08, 0.08))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.55, 0.5, 0.45),
-                    ..default()
-                })),
+                Mesh3d(shared_fx.dust_mesh.clone()),
+                MeshMaterial3d(shared_fx.dust_mat.clone()),
                 particle_physics_bundle(
                     config,
                     pos,
@@ -4677,8 +4823,7 @@ fn spawn_fx_from_server_event(
                 commands,
                 config,
                 render_state,
-                meshes,
-                materials,
+                shared_fx,
                 pos + Vec3::Y * 0.03,
                 intensity,
             );
@@ -4689,19 +4834,13 @@ fn spawn_fx_from_server_event(
         GameplayFxEvent::HeroLeveledUp { pos, new_level: _ } => {
             audio_q.0.push(ClientAudioEvent::HeroLeveledUp);
             let dur = config.fx.level_up_vfx_duration_secs;
-            let pillar_mat = materials.add(StandardMaterial {
-                base_color: Color::srgba(1.0, 0.86, 0.25, 0.42),
-                emissive: LinearRgba::new(6.5, 4.8, 0.8, 0.42),
-                alpha_mode: AlphaMode::Add,
-                unlit: true,
-                ..default()
-            });
+            let pillar_mat = shared_fx.level_up_pillar_mat.clone();
             commands.spawn((
                 LevelUpVfx {
                     timer: Timer::from_seconds(dur, TimerMode::Once),
                     is_ring: false,
                 },
-                Mesh3d(meshes.add(Cylinder::new(0.85, 6.8))),
+                Mesh3d(shared_fx.level_up_pillar_mesh.clone()),
                 MeshMaterial3d(pillar_mat.clone()),
                 Transform::from_translation(pos + Vec3::Y * 3.4),
                 PointLight {
@@ -4718,19 +4857,14 @@ fn spawn_fx_from_server_event(
                     timer: Timer::from_seconds(dur, TimerMode::Once),
                     is_ring: true,
                 },
-                Mesh3d(meshes.add(Torus::new(0.95, 1.15))),
+                Mesh3d(shared_fx.level_up_ring_mesh.clone()),
                 MeshMaterial3d(pillar_mat),
                 Transform::from_translation(pos + Vec3::Y * 0.15),
                 NotShadowCaster,
             ));
 
-            let spark_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(1.0, 0.90, 0.35),
-                emissive: LinearRgba::new(10.0, 7.2, 1.2, 1.0),
-                unlit: true,
-                ..default()
-            });
-            let spark_mesh = meshes.add(Sphere::new(0.06));
+            let spark_mat = shared_fx.level_up_spark_mat.clone();
+            let spark_mesh = shared_fx.level_up_spark_mesh.clone();
             for i in 0..config.fx.level_up_particle_count {
                 let angle = (i as f32) * (std::f32::consts::TAU / config.fx.level_up_particle_count as f32);
                 let r = 0.55 + render_state.next_fx_rand() * 0.55;
@@ -4746,14 +4880,8 @@ fn spawn_fx_from_server_event(
         }
         GameplayFxEvent::LastHitGold { pos, gold } => {
             audio_q.0.push(ClientAudioEvent::LastHitGold);
-            let coin_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(1.0, 0.84, 0.16),
-                emissive: LinearRgba::new(5.5, 4.0, 0.4, 1.0),
-                metallic: 0.85,
-                perceptual_roughness: 0.25,
-                ..default()
-            });
-            let coin_mesh = meshes.add(Cylinder::new(0.11, 0.03));
+            let coin_mat = shared_fx.coin_mat.clone();
+            let coin_mesh = shared_fx.coin_mesh.clone();
             for i in 0..config.fx.coin_burst_count {
                 let angle = (i as f32) * (std::f32::consts::TAU / config.fx.coin_burst_count.max(1) as f32)
                     + render_state.next_fx_rand() * 0.4;
@@ -4769,6 +4897,7 @@ fn spawn_fx_from_server_event(
                         config.fx.coin_lifetime_secs,
                         true,
                     ),
+                    NotShadowCaster,
                 ));
             }
 
@@ -5974,7 +6103,9 @@ fn update_map_object_labels_system(
 ) {
     if !config.map.show_object_labels {
         for (_, _, mut vis) in &mut label_query {
-            *vis = Visibility::Hidden;
+            if *vis != Visibility::Hidden {
+                *vis = Visibility::Hidden;
+            }
         }
         return;
     }
@@ -6866,20 +6997,98 @@ fn init_fog_of_war(config: &GameConfig, images: &mut Assets<Image>) -> FogOfWarS
 
     FogOfWarState {
         shared,
-        alpha_grid: vec![0.86; total],
+        alpha_grid: vec![config.map.fog_unexplored_alpha; total],
+        blurred_target: vec![config.map.fog_unexplored_alpha; total],
+        blur_scratch: vec![config.map.fog_unexplored_alpha; total],
+        target_dirty: true,
         fog_image,
     }
 }
 
 fn fog_of_war_update_system(
     time: Res<Time>,
+    config: Res<GameConfig>,
     mut fow: ResMut<FogOfWarState>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let dt = time.delta_secs();
-    let t = time.elapsed_secs();
+    let dt = time.delta_secs().min(0.1);
+    if dt <= 1e-5 {
+        return;
+    }
 
-    let lerp_rate = (10.0 * dt).clamp(0.05, 1.0);
+    let total = FOW_GRID_W * FOW_GRID_H;
+    if fow.target_dirty {
+        let exp_a = config.map.fog_explored_alpha;
+        let unexp_a = config.map.fog_unexplored_alpha;
+        // ۱. پر کردن حفره‌های تک‌سلولی ناشی از Raycast و تبدیل شبکه باینری به آلفای هدف
+        for gz in 0..FOW_GRID_H {
+            for gx in 0..FOW_GRID_W {
+                let idx = gz * FOW_GRID_W + gx;
+                let mut vis = fow.shared.visible_now[idx];
+                if !vis && gx > 0 && gx + 1 < FOW_GRID_W && gz > 0 && gz + 1 < FOW_GRID_H {
+                    let vis_neighbors = fow.shared.visible_now[idx - 1] as u8
+                        + fow.shared.visible_now[idx + 1] as u8
+                        + fow.shared.visible_now[idx - FOW_GRID_W] as u8
+                        + fow.shared.visible_now[idx + FOW_GRID_W] as u8;
+                    if vis_neighbors >= 3 {
+                        vis = true;
+                    }
+                }
+                fow.blurred_target[idx] = if vis {
+                    0.0
+                } else if fow.shared.explored[idx] {
+                    exp_a
+                } else {
+                    unexp_a
+                };
+            }
+        }
+
+        // ۲. بلور فضایی نرم (Separable Gaussian [0.25, 0.5, 0.25]) برای ایجاد حاشیه مه شبیه Dota 2
+        for _ in 0..config.map.fog_blur_passes {
+            for gz in 0..FOW_GRID_H {
+                let row = gz * FOW_GRID_W;
+                for gx in 0..FOW_GRID_W {
+                    let l = fow.blurred_target[row + gx.saturating_sub(1)];
+                    let c = fow.blurred_target[row + gx];
+                    let r = fow.blurred_target[row + (gx + 1).min(FOW_GRID_W - 1)];
+                    fow.blur_scratch[row + gx] = l * 0.25 + c * 0.5 + r * 0.25;
+                }
+            }
+            for gz in 0..FOW_GRID_H {
+                let up_z = gz.saturating_sub(1);
+                let dn_z = (gz + 1).min(FOW_GRID_H - 1);
+                for gx in 0..FOW_GRID_W {
+                    let u = fow.blur_scratch[up_z * FOW_GRID_W + gx];
+                    let c = fow.blur_scratch[gz * FOW_GRID_W + gx];
+                    let d = fow.blur_scratch[dn_z * FOW_GRID_W + gx];
+                    fow.blurred_target[gz * FOW_GRID_W + gx] = u * 0.25 + c * 0.5 + d * 0.25;
+                }
+            }
+        }
+        fow.target_dirty = false;
+    }
+
+    // ۳. نرم‌سازی زمانی پیوسته (Exponential Smoothing)؛ فقط در صورت تغییر واقعی تکسچر GPU آپلود می‌شود
+    let blend = (1.0 - (-config.map.fog_fade_speed * dt).exp()).clamp(0.0, 1.0);
+    let mut any_changed = false;
+    for i in 0..total {
+        let target = fow.blurred_target[i];
+        let cur = fow.alpha_grid[i];
+        let diff = target - cur;
+        if diff.abs() > 0.0015 {
+            fow.alpha_grid[i] = (cur + diff * blend).clamp(0.0, 0.96);
+            any_changed = true;
+        } else if cur != target {
+            fow.alpha_grid[i] = target;
+            any_changed = true;
+        }
+    }
+
+    if !any_changed {
+        return;
+    }
+
     let fog_handle = fow.fog_image.clone();
     let Some(mut img) = images.get_mut(&fog_handle) else {
         return;
@@ -6888,41 +7097,19 @@ fn fog_of_war_update_system(
         return;
     };
 
-    for gz in 0..FOW_GRID_H {
-        for gx in 0..FOW_GRID_W {
-            let idx = gz * FOW_GRID_W + gx;
-            let is_vis = fow.shared.visible_now[idx];
-            let is_exp = fow.shared.explored[idx];
-            let target_alpha = if is_vis {
-                0.0
-            } else if is_exp {
-                0.55
-            } else {
-                0.86
-            };
-
-            fow.alpha_grid[idx] =
-                fow.alpha_grid[idx] + (target_alpha - fow.alpha_grid[idx]) * lerp_rate;
-            let shimmer =
-                ((gx as f32 * 0.18 + t * 0.9).sin() * (gz as f32 * 0.18 - t * 0.7).cos()) * 0.025;
-            let a = if target_alpha == 0.0 && fow.alpha_grid[idx] < 0.04 {
-                0.0
-            } else {
-                (fow.alpha_grid[idx] + shimmer).clamp(0.0, 0.92)
-            };
-
-            let p = idx * 4;
-            if is_exp {
-                data[p] = 12;
-                data[p + 1] = 20;
-                data[p + 2] = 36;
-            } else {
-                data[p] = 6;
-                data[p + 1] = 10;
-                data[p + 2] = 18;
-            }
-            data[p + 3] = (a * 255.0) as u8;
+    for idx in 0..total {
+        let a = fow.alpha_grid[idx];
+        let p = idx * 4;
+        if fow.shared.explored[idx] {
+            data[p] = 12;
+            data[p + 1] = 20;
+            data[p + 2] = 36;
+        } else {
+            data[p] = 6;
+            data[p + 1] = 10;
+            data[p + 2] = 18;
         }
+        data[p + 3] = (a.clamp(0.0, 0.96) * 255.0) as u8;
     }
 }
 
@@ -6962,7 +7149,8 @@ fn segment_intersects_aabb(seg_a: Vec3, seg_b: Vec3, center: Vec3, half: Vec3, r
 
 fn optimize_tree_shadows_system(
     mut commands: Commands,
-    mut tree_query: Query<(Entity, &mut TreeVisualMarker)>,
+    mut tree_query: Query<(Entity, &mut TreeVisualMarker), Without<MountainVisualMarker>>,
+    mut mountain_query: Query<(Entity, &mut MountainVisualMarker), Without<TreeVisualMarker>>,
     children_query: Query<&Children>,
     mesh_query: Query<(), With<Mesh3d>>,
 ) {
@@ -6976,6 +7164,25 @@ fn optimize_tree_shadows_system(
             found_mesh = true;
         }
         for desc in children_query.iter_descendants(tree_ent) {
+            if mesh_query.contains(desc) {
+                commands.entity(desc).insert(NotShadowCaster);
+                found_mesh = true;
+            }
+        }
+        if found_mesh {
+            marker.shadows_optimized = true;
+        }
+    }
+    for (mtn_ent, mut marker) in &mut mountain_query {
+        if marker.shadows_optimized {
+            continue;
+        }
+        let mut found_mesh = false;
+        if mesh_query.contains(mtn_ent) {
+            commands.entity(mtn_ent).insert(NotShadowCaster);
+            found_mesh = true;
+        }
+        for desc in children_query.iter_descendants(mtn_ent) {
             if mesh_query.contains(desc) {
                 commands.entity(desc).insert(NotShadowCaster);
                 found_mesh = true;
@@ -7396,13 +7603,16 @@ fn ensure_repeat_sampler(img: &mut Image) {
     desc.address_mode_v = ImageAddressMode::Repeat;
 }
 
+#[derive(Component)]
+struct GlbWaterChecked;
+
 /// انیمیت خودکار آبشارها و آب‌های عمیق درون مدل‌های `.glb` با حفظ کامل متریال و تکسچر اصلی مدل
 fn animate_glb_waterfall_materials_system(
     mut commands: Commands,
     time: Res<Time>,
     mut candidate_query: Query<
         (Entity, &mut MeshMaterial3d<StandardMaterial>, Option<&Name>, Option<&GltfMaterialName>),
-        Without<GlbAnimatedWaterTag>,
+        (Without<GlbAnimatedWaterTag>, Without<GlbWaterChecked>),
     >,
     tagged_query: Query<(&MeshMaterial3d<StandardMaterial>, &GlbAnimatedWaterTag)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -7460,6 +7670,8 @@ fn animate_glb_waterfall_materials_system(
             commands
                 .entity(ent)
                 .insert(GlbAnimatedWaterTag { is_waterfall });
+        } else {
+            commands.entity(ent).insert(GlbWaterChecked);
         }
     }
 
@@ -10248,8 +10460,8 @@ fn adaptive_ui_performance_mode_system(
     } else {
         *winit_settings = bevy::winit::WinitSettings::game();
         if let Ok(mut window) = window_query.single_mut() {
-            if window.present_mode != PresentMode::AutoNoVsync {
-                window.present_mode = PresentMode::AutoNoVsync;
+            if window.present_mode != PresentMode::AutoVsync {
+                window.present_mode = PresentMode::AutoVsync;
             }
         }
     }
@@ -10918,26 +11130,13 @@ fn spawn_creep_rifle_on_hand(
     hand_ent: Entity,
     team: TeamId,
     tuner: &moba_shared::WeaponTunerConfig,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    shared_fx: &SharedFxAssets,
 ) {
-    let (body_col, accent_col) = match team {
-        TeamId::Dawn => (Color::srgb(0.14, 0.16, 0.19), Color::srgb(0.18, 0.72, 0.58)),
-        TeamId::Dusk => (Color::srgb(0.17, 0.14, 0.16), Color::srgb(0.86, 0.28, 0.22)),
-        TeamId::Neutral => (Color::srgb(0.18, 0.15, 0.12), Color::srgb(0.92, 0.62, 0.18)),
+    let (body_mat, accent_mat) = match team {
+        TeamId::Dawn => (&shared_fx.creep_rifle_body_dawn, &shared_fx.creep_rifle_accent_dawn),
+        TeamId::Dusk => (&shared_fx.creep_rifle_body_dusk, &shared_fx.creep_rifle_accent_dusk),
+        TeamId::Neutral => (&shared_fx.creep_rifle_body_neutral, &shared_fx.creep_rifle_accent_neutral),
     };
-    let body_mat = materials.add(StandardMaterial {
-        base_color: body_col,
-        metallic: 0.85,
-        perceptual_roughness: 0.35,
-        ..default()
-    });
-    let accent_mat = materials.add(StandardMaterial {
-        base_color: accent_col,
-        metallic: 0.65,
-        perceptual_roughness: 0.42,
-        ..default()
-    });
     let off = tuner.initial_offset;
     let rot_d = tuner.initial_rotation_deg;
     let root_tf = Transform::from_xyz(off.0, off.1, off.2)
@@ -10961,50 +11160,15 @@ fn spawn_creep_rifle_on_hand(
                 root_tf,
                 Visibility::Visible,
             )).with_children(|weapon| {
-                weapon.spawn((
-                    Mesh3d(meshes.add(Cuboid::new(0.055, 0.10, 0.44))),
-                    MeshMaterial3d(body_mat.clone()),
-                    Transform::from_xyz(0.0, 0.03, -0.12),
-                ));
-                weapon.spawn((
-                    Mesh3d(meshes.add(Cuboid::new(0.048, 0.075, 0.30))),
-                    MeshMaterial3d(accent_mat.clone()),
-                    Transform::from_xyz(0.0, 0.035, -0.42),
-                ));
-                weapon.spawn((
-                    Mesh3d(meshes.add(Cylinder::new(0.013, 0.40))),
-                    MeshMaterial3d(body_mat.clone()),
-                    Transform::from_xyz(0.0, 0.045, -0.60)
-                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                ));
-                weapon.spawn((
-                    Mesh3d(meshes.add(Cylinder::new(0.019, 0.07))),
-                    MeshMaterial3d(accent_mat.clone()),
-                    Transform::from_xyz(0.0, 0.045, -0.80)
-                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                ));
-                weapon.spawn((
-                    Mesh3d(meshes.add(Cuboid::new(0.048, 0.085, 0.22))),
-                    MeshMaterial3d(accent_mat.clone()),
-                    Transform::from_xyz(0.0, 0.02, 0.18),
-                ));
-                weapon.spawn((
-                    Mesh3d(meshes.add(Cuboid::new(0.04, 0.19, 0.072))),
-                    MeshMaterial3d(accent_mat.clone()),
-                    Transform::from_xyz(0.0, -0.09, -0.24)
-                        .with_rotation(Quat::from_rotation_x(0.22)),
-                ));
-                weapon.spawn((
-                    Mesh3d(meshes.add(Cuboid::new(0.042, 0.13, 0.055))),
-                    MeshMaterial3d(body_mat),
-                    Transform::from_xyz(0.0, -0.05, -0.02)
-                        .with_rotation(Quat::from_rotation_x(-0.25)),
-                ));
-                weapon.spawn((
-                    Mesh3d(meshes.add(Cuboid::new(0.044, 0.05, 0.10))),
-                    MeshMaterial3d(accent_mat),
-                    Transform::from_xyz(0.0, 0.10, -0.14),
-                ));
+                for (mesh_h, part_tf, is_accent) in &shared_fx.creep_rifle_parts {
+                    let mat_h = if *is_accent { accent_mat.clone() } else { body_mat.clone() };
+                    weapon.spawn((
+                        Mesh3d(mesh_h.clone()),
+                        MeshMaterial3d(mat_h),
+                        *part_tf,
+                        NotShadowCaster,
+                    ));
+                }
             });
         });
 }
@@ -11022,6 +11186,7 @@ struct OverheadCreepHpFill {
 #[derive(SystemParam)]
 struct CreepAssetParams<'w> {
     config: Res<'w, GameConfig>,
+    shared_fx: Res<'w, SharedFxAssets>,
     asset_server: Res<'w, AssetServer>,
     match_flow: Res<'w, ClientMatchFlow>,
     render_state: Res<'w, ClientRenderState>,
@@ -11127,8 +11292,7 @@ fn sync_lane_creeps_system(
                             h_ent,
                             cs.team,
                             &res.config.weapon_tuner,
-                            &mut res.meshes,
-                            &mut res.materials,
+                            &res.shared_fx,
                         );
                         vis_comp.weapon_attached = true;
                         break;
@@ -11300,7 +11464,9 @@ fn update_overhead_creep_bars_system(
         existing_bars.insert(root.creep_id, ent);
 
         if cs.is_dead || !cs.is_visible {
-            node.display = Display::None;
+            if node.display != Display::None {
+                node.display = Display::None;
+            }
             continue;
         }
 
@@ -11312,10 +11478,18 @@ fn update_overhead_creep_bars_system(
             .unwrap_or(config.creeps.hitbox_height);
         let world_head = cs.pos + Vec3::Y * (c_height + 0.45);
         if let Ok(sp) = camera.world_to_viewport(cam_gtf, world_head) {
-            node.display = Display::Flex;
-            node.left = px(sp.x - 28.0);
-            node.top = px(sp.y - 12.0);
-        } else {
+            if node.display != Display::Flex {
+                node.display = Display::Flex;
+            }
+            let new_left = px(sp.x - 28.0);
+            let new_top = px(sp.y - 12.0);
+            if node.left != new_left {
+                node.left = new_left;
+            }
+            if node.top != new_top {
+                node.top = new_top;
+            }
+        } else if node.display != Display::None {
             node.display = Display::None;
         }
     }
@@ -11386,6 +11560,15 @@ struct TopMatchHudRoot;
 
 #[derive(Component)]
 struct TopMatchClockText;
+
+#[derive(Component)]
+struct TopDayNightOrb;
+
+#[derive(Component)]
+struct TopDayNightCrescent;
+
+#[derive(Component)]
+struct TopDayNightLabel;
 
 #[derive(Component)]
 struct TopDawnKillsText;
@@ -11459,30 +11642,100 @@ fn spawn_top_match_hud_ui(commands: &mut Commands) {
                 ));
             });
 
-            // ساعت مرکزی بازی (MM:SS)
+            // ستون مرکزی: آیکون خورشید/ماه بالای زمان بازی (MM:SS)
             root.spawn((
                 Pickable::IGNORE,
                 Node {
-                    padding: UiRect::axes(px(16.0), px(7.0)),
-                    border: UiRect::all(px(1.5)),
-                    border_radius: BorderRadius::all(px(8.0)),
-                    justify_content: JustifyContent::Center,
+                    flex_direction: FlexDirection::Column,
                     align_items: AlignItems::Center,
+                    row_gap: px(3.0),
                     ..default()
                 },
-                BorderColor::all(Color::srgba(0.65, 0.72, 0.80, 0.85)),
-                BackgroundColor(Color::srgba(0.05, 0.07, 0.11, 0.92)),
             ))
-            .with_children(|clock| {
-                clock.spawn((
-                    TopMatchClockText,
-                    Text::new("00:00"),
-                    TextFont {
-                        font_size: FontSize::Px(18.0),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.98, 0.94, 0.76)),
-                ));
+            .with_children(|center_col| {
+                // نشانگر خورشید / ماه با افکت درخشش
+                center_col
+                    .spawn((
+                        Pickable::IGNORE,
+                        Node {
+                            padding: UiRect::axes(px(10.0), px(3.0)),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: px(6.0),
+                            border: UiRect::all(px(1.2)),
+                            border_radius: BorderRadius::all(px(12.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.98, 0.78, 0.25, 0.85)),
+                        BackgroundColor(Color::srgba(0.06, 0.08, 0.14, 0.90)),
+                    ))
+                    .with_children(|badge| {
+                        badge
+                            .spawn((
+                                TopDayNightOrb,
+                                Node {
+                                    width: px(16.0),
+                                    height: px(16.0),
+                                    border: UiRect::all(px(2.0)),
+                                    border_radius: BorderRadius::all(px(8.0)),
+                                    ..default()
+                                },
+                                BorderColor::all(Color::srgba(1.0, 0.92, 0.45, 0.95)),
+                                BackgroundColor(Color::srgb(1.0, 0.82, 0.22)),
+                            ))
+                            .with_children(|orb| {
+                                orb.spawn((
+                                    TopDayNightCrescent,
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        top: px(-2.0),
+                                        right: px(-2.0),
+                                        width: px(11.0),
+                                        height: px(11.0),
+                                        border_radius: BorderRadius::all(px(5.5)),
+                                        display: Display::None,
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.06, 0.08, 0.14, 1.0)),
+                                ));
+                            });
+                        badge.spawn((
+                            TopDayNightLabel,
+                            Text::new("DAY"),
+                            TextFont {
+                                font_size: FontSize::Px(10.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(1.0, 0.88, 0.48)),
+                        ));
+                    });
+
+                // ساعت مرکزی بازی (MM:SS)
+                center_col
+                    .spawn((
+                        Pickable::IGNORE,
+                        Node {
+                            padding: UiRect::axes(px(16.0), px(6.0)),
+                            border: UiRect::all(px(1.5)),
+                            border_radius: BorderRadius::all(px(8.0)),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.65, 0.72, 0.80, 0.85)),
+                        BackgroundColor(Color::srgba(0.05, 0.07, 0.11, 0.92)),
+                    ))
+                    .with_children(|clock| {
+                        clock.spawn((
+                            TopMatchClockText,
+                            Text::new("00:00"),
+                            TextFont {
+                                font_size: FontSize::Px(18.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.98, 0.94, 0.76)),
+                        ));
+                    });
             });
 
             // تعداد کل کیل‌های تیم Dusk (راست زمان بازی)
@@ -11699,6 +11952,123 @@ fn spawn_portrait_card(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(SystemParam)]
+struct DayNightVisualQueries<'w, 's> {
+    dir_light_q: Query<'w, 's, &'static mut DirectionalLight>,
+    fog_q: Query<'w, 's, &'static mut DistanceFog, With<MobaCamera>>,
+    orb_q: Query<'w, 's, (&'static mut BackgroundColor, &'static mut BorderColor), With<TopDayNightOrb>>,
+    crescent_q: Query<'w, 's, &'static mut Node, With<TopDayNightCrescent>>,
+    label_q: Query<'w, 's, (&'static mut Text, &'static mut TextColor), With<TopDayNightLabel>>,
+}
+
+fn day_night_cycle_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    config: Res<GameConfig>,
+    asset_server: Res<AssetServer>,
+    match_flow: Res<ClientMatchFlow>,
+    top_bar: Res<LatestTopBarState>,
+    mut ambient: ResMut<GlobalAmbientLight>,
+    mut q: DayNightVisualQueries,
+    mut last_is_night: Local<Option<bool>>,
+) {
+    if !match_flow.is_in_game() {
+        *last_is_night = None;
+        return;
+    }
+
+    let elapsed = top_bar.match_elapsed_secs;
+    let is_night = config.is_night_at(elapsed);
+    let blend = config.day_night_blend_at(elapsed);
+
+    // پخش صدای تغییر فاز شب و روز
+    if let Some(prev) = *last_is_night {
+        if prev != is_night {
+            let (sound_path, vol) = if is_night {
+                (&config.day_night.night_start_sound, config.day_night.night_start_volume)
+            } else {
+                (&config.day_night.day_start_sound, config.day_night.day_start_volume)
+            };
+            if Path::new("assets").join(sound_path).is_file() || Path::new(sound_path).is_file() {
+                commands.spawn((
+                    AudioPlayer::new(asset_server.load(sound_path)),
+                    PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(vol)),
+                ));
+            }
+        }
+    }
+    *last_is_night = Some(is_night);
+
+    // تغییر نرم نور خورشید به مهتاب شبانه
+    let dn = &config.day_night;
+    let day_dir_col = Vec3::new(1.0, 0.96, 0.88);
+    let night_dir_col = Vec3::new(dn.night_directional_color_rgb.0, dn.night_directional_color_rgb.1, dn.night_directional_color_rgb.2);
+    let dir_col = day_dir_col.lerp(night_dir_col, blend);
+    let dir_illum = config.lighting.directional_illuminance + (dn.night_directional_illuminance - config.lighting.directional_illuminance) * blend;
+    for mut light in &mut q.dir_light_q {
+        light.color = Color::srgb(dir_col.x, dir_col.y, dir_col.z);
+        light.illuminance = dir_illum;
+    }
+
+    // تغییر نرم نور محیطی (GlobalAmbientLight)
+    let day_amb = Vec3::new(config.lighting.ambient_color_rgb.0, config.lighting.ambient_color_rgb.1, config.lighting.ambient_color_rgb.2);
+    let night_amb = Vec3::new(dn.night_ambient_color_rgb.0, dn.night_ambient_color_rgb.1, dn.night_ambient_color_rgb.2);
+    let amb_col = day_amb.lerp(night_amb, blend);
+    ambient.color = Color::srgb(amb_col.x, amb_col.y, amb_col.z);
+    ambient.brightness = config.lighting.ambient_brightness + (dn.night_ambient_brightness - config.lighting.ambient_brightness) * blend;
+
+    // تغییر مه اتمسفریک شب و روز روی دوربین
+    let day_fog_c = Vec3::new(dn.day_fog_color_rgb.0, dn.day_fog_color_rgb.1, dn.day_fog_color_rgb.2);
+    let night_fog_c = Vec3::new(dn.night_fog_color_rgb.0, dn.night_fog_color_rgb.1, dn.night_fog_color_rgb.2);
+    let fog_c = day_fog_c.lerp(night_fog_c, blend);
+    let fog_start = dn.day_fog_start + (dn.night_fog_start - dn.day_fog_start) * blend;
+    let fog_end = dn.day_fog_end + (dn.night_fog_end - dn.day_fog_end) * blend;
+    for mut fog in &mut q.fog_q {
+        fog.color = Color::srgba(fog_c.x, fog_c.y, fog_c.z, 1.0);
+        fog.directional_light_color = Color::srgba(
+            1.0 - 0.65 * blend,
+            0.92 - 0.35 * blend,
+            0.78 + 0.18 * blend,
+            0.45 - 0.20 * blend,
+        );
+        fog.falloff = FogFalloff::Linear {
+            start: fog_start,
+            end: fog_end,
+        };
+    }
+
+    // افکت پالس و تغییر رنگ آیکون خورشید / ماه بالای زمان بازی
+    let pulse = 0.5 + 0.5 * (time.elapsed_secs() * 2.6).sin();
+    let sun_bg = Vec3::new(1.0, 0.82, 0.22);
+    let moon_bg = Vec3::new(0.76, 0.88, 1.0);
+    let orb_c = sun_bg.lerp(moon_bg, blend);
+    let sun_glow = Vec3::new(1.0, 0.92, 0.45);
+    let moon_glow = Vec3::new(0.42, 0.72, 1.0);
+    let glow_c = sun_glow.lerp(moon_glow, blend);
+
+    if let Ok((mut bg, mut border)) = q.orb_q.single_mut() {
+        bg.0 = Color::srgb(orb_c.x, orb_c.y, orb_c.z);
+        *border = BorderColor::all(Color::srgba(glow_c.x, glow_c.y, glow_c.z, 0.55 + 0.40 * pulse));
+    }
+    if let Ok(mut cres_node) = q.crescent_q.single_mut() {
+        let want_disp = if blend >= 0.45 { Display::Flex } else { Display::None };
+        if cres_node.display != want_disp {
+            cres_node.display = want_disp;
+        }
+    }
+    if let Ok((mut txt, mut col)) = q.label_q.single_mut() {
+        let want_str = if is_night { "NIGHT" } else { "DAY" };
+        if txt.0 != want_str {
+            txt.0 = want_str.to_string();
+        }
+        *col = if is_night {
+            TextColor(Color::srgb(0.70, 0.86, 1.0))
+        } else {
+            TextColor(Color::srgb(1.0, 0.88, 0.48))
+        };
+    }
+}
+
 fn update_top_match_hud_system(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -13968,6 +14338,45 @@ struct TelemetryTopRowText;
 #[derive(Component)]
 struct TelemetryLossRowText;
 
+#[derive(Component)]
+struct TelemetryDrawRowText;
+
+#[derive(Component)]
+struct TelemetryGpuRowText;
+
+#[derive(Default)]
+struct TelemetryFrameStats {
+    window_max_ms: f32,
+    samples_ms: Vec<f32>,
+}
+
+#[derive(SystemParam)]
+struct TelemetryRenderQueries<'w, 's> {
+    diagnostics: Res<'w, DiagnosticsStore>,
+    mesh_q: Query<
+        'w,
+        's,
+        (
+            &'static ViewVisibility,
+            Has<NotShadowCaster>,
+            Option<&'static MeshMaterial3d<StandardMaterial>>,
+        ),
+        With<Mesh3d>,
+    >,
+    lights_q: Query<'w, 's, &'static ViewVisibility, With<PointLight>>,
+    std_mats: Res<'w, Assets<StandardMaterial>>,
+    text_q: ParamSet<
+        'w,
+        's,
+        (
+            Query<'w, 's, (&'static mut Text, &'static mut TextColor), With<TelemetryTopRowText>>,
+            Query<'w, 's, (&'static mut Text, &'static mut TextColor), With<TelemetryLossRowText>>,
+            Query<'w, 's, (&'static mut Text, &'static mut Node), With<TelemetryDrawRowText>>,
+            Query<'w, 's, (&'static mut Text, &'static mut Node), With<TelemetryGpuRowText>>,
+        ),
+    >,
+}
+
 fn spawn_telemetry_hud_ui(commands: &mut Commands) {
     commands
         .spawn((
@@ -13986,7 +14395,7 @@ fn spawn_telemetry_hud_ui(commands: &mut Commands) {
                 ..default()
             },
             BorderColor::all(Color::srgba(0.28, 0.36, 0.48, 0.50)),
-            BackgroundColor(Color::srgba(0.03, 0.05, 0.09, 0.74)),
+            BackgroundColor(Color::srgba(0.03, 0.05, 0.09, 0.78)),
         ))
         .with_children(|box_node| {
             box_node.spawn((
@@ -14007,23 +14416,54 @@ fn spawn_telemetry_hud_ui(commands: &mut Commands) {
                 },
                 TextColor(Color::srgb(0.74, 0.84, 0.94)),
             ));
+            box_node.spawn((
+                TelemetryDrawRowText,
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+                Text::new("DC ~0  |  MESH 0"),
+                TextFont {
+                    font_size: FontSize::Px(10.5),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.68, 0.88, 0.82)),
+            ));
+            box_node.spawn((
+                TelemetryGpuRowText,
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+                Text::new("RND CPU 0.0ms  |  GPU N/A"),
+                TextFont {
+                    font_size: FontSize::Px(10.5),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.82, 0.78, 0.96)),
+            ));
         });
 }
 
 fn update_telemetry_hud_system(
     time: Res<Time>,
+    config: Res<GameConfig>,
     net: Res<ClientNetwork>,
     mut telemetry: ResMut<ClientTelemetryState>,
-    mut top_q: Query<(&mut Text, &mut TextColor), With<TelemetryTopRowText>>,
-    mut loss_q: Query<
-        (&mut Text, &mut TextColor),
-        (With<TelemetryLossRowText>, Without<TelemetryTopRowText>),
-    >,
+    mut frame_stats: Local<TelemetryFrameStats>,
+    mut rq: TelemetryRenderQueries,
 ) {
     let dt = time.delta_secs();
     if dt > 1e-4 {
         let inst_fps = (1.0 / dt).clamp(1.0, 999.0);
         telemetry.fps_smoothed = telemetry.fps_smoothed * 0.92 + inst_fps * 0.08;
+        let frame_ms = dt * 1000.0;
+        if frame_ms > frame_stats.window_max_ms {
+            frame_stats.window_max_ms = frame_ms;
+        }
+        if frame_stats.samples_ms.len() < 240 {
+            frame_stats.samples_ms.push(frame_ms);
+        }
     }
 
     telemetry.loss_sample_timer += dt;
@@ -14040,29 +14480,79 @@ fn update_telemetry_hud_system(
     }
 
     telemetry.refresh_timer += dt;
-    if telemetry.refresh_timer < 0.40 {
+    if telemetry.refresh_timer < config.telemetry.refresh_interval_secs {
         return;
     }
     telemetry.refresh_timer = 0.0;
 
     let ping_ms = (net.client.rtt() * 1000.0).max(0.0) as u32;
     let loss_out_pct = (net.client.packet_loss() * 100.0).clamp(0.0, 100.0) as f32;
-    let fps = telemetry.fps_smoothed.round() as u32;
-    let loss_in = telemetry.packet_loss_in_pct;
+    let diag_fps = rq
+        .diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|d| d.smoothed())
+        .map(|v| v.round() as u32)
+        .unwrap_or_else(|| telemetry.fps_smoothed.round() as u32);
+    let avg_ms = rq
+        .diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.smoothed())
+        .unwrap_or_else(|| (1000.0 / telemetry.fps_smoothed.max(1.0)) as f64);
 
-    if let Ok((mut text, mut color)) = top_q.single_mut() {
-        **text = format!("FPS {}  |  PING {}ms", fps, ping_ms);
-        *color = if ping_ms >= 160 || fps < 30 {
+    let one_pct_low_fps = if !frame_stats.samples_ms.is_empty() {
+        frame_stats.samples_ms.sort_by(|a, b| b.total_cmp(a));
+        let top_idx = (frame_stats.samples_ms.len() / 100).max(0);
+        let p99_ms = frame_stats.samples_ms[top_idx].max(0.5);
+        (1000.0 / p99_ms).round() as u32
+    } else {
+        diag_fps
+    };
+    let max_ms = frame_stats.window_max_ms;
+    frame_stats.window_max_ms = 0.0;
+    frame_stats.samples_ms.clear();
+
+    let loss_in = telemetry.packet_loss_in_pct;
+    let show_render = config.telemetry.show_detailed_render_stats;
+
+    if let Ok((mut text, mut color)) = rq.text_q.p0().single_mut() {
+        **text = if show_render {
+            format!(
+                "FPS {} (1%L {}) | {:.1}ms (MAX {:.1}ms) | PING {}ms",
+                diag_fps, one_pct_low_fps, avg_ms, max_ms, ping_ms
+            )
+        } else {
+            format!("FPS {}  |  PING {}ms", diag_fps, ping_ms)
+        };
+        *color = if ping_ms >= config.telemetry.high_ping_critical_ms
+            || diag_fps < config.telemetry.low_fps_critical_threshold
+        {
             TextColor(Color::srgb(0.98, 0.40, 0.36))
-        } else if ping_ms >= 95 || fps < 50 {
+        } else if ping_ms >= config.telemetry.high_ping_warning_ms
+            || diag_fps < config.telemetry.low_fps_warning_threshold
+        {
             TextColor(Color::srgb(0.96, 0.82, 0.34))
         } else {
             TextColor(Color::srgb(0.86, 0.92, 0.98))
         };
     }
 
-    if let Ok((mut text, mut color)) = loss_q.single_mut() {
-        **text = format!("IN {:.1}%  |  OUT {:.1}%", loss_in, loss_out_pct);
+    let entity_count = rq
+        .diagnostics
+        .get(&EntityCountDiagnosticsPlugin::ENTITY_COUNT)
+        .and_then(|d| d.value())
+        .map(|v| v as u32)
+        .unwrap_or(0);
+
+    if let Ok((mut text, mut color)) = rq.text_q.p1().single_mut() {
+        **text = if show_render {
+            let active_lights = rq.lights_q.iter().filter(|v| v.get()).count();
+            format!(
+                "IN {:.1}%  |  OUT {:.1}%  |  ENT {}  |  LIGHTS {}",
+                loss_in, loss_out_pct, entity_count, active_lights
+            )
+        } else {
+            format!("IN {:.1}%  |  OUT {:.1}%", loss_in, loss_out_pct)
+        };
         *color = if loss_in >= 5.0 || loss_out_pct >= 5.0 {
             TextColor(Color::srgb(0.98, 0.40, 0.36))
         } else if loss_in >= 2.0 || loss_out_pct >= 2.0 {
@@ -14070,6 +14560,103 @@ fn update_telemetry_hud_system(
         } else {
             TextColor(Color::srgb(0.74, 0.84, 0.94))
         };
+    }
+
+    if let Ok((mut text, mut node)) = rq.text_q.p2().single_mut() {
+        if show_render {
+            if node.display != Display::Flex {
+                node.display = Display::Flex;
+            }
+            let mut vis_total = 0u32;
+            let mut vis_opaque = 0u32;
+            let mut vis_transparent = 0u32;
+            let mut shadow_casters = 0u32;
+            for (vis, no_shadow, std_mat_opt) in &rq.mesh_q {
+                if !vis.get() {
+                    continue;
+                }
+                vis_total += 1;
+                if !no_shadow {
+                    shadow_casters += 1;
+                }
+                let is_trans = match std_mat_opt {
+                    Some(h) => rq
+                        .std_mats
+                        .get(&h.0)
+                        .map(|m| !matches!(m.alpha_mode, AlphaMode::Opaque | AlphaMode::Mask(_)))
+                        .unwrap_or(false),
+                    None => true,
+                };
+                if is_trans {
+                    vis_transparent += 1;
+                } else {
+                    vis_opaque += 1;
+                }
+            }
+            // تخمین تعداد Draw Callها: هر مش شفاف/شیدر اختصاصی ۱ draw call + هر سایه‌گیر در ۲ کسکید + دسته‌های ماتریال مات
+            let est_dc = vis_transparent + (shadow_casters * 2) + (vis_opaque / 4).max(1);
+            **text = format!(
+                "EST_DC ~{}  |  MESH {} (OPQ {} / TRN {})  |  SHD {}",
+                est_dc, vis_total, vis_opaque, vis_transparent, shadow_casters
+            );
+        } else if node.display != Display::None {
+            node.display = Display::None;
+        }
+    }
+
+    if let Ok((mut text, mut node)) = rq.text_q.p3().single_mut() {
+        if show_render {
+            if node.display != Display::Flex {
+                node.display = Display::Flex;
+            }
+            let mut cpu_ms = 0.0_f64;
+            let mut gpu_ms = 0.0_f64;
+            let mut has_gpu = false;
+            let mut vtx_invoc = 0.0_f64;
+            let mut frag_invoc = 0.0_f64;
+            let mut has_pipe = false;
+
+            for diag in rq.diagnostics.iter() {
+                let p = diag.path().as_str();
+                if !p.starts_with("render/") {
+                    continue;
+                }
+                if p.ends_with("/elapsed_cpu") {
+                    if let Some(v) = diag.smoothed() {
+                        cpu_ms += v;
+                    }
+                } else if p.ends_with("/elapsed_gpu") {
+                    if let Some(v) = diag.smoothed() {
+                        gpu_ms += v;
+                        has_gpu = true;
+                    }
+                } else if p.ends_with("/vertex_shader_invocations") {
+                    if let Some(v) = diag.value() {
+                        vtx_invoc += v;
+                        has_pipe = true;
+                    }
+                } else if p.ends_with("/fragment_shader_invocations") {
+                    if let Some(v) = diag.value() {
+                        frag_invoc += v;
+                        has_pipe = true;
+                    }
+                }
+            }
+
+            let gpu_str = if has_gpu {
+                format!("{:.2}ms", gpu_ms)
+            } else {
+                "N/A".to_string()
+            };
+            let pipe_str = if has_pipe {
+                format!("VTX {:.0}K  |  FRAG {:.2}M", vtx_invoc / 1000.0, frag_invoc / 1_000_000.0)
+            } else {
+                "PIPE N/A".to_string()
+            };
+            **text = format!("RND CPU {:.2}ms  |  GPU {}  |  {}", cpu_ms, gpu_str, pipe_str);
+        } else if node.display != Display::None {
+            node.display = Display::None;
+        }
     }
 }
 

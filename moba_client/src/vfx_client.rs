@@ -591,6 +591,23 @@ pub enum ClientVfxEvent {
 #[derive(Resource, Default)]
 pub struct VfxEventQueue(pub Vec<ClientVfxEvent>);
 
+#[derive(Resource, Default)]
+struct VfxMaterialPool {
+    free_trail_mats: Vec<Handle<BulletTrailMaterial>>,
+    free_flash_mats: Vec<Handle<MuzzleFlashMaterial>>,
+    free_ring_mats: Vec<Handle<ShockwaveRingMaterial>>,
+    free_blood_mats: Vec<Handle<BloodSplatterMaterial>>,
+}
+
+const MAX_POOLED_TRAIL_MATS: usize = 72;
+const MAX_POOLED_FLASH_MATS: usize = 32;
+const MAX_POOLED_RING_MATS: usize = 32;
+const MAX_POOLED_BLOOD_MATS: usize = 48;
+const MAX_ACTIVE_TRAILS: usize = 72;
+const MAX_ACTIVE_RINGS: usize = 24;
+const MAX_ACTIVE_HANABI: usize = 36;
+const MAX_ACTIVE_BLOOD_DECALS: usize = 40;
+
 #[derive(Resource)]
 struct HanabiEffectHandles {
     muzzle_smoke: Handle<EffectAsset>,
@@ -691,6 +708,7 @@ impl Plugin for MobaVfxPlugin {
             .add_plugins(MaterialPlugin::<WaterExplosionMaterial>::default())
             .add_plugins(MaterialPlugin::<TeleportPortalMaterial>::default())
             .init_resource::<VfxEventQueue>()
+            .init_resource::<VfxMaterialPool>()
             .init_resource::<BulletVfxRegistry>()
             .add_systems(Startup, (init_hanabi_vfx_assets_system, init_bullet_vfx_registry_system))
             .add_systems(
@@ -1308,12 +1326,22 @@ fn next_vfx_rand(seed: &mut u32) -> f32 {
     (*seed as f32) / (u32::MAX as f32)
 }
 
+#[derive(SystemParam)]
+struct VfxActiveCounts<'w, 's> {
+    one_shot_q: Query<'w, 's, (), With<OneShotVfxDespawn>>,
+    trail_q: Query<'w, 's, (), With<BulletTrailInstance>>,
+    ring_q: Query<'w, 's, (), With<ShockwaveRingInstance>>,
+    decal_q: Query<'w, 's, (), With<BloodGroundDecal>>,
+}
+
 fn process_vfx_events_system(
     mut commands: Commands,
     time: Res<Time>,
     config: Res<GameConfig>,
     handles: Option<Res<HanabiEffectHandles>>,
     mut queue: ResMut<VfxEventQueue>,
+    mut pool: ResMut<VfxMaterialPool>,
+    active_counts: VfxActiveCounts,
     mut mats: VfxProcessMaterials,
     mut rng_seed: Local<u32>,
 ) {
@@ -1330,6 +1358,10 @@ fn process_vfx_events_system(
     let t = time.elapsed_secs();
     let cam_pos = mats.cam_q.iter().next().map(|tf| tf.translation);
     let mut active_lights = mats.active_lights_q.iter().count();
+    let mut active_hanabi = active_counts.one_shot_q.iter().count();
+    let mut active_trails = active_counts.trail_q.iter().count();
+    let mut active_rings = active_counts.ring_q.iter().count();
+    let mut active_decals = active_counts.decal_q.iter().count();
     const MAX_ACTIVE_VFX_LIGHTS: usize = 10;
     const MAX_VFX_CAMERA_DIST_SQ: f32 = 85.0 * 85.0;
     let is_near_camera = |p: Vec3| -> bool {
@@ -1350,35 +1382,47 @@ fn process_vfx_events_system(
                 let forward = dir.normalize_or_zero();
                 let spawn_pos = pos + forward * 0.16;
 
-                // لایه ۱: دود سر لوله تفنگ (Hanabi)
-                commands.spawn((
-                    ParticleEffect::new(handles.muzzle_smoke.clone()),
-                    Transform::from_translation(spawn_pos),
-                    Visibility::default(),
-                    OneShotVfxDespawn {
-                        timer: Timer::from_seconds(0.65, TimerMode::Once),
-                    },
-                ));
+                let is_hero_shot = matches!(vfx_source, BulletVfxSource::Hero { .. });
+                // لایه ۱: دود سر لوله تفنگ (Hanabi با سقف همزمانی برای جلوگیری از دراپ در درگیری شلوغ)
+                if active_hanabi < MAX_ACTIVE_HANABI && (is_hero_shot || active_hanabi < MAX_ACTIVE_HANABI / 2) {
+                    active_hanabi += 1;
+                    commands.spawn((
+                        ParticleEffect::new(handles.muzzle_smoke.clone()),
+                        Transform::from_translation(spawn_pos),
+                        Visibility::default(),
+                        OneShotVfxDespawn {
+                            timer: Timer::from_seconds(0.65, TimerMode::Once),
+                        },
+                    ));
+                }
 
-                // لایه ۲: شعله ستاره‌ای سر لوله با شیدر WESL اختصاصی
+                // لایه ۲: شعله ستاره‌ای سر لوله با شیدر WESL اختصاصی (بازیافت از Pool)
                 let flash_rot = Quat::from_rotation_arc(Vec3::Y, forward);
-                let flash_mat = mats.flash_materials.add(MuzzleFlashMaterial {
-                    uniforms: MuzzleFlashUniforms {
-                        core_color: Vec4::new(
-                            profile.core_color_rgb.0,
-                            profile.core_color_rgb.1,
-                            profile.core_color_rgb.2,
-                            1.0,
-                        ),
-                        edge_color: Vec4::new(
-                            profile.edge_color_rgb.0,
-                            profile.edge_color_rgb.1,
-                            profile.edge_color_rgb.2,
-                            1.0,
-                        ),
-                        params: Vec4::new(0.0, profile.bloom_intensity, t.fract(), 0.0),
-                    },
-                });
+                let flash_uniforms = MuzzleFlashUniforms {
+                    core_color: Vec4::new(
+                        profile.core_color_rgb.0,
+                        profile.core_color_rgb.1,
+                        profile.core_color_rgb.2,
+                        1.0,
+                    ),
+                    edge_color: Vec4::new(
+                        profile.edge_color_rgb.0,
+                        profile.edge_color_rgb.1,
+                        profile.edge_color_rgb.2,
+                        1.0,
+                    ),
+                    params: Vec4::new(0.0, profile.bloom_intensity, t.fract(), 0.0),
+                };
+                let flash_mat = if let Some(reused) = pool.free_flash_mats.pop() {
+                    if let Some(mut existing) = mats.flash_materials.get_mut(&reused) {
+                        existing.uniforms = flash_uniforms;
+                    }
+                    reused
+                } else {
+                    mats.flash_materials.add(MuzzleFlashMaterial {
+                        uniforms: flash_uniforms,
+                    })
+                };
                 commands.spawn((
                     Mesh3d(handles.muzzle_flash_mesh.clone()),
                     MeshMaterial3d(flash_mat.clone()),
@@ -1397,9 +1441,10 @@ fn process_vfx_events_system(
                     },
                 ));
 
-                // لایه ۳: حلقه موج شوک سر لوله (Muzzle Shockwave Ring WESL)
-                let ring_mat = mats.shockwave_materials.add(ShockwaveRingMaterial {
-                    uniforms: ShockwaveUniforms {
+                // لایه ۳: حلقه موج شوک سر لوله (بازیافت از Pool + سقف همزمانی)
+                if active_rings < MAX_ACTIVE_RINGS && (is_hero_shot || active_rings < MAX_ACTIVE_RINGS / 2) {
+                    active_rings += 1;
+                    let ring_uniforms = ShockwaveUniforms {
                         core_color: Vec4::new(
                             profile.core_color_rgb.0,
                             profile.core_color_rgb.1,
@@ -1413,27 +1458,37 @@ fn process_vfx_events_system(
                             1.0,
                         ),
                         params: Vec4::new(0.0, profile.bloom_intensity * 0.75, 8.0, 0.0),
-                    },
-                });
-                commands.spawn((
-                    Mesh3d(handles.shockwave_ring_mesh.clone()),
-                    MeshMaterial3d(ring_mat.clone()),
-                    Transform {
-                        translation: pos + forward * 0.14,
-                        rotation: flash_rot,
-                        scale: Vec3::splat(profile.muzzle_ring_start_scale),
-                    },
-                    NotShadowCaster,
-                    ShockwaveRingInstance {
-                        timer: Timer::from_seconds(
-                            profile.muzzle_flash_lifetime_secs * 1.4,
-                            TimerMode::Once,
-                        ),
-                        start_scale: profile.muzzle_ring_start_scale,
-                        end_scale: profile.muzzle_ring_end_scale,
-                        mat_handle: ring_mat,
-                    },
-                ));
+                    };
+                    let ring_mat = if let Some(reused) = pool.free_ring_mats.pop() {
+                        if let Some(mut existing) = mats.shockwave_materials.get_mut(&reused) {
+                            existing.uniforms = ring_uniforms;
+                        }
+                        reused
+                    } else {
+                        mats.shockwave_materials.add(ShockwaveRingMaterial {
+                            uniforms: ring_uniforms,
+                        })
+                    };
+                    commands.spawn((
+                        Mesh3d(handles.shockwave_ring_mesh.clone()),
+                        MeshMaterial3d(ring_mat.clone()),
+                        Transform {
+                            translation: pos + forward * 0.14,
+                            rotation: flash_rot,
+                            scale: Vec3::splat(profile.muzzle_ring_start_scale),
+                        },
+                        NotShadowCaster,
+                        ShockwaveRingInstance {
+                            timer: Timer::from_seconds(
+                                profile.muzzle_flash_lifetime_secs * 1.4,
+                                TimerMode::Once,
+                            ),
+                            start_scale: profile.muzzle_ring_start_scale,
+                            end_scale: profile.muzzle_ring_end_scale,
+                            mat_handle: ring_mat,
+                        },
+                    ));
+                }
 
                 // لایه ۴: نور دینامیک HDR سر لوله تفنگ (فقط برای هیروها و با سقف همزمانی برای حفظ FPS)
                 if matches!(vfx_source, BulletVfxSource::Hero { .. })
@@ -1488,29 +1543,42 @@ fn process_vfx_events_system(
                     Quat::IDENTITY
                 };
 
-                let mat_handle = mats.trail_materials.add(BulletTrailMaterial {
-                    uniforms: BulletTrailUniforms {
-                        core_color: Vec4::new(
-                            profile.core_color_rgb.0,
-                            profile.core_color_rgb.1,
-                            profile.core_color_rgb.2,
-                            1.0,
-                        ),
-                        wave_color: Vec4::new(
-                            profile.edge_color_rgb.0,
-                            profile.edge_color_rgb.1,
-                            profile.edge_color_rgb.2,
-                            1.0,
-                        ),
-                        params: Vec4::new(0.0, t, profile.trail_wave_freq, profile.trail_wave_amp),
-                        style_params: Vec4::new(
-                            profile.bloom_intensity * 0.55,
-                            profile.trail_style_mode,
-                            0.0,
-                            0.0,
-                        ),
-                    },
-                });
+                let is_hero_trail = matches!(vfx_source, BulletVfxSource::Hero { .. });
+                if active_trails >= MAX_ACTIVE_TRAILS || (!is_hero_trail && active_trails >= MAX_ACTIVE_TRAILS * 2 / 3) {
+                    continue;
+                }
+                active_trails += 1;
+                let trail_uniforms = BulletTrailUniforms {
+                    core_color: Vec4::new(
+                        profile.core_color_rgb.0,
+                        profile.core_color_rgb.1,
+                        profile.core_color_rgb.2,
+                        1.0,
+                    ),
+                    wave_color: Vec4::new(
+                        profile.edge_color_rgb.0,
+                        profile.edge_color_rgb.1,
+                        profile.edge_color_rgb.2,
+                        1.0,
+                    ),
+                    params: Vec4::new(0.0, t, profile.trail_wave_freq, profile.trail_wave_amp),
+                    style_params: Vec4::new(
+                        profile.bloom_intensity * 0.55,
+                        profile.trail_style_mode,
+                        0.0,
+                        0.0,
+                    ),
+                };
+                let mat_handle = if let Some(reused) = pool.free_trail_mats.pop() {
+                    if let Some(mut existing) = mats.trail_materials.get_mut(&reused) {
+                        existing.uniforms = trail_uniforms;
+                    }
+                    reused
+                } else {
+                    mats.trail_materials.add(BulletTrailMaterial {
+                        uniforms: trail_uniforms,
+                    })
+                };
 
                 commands.spawn((
                     Mesh3d(handles.trail_mesh.clone()),
@@ -1546,18 +1614,23 @@ fn process_vfx_events_system(
                     ImpactSurface::Water => (handles.water_splash.clone(), 0.65),
                 };
 
-                commands.spawn((
-                    ParticleEffect::new(effect_h),
-                    Transform::from_translation(pos),
-                    Visibility::default(),
-                    OneShotVfxDespawn {
-                        timer: Timer::from_seconds(lifetime, TimerMode::Once),
-                    },
-                ));
+                let is_hero_impact = matches!(vfx_source, BulletVfxSource::Hero { .. });
+                if active_hanabi < MAX_ACTIVE_HANABI && (is_hero_impact || active_hanabi < MAX_ACTIVE_HANABI * 2 / 3) {
+                    active_hanabi += 1;
+                    commands.spawn((
+                        ParticleEffect::new(effect_h),
+                        Transform::from_translation(pos),
+                        Visibility::default(),
+                        OneShotVfxDespawn {
+                            timer: Timer::from_seconds(lifetime, TimerMode::Once),
+                        },
+                    ));
+                }
 
-                // حلقه موج برخورد با رنگ و بلوم اختصاصی هیرو
-                let imp_ring_mat = mats.shockwave_materials.add(ShockwaveRingMaterial {
-                    uniforms: ShockwaveUniforms {
+                // حلقه موج برخورد با رنگ و بلوم اختصاصی هیرو (بازیافت از Pool)
+                if active_rings < MAX_ACTIVE_RINGS && (is_hero_impact || active_rings < MAX_ACTIVE_RINGS / 2) {
+                    active_rings += 1;
+                    let imp_ring_uniforms = ShockwaveUniforms {
                         core_color: Vec4::new(
                             profile.core_color_rgb.0,
                             profile.core_color_rgb.1,
@@ -1571,24 +1644,34 @@ fn process_vfx_events_system(
                             1.0,
                         ),
                         params: Vec4::new(0.0, profile.bloom_intensity * 0.85, 10.0, 0.0),
-                    },
-                });
-                commands.spawn((
-                    Mesh3d(handles.shockwave_ring_mesh.clone()),
-                    MeshMaterial3d(imp_ring_mat.clone()),
-                    Transform::from_translation(pos + Vec3::Y * 0.06)
-                        .with_scale(Vec3::splat(0.15)),
-                    NotShadowCaster,
-                    ShockwaveRingInstance {
-                        timer: Timer::from_seconds(
-                            profile.impact_ring_lifetime_secs,
-                            TimerMode::Once,
-                        ),
-                        start_scale: 0.15,
-                        end_scale: profile.impact_ring_end_scale,
-                        mat_handle: imp_ring_mat,
-                    },
-                ));
+                    };
+                    let imp_ring_mat = if let Some(reused) = pool.free_ring_mats.pop() {
+                        if let Some(mut existing) = mats.shockwave_materials.get_mut(&reused) {
+                            existing.uniforms = imp_ring_uniforms;
+                        }
+                        reused
+                    } else {
+                        mats.shockwave_materials.add(ShockwaveRingMaterial {
+                            uniforms: imp_ring_uniforms,
+                        })
+                    };
+                    commands.spawn((
+                        Mesh3d(handles.shockwave_ring_mesh.clone()),
+                        MeshMaterial3d(imp_ring_mat.clone()),
+                        Transform::from_translation(pos + Vec3::Y * 0.06)
+                            .with_scale(Vec3::splat(0.15)),
+                        NotShadowCaster,
+                        ShockwaveRingInstance {
+                            timer: Timer::from_seconds(
+                                profile.impact_ring_lifetime_secs,
+                                TimerMode::Once,
+                            ),
+                            start_scale: 0.15,
+                            end_scale: profile.impact_ring_end_scale,
+                            mat_handle: imp_ring_mat,
+                        },
+                    ));
+                }
 
                 // نور لحظه‌ای برخورد با بلوم سینماتیک (فقط برای هیروها و با سقف همزمانی)
                 if matches!(vfx_source, BulletVfxSource::Hero { .. })
@@ -1663,13 +1746,25 @@ fn process_vfx_events_system(
                         let offset = base_dir * (0.25 + r_dist * 0.85)
                             + Vec3::new(r_ang.cos() * r_dist * 0.65, 0.004 * (i as f32 + 1.0), r_ang.sin() * r_dist * 0.65);
 
-                        let blood_mat = mats.blood_materials.add(BloodSplatterMaterial {
-                            uniforms: BloodSplatterUniforms {
-                                core_color: Vec4::new(bs.core_color_rgb.0, bs.core_color_rgb.1, bs.core_color_rgb.2, 1.0),
-                                edge_color: Vec4::new(bs.edge_color_rgb.0, bs.edge_color_rgb.1, bs.edge_color_rgb.2, 1.0),
-                                params: Vec4::new(0.0, r_seed, r_stretch, bs.gloss_strength),
-                            },
-                        });
+                        if active_decals >= MAX_ACTIVE_BLOOD_DECALS {
+                            break;
+                        }
+                        active_decals += 1;
+                        let blood_uniforms = BloodSplatterUniforms {
+                            core_color: Vec4::new(bs.core_color_rgb.0, bs.core_color_rgb.1, bs.core_color_rgb.2, 1.0),
+                            edge_color: Vec4::new(bs.edge_color_rgb.0, bs.edge_color_rgb.1, bs.edge_color_rgb.2, 1.0),
+                            params: Vec4::new(0.0, r_seed, r_stretch, bs.gloss_strength),
+                        };
+                        let blood_mat = if let Some(reused) = pool.free_blood_mats.pop() {
+                            if let Some(mut existing) = mats.blood_materials.get_mut(&reused) {
+                                existing.uniforms = blood_uniforms;
+                            }
+                            reused
+                        } else {
+                            mats.blood_materials.add(BloodSplatterMaterial {
+                                uniforms: blood_uniforms,
+                            })
+                        };
                         commands.spawn((
                             Mesh3d(handles.blood_decal_mesh.clone()),
                             MeshMaterial3d(blood_mat.clone()),
@@ -1963,31 +2058,32 @@ struct VfxLifetimeQueries<'w, 's> {
 fn update_vfx_lifetimes_system(
     mut commands: Commands,
     time: Res<Time>,
+    mut pool: ResMut<VfxMaterialPool>,
     mut mats: VfxLifetimeMaterials,
     mut q: VfxLifetimeQueries,
 ) {
     let dt = time.delta();
     let t = time.elapsed_secs();
 
-    for (_, mut mat) in mats.vanguard_mats.iter_mut() {
+    for (_, mat) in mats.vanguard_mats.iter_mut() {
         mat.uniforms.params.x = t;
     }
-    for (_, mut mat) in mats.frost_mats.iter_mut() {
+    for (_, mat) in mats.frost_mats.iter_mut() {
         mat.uniforms.params.x = t;
     }
-    for (_, mut mat) in mats.iron_mats.iter_mut() {
+    for (_, mat) in mats.iron_mats.iter_mut() {
         mat.uniforms.params.x = t;
     }
-    for (_, mut mat) in mats.pyro_mats.iter_mut() {
+    for (_, mat) in mats.pyro_mats.iter_mut() {
         mat.uniforms.params.x = t;
     }
-    for (_, mut mat) in mats.pistol_mats.iter_mut() {
+    for (_, mat) in mats.pistol_mats.iter_mut() {
         mat.uniforms.params.x = t;
     }
-    for (_, mut mat) in mats.kinetic_mats.iter_mut() {
+    for (_, mat) in mats.kinetic_mats.iter_mut() {
         mat.uniforms.params.x = t;
     }
-    for (_, mut mat) in mats.teleport_portal_materials.iter_mut() {
+    for (_, mat) in mats.teleport_portal_materials.iter_mut() {
         mat.uniforms.params.x = t;
     }
 
@@ -2015,6 +2111,9 @@ fn update_vfx_lifetimes_system(
             mat.uniforms.params.y = t;
         }
         if tr.timer.is_finished() {
+            if pool.free_trail_mats.len() < MAX_POOLED_TRAIL_MATS {
+                pool.free_trail_mats.push(tr.mat_handle.clone());
+            }
             commands.entity(ent).despawn();
         }
     }
@@ -2026,6 +2125,9 @@ fn update_vfx_lifetimes_system(
             mat.uniforms.params.x = frac;
         }
         if fl.timer.is_finished() {
+            if pool.free_flash_mats.len() < MAX_POOLED_FLASH_MATS {
+                pool.free_flash_mats.push(fl.mat_handle.clone());
+            }
             commands.entity(ent).despawn();
         }
     }
@@ -2040,6 +2142,9 @@ fn update_vfx_lifetimes_system(
             mat.uniforms.params.x = frac;
         }
         if ring.timer.is_finished() {
+            if pool.free_ring_mats.len() < MAX_POOLED_RING_MATS {
+                pool.free_ring_mats.push(ring.mat_handle.clone());
+            }
             commands.entity(ent).despawn();
         }
     }
@@ -2080,6 +2185,9 @@ fn update_vfx_lifetimes_system(
             mat.uniforms.params.x = frac;
         }
         if dec.timer.is_finished() {
+            if pool.free_blood_mats.len() < MAX_POOLED_BLOOD_MATS {
+                pool.free_blood_mats.push(dec.mat_handle.clone());
+            }
             commands.entity(ent).despawn();
         }
     }

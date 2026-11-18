@@ -3115,6 +3115,90 @@ pub fn canyon_sample_height(canyon: &CanyonConfig, x: f32, z: f32) -> f32 {
 }
 
 /// ارتفاع هدف دوربین در حالت Free-Look: روی پل مرکزی و تمام لاین‌ها (بالا، وسط، پایین) بالا می‌رود و فقط در بستر باز دره پایین می‌آید
+#[inline]
+pub fn is_on_bridge_or_lane(config: &GameConfig, x: f32, z: f32) -> bool {
+    let cb = &config.map.center_bridge;
+    let cb_tf = cb.model_transform.to_transform();
+    let cb_rad = cb.outer_radius * cb_tf.scale.x.max(cb_tf.scale.z);
+    let dx = x - cb_tf.translation.x;
+    let dz = z - cb_tf.translation.z;
+    if dx * dx + dz * dz <= cb_rad * cb_rad {
+        return true;
+    }
+    let p_xz = Vec2::new(x, z);
+    for lane in &config.map.lanes {
+        let half_w = lane.width * 0.5;
+        let half_w_sq = half_w * half_w;
+        for pair in lane.waypoints.windows(2) {
+            let a_xz = Vec2::new(pair[0].0, pair[0].2);
+            let b_xz = Vec2::new(pair[1].0, pair[1].2);
+            let ab = b_xz - a_xz;
+            let len_sq = ab.length_squared();
+            let t = if len_sq > 1e-5 {
+                ((p_xz - a_xz).dot(ab) / len_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let closest = a_xz + ab * t;
+            if (p_xz - closest).length_squared() <= half_w_sq {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[inline]
+pub fn clamp_to_bridge_or_lane(config: &GameConfig, x: f32, z: f32) -> (f32, f32) {
+    let p_xz = Vec2::new(x, z);
+    let mut best_pt = p_xz;
+    let mut best_dist_sq = f32::MAX;
+
+    let cb = &config.map.center_bridge;
+    let cb_tf = cb.model_transform.to_transform();
+    let cb_rad = (cb.outer_radius * cb_tf.scale.x.max(cb_tf.scale.z) - 0.08).max(0.5);
+    let cb_center = Vec2::new(cb_tf.translation.x, cb_tf.translation.z);
+    let to_cb = p_xz - cb_center;
+    let d_cb = to_cb.length();
+    if d_cb > 1e-5 {
+        let clamped = cb_center + (to_cb / d_cb) * d_cb.min(cb_rad);
+        let dsq = p_xz.distance_squared(clamped);
+        if dsq < best_dist_sq {
+            best_dist_sq = dsq;
+            best_pt = clamped;
+        }
+    }
+
+    for lane in &config.map.lanes {
+        let half_w = (lane.width * 0.5 - 0.08).max(0.5);
+        for pair in lane.waypoints.windows(2) {
+            let a_xz = Vec2::new(pair[0].0, pair[0].2);
+            let b_xz = Vec2::new(pair[1].0, pair[1].2);
+            let ab = b_xz - a_xz;
+            let len_sq = ab.length_squared();
+            let t = if len_sq > 1e-5 {
+                ((p_xz - a_xz).dot(ab) / len_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let closest = a_xz + ab * t;
+            let diff = p_xz - closest;
+            let d = diff.length();
+            let clamped = if d > half_w && d > 1e-5 {
+                closest + (diff / d) * half_w
+            } else {
+                p_xz
+            };
+            let dsq = p_xz.distance_squared(clamped);
+            if dsq < best_dist_sq {
+                best_dist_sq = dsq;
+                best_pt = clamped;
+            }
+        }
+    }
+    (best_pt.x, best_pt.y)
+}
+
 pub fn sample_camera_focus_y(config: &GameConfig, x: f32, z: f32) -> f32 {
     let cb = &config.map.center_bridge;
     let cb_tf = cb.model_transform.to_transform();
@@ -3716,6 +3800,34 @@ impl CustomPhysicsWorld {
 
                 if !any_wall_push {
                     break;
+                }
+            }
+        }
+
+        // قفل لبه دره و لبه‌های پل/لاین روی دره در فاز افقی (قبل از بررسی زمین)
+        if config.map.canyon.enabled && (center.y - center_y_offset) >= -0.35 {
+            let was_on_bridge = is_on_bridge_or_lane(config, current_center.x, current_center.z);
+            let now_on_bridge = is_on_bridge_or_lane(config, center.x, center.z);
+            if !now_on_bridge {
+                let edge_d = canyon_edge_distance(&config.map.canyon, center.x, center.z);
+                if edge_d > -radius {
+                    if was_on_bridge {
+                        // اگر بازیکن روی پل یا لاینِ عبوری از دره بوده، روی لبه همان پل/لاین نگه داشته می‌شود
+                        let (cx, cz) = clamp_to_bridge_or_lane(config, center.x, center.z);
+                        center.x = cx;
+                        center.z = cz;
+                    } else if edge_d < 2.2 {
+                        let eps = 0.8_f32;
+                        let gx = canyon_edge_distance(&config.map.canyon, center.x + eps, center.z)
+                            - canyon_edge_distance(&config.map.canyon, center.x - eps, center.z);
+                        let gz = canyon_edge_distance(&config.map.canyon, center.x, center.z + eps)
+                            - canyon_edge_distance(&config.map.canyon, center.x, center.z - eps);
+                        let outward_dir = -Vec3::new(gx, 0.0, gz).normalize_or_zero();
+                        if outward_dir != Vec3::ZERO {
+                            let push = (edge_d + radius).clamp(0.0, 2.5);
+                            center += outward_dir * push;
+                        }
+                    }
                 }
             }
         }
@@ -5486,7 +5598,7 @@ impl SharedFogOfWar {
                     let scl = tree.model_transform.scale;
                     let ts = scl.0.abs().max(scl.2.abs());
                     let top_y = loc.1 + (tree.trunk_height + tree.canopy_height) * scl.1.abs();
-                    let r = (tree.trunk_radius * 1.45 * ts).max(0.85);
+                    let r = (tree.trunk_radius * 0.55 * ts).clamp(0.45, 1.1);
                     let tdx = wx - loc.0;
                     let tdz = wz - loc.2;
                     if tdx * tdx + tdz * tdz <= r * r {
@@ -5571,9 +5683,11 @@ impl SharedFogOfWar {
         vision_range: f32,
         ray_count: usize,
     ) {
-        let origin_y = Self::world_to_cell(config, origin.x, origin.z)
-            .map(|(gx, gz)| self.terrain_y[gz * FOW_GRID_W + gx])
-            .unwrap_or(origin.y);
+        let origin_y = origin.y.max(
+            Self::world_to_cell(config, origin.x, origin.z)
+                .map(|(gx, gz)| self.terrain_y[gz * FOW_GRID_W + gx])
+                .unwrap_or(origin.y),
+        );
 
         let observer_in_pit = is_point_inside_roshan_pit(&config.map.roshan_pit, origin.x, origin.z);
         let step_size = 1.5_f32;
@@ -5608,7 +5722,10 @@ impl SharedFogOfWar {
                 self.visible_now[idx] = true;
                 self.explored[idx] = true;
 
-                if self.blocker_top_y[idx] >= origin_y + config.map.high_ground_occlusion_min_diff && dist > 1.8 {
+                if self.blocker_top_y[idx] >= origin_y + config.map.high_ground_occlusion_min_diff
+                    && dist > 1.8
+                    && !(origin_y >= -0.35 && cell_y < -0.35)
+                {
                     break;
                 }
             }
@@ -5618,9 +5735,11 @@ impl SharedFogOfWar {
     pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, allied_creeps: &[Vec3]) {
         self.visible_now.fill(false);
 
-        let hero_ground_y = Self::world_to_cell(config, hero_pos.x, hero_pos.z)
-            .map(|(gx, gz)| self.terrain_y[gz * FOW_GRID_W + gx])
-            .unwrap_or(hero_pos.y);
+        let hero_ground_y = hero_pos.y.max(
+            Self::world_to_cell(config, hero_pos.x, hero_pos.z)
+                .map(|(gx, gz)| self.terrain_y[gz * FOW_GRID_W + gx])
+                .unwrap_or(hero_pos.y),
+        );
 
         let hero_range = hero.vision_range
             + if hero_ground_y >= config.map.high_ground_occlusion_min_diff {
@@ -9459,116 +9578,6 @@ fn step_traversal_custom(
             .is_some()
     };
 
-    // اگر بازیکن بدون زدن Space از لبه دره یا پل به سمت آب عمیق سقوط کند، انیمیشن run_to_dive اجرا می‌شود
-    if !controller.grounded
-        && !input.space_held
-        && !input.space_just_pressed
-        && world.space_hold_secs.is_none()
-    {
-        let dive_dur = config.exact_anim_duration("run_to_dive");
-        let fall_horiz_dist = config.soldier.cliff_dive_speed * dive_dur;
-        let shape_pos = Vec3::new(
-            world.soldier_pos.x,
-            world.soldier_pos.y + config.physics.soldier_capsule_center_y,
-            world.soldier_pos.z,
-        );
-        let safe_dist = physics_world.sweep_capsule_horizontal(
-            shape_pos,
-            config.physics.soldier_capsule_half_segment,
-            config.soldier.player_radius,
-            travel_dir,
-            fall_horiz_dist,
-            config.soldier.free_traversal_wall_padding,
-            query_groups,
-            |entity| {
-                if let Ok(t) = target_query.get(entity) {
-                    !world.targets[t.index].is_dead
-                } else {
-                    true
-                }
-            },
-        );
-        let dive_x = world.soldier_pos.x + travel_dir.x * safe_dist;
-        let dive_z = world.soldier_pos.z + travel_dir.z * safe_dist;
-        let dive_bed = canyon_sample_height(&config.map.canyon, dive_x, dive_z);
-        let inside_canyon_carve = config.map.canyon.enabled && dive_bed < -0.15;
-        let landing_ray_orig = Vec3::new(dive_x, world.soldier_pos.y + 1.0, dive_z);
-        let bridge_or_ground_hit = physics_world
-            .cast_ray(
-                landing_ray_orig,
-                Vec3::NEG_Y,
-                32.0,
-                query_groups,
-                |entity| {
-                    if let Ok(t) = target_query.get(entity) {
-                        if world.targets[t.index].is_dead {
-                            return false;
-                        }
-                    }
-                    if let Ok(mtn) = mountain_query.get(entity) {
-                        if mtn.id.starts_with("mtn_canyon_") {
-                            return false;
-                        }
-                    }
-                    if inside_canyon_carve {
-                        if let Ok(elev) = elev_query.get(entity) {
-                            if elev.elevation_tier <= 0 {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                },
-            )
-            .filter(|(ent, hit)| {
-                *ent != Entity::PLACEHOLDER && hit.point.y >= config.map.canyon.water_y - 0.25
-            })
-            .map(|(_, hit)| hit.point.y);
-
-        let effective_landing_y = if let Some(hit_y) = bridge_or_ground_hit {
-            hit_y
-        } else if inside_canyon_carve {
-            let swim_floor = config.map.canyon.water_y - 1.15;
-            dive_bed.max(swim_floor)
-        } else {
-            world.soldier_pos.y
-        };
-
-        let leads_to_deep_water = if bridge_or_ground_hit.is_some() && inside_canyon_carve {
-            false
-        } else if let Some((water_y, _)) = sample_water_surface_at(
-            config,
-            Vec3::new(dive_x, effective_landing_y, dive_z),
-        ) {
-            let extra_depth = sample_waterfall_depth_offset(config, dive_x, dive_z);
-            let effective_bed_y = if inside_canyon_carve {
-                dive_bed
-            } else {
-                (effective_landing_y - extra_depth).max(-1.6)
-            };
-            world.soldier_pos.y > water_y + config.physics.character_snap_to_ground
-                && (water_y - effective_bed_y) >= 0.85
-        } else {
-            false
-        };
-
-        if leads_to_deep_water {
-            world.traversal.is_active = true;
-            world.traversal.kind = TraversalKind::FallDive;
-            world.traversal.anim_name = "run_to_dive".to_string();
-            world.traversal.elapsed = 0.0;
-            world.traversal.duration = dive_dur;
-            world.traversal.start_pos = world.soldier_pos;
-            world.traversal.target_pos = Vec3::new(dive_x, effective_landing_y, dive_z);
-            world.traversal.travel_dir = travel_dir;
-            world.traversal.chain_dive_after = false;
-            world.soldier_facing_dir = travel_dir;
-            world.firing_anim_remaining = None;
-            world.reload_remaining = None;
-            return;
-        }
-    }
-
     let (kind, anim_name, speed, stamina_cost) = if world.effective_stance == Stance::Run {
         if input.space_just_pressed && world.space_hold_secs.is_none() {
             if check_vault() {
@@ -9748,7 +9757,7 @@ fn step_traversal_custom(
         d += probe_step;
     }
 
-    let mut chain_dive_after = false;
+    let chain_dive_after = false;
     let final_anim_name = if let Some(drop_d) = first_cliff_drop_dist {
         let edge_dist = (drop_d - probe_step - config.soldier.cliff_edge_stop_margin).max(0.0);
         if edge_dist >= config.soldier.cliff_chain_min_slide_dist {
@@ -9759,7 +9768,6 @@ fn step_traversal_custom(
             );
             let frac = (edge_dist / distance.max(0.001)).clamp(0.0, 1.0);
             exact_duration = (exact_duration * frac).max(config.soldier.cliff_edge_min_anim_duration_secs);
-            chain_dive_after = true;
             anim_name
         } else {
             exact_duration = config.exact_anim_duration("run_to_dive");

@@ -701,6 +701,16 @@ GameConfig(
                 bounty_gold: 125,
                 vision_range: 6.0,
             ),
+            weapon_models: HeroWeaponModelsConfig(
+                primary: WeaponModelDef(
+                    model_path: "models/weapons/vanguard_rifle.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, -0.2, 0.0), rotation: (0.0, -90.0, 0.0), scale: (0.5, 0.5, 0.5)),
+                ),
+                pistol: WeaponModelDef(
+                    model_path: "models/weapons/frost_pistol.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, -0.2), rotation: (0.0, -90.0, 0.0), scale: (0.2, 0.2, 0.2)),
+                ),
+            ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
                     shader_path: "shaders/vfx_vanguard_bullet.wesl",
@@ -998,6 +1008,16 @@ GameConfig(
                 hit_radius: 1.10,
                 bounty_gold: 125,
                 vision_range: 6.0,
+            ),
+            weapon_models: HeroWeaponModelsConfig(
+                primary: WeaponModelDef(
+                    model_path: "models/weapons/frost_sniper.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, -90.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+                pistol: WeaponModelDef(
+                    model_path: "models/weapons/frost_pistol.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, -0.2), rotation: (0.0, -90.0, 0.0), scale: (0.2, 0.2, 0.2)),
+                ),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -1297,6 +1317,16 @@ GameConfig(
                 bounty_gold: 125,
                 vision_range: 6.0,
             ),
+            weapon_models: HeroWeaponModelsConfig(
+                primary: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+                pistol: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+            ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
                     shader_path: "shaders/vfx_iron_bullet.wesl",
@@ -1594,6 +1624,16 @@ GameConfig(
                 hit_radius: 1.15,
                 bounty_gold: 125,
                 vision_range: 6.0,
+            ),
+            weapon_models: HeroWeaponModelsConfig(
+                primary: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+                pistol: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -1893,6 +1933,16 @@ GameConfig(
                 bounty_gold: 125,
                 vision_range: 6.0,
             ),
+            weapon_models: HeroWeaponModelsConfig(
+                primary: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+                pistol: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+            ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
                     shader_path: "shaders/vfx_venom_bullet.wesl",
@@ -2190,6 +2240,16 @@ GameConfig(
                 hit_radius: 1.15,
                 bounty_gold: 125,
                 vision_range: 6.0,
+            ),
+            weapon_models: HeroWeaponModelsConfig(
+                primary: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+                pistol: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -2489,6 +2549,16 @@ GameConfig(
                 bounty_gold: 125,
                 vision_range: 6.0,
             ),
+            weapon_models: HeroWeaponModelsConfig(
+                primary: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+                pistol: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+            ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
                     shader_path: "shaders/vfx_flame_bullet.wesl",
@@ -2786,6 +2856,16 @@ GameConfig(
                 hit_radius: 1.15,
                 bounty_gold: 125,
                 vision_range: 6.0,
+            ),
+            weapon_models: HeroWeaponModelsConfig(
+                primary: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
+                pistol: WeaponModelDef(
+                    model_path: "",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                ),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -3156,7 +3236,7 @@ GameConfig(
                 hovered_tint_emissive_rgb: (2.2, 0.18, 0.15),
             ),
             "centaur_conqueror": NeutralCreepTypeDef(
-                model_path: "soldier.glb",
+                model_path: "soldier_1.glb",
                 scale: 0.94,
                 collider_radius: 0.44,
                 hitbox_height: 2.20,
@@ -3182,7 +3262,7 @@ GameConfig(
                 hovered_tint_emissive_rgb: (2.2, 0.18, 0.15),
             ),
             "hellbear_smasher": NeutralCreepTypeDef(
-                model_path: "soldier.glb",
+                model_path: "soldier_1.glb",
                 scale: 0.98,
                 collider_radius: 0.46,
                 hitbox_height: 2.30,
@@ -3303,7 +3383,7 @@ GameConfig(
         ],
     ),
     animations: AnimationConfig(
-        model_path: "soldier.glb",
+        model_path: "hero_1.glb",
         death_blend_ms: 80,
         traversal_blend_ms: 60,
         locomotion_blend_ms: 140,

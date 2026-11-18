@@ -1325,6 +1325,18 @@ pub enum ActiveWeaponSlot {
     Pistol,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WeaponModelDef {
+    pub model_path: String,
+    pub model_transform: ModelTransformConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroWeaponModelsConfig {
+    pub primary: WeaponModelDef,
+    pub pistol: WeaponModelDef,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct HeroWeaponDef {
     pub weapon_kind: WeaponKind,
@@ -1440,6 +1452,7 @@ pub struct HeroDef {
     pub grenade: HeroGrenadeDef,
     pub level_growth: HeroLevelGrowth,
     pub courier: CourierConfig,
+    pub weapon_models: HeroWeaponModelsConfig,
     pub bullet_vfx: HeroBulletVfxConfig,
 }
 
@@ -7892,6 +7905,46 @@ pub fn angle_to_direction_8(degrees: f32) -> &'static str {
     }
 }
 
+pub fn angle_to_direction_8_hysteresis(degrees: f32, prev_locomotion: &str) -> &'static str {
+    let prev_dir = prev_locomotion
+        .strip_prefix("run_")
+        .or_else(|| prev_locomotion.strip_prefix("walk_crouching_"))
+        .or_else(|| prev_locomotion.strip_prefix("walk_"))
+        .unwrap_or("");
+    let center_deg = match prev_dir {
+        "forward" => Some(0.0_f32),
+        "forward_right" => Some(45.0),
+        "right" => Some(90.0),
+        "backward_right" => Some(135.0),
+        "backward" => Some(180.0),
+        "backward_left" => Some(-135.0),
+        "left" => Some(-90.0),
+        "forward_left" => Some(-45.0),
+        _ => None,
+    };
+    if let Some(c) = center_deg {
+        let mut diff = (degrees - c).abs();
+        if diff > 180.0 {
+            diff = 360.0 - diff;
+        }
+        // هیسترزیس ۸ درجه‌ای برای جلوگیری از لرزش انیمیشن روی مرزهای ۲۲.۵ و ۴۵ درجه
+        if diff <= 22.5 + 8.0 {
+            return match prev_dir {
+                "forward" => "forward",
+                "forward_right" => "forward_right",
+                "right" => "right",
+                "backward_right" => "backward_right",
+                "backward" => "backward",
+                "backward_left" => "backward_left",
+                "left" => "left",
+                "forward_left" => "forward_left",
+                _ => angle_to_direction_8(degrees),
+            };
+        }
+    }
+    angle_to_direction_8(degrees)
+}
+
 pub fn compute_laser_hit<F>(
     physics_world: &CustomPhysicsWorld,
     muzzle_pos: Vec3,
@@ -8982,7 +9035,7 @@ fn shared_drive_single_player(
             let local_forward = move_norm.dot(forward);
             let local_right = move_norm.dot(right);
             let angle_deg = local_right.atan2(local_forward).to_degrees();
-            let dir_suffix = angle_to_direction_8(angle_deg);
+            let dir_suffix = angle_to_direction_8_hysteresis(angle_deg, &world.current_locomotion);
 
             world.current_locomotion = match world.effective_stance {
                 Stance::Run => format!("run_{dir_suffix}"),

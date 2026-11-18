@@ -3605,6 +3605,7 @@ fn attach_split_body_animation_graphs(
 fn attach_weapon_to_left_hand(
     mut commands: Commands,
     config: Res<GameConfig>,
+    asset_server: Res<AssetServer>,
     match_flow: Res<ClientMatchFlow>,
     hero_state: Res<LatestHeroSnapshot>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -3712,6 +3713,25 @@ fn attach_weapon_to_left_hand(
                         Visibility::Visible,
                     ))
                     .with_children(|weapon| {
+                        let hero_cfg = config
+                            .heroes
+                            .iter()
+                            .find(|h| h.id == hero_state.0.hero_id)
+                            .unwrap_or_else(|| config.active_hero(0));
+                        let w_model_def = if weapon_kind == WeaponKind::Pistol {
+                            &hero_cfg.weapon_models.pistol
+                        } else {
+                            &hero_cfg.weapon_models.primary
+                        };
+                        if custom_glb_exists(&w_model_def.model_path) {
+                            let mut glb = glb_model_bundle(
+                                &asset_server,
+                                &w_model_def.model_path,
+                                &w_model_def.model_transform,
+                            );
+                            glb.1 = model_transform_to_bevy(&w_model_def.model_transform);
+                            weapon.spawn(glb);
+                        } else {
                         match weapon_kind {
                             WeaponKind::AutomaticRifle => {
                                 weapon.spawn((
@@ -3928,6 +3948,7 @@ fn attach_weapon_to_left_hand(
                             MeshMaterial3d(laser_box_mat),
                             Transform::from_xyz(0.0, 0.0, -0.50),
                         ));
+                        }
                         weapon.spawn((
                             MuzzlePoint,
                             Transform::from_xyz(m_off.0, m_off.1, m_off.2),
@@ -6079,7 +6100,9 @@ fn soldier_animation_player_system(
         UpperBodyAction::None => {
             let in_deep_water_anim = render_state.current_locomotion == "swimming"
                 || render_state.current_locomotion == "treading_water";
-            if hero_hud.0.active_weapon == ActiveWeaponSlot::Pistol && !in_deep_water_anim {
+            let is_running_loco = render_state.current_locomotion.starts_with("run_");
+            let use_full_body_loco = in_deep_water_anim || is_running_loco;
+            if hero_hud.0.active_weapon == ActiveWeaponSlot::Pistol && !use_full_body_loco {
                 let node = anim_assets.get_or_fallback("pistol_run", "rifle_aiming_idle");
                 if render_state.previous_upper_anim != "pistol_run"
                     || !upper_player.is_playing_animation(node)
@@ -6089,7 +6112,7 @@ fn soldier_animation_player_system(
                         .repeat();
                     render_state.previous_upper_anim = "pistol_run".to_string();
                 }
-            } else if !in_deep_water_anim {
+            } else if !use_full_body_loco {
                 let aim_node = anim_assets.get_or_fallback("rifle_aiming_idle", "idle");
                 if render_state.previous_upper_anim != "rifle_aiming_idle"
                     || !upper_player.is_playing_animation(aim_node)
@@ -9371,10 +9394,36 @@ fn spawn_showcase_weapon_on_hand(
     root_ent: Entity,
     hand_ent: Entity,
     weapon_kind: WeaponKind,
+    weapon_model: Option<&moba_shared::WeaponModelDef>,
+    asset_server: &AssetServer,
     tuner: &moba_shared::WeaponTunerConfig,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) {
+    if let Some(wm) = weapon_model {
+        if custom_glb_exists(&wm.model_path) {
+            let mut glb = glb_model_bundle(asset_server, &wm.model_path, &wm.model_transform);
+            glb.1 = model_transform_to_bevy(&wm.model_transform);
+            commands
+                .entity(hand_ent)
+                .insert(ShowcaseWeaponAttached)
+                .with_children(|parent| {
+                    parent
+                        .spawn((
+                            HorizontalWeaponAlign {
+                                root_entity: root_ent,
+                                hand_entity: hand_ent,
+                            },
+                            Transform::from_scale(Vec3::splat(tuner.initial_scale)),
+                            Visibility::Visible,
+                        ))
+                        .with_children(|w| {
+                            w.spawn(glb);
+                        });
+                });
+            return;
+        }
+    }
     let (body_col, accent_col, barrel_len, body_len) = match weapon_kind {
         WeaponKind::AutomaticRifle => (Color::srgb(0.14, 0.16, 0.20), Color::srgb(0.22, 0.65, 0.85), 0.34, 0.38),
         WeaponKind::Sniper => (Color::srgb(0.15, 0.22, 0.18), Color::srgb(0.40, 0.88, 0.52), 0.56, 0.42),
@@ -9539,11 +9588,18 @@ fn hero_preview_system(
                     let is_finger = n.contains("thumb") || n.contains("index") || n.contains("middle")
                         || n.contains("ring") || n.contains("pinky") || n.contains("finger") || n.contains("twist");
                     if is_hand && is_left && !is_finger {
+                        let wm = config
+                            .heroes
+                            .iter()
+                            .find(|h| h.weapon.weapon_kind == prev_root.weapon_kind)
+                            .map(|h| &h.weapon_models.primary);
                         spawn_showcase_weapon_on_hand(
                             &mut commands,
                             root_ent,
                             h_ent,
                             prev_root.weapon_kind,
+                            wm,
+                            &sc.asset_server,
                             &config.weapon_tuner,
                             &mut sc.meshes,
                             &mut sc.materials,
@@ -9643,11 +9699,18 @@ fn hero_preview_system(
                     let is_finger = n.contains("thumb") || n.contains("index") || n.contains("middle")
                         || n.contains("ring") || n.contains("pinky") || n.contains("finger") || n.contains("twist");
                     if is_hand && is_left && !is_finger {
+                        let wm = config
+                            .heroes
+                            .iter()
+                            .find(|h| h.weapon.weapon_kind == b_hero.weapon_kind)
+                            .map(|h| &h.weapon_models.primary);
                         spawn_showcase_weapon_on_hand(
                             &mut commands,
                             root_ent,
                             h_ent,
                             b_hero.weapon_kind,
+                            wm,
+                            &sc.asset_server,
                             &config.weapon_tuner,
                             &mut sc.meshes,
                             &mut sc.materials,
@@ -10665,17 +10728,49 @@ fn sync_remote_players_system(
                                     perceptual_roughness: 0.35,
                                     ..default()
                                 });
+                                let rp_hero_cfg = res
+                                    .config
+                                    .heroes
+                                    .iter()
+                                    .find(|h| h.id == rp.hero_id)
+                                    .unwrap_or_else(|| res.config.active_hero(0));
+                                let rp_w_model = if rp.weapon_kind == WeaponKind::Pistol {
+                                    &rp_hero_cfg.weapon_models.pistol
+                                } else {
+                                    &rp_hero_cfg.weapon_models.primary
+                                };
                                 commands.entity(h_ent).insert(RemoteWeaponAttached).with_children(|parent| {
-                                    parent.spawn((
-                                        HorizontalWeaponAlign {
-                                            root_entity: root_ent,
-                                            hand_entity: h_ent,
-                                        },
-                                        Mesh3d(res.meshes.add(Cuboid::new(0.06, 0.09, 0.52))),
-                                        MeshMaterial3d(w_mat),
-                                        Transform::from_xyz(0.0, 0.03, -0.22)
-                                            .with_scale(Vec3::splat(res.config.weapon_tuner.initial_scale)),
-                                    ));
+                                    if custom_glb_exists(&rp_w_model.model_path) {
+                                        let mut glb = glb_model_bundle(
+                                            &res.asset_server,
+                                            &rp_w_model.model_path,
+                                            &rp_w_model.model_transform,
+                                        );
+                                        glb.1 = model_transform_to_bevy(&rp_w_model.model_transform);
+                                        parent
+                                            .spawn((
+                                                HorizontalWeaponAlign {
+                                                    root_entity: root_ent,
+                                                    hand_entity: h_ent,
+                                                },
+                                                Transform::from_scale(Vec3::splat(res.config.weapon_tuner.initial_scale)),
+                                                Visibility::Visible,
+                                            ))
+                                            .with_children(|w| {
+                                                w.spawn(glb);
+                                            });
+                                    } else {
+                                        parent.spawn((
+                                            HorizontalWeaponAlign {
+                                                root_entity: root_ent,
+                                                hand_entity: h_ent,
+                                            },
+                                            Mesh3d(res.meshes.add(Cuboid::new(0.06, 0.09, 0.52))),
+                                            MeshMaterial3d(w_mat),
+                                            Transform::from_xyz(0.0, 0.03, -0.22)
+                                                .with_scale(Vec3::splat(res.config.weapon_tuner.initial_scale)),
+                                        ));
+                                    }
                                 });
                             }
                         }

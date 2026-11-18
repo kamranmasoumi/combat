@@ -19,6 +19,7 @@ use bevy::prelude::*;
 use bevy::transform::TransformSystems;
 use bevy::window::{CursorOptions, MonitorSelection, PresentMode, PrimaryWindow, WindowMode, WindowResolution};
 use moba_shared::{
+    WeatherKind,
     ancient_physics_bundle, barracks_physics_bundle, center_bridge_physics_bundle, is_point_in_roshan_pit_circle, roshan_pit_physics_bundles, create_shared_renet_client,
     grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
     mountain_physics_bundle, obstacle_physics_bundle, orient_soldier_towards,
@@ -50,7 +51,7 @@ mod pregame_ui;
 mod vfx_client;
 use backend_client::BackendClient;
 use pregame_ui::{AppScreenState, PendingMatchConnection, PreGamePlugin, PreGameSessionState};
-use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, MobaVfxPlugin, TeleportPortalMaterial, TeleportPortalUniforms, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms};
+use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, MobaVfxPlugin, TeleportPortalMaterial, TeleportPortalUniforms, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms, WeatherVfxState};
 mod shop_client;
 use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
 use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, TeleportPreviewState, VerticalAimKeyState};
@@ -259,6 +260,7 @@ fn main() {
         .insert_resource(InspectedUnit::default())
         .insert_resource(HeroClickMoveTarget::default())
         .insert_resource(LatestTopBarState::default())
+        .insert_resource(WeatherLightningFlashState::default())
         .insert_resource(LatestScoreboard::default())
         .insert_resource(LatestTurrets::default())
         .insert_resource(LatestBarracks::default())
@@ -4289,8 +4291,16 @@ fn client_flush_input_to_server_system(
     let _ = net.transport.send_packets(&mut net.client);
 }
 
+#[derive(Resource, Default)]
+struct WeatherLightningFlashState {
+    remaining_secs: f32,
+    total_secs: f32,
+    intensity: f32,
+}
+
 #[derive(SystemParam)]
 struct TurretFxResources<'w, 's> {
+    weather_flash: ResMut<'w, WeatherLightningFlashState>,
     shared_fx: Res<'w, SharedFxAssets>,
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
@@ -4401,6 +4411,7 @@ fn client_receive_snapshot_and_sync_system(
         hud_sync.creeps.0 = snap.creeps.clone();
         hud_sync.couriers.0 = snap.couriers.clone();
         hud_sync.top_bar.match_elapsed_secs = snap.match_elapsed_secs;
+        hud_sync.top_bar.current_weather = Some(snap.current_weather);
         hud_sync.top_bar.dawn_total_kills = snap.dawn_total_kills;
         hud_sync.top_bar.dusk_total_kills = snap.dusk_total_kills;
         hud_sync.top_bar.heroes = snap.top_bar_heroes.clone();
@@ -4634,6 +4645,7 @@ fn client_receive_snapshot_and_sync_system(
             &fx_res.shared_fx,
             &mut fx_res.audio_q,
             &mut fx_res.vfx_q,
+            &mut fx_res.weather_flash,
             &mut fx_res.turret_gun_q,
             &fx_res.turret_muzzle_q,
             fx_live_muzzle,
@@ -4689,6 +4701,7 @@ fn spawn_fx_from_server_event(
     shared_fx: &SharedFxAssets,
     audio_q: &mut AudioEventQueue,
     vfx_q: &mut VfxEventQueue,
+    weather_flash: &mut WeatherLightningFlashState,
     turret_gun_q: &mut Query<&mut TurretGunBone>,
     turret_muzzle_q: &Query<(&TurretMuzzlePoint, &GlobalTransform)>,
     live_muzzle_opt: Option<Vec3>,
@@ -5027,6 +5040,15 @@ fn spawn_fx_from_server_event(
         }
         GameplayFxEvent::ShadowBladeActivated { slot_index: _, pos } => {
             audio_q.0.push(ClientAudioEvent::ShadowBladeActivate { pos });
+        }
+        GameplayFxEvent::LightningStrike { intensity } => {
+            weather_flash.remaining_secs = config.weather.lightning_flash_duration_secs;
+            weather_flash.total_secs = config.weather.lightning_flash_duration_secs;
+            weather_flash.intensity = intensity;
+            audio_q.0.push(ClientAudioEvent::ThunderStrike {
+                delay_secs: config.weather.thunder_sound_delay_secs,
+                intensity,
+            });
         }
         GameplayFxEvent::ShadowBladeEnded { slot_index: _, pos } => {
             audio_q.0.push(ClientAudioEvent::ShadowBladeEnd { pos });
@@ -7471,10 +7493,12 @@ fn bake_water_foam_noise_texture() -> Image {
 fn water_shader_update_system(
     time: Res<Time>,
     config: Res<GameConfig>,
+    top_bar: Res<LatestTopBarState>,
     prediction: Res<ClientPhysicsPredictionState>,
     camera_query: Query<&GlobalTransform, With<MobaCamera>>,
     mut water_materials: ResMut<Assets<WaterSurfaceMaterial>>,
     mut prev_hero_pos: Local<Option<Vec3>>,
+    mut rain_fade: Local<f32>,
 ) {
     let t = time.elapsed_secs();
     let dt = time.delta_secs().max(0.0001);
@@ -7501,8 +7525,17 @@ fn water_shader_update_system(
         Vec4::new(0.0, 0.0, 0.0, -1.0)
     };
 
+    let target_rain = if top_bar.current_weather == Some(WeatherKind::Rainy) { 1.0 } else { 0.0 };
+    let r_step = dt / config.weather.transition_duration_secs.max(0.1);
+    if *rain_fade < target_rain {
+        *rain_fade = (*rain_fade + r_step).min(target_rain);
+    } else {
+        *rain_fade = (*rain_fade - r_step).max(target_rain);
+    }
+
     for (_, mat) in water_materials.iter_mut() {
         mat.uniforms.flow_and_params.z = t;
+        mat.uniforms.foam_color.w = *rain_fade;
         mat.uniforms.camera_pos.x = cam_pos.x;
         mat.uniforms.camera_pos.y = cam_pos.y;
         mat.uniforms.camera_pos.z = cam_pos.z;
@@ -8088,6 +8121,7 @@ struct HeroHudExtraStatQueries<'w, 's> {
 fn update_hero_hud_system(
     config: Res<GameConfig>,
     items_cfg: Res<ItemsConfig>,
+    top_bar: Res<LatestTopBarState>,
     hero_state: Res<LatestHeroSnapshot>,
     inspect_p: HudInspectParams,
     mut extra_stats: HeroHudExtraStatQueries,
@@ -8357,7 +8391,18 @@ fn update_hero_hud_system(
             **t = format!("{:.0} / {:.0} (+{:.1}/s)", h.hp, h.max_hp, h.hp_regen_per_sec);
         }
     }
-    let mods = items_cfg.sum_inventory_modifiers(&h.inventory);
+    let mut mods = items_cfg.sum_inventory_modifiers(&h.inventory);
+    let cur_weather = top_bar.current_weather.unwrap_or(config.weather.initial_weather);
+    let is_night = config.is_night_at(top_bar.match_elapsed_secs);
+    let env_mod = config
+        .heroes
+        .iter()
+        .find(|hd| hd.id == h.hero_id)
+        .unwrap_or_else(|| config.active_hero(0))
+        .environment
+        .combined(is_night, cur_weather)
+        .to_item_stats_modifier();
+    mods.add(&env_mod);
     let is_pistol = h.active_weapon == ActiveWeaponSlot::Pistol;
     let item_dmg = if is_pistol { mods.pistol_damage_bonus } else { mods.primary_damage_bonus };
     let item_rate_pct = if is_pistol { mods.pistol_fire_rate_pct } else { mods.primary_fire_rate_pct };
@@ -8812,6 +8857,7 @@ impl CreepModelAnimCache {
 #[derive(Resource, Default)]
 struct LatestTopBarState {
     match_elapsed_secs: f32,
+    current_weather: Option<WeatherKind>,
     dawn_total_kills: u32,
     dusk_total_kills: u32,
     heroes: Vec<TopBarHeroInfo>,
@@ -11565,6 +11611,12 @@ struct TopMatchClockText;
 struct TopDayNightOrb;
 
 #[derive(Component)]
+struct TopWeatherBadge;
+
+#[derive(Component)]
+struct TopWeatherLabel;
+
+#[derive(Component)]
 struct TopDayNightCrescent;
 
 #[derive(Component)]
@@ -11708,6 +11760,26 @@ fn spawn_top_match_hud_ui(commands: &mut Commands) {
                             },
                             TextColor(Color::srgb(1.0, 0.88, 0.48)),
                         ));
+                        badge.spawn((
+                            TopWeatherBadge,
+                            Node {
+                                padding: UiRect::left(px(6.0)),
+                                border: UiRect::left(px(1.0)),
+                                ..default()
+                            },
+                            BorderColor::all(Color::srgba(0.55, 0.65, 0.80, 0.45)),
+                        ))
+                        .with_children(|wb| {
+                            wb.spawn((
+                                TopWeatherLabel,
+                                Text::new("CLEAR"),
+                                TextFont {
+                                    font_size: FontSize::Px(10.0),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.86, 0.92, 0.98)),
+                            ));
+                        });
                     });
 
                 // ساعت مرکزی بازی (MM:SS)
@@ -11959,6 +12031,7 @@ struct DayNightVisualQueries<'w, 's> {
     orb_q: Query<'w, 's, (&'static mut BackgroundColor, &'static mut BorderColor), With<TopDayNightOrb>>,
     crescent_q: Query<'w, 's, &'static mut Node, With<TopDayNightCrescent>>,
     label_q: Query<'w, 's, (&'static mut Text, &'static mut TextColor), With<TopDayNightLabel>>,
+    weather_label_q: Query<'w, 's, (&'static mut Text, &'static mut TextColor), (With<TopWeatherLabel>, Without<TopDayNightLabel>)>,
 }
 
 fn day_night_cycle_system(
@@ -11967,19 +12040,28 @@ fn day_night_cycle_system(
     config: Res<GameConfig>,
     asset_server: Res<AssetServer>,
     match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
     top_bar: Res<LatestTopBarState>,
+    mut weather_flash: ResMut<WeatherLightningFlashState>,
     mut ambient: ResMut<GlobalAmbientLight>,
     mut q: DayNightVisualQueries,
     mut last_is_night: Local<Option<bool>>,
+    mut rain_blend: Local<f32>,
+    mut snow_blend: Local<f32>,
 ) {
     if !match_flow.is_in_game() {
         *last_is_night = None;
+        *rain_blend = 0.0;
+        *snow_blend = 0.0;
+        weather_flash.remaining_secs = 0.0;
         return;
     }
 
+    let dt = time.delta_secs();
     let elapsed = top_bar.match_elapsed_secs;
     let is_night = config.is_night_at(elapsed);
     let blend = config.day_night_blend_at(elapsed);
+    let cur_weather = top_bar.current_weather.unwrap_or(config.weather.initial_weather);
 
     // پخش صدای تغییر فاز شب و روز
     if let Some(prev) = *last_is_night {
@@ -11999,12 +12081,57 @@ fn day_night_cycle_system(
     }
     *last_is_night = Some(is_night);
 
-    // تغییر نرم نور خورشید به مهتاب شبانه
+    // انتقال نرم بین آب و هواها (Clear بدون تغییر روی نور و مه فعلی)
+    let w_cfg = &config.weather;
+    let trans_rate = dt / w_cfg.transition_duration_secs.max(0.1);
+    let target_rain = if cur_weather == WeatherKind::Rainy { 1.0 } else { 0.0 };
+    let target_snow = if cur_weather == WeatherKind::Snowy { 1.0 } else { 0.0 };
+    if *rain_blend < target_rain {
+        *rain_blend = (*rain_blend + trans_rate).min(target_rain);
+    } else {
+        *rain_blend = (*rain_blend - trans_rate).max(target_rain);
+    }
+    if *snow_blend < target_snow {
+        *snow_blend = (*snow_blend + trans_rate).min(target_snow);
+    } else {
+        *snow_blend = (*snow_blend - trans_rate).max(target_snow);
+    }
+
+    // محاسبه فلش رعد و برق (دوبار چشمک‌زدن سریع و طبیعی)
+    let mut flash_alpha = 0.0_f32;
+    if weather_flash.remaining_secs > 0.0 {
+        weather_flash.remaining_secs = (weather_flash.remaining_secs - dt).max(0.0);
+        let prog = 1.0 - (weather_flash.remaining_secs / weather_flash.total_secs.max(0.05));
+        let pulse_a = (1.0 - (prog * 3.8).min(1.0)).max(0.0);
+        let pulse_b = if prog > 0.25 && prog < 0.72 {
+            ((prog - 0.25) / 0.47 * std::f32::consts::PI).sin() * 0.75
+        } else {
+            0.0
+        };
+        flash_alpha = (pulse_a.max(pulse_b) * weather_flash.intensity).clamp(0.0, 1.2);
+    }
+
+    // تغییر نرم نور خورشید به مهتاب شبانه + تاثیر آب و هوا + رعد و برق
     let dn = &config.day_night;
     let day_dir_col = Vec3::new(1.0, 0.96, 0.88);
     let night_dir_col = Vec3::new(dn.night_directional_color_rgb.0, dn.night_directional_color_rgb.1, dn.night_directional_color_rgb.2);
-    let dir_col = day_dir_col.lerp(night_dir_col, blend);
-    let dir_illum = config.lighting.directional_illuminance + (dn.night_directional_illuminance - config.lighting.directional_illuminance) * blend;
+    let mut dir_col = day_dir_col.lerp(night_dir_col, blend);
+    let mut dir_illum = config.lighting.directional_illuminance + (dn.night_directional_illuminance - config.lighting.directional_illuminance) * blend;
+
+    // در شب، باران نورپردازی و مه شبانه را تغییر نمی‌دهد (فقط قطرات باران نمایش داده می‌شوند)
+    let day_rain_atm = *rain_blend * (1.0 - blend);
+    let rain_dir_col = Vec3::new(w_cfg.rain_directional_color_rgb.0, w_cfg.rain_directional_color_rgb.1, w_cfg.rain_directional_color_rgb.2);
+    let snow_dir_col = Vec3::new(w_cfg.snow_directional_color_rgb.0, w_cfg.snow_directional_color_rgb.1, w_cfg.snow_directional_color_rgb.2);
+    dir_col = dir_col.lerp(rain_dir_col, day_rain_atm * 0.45).lerp(snow_dir_col, *snow_blend * 0.55);
+    dir_illum *= 1.0 + (w_cfg.rain_directional_illuminance_mult - 1.0) * day_rain_atm;
+    dir_illum *= 1.0 + (w_cfg.snow_directional_illuminance_mult - 1.0) * *snow_blend;
+
+    let flash_col = Vec3::new(w_cfg.lightning_flash_color_rgb.0, w_cfg.lightning_flash_color_rgb.1, w_cfg.lightning_flash_color_rgb.2);
+    if flash_alpha > 0.001 {
+        dir_col = dir_col.lerp(flash_col, flash_alpha.min(1.0));
+        dir_illum += w_cfg.lightning_flash_directional_illuminance * flash_alpha;
+    }
+
     for mut light in &mut q.dir_light_q {
         light.color = Color::srgb(dir_col.x, dir_col.y, dir_col.z);
         light.illuminance = dir_illum;
@@ -12013,24 +12140,52 @@ fn day_night_cycle_system(
     // تغییر نرم نور محیطی (GlobalAmbientLight)
     let day_amb = Vec3::new(config.lighting.ambient_color_rgb.0, config.lighting.ambient_color_rgb.1, config.lighting.ambient_color_rgb.2);
     let night_amb = Vec3::new(dn.night_ambient_color_rgb.0, dn.night_ambient_color_rgb.1, dn.night_ambient_color_rgb.2);
-    let amb_col = day_amb.lerp(night_amb, blend);
-    ambient.color = Color::srgb(amb_col.x, amb_col.y, amb_col.z);
-    ambient.brightness = config.lighting.ambient_brightness + (dn.night_ambient_brightness - config.lighting.ambient_brightness) * blend;
+    let mut amb_col = day_amb.lerp(night_amb, blend);
+    let mut amb_bright = config.lighting.ambient_brightness + (dn.night_ambient_brightness - config.lighting.ambient_brightness) * blend;
 
-    // تغییر مه اتمسفریک شب و روز روی دوربین
+    let rain_amb_col = Vec3::new(w_cfg.rain_ambient_color_rgb.0, w_cfg.rain_ambient_color_rgb.1, w_cfg.rain_ambient_color_rgb.2);
+    let snow_amb_col = Vec3::new(w_cfg.snow_ambient_color_rgb.0, w_cfg.snow_ambient_color_rgb.1, w_cfg.snow_ambient_color_rgb.2);
+    amb_col = amb_col.lerp(rain_amb_col, day_rain_atm * 0.45).lerp(snow_amb_col, *snow_blend * 0.58);
+    amb_bright *= 1.0 + (w_cfg.rain_ambient_brightness_mult - 1.0) * day_rain_atm;
+    amb_bright *= 1.0 + (w_cfg.snow_ambient_brightness_mult - 1.0) * *snow_blend;
+    if flash_alpha > 0.001 {
+        amb_col = amb_col.lerp(flash_col, flash_alpha.min(1.0));
+        amb_bright += w_cfg.lightning_flash_ambient_brightness * flash_alpha;
+    }
+    ambient.color = Color::srgb(amb_col.x, amb_col.y, amb_col.z);
+    ambient.brightness = amb_bright;
+
+    // تغییر مه اتمسفریک شب و روز + آب و هوا + صفحه مرگ
     let day_fog_c = Vec3::new(dn.day_fog_color_rgb.0, dn.day_fog_color_rgb.1, dn.day_fog_color_rgb.2);
     let night_fog_c = Vec3::new(dn.night_fog_color_rgb.0, dn.night_fog_color_rgb.1, dn.night_fog_color_rgb.2);
-    let fog_c = day_fog_c.lerp(night_fog_c, blend);
-    let fog_start = dn.day_fog_start + (dn.night_fog_start - dn.day_fog_start) * blend;
-    let fog_end = dn.day_fog_end + (dn.night_fog_end - dn.day_fog_end) * blend;
+    let mut fog_c = day_fog_c.lerp(night_fog_c, blend);
+    let mut fog_start = dn.day_fog_start + (dn.night_fog_start - dn.day_fog_start) * blend;
+    let mut fog_end = dn.day_fog_end + (dn.night_fog_end - dn.day_fog_end) * blend;
+
+    let rain_fog_c = Vec3::new(w_cfg.rain_fog_color_rgb.0, w_cfg.rain_fog_color_rgb.1, w_cfg.rain_fog_color_rgb.2);
+    let snow_fog_c = Vec3::new(w_cfg.snow_fog_color_rgb.0, w_cfg.snow_fog_color_rgb.1, w_cfg.snow_fog_color_rgb.2) * (1.0 - 0.45 * blend);
+    fog_c = fog_c.lerp(rain_fog_c, day_rain_atm * 0.55).lerp(snow_fog_c, *snow_blend * 0.85);
+    fog_start *= 1.0 + (w_cfg.rain_fog_start_mult - 1.0) * day_rain_atm;
+    fog_start *= 1.0 + (w_cfg.snow_fog_start_mult - 1.0) * *snow_blend;
+    fog_end *= 1.0 + (w_cfg.rain_fog_end_mult - 1.0) * day_rain_atm;
+    fog_end *= 1.0 + (w_cfg.snow_fog_end_mult - 1.0) * *snow_blend;
+    if flash_alpha > 0.001 {
+        fog_c = fog_c.lerp(flash_col, (flash_alpha * 0.45).min(0.65));
+    }
+
     for mut fog in &mut q.fog_q {
-        fog.color = Color::srgba(fog_c.x, fog_c.y, fog_c.z, 1.0);
-        fog.directional_light_color = Color::srgba(
-            1.0 - 0.65 * blend,
-            0.92 - 0.35 * blend,
-            0.78 + 0.18 * blend,
-            0.45 - 0.20 * blend,
-        );
+        if render_state.is_dead {
+            fog.color = Color::srgba(0.24, 0.25, 0.27, 1.0);
+            fog.directional_light_color = Color::srgba(0.32, 0.33, 0.35, 0.35);
+        } else {
+            fog.color = Color::srgba(fog_c.x, fog_c.y, fog_c.z, 1.0);
+            fog.directional_light_color = Color::srgba(
+                1.0 - 0.65 * blend,
+                0.92 - 0.35 * blend,
+                0.78 + 0.18 * blend,
+                0.45 - 0.20 * blend,
+            );
+        }
         fog.falloff = FogFalloff::Linear {
             start: fog_start,
             end: fog_end,
@@ -12066,6 +12221,17 @@ fn day_night_cycle_system(
         } else {
             TextColor(Color::srgb(1.0, 0.88, 0.48))
         };
+    }
+    if let Ok((mut w_txt, mut w_col)) = q.weather_label_q.single_mut() {
+        let (want_w, c) = match cur_weather {
+            WeatherKind::Clear => ("CLEAR", Color::srgb(0.86, 0.92, 0.98)),
+            WeatherKind::Rainy => ("RAIN", Color::srgb(0.45, 0.82, 1.0)),
+            WeatherKind::Snowy => ("SNOW", Color::srgb(0.88, 0.96, 1.0)),
+        };
+        if w_txt.0 != want_w {
+            w_txt.0 = want_w.to_string();
+        }
+        *w_col = TextColor(c);
     }
 }
 
@@ -12244,7 +12410,6 @@ fn death_screen_overlay_system(
     hero_hud: Res<LatestHeroSnapshot>,
     mut overlay_q: Query<&mut Node, With<DeathScreenOverlay>>,
     mut txt_q: Query<&mut Text, With<DeathScreenCountdownText>>,
-    mut fog_q: Query<&mut DistanceFog, With<MobaCamera>>,
 ) {
     let is_dead_in_game = match_flow.is_in_game() && render_state.is_dead;
 
@@ -12263,15 +12428,7 @@ fn death_screen_overlay_system(
         }
     }
 
-    if let Ok(mut fog) = fog_q.single_mut() {
-        if is_dead_in_game {
-            fog.color = Color::srgba(0.24, 0.25, 0.27, 1.0);
-            fog.directional_light_color = Color::srgba(0.32, 0.33, 0.35, 0.35);
-        } else {
-            fog.color = Color::srgba(0.68, 0.76, 0.84, 1.0);
-            fog.directional_light_color = Color::srgba(1.0, 0.92, 0.78, 0.45);
-        }
-    }
+
 }
 
 
@@ -16154,6 +16311,8 @@ struct AudioSyncStateParams<'w> {
     latest_barracks: Res<'w, LatestBarracks>,
     latest_ancients: Res<'w, LatestAncients>,
     camera_control: Res<'w, CameraControlState>,
+    top_bar: Res<'w, LatestTopBarState>,
+    weather_vfx: ResMut<'w, WeatherVfxState>,
     audio_ctx: ResMut<'w, AudioFrameContext>,
     audio_q: ResMut<'w, AudioEventQueue>,
 }
@@ -16193,6 +16352,9 @@ fn sync_audio_context_system(
         && p.render_state.swing_throw_progress >= 0.99
         && p.render_state.traversal_anim_name == "start_swing";
     p.audio_ctx.in_water = p.render_state.in_water;
+    p.audio_ctx.current_weather = p.top_bar.current_weather;
+    p.weather_vfx.active_weather = if in_game { p.top_bar.current_weather } else { None };
+    p.weather_vfx.camera_focus = p.audio_ctx.listener_pos;
 
     // نزدیک‌ترین Courier در حال پرواز و نزدیک‌ترین سرباز لاین در حال دویدن
     let listener = p.audio_ctx.listener_pos;

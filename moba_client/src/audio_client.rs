@@ -1,6 +1,7 @@
 use bevy::audio::{SpatialListener, Volume};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use moba_shared::{GameConfig, ImpactSurface, ItemsConfig, ShotAudioSource, WeaponKind};
+use moba_shared::{GameConfig, ImpactSurface, ItemsConfig, ShotAudioSource, WeaponKind, WeatherKind};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -172,6 +173,10 @@ pub enum ClientAudioEvent {
     ShadowBladeEnd {
         pos: Vec3,
     },
+    ThunderStrike {
+        delay_secs: f32,
+        intensity: f32,
+    },
 }
 
 #[derive(Resource, Default)]
@@ -188,6 +193,7 @@ pub struct AudioFrameContext {
     pub traversal_active: bool,
     pub swing_in_air: bool,
     pub in_water: bool,
+    pub current_weather: Option<WeatherKind>,
     pub active_courier_pos: Option<Vec3>,
     pub running_creeps_nearest_pos: Option<Vec3>,
     pub running_creeps_count: usize,
@@ -226,6 +232,12 @@ struct TaggedAudio {
 
 #[derive(Component)]
 struct BackgroundMusicLoop;
+
+#[derive(Component)]
+struct RainAmbienceLoop;
+
+#[derive(Component)]
+struct SnowAmbienceLoop;
 
 #[derive(Component)]
 struct CourierFlyLoop;
@@ -269,6 +281,11 @@ struct AudioRuntimeTimers {
     creep_loop_spawned: bool,
     swing_air_loop_spawned: bool,
     ambient_spawned: bool,
+    rain_loop_spawned: bool,
+    snow_loop_spawned: bool,
+    rain_audio_blend: f32,
+    snow_audio_blend: f32,
+    pending_thunder_timers: Vec<(f32, f32)>,
 }
 
 pub struct MobaAudioPlugin;
@@ -413,6 +430,27 @@ fn process_audio_events_system(
     if timers.creep_window_timer >= 0.25 {
         timers.creep_window_timer = 0.0;
         timers.active_creep_shots_window = 0;
+    }
+
+    let dt = time.delta_secs();
+    let mut thunder_idx = 0;
+    while thunder_idx < timers.pending_thunder_timers.len() {
+        timers.pending_thunder_timers[thunder_idx].0 -= dt;
+        if timers.pending_thunder_timers[thunder_idx].0 <= 0.0 {
+            let (_, intensity) = timers.pending_thunder_timers.swap_remove(thunder_idx);
+            if let Some(handle) = cache.get_or_load(&config.weather.thunder_sound, &asset_server) {
+                let duck = if timers.low_hp_duck_factor > 0.0 { timers.low_hp_duck_factor } else { 1.0 };
+                let vol = settings.effective_gain(AudioCategory::Ambience, duck)
+                    * config.weather.thunder_volume
+                    * intensity.clamp(0.5, 1.5);
+                commands.spawn((
+                    AudioPlayer::new(handle),
+                    PlaybackSettings::DESPAWN.with_volume(Volume::Linear(vol)),
+                ));
+            }
+        } else {
+            thunder_idx += 1;
+        }
     }
 
     if queue.0.is_empty() {
@@ -732,6 +770,9 @@ fn process_audio_events_system(
                     sb_cfg.activate_volume,
                 );
             }
+            ClientAudioEvent::ThunderStrike { delay_secs, intensity } => {
+                timers.pending_thunder_timers.push((delay_secs.max(0.0), intensity));
+            }
             ClientAudioEvent::ShadowBladeEnd { pos } => {
                 let sb_cfg = &items_cfg.shadow_blade;
                 play_spatial_sound(
@@ -875,6 +916,12 @@ fn update_locomotion_and_low_hp_audio_system(
     timers.prev_locomotion = ctx.current_locomotion.clone();
 }
 
+#[derive(SystemParam)]
+struct WeatherAudioLoops<'w, 's> {
+    rain_loop_q: Query<'w, 's, Option<&'static mut AudioSink>, (With<RainAmbienceLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<SnowAmbienceLoop>, Without<TeleportLoopAudio>)>,
+    snow_loop_q: Query<'w, 's, Option<&'static mut AudioSink>, (With<SnowAmbienceLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<TeleportLoopAudio>)>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_loops_and_ambient_zones_system(
     mut commands: Commands,
@@ -884,11 +931,13 @@ fn update_loops_and_ambient_zones_system(
     mut cache: ResMut<AudioAssetCache>,
     settings: Res<AudioSettingsState>,
     ctx: Res<AudioFrameContext>,
+    time: Res<Time>,
     mut timers: ResMut<AudioRuntimeTimers>,
     mut listener_q: Query<&mut Transform, With<SpatialListener>>,
     mut courier_loop_q: Query<(&mut Transform, Option<&mut SpatialAudioSink>), (With<CourierFlyLoop>, Without<SpatialListener>, Without<CreepMarchLoop>)>,
     mut creep_loop_q: Query<(&mut Transform, Option<&mut SpatialAudioSink>), (With<CreepMarchLoop>, Without<SpatialListener>, Without<CourierFlyLoop>)>,
-    mut ambient_q: Query<(&AmbientZoneLoop, Option<&mut AudioSink>), Without<SwingAirLoop>>,
+    mut ambient_q: Query<(&AmbientZoneLoop, Option<&mut AudioSink>), (Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<SnowAmbienceLoop>)>,
+    mut weather_loops: WeatherAudioLoops,
     mut swing_air_q: Query<Option<&mut AudioSink>, (With<SwingAirLoop>, Without<AmbientZoneLoop>, Without<TeleportLoopAudio>)>,
     mut teleport_loop_q: Query<(&TeleportLoopAudio, &mut Transform, Option<&mut SpatialAudioSink>), (Without<SpatialListener>, Without<CourierFlyLoop>, Without<CreepMarchLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>)>,
 ) {
@@ -1065,7 +1114,57 @@ fn update_loops_and_ambient_zones_system(
             sink.set_volume(Volume::Linear(target_vol));
         }
     }
+
+    // ۷. لوپ صدای آب و هوا (باران و برف/سوز سرما) با Fade نرم
+    let w_cfg = &config.weather;
+    if ctx.in_game && !timers.rain_loop_spawned {
+        if let Some(handle) = cache.get_or_load(&w_cfg.rain_loop_sound, &asset_server) {
+            commands.spawn((
+                RainAmbienceLoop,
+                AudioPlayer::new(handle),
+                PlaybackSettings::LOOP.with_volume(Volume::Linear(0.0)),
+            ));
+            timers.rain_loop_spawned = true;
+        }
+    }
+    if ctx.in_game && !timers.snow_loop_spawned {
+        if let Some(handle) = cache.get_or_load(&w_cfg.snow_loop_sound, &asset_server) {
+            commands.spawn((
+                SnowAmbienceLoop,
+                AudioPlayer::new(handle),
+                PlaybackSettings::LOOP.with_volume(Volume::Linear(0.0)),
+            ));
+            timers.snow_loop_spawned = true;
+        }
+    }
+    let dt = time.delta_secs();
+    let fade_step = w_cfg.audio_fade_speed * dt;
+    let target_rain = if ctx.in_game && ctx.current_weather == Some(WeatherKind::Rainy) { 1.0 } else { 0.0 };
+    let target_snow = if ctx.in_game && ctx.current_weather == Some(WeatherKind::Snowy) { 1.0 } else { 0.0 };
+    if timers.rain_audio_blend < target_rain {
+        timers.rain_audio_blend = (timers.rain_audio_blend + fade_step).min(target_rain);
+    } else {
+        timers.rain_audio_blend = (timers.rain_audio_blend - fade_step).max(target_rain);
+    }
+    if timers.snow_audio_blend < target_snow {
+        timers.snow_audio_blend = (timers.snow_audio_blend + fade_step).min(target_snow);
+    } else {
+        timers.snow_audio_blend = (timers.snow_audio_blend - fade_step).max(target_snow);
+    }
+    if let Ok(Some(mut sink)) = weather_loops.rain_loop_q.single_mut() {
+        let vol = settings.effective_gain(AudioCategory::Ambience, duck)
+            * w_cfg.rain_loop_volume
+            * timers.rain_audio_blend;
+        sink.set_volume(Volume::Linear(vol));
+    }
+    if let Ok(Some(mut sink)) = weather_loops.snow_loop_q.single_mut() {
+        let vol = settings.effective_gain(AudioCategory::Ambience, duck)
+            * w_cfg.snow_loop_volume
+            * timers.snow_audio_blend;
+        sink.set_volume(Volume::Linear(vol));
+    }
 }
+
 
 fn sync_audio_sink_volumes_system(
     settings: Res<AudioSettingsState>,

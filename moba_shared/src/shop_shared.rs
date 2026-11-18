@@ -1,3 +1,4 @@
+use crate::WeatherKind;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -32,6 +33,131 @@ impl ItemCategory {
 }
 
 /// تمام ۱۶ ویژگی قابل تقویت/تضعیف هیرو و سلاح‌ها (باف با عدد مثبت، دیباف با عدد منفی)
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct HeroEnvironmentStatModifier {
+    pub move_speed_pct: f32,
+    pub primary_fire_rate_pct: f32,
+    pub primary_damage_bonus: f32,
+    pub primary_reload_speed_pct: f32,
+    pub primary_magazine_bonus: i32,
+    pub primary_range_bonus: f32,
+    pub pistol_fire_rate_pct: f32,
+    pub pistol_damage_bonus: f32,
+    pub pistol_reload_speed_pct: f32,
+    pub pistol_magazine_bonus: i32,
+    pub pistol_range_bonus: f32,
+    pub hp_regen_bonus: f32,
+    pub stamina_regen_bonus: f32,
+    pub max_hp_bonus: f32,
+    pub max_stamina_bonus: f32,
+    pub armor_bonus: f32,
+    pub grenade_damage_bonus: f32,
+    pub grenade_aoe_bonus: f32,
+    pub grenade_max_charges_bonus: i32,
+    pub grenade_recharge_speed_pct: f32,
+    pub vision_range_bonus: f32,
+}
+
+impl HeroEnvironmentStatModifier {
+    pub fn zero() -> Self {
+        Self {
+            move_speed_pct: 0.0,
+            primary_fire_rate_pct: 0.0,
+            primary_damage_bonus: 0.0,
+            primary_reload_speed_pct: 0.0,
+            primary_magazine_bonus: 0,
+            primary_range_bonus: 0.0,
+            pistol_fire_rate_pct: 0.0,
+            pistol_damage_bonus: 0.0,
+            pistol_reload_speed_pct: 0.0,
+            pistol_magazine_bonus: 0,
+            pistol_range_bonus: 0.0,
+            hp_regen_bonus: 0.0,
+            stamina_regen_bonus: 0.0,
+            max_hp_bonus: 0.0,
+            max_stamina_bonus: 0.0,
+            armor_bonus: 0.0,
+            grenade_damage_bonus: 0.0,
+            grenade_aoe_bonus: 0.0,
+            grenade_max_charges_bonus: 0,
+            grenade_recharge_speed_pct: 0.0,
+            vision_range_bonus: 0.0,
+        }
+    }
+
+    pub fn add(&mut self, other: &Self) {
+        self.move_speed_pct += other.move_speed_pct;
+        self.primary_fire_rate_pct += other.primary_fire_rate_pct;
+        self.primary_damage_bonus += other.primary_damage_bonus;
+        self.primary_reload_speed_pct += other.primary_reload_speed_pct;
+        self.primary_magazine_bonus += other.primary_magazine_bonus;
+        self.primary_range_bonus += other.primary_range_bonus;
+        self.pistol_fire_rate_pct += other.pistol_fire_rate_pct;
+        self.pistol_damage_bonus += other.pistol_damage_bonus;
+        self.pistol_reload_speed_pct += other.pistol_reload_speed_pct;
+        self.pistol_magazine_bonus += other.pistol_magazine_bonus;
+        self.pistol_range_bonus += other.pistol_range_bonus;
+        self.hp_regen_bonus += other.hp_regen_bonus;
+        self.stamina_regen_bonus += other.stamina_regen_bonus;
+        self.max_hp_bonus += other.max_hp_bonus;
+        self.max_stamina_bonus += other.max_stamina_bonus;
+        self.armor_bonus += other.armor_bonus;
+        self.grenade_damage_bonus += other.grenade_damage_bonus;
+        self.grenade_aoe_bonus += other.grenade_aoe_bonus;
+        self.grenade_max_charges_bonus += other.grenade_max_charges_bonus;
+        self.grenade_recharge_speed_pct += other.grenade_recharge_speed_pct;
+        self.vision_range_bonus += other.vision_range_bonus;
+    }
+
+    pub fn to_item_stats_modifier(&self) -> ItemStatsModifier {
+        ItemStatsModifier {
+            move_speed_pct: self.move_speed_pct,
+            primary_fire_rate_pct: self.primary_fire_rate_pct,
+            primary_damage_bonus: self.primary_damage_bonus,
+            primary_reload_speed_pct: self.primary_reload_speed_pct,
+            primary_magazine_bonus: self.primary_magazine_bonus,
+            primary_range_bonus: self.primary_range_bonus,
+            pistol_fire_rate_pct: self.pistol_fire_rate_pct,
+            pistol_damage_bonus: self.pistol_damage_bonus,
+            pistol_reload_speed_pct: self.pistol_reload_speed_pct,
+            pistol_magazine_bonus: self.pistol_magazine_bonus,
+            pistol_range_bonus: self.pistol_range_bonus,
+            hp_regen_bonus: self.hp_regen_bonus,
+            stamina_regen_bonus: self.stamina_regen_bonus,
+            max_hp_bonus: self.max_hp_bonus,
+            max_stamina_bonus: self.max_stamina_bonus,
+            armor_bonus: self.armor_bonus,
+            grenade_damage_bonus: self.grenade_damage_bonus,
+            grenade_aoe_bonus: self.grenade_aoe_bonus,
+            grenade_max_charges_bonus: self.grenade_max_charges_bonus,
+            grenade_recharge_speed_pct: self.grenade_recharge_speed_pct,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroEnvironmentModifiers {
+    pub day: HeroEnvironmentStatModifier,
+    pub night: HeroEnvironmentStatModifier,
+    pub clear: HeroEnvironmentStatModifier,
+    pub rainy: HeroEnvironmentStatModifier,
+    pub snowy: HeroEnvironmentStatModifier,
+}
+
+impl HeroEnvironmentModifiers {
+    pub fn combined(&self, is_night: bool, weather: WeatherKind) -> HeroEnvironmentStatModifier {
+        let mut out = if is_night { self.night } else { self.day };
+        let w = match weather {
+            WeatherKind::Clear => &self.clear,
+            WeatherKind::Rainy => &self.rainy,
+            WeatherKind::Snowy => &self.snowy,
+        };
+        out.add(w);
+        out
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct ItemStatsModifier {
     pub move_speed_pct: f32,
@@ -462,7 +588,10 @@ pub fn recompute_player_slot_stats(
     let levels_gained = p.hero_level.saturating_sub(1) as f32;
     let growth = &base.level_growth;
 
-    let mut total_mod = ItemStatsModifier::zero();
+    let mut total_mod = base
+        .environment
+        .combined(p.active_is_night, p.active_weather)
+        .to_item_stats_modifier();
     for inv in &p.inventory {
         if let Some(item) = items_cfg.get_item(&inv.item_id) {
             total_mod.add(&item.stats);

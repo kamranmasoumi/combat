@@ -204,6 +204,68 @@ pub struct AudioConfig {
     pub ambient_zones: Vec<AmbientZoneAudioDef>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WeatherKind {
+    Clear,
+    Rainy,
+    Snowy,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WeatherConfig {
+    pub initial_weather: WeatherKind,
+    pub clear_min_duration_secs: f32,
+    pub clear_max_duration_secs: f32,
+    pub rainy_min_duration_secs: f32,
+    pub rainy_max_duration_secs: f32,
+    pub snowy_min_duration_secs: f32,
+    pub snowy_max_duration_secs: f32,
+    pub clear_weight: f32,
+    pub rainy_weight: f32,
+    pub snowy_weight: f32,
+    pub transition_duration_secs: f32,
+    pub rain_directional_illuminance_mult: f32,
+    pub rain_directional_color_rgb: (f32, f32, f32),
+    pub rain_ambient_color_rgb: (f32, f32, f32),
+    pub rain_ambient_brightness_mult: f32,
+    pub rain_fog_color_rgb: (f32, f32, f32),
+    pub rain_fog_start_mult: f32,
+    pub rain_fog_end_mult: f32,
+    pub snow_directional_illuminance_mult: f32,
+    pub snow_directional_color_rgb: (f32, f32, f32),
+    pub snow_ambient_color_rgb: (f32, f32, f32),
+    pub snow_ambient_brightness_mult: f32,
+    pub snow_fog_color_rgb: (f32, f32, f32),
+    pub snow_fog_start_mult: f32,
+    pub snow_fog_end_mult: f32,
+    pub rain_fall_speed: f32,
+    pub rain_wind_tilt: f32,
+    pub rain_density: f32,
+    pub rain_streak_width: f32,
+    pub rain_streak_length: f32,
+    pub rain_drop_color_rgba: (f32, f32, f32, f32),
+    pub snow_fall_speed: f32,
+    pub snow_sway_amp: f32,
+    pub snow_density: f32,
+    pub snow_flake_size: f32,
+    pub snow_flake_softness: f32,
+    pub snow_flake_color_rgba: (f32, f32, f32, f32),
+    pub lightning_min_interval_secs: f32,
+    pub lightning_max_interval_secs: f32,
+    pub lightning_flash_duration_secs: f32,
+    pub lightning_flash_directional_illuminance: f32,
+    pub lightning_flash_ambient_brightness: f32,
+    pub lightning_flash_color_rgb: (f32, f32, f32),
+    pub thunder_sound_delay_secs: f32,
+    pub thunder_sound: String,
+    pub thunder_volume: f32,
+    pub rain_loop_sound: String,
+    pub rain_loop_volume: f32,
+    pub snow_loop_sound: String,
+    pub snow_loop_volume: f32,
+    pub audio_fade_speed: f32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DayNightConfig {
     pub phase_duration_secs: f32,
@@ -239,6 +301,7 @@ pub struct TelemetryConfig {
 
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
+    pub weather: WeatherConfig,
     pub day_night: DayNightConfig,
     pub telemetry: TelemetryConfig,
     pub pause: PauseConfig,
@@ -288,6 +351,7 @@ impl GameConfig {
         cfg.validate_chat();
         cfg.validate_scoreboard();
         cfg.validate_audio();
+        cfg.validate_weather();
         cfg.validate_day_night();
         cfg.validate_telemetry();
         cfg.validate_ping();
@@ -616,12 +680,39 @@ impl GameConfig {
         if in_night { smooth } else { 1.0 - smooth }
     }
 
-    pub fn hero_effective_vision(&self, hero: &HeroDef, match_elapsed_secs: f32) -> f32 {
-        if self.is_night_at(match_elapsed_secs) {
+    pub fn hero_effective_vision(&self, hero: &HeroDef, match_elapsed_secs: f32, weather: WeatherKind) -> f32 {
+        let is_night = self.is_night_at(match_elapsed_secs);
+        let base = if is_night {
             hero.night_vision_range
         } else {
             hero.vision_range
+        };
+        let env_bonus = hero.environment.combined(is_night, weather).vision_range_bonus;
+        (base + env_bonus).max(4.0)
+    }
+
+    pub fn weather_duration_bounds(&self, weather: WeatherKind) -> (f32, f32) {
+        match weather {
+            WeatherKind::Clear => (self.weather.clear_min_duration_secs, self.weather.clear_max_duration_secs),
+            WeatherKind::Rainy => (self.weather.rainy_min_duration_secs, self.weather.rainy_max_duration_secs),
+            WeatherKind::Snowy => (self.weather.snowy_min_duration_secs, self.weather.snowy_max_duration_secs),
         }
+    }
+
+    pub fn validate_weather(&self) {
+        let w = &self.weather;
+        assert!(w.clear_min_duration_secs >= 5.0 && w.clear_max_duration_secs >= w.clear_min_duration_secs, "بازه زمانی آب و هوای صاف نامعتبر است");
+        assert!(w.rainy_min_duration_secs >= 5.0 && w.rainy_max_duration_secs >= w.rainy_min_duration_secs, "بازه زمانی آب و هوای بارانی نامعتبر است");
+        assert!(w.snowy_min_duration_secs >= 5.0 && w.snowy_max_duration_secs >= w.snowy_min_duration_secs, "بازه زمانی آب و هوای برفی نامعتبر است");
+        assert!(w.clear_weight > 0.0 && w.rainy_weight > 0.0 && w.snowy_weight > 0.0, "وزن احتمالات آب و هوا باید مثبت باشد");
+        assert!(w.transition_duration_secs > 0.0 && w.transition_duration_secs <= 30.0, "weather.transition_duration_secs نامعتبر است");
+        assert!(w.rain_fall_speed > 0.1 && w.rain_density > 0.05 && w.rain_streak_width > 0.002 && w.rain_streak_length > 0.02, "پارامترهای شیدر باران نامعتبر است");
+        assert!(w.snow_fall_speed > 0.02 && w.snow_density > 0.05 && w.snow_flake_size > 0.005 && (0.05..=1.0).contains(&w.snow_flake_softness), "پارامترهای شیدر برف نامعتبر است");
+        assert!(w.lightning_min_interval_secs >= 1.0 && w.lightning_max_interval_secs >= w.lightning_min_interval_secs, "بازه زمانی رعد و برق نامعتبر است");
+        assert!(w.lightning_flash_duration_secs > 0.05 && w.thunder_sound_delay_secs >= 0.0, "مدت فلش رعد و برق نامعتبر است");
+        assert!(!w.thunder_sound.trim().is_empty() && !w.rain_loop_sound.trim().is_empty() && !w.snow_loop_sound.trim().is_empty(), "مسیر فایل‌های صوتی آب و هوا نباید خالی باشد");
+        assert!((0.0..=2.0).contains(&w.thunder_volume) && (0.0..=2.0).contains(&w.rain_loop_volume) && (0.0..=2.0).contains(&w.snow_loop_volume), "ولوم صدای آب و هوا باید بین 0 تا 2 باشد");
+        assert!(w.audio_fade_speed > 0.0, "weather.audio_fade_speed باید مثبت باشد");
     }
 
     pub fn effective_vision_multiplier(&self, match_elapsed_secs: f32, night_mult: f32) -> f32 {
@@ -1340,6 +1431,7 @@ pub struct HeroDef {
     pub deep_water_speed_multiplier: f32,
     pub vision_range: f32,
     pub night_vision_range: f32,
+    pub environment: HeroEnvironmentModifiers,
     pub high_ground_vision_bonus: f32,
     pub wall_climb: WallClimbConfig,
     pub swing: HeroSwingConfig,
@@ -2185,6 +2277,9 @@ pub enum ShotAudioSource {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum GameplayFxEvent {
+    LightningStrike {
+        intensity: f32,
+    },
     ShotFired {
         muzzle_pos: Vec3,
         shot_dir: Vec3,
@@ -3030,6 +3125,7 @@ pub struct RemotePlayerSnapshot {
 pub struct ServerWorldSnapshot {
     pub tick: u64,
     pub match_elapsed_secs: f32,
+    pub current_weather: WeatherKind,
     pub dawn_total_kills: u32,
     pub dusk_total_kills: u32,
     pub soldier_pos: Vec3,
@@ -5868,7 +5964,7 @@ impl SharedFogOfWar {
         }
     }
 
-    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, allied_creeps: &[Vec3], match_elapsed_secs: f32) {
+    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, allied_creeps: &[Vec3], match_elapsed_secs: f32, weather: WeatherKind) {
         self.visible_now.fill(false);
 
         let struct_mult = config.effective_vision_multiplier(match_elapsed_secs, config.day_night.night_turret_vision_multiplier);
@@ -5880,7 +5976,7 @@ impl SharedFogOfWar {
                 .unwrap_or(hero_pos.y),
         );
 
-        let base_hero_vision = config.hero_effective_vision(hero, match_elapsed_secs);
+        let base_hero_vision = config.hero_effective_vision(hero, match_elapsed_secs, weather);
         let hero_range = base_hero_vision
             + if hero_ground_y >= config.map.high_ground_occlusion_min_diff {
                 hero.high_ground_vision_bonus
@@ -6123,6 +6219,8 @@ pub struct PlayerSlotState {
     pub hero_shallow_water_speed_multiplier: f32,
     pub hero_deep_water_speed_multiplier: f32,
     pub hero_vision_range: f32,
+    pub active_is_night: bool,
+    pub active_weather: WeatherKind,
     pub hero_weapon: HeroWeaponDef,
     pub hero_pistol: HeroWeaponDef,
     pub hero_grenade: HeroGrenadeDef,
@@ -6275,6 +6373,11 @@ pub struct AuthoritativeWorldState {
     pub dusk_time_bank_secs: f32,
     pub winning_team: Option<TeamId>,
     pub match_elapsed_secs: f32,
+    pub current_weather: WeatherKind,
+    pub weather_remaining_secs: f32,
+    pub lightning_cooldown_secs: f32,
+    pub last_env_is_night: bool,
+    pub last_env_weather: WeatherKind,
     pub next_wave_time_secs: f32,
     pub next_camp_spawn_time_secs: f32,
     pub next_creep_id: u64,
@@ -6520,6 +6623,11 @@ impl AuthoritativeWorldState {
             dusk_time_bank_secs: config.pause.team_time_bank_secs,
             winning_team: None,
             match_elapsed_secs: 0.0,
+            current_weather: config.weather.initial_weather,
+            weather_remaining_secs: config.weather_duration_bounds(config.weather.initial_weather).0,
+            lightning_cooldown_secs: config.weather.lightning_min_interval_secs,
+            last_env_is_night: false,
+            last_env_weather: config.weather.initial_weather,
             next_wave_time_secs: config.creeps.first_wave_delay_secs,
             next_camp_spawn_time_secs: config.neutral_camps.first_spawn_delay_secs,
             next_creep_id: 1,
@@ -7046,6 +7154,8 @@ impl AuthoritativeWorldState {
                 hero_shallow_water_speed_multiplier: hero.shallow_water_speed_multiplier,
                 hero_deep_water_speed_multiplier: hero.deep_water_speed_multiplier,
                 hero_vision_range: hero.vision_range,
+                active_is_night: false,
+                active_weather: config.weather.initial_weather,
                 ammo_in_mag: hero.weapon.magazine_size,
                 hero_weapon: hero.weapon,
                 hero_pistol: hero.pistol,
@@ -7493,6 +7603,7 @@ impl AuthoritativeWorldState {
         ServerWorldSnapshot {
             tick: self.tick,
             match_elapsed_secs: self.match_elapsed_secs,
+            current_weather: self.current_weather,
             dawn_total_kills: 0,
             dusk_total_kills: 0,
             soldier_pos: self.soldier_pos,
@@ -11839,7 +11950,7 @@ fn shared_authoritative_react_system(
         .filter(|p| !p.is_dead)
         .map(|p| {
             let h = config.active_hero(p.hero_index);
-            (p.slot_index, p.hero_team, p.soldier_pos, config.hero_effective_vision(h, world.match_elapsed_secs))
+            (p.slot_index, p.hero_team, p.soldier_pos, config.hero_effective_vision(h, world.match_elapsed_secs, world.current_weather))
         })
         .collect();
 
@@ -11947,10 +12058,11 @@ fn shared_authoritative_react_system(
                 .collect();
             let elapsed_secs = world.match_elapsed_secs;
             let courier_mult = config.effective_vision_multiplier(elapsed_secs, config.day_night.night_courier_vision_multiplier);
-            world.hero_vision_range = config.hero_effective_vision(hero, elapsed_secs);
+            let cur_weather = world.current_weather;
+            world.hero_vision_range = config.hero_effective_vision(hero, elapsed_secs, cur_weather);
             world
                 .fog_of_war
-                .update_for_hero(&config, hero_pos, hero, &allied_creep_positions, elapsed_secs);
+                .update_for_hero(&config, hero_pos, hero, &allied_creep_positions, elapsed_secs, cur_weather);
             for (c_pos, c_range) in allied_courier_vision {
                 world.fog_of_war.reveal_from_source(&config, c_pos, c_range * courier_mult, 48);
             }
@@ -13111,5 +13223,90 @@ fn step_ancients_system(
         };
 
         world.ancients[idx].is_invulnerable = !any_t3_dead || !has_enemy_lane_creeps;
+    }
+}
+
+impl AuthoritativeWorldState {
+    pub fn pick_next_weather(&mut self, config: &GameConfig) -> (WeatherKind, f32) {
+        let w = &config.weather;
+        let candidates = match self.current_weather {
+            WeatherKind::Clear => [
+                (WeatherKind::Rainy, w.rainy_weight),
+                (WeatherKind::Snowy, w.snowy_weight),
+            ],
+            WeatherKind::Rainy => [
+                (WeatherKind::Clear, w.clear_weight),
+                (WeatherKind::Snowy, w.snowy_weight),
+            ],
+            WeatherKind::Snowy => [
+                (WeatherKind::Clear, w.clear_weight),
+                (WeatherKind::Rainy, w.rainy_weight),
+            ],
+        };
+        let total_w = (candidates[0].1 + candidates[1].1).max(0.0001);
+        let next_w = if self.next_rand() * total_w <= candidates[0].1 {
+            candidates[0].0
+        } else {
+            candidates[1].0
+        };
+        let (min_d, max_d) = config.weather_duration_bounds(next_w);
+        let dur = min_d + (max_d - min_d).max(0.0) * self.next_rand();
+        (next_w, dur)
+    }
+}
+
+pub fn step_weather_and_environment_system(
+    time: Res<Time<Fixed>>,
+    config: Res<GameConfig>,
+    items_cfg: Res<crate::shop_shared::ItemsConfig>,
+    match_state: Option<Res<AuthoritativeMatchState>>,
+    mut world: ResMut<AuthoritativeWorldState>,
+) {
+    if match_state
+        .as_ref()
+        .is_some_and(|m| m.phase != MatchPhase::InGame)
+    {
+        return;
+    }
+    if world.pause_phase != PausePhase::Running || world.winning_team.is_some() {
+        return;
+    }
+
+    let dt = time.delta_secs();
+    world.weather_remaining_secs -= dt;
+    if world.weather_remaining_secs <= 0.0 {
+        let (next_w, next_dur) = world.pick_next_weather(&config);
+        world.current_weather = next_w;
+        world.weather_remaining_secs = next_dur;
+        if next_w == WeatherKind::Rainy {
+            let min_l = config.weather.lightning_min_interval_secs;
+            let max_l = config.weather.lightning_max_interval_secs;
+            world.lightning_cooldown_secs =
+                min_l + (max_l - min_l).max(0.0) * world.next_rand();
+        }
+    }
+
+    if world.current_weather == WeatherKind::Rainy {
+        world.lightning_cooldown_secs -= dt;
+        if world.lightning_cooldown_secs <= 0.0 {
+            let intensity = 0.85 + 0.30 * world.next_rand();
+            world.pending_fx.push(GameplayFxEvent::LightningStrike { intensity });
+            let min_l = config.weather.lightning_min_interval_secs;
+            let max_l = config.weather.lightning_max_interval_secs;
+            world.lightning_cooldown_secs =
+                min_l + (max_l - min_l).max(0.0) * world.next_rand();
+        }
+    }
+
+    let is_night = config.is_night_at(world.match_elapsed_secs);
+    let cur_weather = world.current_weather;
+    if is_night != world.last_env_is_night || cur_weather != world.last_env_weather {
+        world.last_env_is_night = is_night;
+        world.last_env_weather = cur_weather;
+        for p in &mut world.players {
+            p.active_is_night = is_night;
+            p.active_weather = cur_weather;
+            crate::shop_shared::recompute_player_slot_stats(p, &config, &items_cfg);
+        }
     }
 }

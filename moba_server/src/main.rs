@@ -2,6 +2,7 @@ use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use moba_shared::{
     create_shared_renet_server, parse_server_cli_args, step_couriers_system, step_shadow_blade_system, step_teleports_system,
+    step_weather_and_environment_system,
     try_buy_cart, try_buy_item, try_cancel_teleport, try_courier_deliver, try_courier_move_to,
     try_courier_return_to_fountain, try_cycle_item_mode, try_sell_courier_item, try_sell_item,
     try_activate_shadow_blade, try_start_teleport, try_swap_inventory_slots, AuthoritativeMatchState,
@@ -123,6 +124,9 @@ fn main() {
                     .after(MobaPhysicsSet::Drive)
                     .before(server_send_snapshot_system),
                 step_shadow_blade_system
+                    .after(MobaPhysicsSet::Drive)
+                    .before(server_send_snapshot_system),
+                step_weather_and_environment_system
                     .after(MobaPhysicsSet::Drive)
                     .before(server_send_snapshot_system),
                 server_send_snapshot_system.after(MobaPhysicsSet::React),

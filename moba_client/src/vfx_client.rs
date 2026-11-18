@@ -9,7 +9,7 @@ use bevy_hanabi::prelude::{
     SetPositionSphereModifier, SetVelocitySphereModifier, ShapeDimension, SizeOverLifetimeModifier,
     SpawnerSettings,
 };
-use moba_shared::{particle_physics_bundle, BulletVfxSource, GameConfig, ImpactSurface, WeaponKind, WeaponVfxProfile};
+use moba_shared::{particle_physics_bundle, BulletVfxSource, GameConfig, ImpactSurface, WeaponKind, WeaponVfxProfile, WeatherKind};
 use std::collections::HashMap;
 
 // -----------------------------------------------------------------------------
@@ -707,15 +707,19 @@ impl Plugin for MobaVfxPlugin {
             .add_plugins(MaterialPlugin::<ExplosionFireballMaterial>::default())
             .add_plugins(MaterialPlugin::<WaterExplosionMaterial>::default())
             .add_plugins(MaterialPlugin::<TeleportPortalMaterial>::default())
+            .add_plugins(MaterialPlugin::<WeatherRainMaterial>::default())
+            .add_plugins(MaterialPlugin::<WeatherSnowMaterial>::default())
             .init_resource::<VfxEventQueue>()
             .init_resource::<VfxMaterialPool>()
             .init_resource::<BulletVfxRegistry>()
+            .init_resource::<WeatherVfxState>()
             .add_systems(Startup, (init_hanabi_vfx_assets_system, init_bullet_vfx_registry_system))
             .add_systems(
                 Update,
                 (
                     process_vfx_events_system,
                     update_vfx_lifetimes_system,
+                    update_weather_vfx_system,
                 )
                     .chain(),
             );
@@ -2384,4 +2388,309 @@ pub fn build_curved_waterfall_mesh() -> Mesh {
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(indices));
     mesh
+}
+
+#[derive(ShaderType, Debug, Clone)]
+pub struct WeatherShaderUniforms {
+    pub color: Vec4,
+    pub params: Vec4,
+    pub shape: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct WeatherRainMaterial {
+    #[uniform(0)]
+    pub uniforms: WeatherShaderUniforms,
+}
+
+impl Material for WeatherRainMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/weather_rain.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct WeatherSnowMaterial {
+    #[uniform(0)]
+    pub uniforms: WeatherShaderUniforms,
+}
+
+impl Material for WeatherSnowMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/weather_snow.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct WeatherVfxState {
+    pub active_weather: Option<WeatherKind>,
+    pub camera_focus: Vec3,
+}
+
+#[derive(Component)]
+struct WeatherRainMesh {
+    fade: f32,
+}
+
+#[derive(Component)]
+struct WeatherRainGroundMesh;
+
+fn build_weather_terrain_splash_mesh(canyon: &moba_shared::CanyonConfig) -> Mesh {
+    let nx: usize = 96;
+    let nz: usize = 72;
+    let min_x = -160.0_f32;
+    let max_x = 160.0_f32;
+    let min_z = -110.0_f32;
+    let max_z = 110.0_f32;
+    let dx = (max_x - min_x) / (nx as f32);
+    let dz = (max_z - min_z) / (nz as f32);
+
+    let cols = nx + 1;
+    let rows = nz + 1;
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(cols * rows);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(cols * rows);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(cols * rows);
+    let mut heights: Vec<f32> = Vec::with_capacity(cols * rows);
+
+    for iz in 0..rows {
+        let z = min_z + (iz as f32) * dz;
+        for ix in 0..cols {
+            let x = min_x + (ix as f32) * dx;
+            let y = moba_shared::canyon_sample_height(canyon, x, z);
+            heights.push(y);
+            positions.push([x, y + 0.05, z]);
+            normals.push([0.0, 1.0, 0.0]);
+            uvs.push([0.5, 0.5]);
+        }
+    }
+
+    let water_cutoff = canyon.water_y + 0.18;
+    let mut indices: Vec<u32> = Vec::new();
+    for iz in 0..nz {
+        for ix in 0..nx {
+            let i00 = iz * cols + ix;
+            let i10 = i00 + 1;
+            let i01 = i00 + cols;
+            let i11 = i01 + 1;
+            if heights[i00] > water_cutoff
+                && heights[i10] > water_cutoff
+                && heights[i01] > water_cutoff
+                && heights[i11] > water_cutoff
+            {
+                indices.extend_from_slice(&[
+                    i00 as u32, i01 as u32, i10 as u32,
+                    i10 as u32, i01 as u32, i11 as u32,
+                ]);
+            }
+        }
+    }
+
+    let mut mesh = Mesh::new(
+        bevy::mesh::PrimitiveTopology::TriangleList,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(bevy::mesh::Indices::U32(indices));
+    mesh
+}
+
+#[derive(Component)]
+struct WeatherSnowMesh {
+    fade: f32,
+}
+
+fn build_weather_curtain_mesh(width: f32, height: f32, include_ground_splashes: bool) -> Mesh {
+    // چند صفحه مورب رو به دوربین ایزومتریک (با دو رویه برای دید کامل)
+    let hw = width * 0.5;
+    let hh = height * 0.5;
+    let offsets = [
+        Vec3::new(0.0, 9.5, 4.0),
+        Vec3::new(0.0, 12.5, -2.5),
+    ];
+    let tilt_rad: f32 = -0.58;
+    let rot = Quat::from_rotation_x(tilt_rad);
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    for (layer_idx, off) in offsets.iter().enumerate() {
+        let base = positions.len() as u32;
+        let corners = [
+            Vec3::new(-hw, -hh, 0.0),
+            Vec3::new(hw, -hh, 0.0),
+            Vec3::new(hw, hh, 0.0),
+            Vec3::new(-hw, hh, 0.0),
+        ];
+        let u_shift = (layer_idx as f32) * 0.31;
+        let layer_uvs = [
+            [0.0 + u_shift, 0.0],
+            [1.0 + u_shift, 0.0],
+            [1.0 + u_shift, 1.0],
+            [0.0 + u_shift, 1.0],
+        ];
+        let n = (rot * Vec3::Z).to_array();
+        for i in 0..4 {
+            let p = *off + rot * corners[i];
+            positions.push(p.to_array());
+            normals.push(n);
+            uvs.push(layer_uvs[i]);
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    if include_ground_splashes {
+        let base = positions.len() as u32;
+        let gy = 0.08_f32;
+        let gw = width * 0.48;
+        let gd = height * 0.65;
+        let g_corners = [
+            [-gw, gy, -gd],
+            [gw, gy, -gd],
+            [gw, gy, gd],
+            [-gw, gy, gd],
+        ];
+        let g_uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        for i in 0..4 {
+            positions.push(g_corners[i]);
+            normals.push([0.0, 1.0, 0.0]);
+            uvs.push(g_uvs[i]);
+        }
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+    }
+
+    let mut mesh = Mesh::new(
+        bevy::mesh::PrimitiveTopology::TriangleList,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(bevy::mesh::Indices::U32(indices));
+    mesh
+}
+
+fn update_weather_vfx_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    config: Res<GameConfig>,
+    weather_state: Res<WeatherVfxState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut rain_mats: ResMut<Assets<WeatherRainMaterial>>,
+    mut snow_mats: ResMut<Assets<WeatherSnowMaterial>>,
+    mut rain_q: Query<(Entity, &mut WeatherRainMesh, &MeshMaterial3d<WeatherRainMaterial>, &mut Transform), (Without<WeatherSnowMesh>, Without<WeatherRainGroundMesh>)>,
+    rain_ground_q: Query<Entity, (With<WeatherRainGroundMesh>, Without<WeatherRainMesh>, Without<WeatherSnowMesh>)>,
+    mut snow_q: Query<(Entity, &mut WeatherSnowMesh, &MeshMaterial3d<WeatherSnowMaterial>, &mut Transform), Without<WeatherRainMesh>>,
+) {
+    let dt = time.delta_secs();
+    let t = time.elapsed_secs();
+    let w = &config.weather;
+    let fade_rate = dt / w.transition_duration_secs.max(0.1);
+    let focus = Vec3::new(weather_state.camera_focus.x, 0.0, weather_state.camera_focus.z);
+
+    let want_rain = weather_state.active_weather == Some(WeatherKind::Rainy);
+    if want_rain && rain_q.is_empty() {
+        let mesh = meshes.add(build_weather_curtain_mesh(54.0, 32.0, false));
+        let c = w.rain_drop_color_rgba;
+        let mat = rain_mats.add(WeatherRainMaterial {
+            uniforms: WeatherShaderUniforms {
+                color: Vec4::new(c.0, c.1, c.2, c.3),
+                params: Vec4::new(t, w.rain_fall_speed, w.rain_wind_tilt, w.rain_density),
+                shape: Vec4::new(w.rain_streak_width, w.rain_streak_length, 0.0, 1.37),
+            },
+        });
+        commands.spawn((
+            WeatherRainMesh { fade: 0.0 },
+            Mesh3d(mesh),
+            MeshMaterial3d(mat.clone()),
+            Transform::from_translation(focus),
+            NotShadowCaster,
+        ));
+        if rain_ground_q.is_empty() {
+            let g_mesh = meshes.add(build_weather_terrain_splash_mesh(&config.map.canyon));
+            commands.spawn((
+                WeatherRainGroundMesh,
+                Mesh3d(g_mesh),
+                MeshMaterial3d(mat),
+                Transform::IDENTITY,
+                NotShadowCaster,
+            ));
+        }
+    }
+    for (ent, mut rm, mat_h, mut tf) in &mut rain_q {
+        tf.translation = focus;
+        if want_rain {
+            rm.fade = (rm.fade + fade_rate).min(1.0);
+        } else {
+            rm.fade = (rm.fade - fade_rate).max(0.0);
+            if rm.fade <= 0.001 {
+                commands.entity(ent).despawn();
+                for ge in &rain_ground_q {
+                    commands.entity(ge).despawn();
+                }
+                continue;
+            }
+        }
+        if let Some(mut mat) = rain_mats.get_mut(&mat_h.0) {
+            mat.uniforms.params.x = t;
+            mat.uniforms.shape.z = rm.fade;
+        }
+    }
+
+    let want_snow = weather_state.active_weather == Some(WeatherKind::Snowy);
+    if want_snow && snow_q.is_empty() {
+        let mesh = meshes.add(build_weather_curtain_mesh(56.0, 32.0, false));
+        let c = w.snow_flake_color_rgba;
+        let mat = snow_mats.add(WeatherSnowMaterial {
+            uniforms: WeatherShaderUniforms {
+                color: Vec4::new(c.0, c.1, c.2, c.3),
+                params: Vec4::new(t, w.snow_fall_speed, w.snow_sway_amp, w.snow_density),
+                shape: Vec4::new(w.snow_flake_size, w.snow_flake_softness, 0.0, 2.71),
+            },
+        });
+        commands.spawn((
+            WeatherSnowMesh { fade: 0.0 },
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::from_translation(focus),
+            NotShadowCaster,
+        ));
+    }
+    for (ent, mut sm, mat_h, mut tf) in &mut snow_q {
+        tf.translation = focus;
+        if want_snow {
+            sm.fade = (sm.fade + fade_rate).min(1.0);
+        } else {
+            sm.fade = (sm.fade - fade_rate).max(0.0);
+            if sm.fade <= 0.001 {
+                commands.entity(ent).despawn();
+                continue;
+            }
+        }
+        if let Some(mut mat) = snow_mats.get_mut(&mat_h.0) {
+            mat.uniforms.params.x = t;
+            mat.uniforms.shape.z = sm.fade;
+        }
+    }
 }

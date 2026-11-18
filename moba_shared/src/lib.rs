@@ -1671,6 +1671,7 @@ pub struct CanyonConfig {
     pub mist_intensity: f32,
     pub mist_drift_speed: f32,
     pub grid_resolution: (u32, u32),
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1690,6 +1691,7 @@ pub struct RoshanPitConfig {
     pub climb_enter_distance: f32,
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1760,6 +1762,7 @@ pub struct WaterfallDef {
     pub water_color_rgb: (f32, f32, f32),
     pub foam_emissive_rgb: (f32, f32, f32),
     pub mist_particle_interval_secs: f32,
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1773,6 +1776,7 @@ pub struct CenterBridgeDef {
     pub color_rgb: (f32, f32, f32),
     pub accent_color_rgb: (f32, f32, f32),
     pub roughness: f32,
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1804,6 +1808,7 @@ pub struct AncientDef {
     pub backdoor_protection_requires_creeps: bool,
     pub color_rgb: (f32, f32, f32),
     pub core_emissive_rgb: (f32, f32, f32),
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -1837,6 +1842,7 @@ pub struct BarracksDef {
     pub backdoor_protection_requires_creeps: bool,
     pub color_rgb: (f32, f32, f32),
     pub accent_emissive_rgb: (f32, f32, f32),
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1863,6 +1869,7 @@ pub struct TurretDef {
     pub backdoor_protection_requires_creeps: bool,
     pub color_rgb: (f32, f32, f32),
     pub crystal_emissive_rgb: (f32, f32, f32),
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1874,6 +1881,7 @@ pub struct MountainDef {
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
     pub climbable: bool,
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1888,6 +1896,7 @@ pub struct TreeDef {
     pub canopy_height: f32,
     pub trunk_color_rgb: (f32, f32, f32),
     pub canopy_color_rgb: (f32, f32, f32),
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1899,6 +1908,7 @@ pub struct LanePathDef {
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
     pub waypoints: Vec<(f32, f32, f32)>,
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1911,6 +1921,7 @@ pub struct ObstacleDef {
     pub can_vault: bool,
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
+    pub occlusion_fade_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3137,11 +3148,7 @@ pub fn sample_camera_focus_y(config: &GameConfig, x: f32, z: f32) -> f32 {
         }
     }
 
-    if config.map.canyon.enabled && canyon_sample_height(&config.map.canyon, x, z) < -0.15 {
-        config.map.canyon.water_y
-    } else {
-        0.0
-    }
+    0.0
 }
 
 pub fn sample_waterfall_depth_offset(config: &GameConfig, wx: f32, wz: f32) -> f32 {
@@ -3219,6 +3226,67 @@ pub fn sample_water_surface_at(config: &GameConfig, world_pos: Vec3) -> Option<(
         return Some((wy, f));
     }
     None
+}
+
+/// تقاطع اشعه دوربین با سطح آب برکه‌ها و رودخانه دره (برای دقت هدف‌گیری سه‌بعدی روی سطح آب)
+pub fn raycast_water_surface(
+    config: &GameConfig,
+    origin: Vec3,
+    ray_dir: Vec3,
+    max_dist: f32,
+) -> Option<(f32, Vec3)> {
+    if ray_dir.y.abs() <= 1e-5 {
+        return None;
+    }
+    let mut best: Option<(f32, Vec3)> = None;
+    for seg in &config.map.river_segments {
+        let seg_tf = seg.model_transform.to_transform();
+        let seg_pos = seg_tf.translation;
+        let half = Vec3::new(
+            seg.size.0 * 0.5 * seg_tf.scale.x,
+            seg.size.1 * 0.5 * seg_tf.scale.y,
+            seg.size.2 * 0.5 * seg_tf.scale.z,
+        );
+        let water_top_y = seg_pos.y + half.y;
+        let t = (water_top_y - origin.y) / ray_dir.y;
+        if t <= 0.0 || t > max_dist {
+            continue;
+        }
+        let hit_pt = origin + ray_dir * t;
+        if is_point_in_roshan_pit_circle(
+            &config.map.roshan_pit,
+            hit_pt.x,
+            hit_pt.z,
+            config.map.roshan_pit.outer_radius,
+        ) {
+            continue;
+        }
+        let inv_rot = seg_tf.rotation.inverse();
+        let local = inv_rot * (hit_pt - seg_pos);
+        let nx = local.x / half.x.max(0.1);
+        let nz = local.z / half.z.max(0.1);
+        if nx * nx + nz * nz <= 1.00 && best.map_or(true, |(bt, _)| t < bt) {
+            best = Some((t, hit_pt));
+        }
+    }
+    if config.map.canyon.enabled {
+        let wy = config.map.canyon.water_y;
+        let t = (wy - origin.y) / ray_dir.y;
+        if t > 0.0 && t <= max_dist {
+            let hit_pt = origin + ray_dir * t;
+            if !is_point_in_roshan_pit_circle(
+                &config.map.roshan_pit,
+                hit_pt.x,
+                hit_pt.z,
+                config.map.roshan_pit.outer_radius,
+            ) && canyon_sample_height(&config.map.canyon, hit_pt.x, hit_pt.z) < wy - 0.10
+                && best.map_or(true, |(bt, _)| t < bt)
+            {
+                best = Some((t, hit_pt));
+            }
+        }
+    }
+    best
 }
 
 /// کامپوننت غیرفعال‌سازی کولایدر (برای اهداف منهدم‌شده)
@@ -6936,14 +7004,19 @@ impl AuthoritativeWorldState {
             } else {
                 None
             };
+            let in_deep_water_loco = p.current_locomotion == "swimming"
+                || p.current_locomotion == "treading_water";
+            let is_climb_loco = p.current_locomotion.starts_with("climbing_");
             let upper_anim = if p.grenade_elapsed_and_duration.is_some() {
                 Some("toss_grenade".to_string())
             } else if p.reload_remaining.is_some() {
                 Some("reloading".to_string())
-            } else if p.firing_anim_remaining.is_some() {
-                Some("firing_rifle".to_string())
-            } else {
+            } else if in_deep_water_loco || is_climb_loco {
                 None
+            } else if p.active_weapon == ActiveWeaponSlot::Pistol {
+                Some("pistol_run".to_string())
+            } else {
+                Some("rifle_aiming_idle".to_string())
             };
             others.push(RemotePlayerSnapshot {
                 slot_index: p.slot_index,
@@ -8461,18 +8534,16 @@ fn shared_drive_single_player(
 
                 if !locked_enemy {
                     if input.vertical_aim_held {
-                        if hit.normal.y > 0.7 {
-                            // تقاطع خود اشعه دوربین با صفحه ارتفاعی هم‌تراز سینه روی همان سطح زمین
-                            // تا انتهای خط لیزر دقیقاً روی پیکسل مرکز نشانه‌گر موس منطبق بماند
-                            let elevated_plane_y = hit.point.y + config.soldier.aim_plane_height_offset;
-                            let t_elevated = (elevated_plane_y - input.aim_ray_origin.y) / ray_dir.y;
-                            if t_elevated > 0.0 {
-                                resolved_hit = Some(input.aim_ray_origin + ray_dir * t_elevated);
-                            } else {
-                                resolved_hit = Some(hit.point);
-                            }
+                        // در حالت هدف‌گیری سه‌بعدی (نگه داشتن X)، اگر اشعه دوربین قبل از کف رودخانه
+                        // به سطح آب برخورد کند، سطح آب ملاک هدف قرار می‌گیرد
+                        if let Some((_, water_pt)) = raycast_water_surface(
+                            config,
+                            input.aim_ray_origin,
+                            ray_dir,
+                            hit.toi,
+                        ) {
+                            resolved_hit = Some(water_pt);
                         } else {
-                            // برخورد با دیواره عمودی، صخره یا مانع: خود نقطه برخورد روی اشعه موس است
                             resolved_hit = Some(hit.point);
                         }
                     } else {
@@ -8482,6 +8553,21 @@ fn shared_drive_single_player(
                         if t > 0.0 {
                             resolved_hit = Some(input.aim_ray_origin + ray_dir * t);
                         }
+                    }
+                }
+            } else if input.vertical_aim_held {
+                if let Some((_, water_pt)) = raycast_water_surface(
+                    config,
+                    input.aim_ray_origin,
+                    ray_dir,
+                    max_aim_dist,
+                ) {
+                    resolved_hit = Some(water_pt);
+                } else {
+                    let aim_plane_y = world.soldier_pos.y + config.soldier.aim_plane_height_offset;
+                    let t = (aim_plane_y - input.aim_ray_origin.y) / ray_dir.y;
+                    if t > 0.0 {
+                        resolved_hit = Some(input.aim_ray_origin + ray_dir * t);
                     }
                 }
             } else {
@@ -11260,6 +11346,16 @@ fn shared_authoritative_react_system(
             if hit.toi < best_toi {
                 best_toi = hit.toi;
                 hit_world_ent = Some(hit_ent);
+                hit_hero = None;
+                hit_creep = None;
+                hit_courier = None;
+            }
+        }
+
+        if let Some((water_toi, _)) = raycast_water_surface(&config, muzzle_pos, beam_dir, best_toi) {
+            if water_toi < best_toi {
+                best_toi = water_toi;
+                hit_world_ent = None;
                 hit_hero = None;
                 hit_creep = None;
                 hit_courier = None;

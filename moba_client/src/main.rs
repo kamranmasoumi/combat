@@ -383,7 +383,7 @@ fn main() {
                 align_weapon_horizontally_system,
                 align_other_weapons_horizontally_system,
             )
-                .after(bevy::app::AnimationSystems)
+                .after(compensate_upper_body_hips_twist_system)
                 .before(TransformSystems::Propagate)
                 .run_if(in_state(AppScreenState::InGame)),
         )
@@ -910,6 +910,7 @@ struct ClientRenderState {
     previous_lower_anim: String,
     previous_upper_anim: String,
     neutral_hips_yaw: Option<f32>,
+    smoothed_aim_pitch: f32,
     upper_action: UpperBodyAction,
     traversal_active: bool,
     traversal_anim_name: String,
@@ -958,6 +959,7 @@ impl ClientRenderState {
             previous_lower_anim: String::new(),
             previous_upper_anim: String::new(),
             neutral_hips_yaw: None,
+            smoothed_aim_pitch: 0.0,
             upper_action: UpperBodyAction::None,
             traversal_active: false,
             traversal_anim_name: String::new(),
@@ -1548,7 +1550,9 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
-        ent_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
+        if wf.occlusion_fade_enabled {
+            ent_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
+        }
         let wf_ent = ent_cmds.id();
         if custom_glb_exists(&wf.model_path) {
             ent_cmds.with_children(|parent| {
@@ -1707,11 +1711,13 @@ fn setup_scene(
     let mut bridge_cmds = commands.spawn((
         center_bridge_physics_bundle(&config, bridge),
         Visibility::Visible,
-        VisionOccludable {
+    ));
+    if bridge.occlusion_fade_enabled {
+        bridge_cmds.insert(VisionOccludable {
             is_faded: false,
             half_extents: Vec3::new(bridge.outer_radius, bridge.deck_thickness * 0.5, bridge.outer_radius),
-        },
-    ));
+        });
+    }
 
     let bridge_ent = bridge_cmds.id();
     if custom_glb_exists(&bridge.model_path) {
@@ -1790,11 +1796,13 @@ fn setup_scene(
             RoshanPitVisualRoot,
             pit_tf,
             Visibility::Visible,
-            VisionOccludable {
+        ));
+        if pit.occlusion_fade_enabled {
+            pit_cmds.insert(VisionOccludable {
                 is_faded: false,
                 half_extents: Vec3::new(pit.outer_radius, pit.wall_height * 0.6, pit.outer_radius),
-            },
-        ));
+            });
+        }
         let pit_ent = pit_cmds.id();
 
         if custom_glb_exists(&pit.model_path) {
@@ -1887,24 +1895,26 @@ fn setup_scene(
             let end = Vec3::new(b.0, b.1, b.2);
             let len_3d = start.distance(end);
             if len_3d > 0.1 {
-                commands
-                    .spawn((
-                        Mesh3d(meshes.add(Cuboid::new(lane.width, lane.thickness, len_3d))),
-                        MeshMaterial3d(lane_mat.clone()),
-                        lane_segment_physics_bundle(
-                            &config,
-                            format!("{}_seg_{}", lane.id, seg_idx),
-                            start,
-                            end,
-                            lane.width,
-                            lane.thickness,
-                        ),
-                        Visibility::Visible,
-                        VisionOccludable {
-                            is_faded: false,
-                            half_extents: Vec3::new(lane.width * 0.5, lane.thickness * 0.5, len_3d * 0.5),
-                        },
-                    ))
+                let mut seg_cmds = commands.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(lane.width, lane.thickness, len_3d))),
+                    MeshMaterial3d(lane_mat.clone()),
+                    lane_segment_physics_bundle(
+                        &config,
+                        format!("{}_seg_{}", lane.id, seg_idx),
+                        start,
+                        end,
+                        lane.width,
+                        lane.thickness,
+                    ),
+                    Visibility::Visible,
+                ));
+                if lane.occlusion_fade_enabled {
+                    seg_cmds.insert(VisionOccludable {
+                        is_faded: false,
+                        half_extents: Vec3::new(lane.width * 0.5, lane.thickness * 0.5, len_3d * 0.5),
+                    });
+                }
+                seg_cmds
                     .with_children(|parent| {
                         // لبه‌های سنگی دو طرف جاده (Curbs)
                         for &side in &[-1.0_f32, 1.0_f32] {
@@ -1993,7 +2003,9 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
-        anc_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(bs.x * 0.5, anc.core_height * 0.6, bs.z * 0.5) });
+        if anc.occlusion_fade_enabled {
+            anc_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(bs.x * 0.5, anc.core_height * 0.6, bs.z * 0.5) });
+        }
         let anc_ent = anc_cmds.id();
         if custom_glb_exists(&anc.model_path) {
             anc_cmds.with_children(|parent| {
@@ -2100,7 +2112,9 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
-        tur_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(tur.base_radius * 1.4, tur.height * 0.55, tur.base_radius * 1.4) });
+        if tur.occlusion_fade_enabled {
+            tur_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(tur.base_radius * 1.4, tur.height * 0.55, tur.base_radius * 1.4) });
+        }
         let tur_ent = tur_cmds.id();
         if custom_glb_exists(&tur.model_path) {
             tur_cmds.with_children(|parent| {
@@ -2186,10 +2200,12 @@ fn setup_scene(
             },
             Visibility::Visible,
         ));
-        bar_cmds.insert(VisionOccludable {
-            is_faded: false,
-            half_extents: bs * 0.5,
-        });
+        if bar.occlusion_fade_enabled {
+            bar_cmds.insert(VisionOccludable {
+                is_faded: false,
+                half_extents: bs * 0.5,
+            });
+        }
         let bar_ent = bar_cmds.id();
         if custom_glb_exists(&bar.model_path) {
             bar_cmds.with_children(|parent| {
@@ -2257,7 +2273,9 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
-        mtn_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
+        if mtn.occlusion_fade_enabled {
+            mtn_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
+        }
         let mtn_ent = mtn_cmds.id();
         if custom_glb_exists(&mtn.model_path) {
             mtn_cmds.with_children(|parent| {
@@ -2319,7 +2337,9 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
-        tree_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(tree.canopy_radius, (tree.trunk_height + tree.canopy_height) * 0.5, tree.canopy_radius) });
+        if tree.occlusion_fade_enabled {
+            tree_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(tree.canopy_radius, (tree.trunk_height + tree.canopy_height) * 0.5, tree.canopy_radius) });
+        }
         tree_cmds.insert(TreeVisualMarker { shadows_optimized: false });
         let tree_ent = tree_cmds.id();
         if custom_glb_exists(&tree.model_path) {
@@ -2412,7 +2432,9 @@ fn setup_scene(
             Visibility::Visible,
         ));
 
-        obs_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
+        if obs.occlusion_fade_enabled {
+            obs_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
+        }
         let obs_ent = obs_cmds.id();
         if custom_glb_exists(&obs.model_path) {
             obs_cmds.with_children(|parent| {
@@ -3761,14 +3783,31 @@ fn attach_weapon_to_left_hand(
 fn align_weapon_horizontally_system(
     status: Res<WeaponAttachmentStatus>,
     tuner: Res<WeaponTuner>,
-    soldier_query: Query<&Transform, (With<SoldierMarker>, Without<WeaponRoot>)>,
-    global_transforms: Query<&GlobalTransform>,
+    render_state: Res<ClientRenderState>,
+    soldier_query: Query<(Entity, &Transform), (With<SoldierMarker>, Without<WeaponRoot>)>,
+    parents_query: Query<&ChildOf>,
+    transforms_query: Query<&Transform, Without<WeaponRoot>>,
     mut weapon_query: Query<&mut Transform, With<WeaponRoot>>,
 ) {
     let Some(hand_entity) = status.hand_entity else { return };
-    let Ok(soldier_tf) = soldier_query.single() else { return };
-    let Ok(hand_gtf) = global_transforms.get(hand_entity) else { return };
+    let Ok((soldier_ent, soldier_tf)) = soldier_query.single() else { return };
     let Ok(mut weapon_tf) = weapon_query.single_mut() else { return };
+
+    let mut hand_world_rot = Quat::IDENTITY;
+    let mut cur = hand_entity;
+    for _ in 0..32 {
+        if let Ok(tf) = transforms_query.get(cur) {
+            hand_world_rot = tf.rotation * hand_world_rot;
+        }
+        if cur == soldier_ent {
+            break;
+        }
+        if let Ok(parent) = parents_query.get(cur) {
+            cur = parent.parent();
+        } else {
+            break;
+        }
+    }
 
     let hero_forward =
         Vec3::new(soldier_tf.back().x, 0.0, soldier_tf.back().z).normalize_or_zero();
@@ -3778,9 +3817,9 @@ fn align_weapon_horizontally_system(
 
     let desired_world_rot = Transform::IDENTITY
         .looking_to(hero_forward, Vec3::Y)
-        .rotation;
+        .rotation
+        * Quat::from_rotation_x(render_state.smoothed_aim_pitch);
 
-    let (_, hand_world_rot, _) = hand_gtf.to_scale_rotation_translation();
     let user_rot_offset = Quat::from_euler(
         EulerRot::YXZ,
         tuner.rotation.y.to_radians(),
@@ -5683,7 +5722,9 @@ fn camera_follow_system(
         let terrain_y = moba_shared::sample_camera_focus_y(&config, free_target.x, free_target.z);
         Vec3::new(free_target.x, terrain_y, free_target.z)
     } else {
-        soldier_tf.translation + ex.camera_control.current_cursor_lead
+        let mut focus = soldier_tf.translation + ex.camera_control.current_cursor_lead;
+        focus.y = focus.y.max(0.0);
+        focus
     };
 
     let cam_alpha = (1.0 - (-config.camera.follow_lerp_speed * dt).exp()).clamp(0.0, 1.0);
@@ -5863,33 +5904,32 @@ fn soldier_animation_player_system(
         }
         UpperBodyAction::FiringRifle => {
             if hero_hud.0.active_weapon == ActiveWeaponSlot::Pistol {
-                let pistol_node = anim_assets.require_node("pistol_run");
+                let pistol_node = anim_assets.get_or_fallback("pistol_run", "rifle_aiming_idle");
                 if render_state.previous_upper_anim != "pistol_run"
                     || !upper_player.is_playing_animation(pistol_node)
                 {
-                    let node = anim_assets.require_node("pistol_run");
                     upper_trans
-                        .play(&mut upper_player, node, loco_blend)
+                        .play(&mut upper_player, pistol_node, loco_blend)
                         .repeat();
                     render_state.previous_upper_anim = "pistol_run".to_string();
                 }
-            } else if render_state.previous_upper_anim != "firing_rifle" {
-                let node = anim_assets.require_node("firing_rifle");
-                upper_trans
-                    .play(
-                        &mut upper_player,
-                        node,
-                        Duration::from_millis(config.animations.firing_blend_ms),
-                    )
-                    .replay();
-                render_state.previous_upper_anim = "firing_rifle".to_string();
+            } else {
+                let aim_node = anim_assets.get_or_fallback("rifle_aiming_idle", "idle");
+                if render_state.previous_upper_anim != "rifle_aiming_idle"
+                    || !upper_player.is_playing_animation(aim_node)
+                {
+                    upper_trans
+                        .play(&mut upper_player, aim_node, loco_blend)
+                        .repeat();
+                    render_state.previous_upper_anim = "rifle_aiming_idle".to_string();
+                }
             }
         }
         UpperBodyAction::None => {
             let in_deep_water_anim = render_state.current_locomotion == "swimming"
                 || render_state.current_locomotion == "treading_water";
             if hero_hud.0.active_weapon == ActiveWeaponSlot::Pistol && !in_deep_water_anim {
-                let node = anim_assets.require_node("pistol_run");
+                let node = anim_assets.get_or_fallback("pistol_run", "rifle_aiming_idle");
                 if render_state.previous_upper_anim != "pistol_run"
                     || !upper_player.is_playing_animation(node)
                 {
@@ -5897,6 +5937,16 @@ fn soldier_animation_player_system(
                         .play(&mut upper_player, node, loco_blend)
                         .repeat();
                     render_state.previous_upper_anim = "pistol_run".to_string();
+                }
+            } else if !in_deep_water_anim {
+                let aim_node = anim_assets.get_or_fallback("rifle_aiming_idle", "idle");
+                if render_state.previous_upper_anim != "rifle_aiming_idle"
+                    || !upper_player.is_playing_animation(aim_node)
+                {
+                    upper_trans
+                        .play(&mut upper_player, aim_node, loco_blend)
+                        .repeat();
+                    render_state.previous_upper_anim = "rifle_aiming_idle".to_string();
                 }
             } else if render_state.previous_upper_anim != render_state.current_locomotion
                 || !upper_player.is_playing_animation(lower_node)
@@ -7091,7 +7141,7 @@ fn occlusion_transparency_system(
 
     // برش موضعی زمین بازی (دیواره دره) هنگام قرار گرفتن هیرو در دره پشت دیواره
     let mut terrain_blocking = false;
-    if config.map.canyon.enabled && hero_focus.y < config.map.canyon.water_y + 3.5 {
+    if config.map.canyon.enabled && config.map.canyon.occlusion_fade_enabled && hero_focus.y < config.map.canyon.water_y + 3.5 {
         for i in 2..=16 {
             let t = (i as f32) / 16.0;
             let p = cam_pos.lerp(ray_end, t);
@@ -10446,7 +10496,9 @@ fn sync_remote_players_system(
 
                     let is_looping_upper = !rp.is_dead
                         && rp.traversal_anim.is_none()
-                        && (rp.upper_anim.is_none() || rp.upper_anim.as_deref() == Some("pistol_run"));
+                        && (rp.upper_anim.is_none()
+                            || rp.upper_anim.as_deref() == Some("pistol_run")
+                            || rp.upper_anim.as_deref() == Some("rifle_aiming_idle"));
                     let upper_is_paused = desired_upper.ends_with("_paused");
                     let upper_clip_name = desired_upper.strip_suffix("_paused").unwrap_or(&desired_upper);
                     let upper_node = assets.get_or_fallback(upper_clip_name, "idle");
@@ -13821,6 +13873,8 @@ fn update_hero_stamina_hud_system(
 
 
 fn compensate_upper_body_hips_twist_system(
+    time: Res<Time>,
+    config: Res<GameConfig>,
     match_flow: Res<ClientMatchFlow>,
     mut render_state: ResMut<ClientRenderState>,
     hips_q: Query<&Transform, (With<SoldierHipsBone>, Without<SoldierSpineRootBone>)>,
@@ -13837,23 +13891,42 @@ fn compensate_upper_body_hips_twist_system(
     };
 
     let (hips_yaw, _, _) = hips_tf.rotation.to_euler(EulerRot::YXZ);
-    if render_state.current_locomotion == "idle" && render_state.previous_upper_anim == "idle" {
+    if !render_state.traversal_active && render_state.current_locomotion == "idle" {
         render_state.neutral_hips_yaw = Some(hips_yaw);
-        return;
     }
 
     if !render_state.traversal_active
         && render_state.previous_upper_anim != render_state.current_locomotion
     {
-        let neutral = render_state.neutral_hips_yaw.unwrap_or(0.0);
-        let mut delta_yaw = hips_yaw - neutral;
-        while delta_yaw > std::f32::consts::PI {
-            delta_yaw -= std::f32::consts::TAU;
+        if let Some(neutral) = render_state.neutral_hips_yaw {
+            let mut delta_yaw = hips_yaw - neutral;
+            while delta_yaw > std::f32::consts::PI {
+                delta_yaw -= std::f32::consts::TAU;
+            }
+            while delta_yaw < -std::f32::consts::PI {
+                delta_yaw += std::f32::consts::TAU;
+            }
+            spine_tf.rotation = Quat::from_rotation_y(-delta_yaw) * spine_tf.rotation;
         }
-        while delta_yaw < -std::f32::consts::PI {
-            delta_yaw += std::f32::consts::TAU;
-        }
-        spine_tf.rotation = Quat::from_rotation_y(-delta_yaw) * spine_tf.rotation;
+    }
+
+    // چرخش نرم بالاتنه در محور عمودی (Pitch) به سمت هدف سه‌بعدی (aim_hit_pos)
+    let can_pitch = !render_state.is_dead
+        && !render_state.traversal_active
+        && !render_state.current_locomotion.starts_with("climbing_");
+    let target_pitch = if can_pitch {
+        let chest_pos = render_state.soldier_pos
+            + Vec3::new(0.0, config.soldier.aim_plane_height_offset, 0.0);
+        let dir = (render_state.aim_hit_pos - chest_pos).normalize_or_zero();
+        let horiz = (dir.x * dir.x + dir.z * dir.z).sqrt().max(0.001);
+        dir.y.atan2(horiz).clamp(-1.25, 1.25)
+    } else {
+        0.0
+    };
+    let alpha = (1.0 - (-16.0 * time.delta_secs()).exp()).clamp(0.0, 1.0);
+    render_state.smoothed_aim_pitch += (target_pitch - render_state.smoothed_aim_pitch) * alpha;
+    if render_state.smoothed_aim_pitch.abs() > 0.001 {
+        spine_tf.rotation = Quat::from_rotation_x(-render_state.smoothed_aim_pitch) * spine_tf.rotation;
     }
 }
 

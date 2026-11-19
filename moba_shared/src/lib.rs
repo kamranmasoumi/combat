@@ -489,6 +489,7 @@ impl GameConfig {
             assert!(hero.courier.hit_radius > 0.0, "courier.hit_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.vision_range > 0.0, "vision_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.night_vision_range > 0.0, "night_vision_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(!hero.weapon_models.run_upper_anim.trim().is_empty(), "weapon_models.run_upper_anim هیرو '{}' نباید خالی باشد (مقدار 'same' یا نام انیمیشن بدهید)", hero.id);
             assert!(hero.courier.vision_range > 0.0, "courier.vision_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.pistol.damage > 0.0, "pistol.damage هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.pistol.projectile_speed > 0.0, "pistol.projectile_speed هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -1335,6 +1336,9 @@ pub struct WeaponModelDef {
 pub struct HeroWeaponModelsConfig {
     pub primary: WeaponModelDef,
     pub pistol: WeaponModelDef,
+    pub run_upper_anim: String,
+    pub sprint_offset: (f32, f32, f32),
+    pub sprint_rotation_deg: (f32, f32, f32),
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]

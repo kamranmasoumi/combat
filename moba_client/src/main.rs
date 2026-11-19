@@ -249,6 +249,7 @@ fn main() {
         .insert_resource(ClientPhysicsPredictionState::new())
         .insert_resource(WeaponAttachmentStatus {
             attached: false,
+            attached_right_hand: false,
             hand_entity: None,
         })
         .insert_resource(tuner)
@@ -708,6 +709,7 @@ struct AmbientFloatingMote {
 #[derive(Resource)]
 struct WeaponAttachmentStatus {
     attached: bool,
+    attached_right_hand: bool,
     hand_entity: Option<Entity>,
 }
 
@@ -972,7 +974,7 @@ struct ClientRenderState {
     current_locomotion: String,
     previous_lower_anim: String,
     previous_upper_anim: String,
-    neutral_hips_yaw: Option<f32>,
+    neutral_hips_twist: Option<Quat>,
     smoothed_aim_pitch: f32,
     upper_action: UpperBodyAction,
     traversal_active: bool,
@@ -1021,7 +1023,7 @@ impl ClientRenderState {
             current_locomotion: "idle".to_string(),
             previous_lower_anim: String::new(),
             previous_upper_anim: String::new(),
-            neutral_hips_yaw: None,
+            neutral_hips_twist: None,
             smoothed_aim_pitch: 0.0,
             upper_action: UpperBodyAction::None,
             traversal_active: false,
@@ -3444,7 +3446,7 @@ fn load_gltf_and_build_graph(
     weapon_status.hand_entity = None;
     render_state.previous_lower_anim.clear();
     render_state.previous_upper_anim.clear();
-    render_state.neutral_hips_yaw = None;
+    render_state.neutral_hips_twist = None;
 
     let graph_handle = animation_graphs.add(graph);
     commands.insert_resource(SoldierAnimationAssets {
@@ -3607,9 +3609,8 @@ fn attach_weapon_to_left_hand(
     config: Res<GameConfig>,
     asset_server: Res<AssetServer>,
     match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
     hero_state: Res<LatestHeroSnapshot>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut status: ResMut<WeaponAttachmentStatus>,
     tuner: Res<WeaponTuner>,
     soldier_marker_query: Query<(), With<SoldierMarker>>,
@@ -3620,8 +3621,24 @@ fn attach_weapon_to_left_hand(
     if !match_flow.is_in_game() {
         return;
     }
+
+    let hero_cfg = config
+        .heroes
+        .iter()
+        .find(|h| h.id == hero_state.0.hero_id)
+        .unwrap_or_else(|| config.active_hero(0));
+    let want_right_hand = match render_state.upper_action {
+        UpperBodyAction::Reloading => true,
+        UpperBodyAction::None => {
+            hero_state.0.active_weapon != ActiveWeaponSlot::Pistol
+                && render_state.current_locomotion.starts_with("run_")
+                && hero_cfg.weapon_models.run_upper_anim == "same"
+        }
+        _ => false,
+    };
+
     for (w_ent, attached_kind) in &existing_weapon_q {
-        if attached_kind.0 != hero_state.0.weapon_kind {
+        if attached_kind.0 != hero_state.0.weapon_kind || status.attached_right_hand != want_right_hand {
             commands.entity(w_ent).despawn();
             status.attached = false;
         }
@@ -3632,8 +3649,11 @@ fn attach_weapon_to_left_hand(
 
     for (entity, name) in &hand_query {
         let n = name.as_str().to_lowercase();
-        let is_left =
-            n.contains("left") || n.contains("_l") || n.contains(".l") || n.contains("l_");
+        let is_target_side = if want_right_hand {
+            n.contains("right") || n.contains("_r") || n.contains(".r") || n.contains("r_")
+        } else {
+            n.contains("left") || n.contains("_l") || n.contains(".l") || n.contains("l_")
+        };
         let is_hand = n.contains("hand") || n.contains("wrist") || n.contains("palm");
         let is_finger = n.contains("thumb")
             || n.contains("index")
@@ -3643,7 +3663,7 @@ fn attach_weapon_to_left_hand(
             || n.contains("finger")
             || n.contains("twist");
 
-        if is_hand && is_left && !is_finger {
+        if is_hand && is_target_side && !is_finger {
             // اطمینان از اینکه دست متعلق به SoldierMarker اصلی است نه مدل پیش‌نمایش
             let mut cur = entity;
             let mut belongs_to_soldier = soldier_marker_query.contains(cur);
@@ -3663,42 +3683,17 @@ fn attach_weapon_to_left_hand(
             }
 
             let weapon_kind = hero_state.0.weapon_kind;
-            let body_mat = materials.add(StandardMaterial {
-                base_color: match weapon_kind {
-                    WeaponKind::AutomaticRifle => Color::srgb(0.14, 0.15, 0.18),
-                    WeaponKind::Sniper => Color::srgb(0.16, 0.22, 0.18),
-                    WeaponKind::Shotgun => Color::srgb(0.18, 0.16, 0.14),
-                    WeaponKind::Throwable => Color::srgb(0.24, 0.16, 0.12),
-                    WeaponKind::Pistol => Color::srgb(0.18, 0.20, 0.24),
-                    WeaponKind::ElectricBeam => Color::srgb(0.14, 0.22, 0.30),
-                    WeaponKind::FlameBeam => Color::srgb(0.28, 0.14, 0.10),
-                    WeaponKind::SpinningBlade => Color::srgb(0.20, 0.22, 0.28),
-                },
-                metallic: 0.85,
-                perceptual_roughness: 0.35,
-                ..default()
-            });
-            let accent_mat = materials.add(StandardMaterial {
-                base_color: match weapon_kind {
-                    WeaponKind::AutomaticRifle => Color::srgb(0.24, 0.26, 0.30),
-                    WeaponKind::Sniper => Color::srgb(0.28, 0.34, 0.30),
-                    WeaponKind::Shotgun => Color::srgb(0.46, 0.28, 0.14),
-                    WeaponKind::Throwable => Color::srgb(0.85, 0.42, 0.10),
-                    WeaponKind::Pistol => Color::srgb(0.55, 0.60, 0.68),
-                    WeaponKind::ElectricBeam => Color::srgb(0.20, 0.78, 1.00),
-                    WeaponKind::FlameBeam => Color::srgb(1.00, 0.42, 0.10),
-                    WeaponKind::SpinningBlade => Color::srgb(0.95, 0.22, 0.45),
-                },
-                metallic: if weapon_kind == WeaponKind::Shotgun { 0.25 } else { 0.65 },
-                perceptual_roughness: 0.45,
-                ..default()
-            });
-            let laser_box_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(0.95, 0.1, 0.1),
-                emissive: LinearRgba::new(5.0, 0.1, 0.1, 1.0),
-                ..default()
-            });
             let m_off = config.weapon_tuner.muzzle_local_offset;
+            let hero_cfg = config
+                .heroes
+                .iter()
+                .find(|h| h.id == hero_state.0.hero_id)
+                .unwrap_or_else(|| config.active_hero(0));
+            let w_model_def = if weapon_kind == WeaponKind::Pistol {
+                &hero_cfg.weapon_models.pistol
+            } else {
+                &hero_cfg.weapon_models.primary
+            };
 
             commands.entity(entity).with_children(|parent| {
                 parent
@@ -3713,16 +3708,6 @@ fn attach_weapon_to_left_hand(
                         Visibility::Visible,
                     ))
                     .with_children(|weapon| {
-                        let hero_cfg = config
-                            .heroes
-                            .iter()
-                            .find(|h| h.id == hero_state.0.hero_id)
-                            .unwrap_or_else(|| config.active_hero(0));
-                        let w_model_def = if weapon_kind == WeaponKind::Pistol {
-                            &hero_cfg.weapon_models.pistol
-                        } else {
-                            &hero_cfg.weapon_models.primary
-                        };
                         if custom_glb_exists(&w_model_def.model_path) {
                             let mut glb = glb_model_bundle(
                                 &asset_server,
@@ -3731,223 +3716,6 @@ fn attach_weapon_to_left_hand(
                             );
                             glb.1 = model_transform_to_bevy(&w_model_def.model_transform);
                             weapon.spawn(glb);
-                        } else {
-                        match weapon_kind {
-                            WeaponKind::AutomaticRifle => {
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.055, 0.10, 0.44))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.03, -0.12),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.048, 0.075, 0.30))),
-                                    MeshMaterial3d(accent_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.035, -0.42),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.013, 0.40))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.045, -0.60)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.019, 0.07))),
-                                    MeshMaterial3d(accent_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.045, -0.80)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.048, 0.085, 0.22))),
-                                    MeshMaterial3d(accent_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.02, 0.18),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.04, 0.19, 0.072))),
-                                    MeshMaterial3d(accent_mat.clone()),
-                                    Transform::from_xyz(0.0, -0.09, -0.24)
-                                        .with_rotation(Quat::from_rotation_x(0.22)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.042, 0.13, 0.055))),
-                                    MeshMaterial3d(body_mat),
-                                    Transform::from_xyz(0.0, -0.05, -0.02)
-                                        .with_rotation(Quat::from_rotation_x(-0.25)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.044, 0.05, 0.10))),
-                                    MeshMaterial3d(accent_mat),
-                                    Transform::from_xyz(0.0, 0.10, -0.14),
-                                ));
-                            }
-                            WeaponKind::Sniper => {
-                                // بدنه کشیده اسنایپر + لوله بلند سایلنسردار + دوربین بزرگ
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.052, 0.09, 0.56))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.03, -0.16),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.014, 0.78))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.048, -0.78)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.024, 0.22))),
-                                    MeshMaterial3d(accent_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.048, -1.16)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                // دوربین اسنایپر
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.032, 0.34))),
-                                    MeshMaterial3d(accent_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.115, -0.18)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.050, 0.095, 0.28))),
-                                    MeshMaterial3d(body_mat),
-                                    Transform::from_xyz(0.0, 0.02, 0.22),
-                                ));
-                            }
-                            WeaponKind::Shotgun => {
-                                // شات‌گان سنگین با دو لوله ضخیم و دستگیره پمپی چوبی/برنزی
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.072, 0.11, 0.42))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.03, -0.10),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.024, 0.52))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.055, -0.48)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.020, 0.46))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.015, -0.46)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                // دستگیره پمپی و قنداق چوبی
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.068, 0.065, 0.24))),
-                                    MeshMaterial3d(accent_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.005, -0.44),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.058, 0.095, 0.26))),
-                                    MeshMaterial3d(accent_mat),
-                                    Transform::from_xyz(0.0, 0.015, 0.20),
-                                ));
-                            }
-                            WeaponKind::Throwable => {
-                                // نارنجک‌انداز سنگین با خشاب استوانه‌ای چرخان و لوله پهن
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.08, 0.12, 0.36))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.03, -0.08),
-                                ));
-                                // خشاب درام چرخان نارنجی/فلزی
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.095, 0.15))),
-                                    MeshMaterial3d(accent_mat.clone()),
-                                    Transform::from_xyz(0.0, -0.02, -0.22)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                // لوله پهن پرتاب‌کننده
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.042, 0.38))),
-                                    MeshMaterial3d(body_mat),
-                                    Transform::from_xyz(0.0, 0.04, -0.44)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.056, 0.09, 0.22))),
-                                    MeshMaterial3d(accent_mat),
-                                    Transform::from_xyz(0.0, 0.02, 0.18),
-                                ));
-                            }
-                            WeaponKind::Pistol => {
-                                // بدنه و اسلاید جمع‌وجور کلت
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.040, 0.065, 0.24))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.04, -0.08),
-                                ));
-                                // قبضه پیستول
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.036, 0.13, 0.055))),
-                                    MeshMaterial3d(accent_mat),
-                                    Transform::from_xyz(0.0, -0.04, 0.01)
-                                        .with_rotation(Quat::from_rotation_x(-0.22)),
-                                ));
-                                // لوله کوتاه کلت
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.012, 0.12))),
-                                    MeshMaterial3d(body_mat),
-                                    Transform::from_xyz(0.0, 0.045, -0.24)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                            }
-                            WeaponKind::SpinningBlade => {
-                                // پرتابگر تیغه دایره‌ای با ریل باز و دیسک برش
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.065, 0.095, 0.42))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.03, -0.10),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.11, 0.025))),
-                                    MeshMaterial3d(accent_mat),
-                                    Transform::from_xyz(0.0, 0.04, -0.34),
-                                ));
-                            }
-                            WeaponKind::FlameBeam => {
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.080, 0.12, 0.46))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.03, -0.10),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.042, 0.26))),
-                                    MeshMaterial3d(accent_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.04, -0.38)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.048, 0.18))),
-                                    MeshMaterial3d(accent_mat),
-                                    Transform::from_xyz(0.0, -0.07, -0.12),
-                                ));
-                            }
-                            WeaponKind::ElectricBeam => {
-                                // بدنه تفنگ برقی تسلا با سیم‌پیچ‌های رسانای آبی
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.070, 0.11, 0.44))),
-                                    MeshMaterial3d(body_mat.clone()),
-                                    Transform::from_xyz(0.0, 0.03, -0.10),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cylinder::new(0.032, 0.34))),
-                                    MeshMaterial3d(accent_mat),
-                                    Transform::from_xyz(0.0, 0.04, -0.36)
-                                        .with_rotation(Quat::from_rotation_x(PI * 0.5)),
-                                ));
-                                weapon.spawn((
-                                    Mesh3d(meshes.add(Cuboid::new(0.050, 0.14, 0.07))),
-                                    MeshMaterial3d(body_mat),
-                                    Transform::from_xyz(0.0, -0.06, -0.02),
-                                ));
-                            }
-                        }
-
-                        weapon.spawn((
-                            Mesh3d(meshes.add(Cuboid::new(0.028, 0.028, 0.08))),
-                            MeshMaterial3d(laser_box_mat),
-                            Transform::from_xyz(0.0, 0.0, -0.50),
-                        ));
                         }
                         weapon.spawn((
                             MuzzlePoint,
@@ -3958,6 +3726,7 @@ fn attach_weapon_to_left_hand(
             });
 
             status.attached = true;
+            status.attached_right_hand = want_right_hand;
             status.hand_entity = Some(entity);
             break;
         }
@@ -3965,6 +3734,8 @@ fn attach_weapon_to_left_hand(
 }
 
 fn align_weapon_horizontally_system(
+    config: Res<GameConfig>,
+    hero_state: Res<LatestHeroSnapshot>,
     status: Res<WeaponAttachmentStatus>,
     tuner: Res<WeaponTuner>,
     render_state: Res<ClientRenderState>,
@@ -3999,10 +3770,37 @@ fn align_weapon_horizontally_system(
         return;
     }
 
+    let is_sprint_pose = status.attached_right_hand
+        && render_state.upper_action == UpperBodyAction::None
+        && render_state.current_locomotion.starts_with("run_");
+
+    let sprint_rot = if is_sprint_pose {
+        let hero_cfg = config
+            .heroes
+            .iter()
+            .find(|h| h.id == hero_state.0.hero_id)
+            .unwrap_or_else(|| config.active_hero(0));
+        let sr = hero_cfg.weapon_models.sprint_rotation_deg;
+        Quat::from_euler(
+            EulerRot::YXZ,
+            sr.1.to_radians(),
+            sr.0.to_radians(),
+            sr.2.to_radians(),
+        )
+    } else {
+        Quat::IDENTITY
+    };
+    let pitch_rot = if is_sprint_pose {
+        Quat::IDENTITY
+    } else {
+        Quat::from_rotation_x(render_state.smoothed_aim_pitch)
+    };
+
     let desired_world_rot = Transform::IDENTITY
         .looking_to(hero_forward, Vec3::Y)
         .rotation
-        * Quat::from_rotation_x(render_state.smoothed_aim_pitch);
+        * pitch_rot
+        * sprint_rot;
 
     let user_rot_offset = Quat::from_euler(
         EulerRot::YXZ,
@@ -4011,7 +3809,18 @@ fn align_weapon_horizontally_system(
         tuner.rotation.z.to_radians(),
     );
 
-    weapon_tf.translation = tuner.offset;
+    let so = if is_sprint_pose {
+        let hero_cfg = config
+            .heroes
+            .iter()
+            .find(|h| h.id == hero_state.0.hero_id)
+            .unwrap_or_else(|| config.active_hero(0));
+        let s = hero_cfg.weapon_models.sprint_offset;
+        Vec3::new(s.0, s.1, s.2)
+    } else {
+        Vec3::ZERO
+    };
+    weapon_tf.translation = tuner.offset + so;
     weapon_tf.rotation = hand_world_rot.inverse() * desired_world_rot * user_rot_offset;
     weapon_tf.scale = Vec3::splat(tuner.scale);
 }
@@ -6101,8 +5910,14 @@ fn soldier_animation_player_system(
             let in_deep_water_anim = render_state.current_locomotion == "swimming"
                 || render_state.current_locomotion == "treading_water";
             let is_running_loco = render_state.current_locomotion.starts_with("run_");
-            let use_full_body_loco = in_deep_water_anim || is_running_loco;
-            if hero_hud.0.active_weapon == ActiveWeaponSlot::Pistol && !use_full_body_loco {
+            let hero_cfg = config
+                .heroes
+                .iter()
+                .find(|h| h.id == hero_hud.0.hero_id)
+                .unwrap_or_else(|| config.active_hero(0));
+            let run_upper_cfg = hero_cfg.weapon_models.run_upper_anim.as_str();
+
+            if hero_hud.0.active_weapon == ActiveWeaponSlot::Pistol && !in_deep_water_anim {
                 let node = anim_assets.get_or_fallback("pistol_run", "rifle_aiming_idle");
                 if render_state.previous_upper_anim != "pistol_run"
                     || !upper_player.is_playing_animation(node)
@@ -6112,7 +5927,17 @@ fn soldier_animation_player_system(
                         .repeat();
                     render_state.previous_upper_anim = "pistol_run".to_string();
                 }
-            } else if !use_full_body_loco {
+            } else if !in_deep_water_anim && is_running_loco && run_upper_cfg != "same" {
+                let node = anim_assets.get_or_fallback(run_upper_cfg, "rifle_aiming_idle");
+                if render_state.previous_upper_anim != run_upper_cfg
+                    || !upper_player.is_playing_animation(node)
+                {
+                    upper_trans
+                        .play(&mut upper_player, node, loco_blend)
+                        .repeat();
+                    render_state.previous_upper_anim = run_upper_cfg.to_string();
+                }
+            } else if !in_deep_water_anim && !is_running_loco {
                 let aim_node = anim_assets.get_or_fallback("rifle_aiming_idle", "idle");
                 if render_state.previous_upper_anim != "rifle_aiming_idle"
                     || !upper_player.is_playing_animation(aim_node)
@@ -9393,12 +9218,9 @@ fn spawn_showcase_weapon_on_hand(
     commands: &mut Commands,
     root_ent: Entity,
     hand_ent: Entity,
-    weapon_kind: WeaponKind,
     weapon_model: Option<&moba_shared::WeaponModelDef>,
     asset_server: &AssetServer,
     tuner: &moba_shared::WeaponTunerConfig,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
 ) {
     if let Some(wm) = weapon_model {
         if custom_glb_exists(&wm.model_path) {
@@ -9421,73 +9243,8 @@ fn spawn_showcase_weapon_on_hand(
                             w.spawn(glb);
                         });
                 });
-            return;
         }
     }
-    let (body_col, accent_col, barrel_len, body_len) = match weapon_kind {
-        WeaponKind::AutomaticRifle => (Color::srgb(0.14, 0.16, 0.20), Color::srgb(0.22, 0.65, 0.85), 0.34, 0.38),
-        WeaponKind::Sniper => (Color::srgb(0.15, 0.22, 0.18), Color::srgb(0.40, 0.88, 0.52), 0.56, 0.42),
-        WeaponKind::Shotgun => (Color::srgb(0.22, 0.17, 0.13), Color::srgb(0.92, 0.54, 0.22), 0.36, 0.36),
-        WeaponKind::Throwable => (Color::srgb(0.26, 0.15, 0.12), Color::srgb(0.95, 0.32, 0.28), 0.24, 0.28),
-        WeaponKind::Pistol => (Color::srgb(0.18, 0.20, 0.24), Color::srgb(0.75, 0.78, 0.92), 0.18, 0.22),
-        WeaponKind::ElectricBeam => (Color::srgb(0.14, 0.22, 0.30), Color::srgb(0.32, 0.88, 1.0), 0.34, 0.38),
-        WeaponKind::FlameBeam => (Color::srgb(0.28, 0.14, 0.10), Color::srgb(1.0, 0.48, 0.15), 0.36, 0.40),
-        WeaponKind::SpinningBlade => (Color::srgb(0.20, 0.22, 0.28), Color::srgb(0.95, 0.25, 0.48), 0.32, 0.36),
-    };
-    let body_mat = materials.add(StandardMaterial {
-        base_color: body_col,
-        metallic: 0.82,
-        perceptual_roughness: 0.32,
-        ..default()
-    });
-    let accent_mat = materials.add(StandardMaterial {
-        base_color: accent_col,
-        emissive: LinearRgba::from(accent_col) * 0.45,
-        metallic: 0.6,
-        perceptual_roughness: 0.3,
-        ..default()
-    });
-    let off = tuner.initial_offset;
-    let rot_d = tuner.initial_rotation_deg;
-    let root_tf = Transform::from_xyz(off.0, off.1, off.2)
-        .with_rotation(Quat::from_euler(
-            EulerRot::XYZ,
-            rot_d.0.to_radians(),
-            rot_d.1.to_radians(),
-            rot_d.2.to_radians(),
-        ))
-        .with_scale(Vec3::splat(tuner.initial_scale));
-
-    commands
-        .entity(hand_ent)
-        .insert(ShowcaseWeaponAttached)
-        .with_children(|parent| {
-            parent.spawn((
-                HorizontalWeaponAlign {
-                    root_entity: root_ent,
-                    hand_entity: hand_ent,
-                },
-                root_tf,
-                Visibility::Visible,
-            )).with_children(|w| {
-                w.spawn((
-                    Mesh3d(meshes.add(Cuboid::new(0.055, 0.085, body_len))),
-                    MeshMaterial3d(body_mat.clone()),
-                    Transform::IDENTITY,
-                ));
-                w.spawn((
-                    Mesh3d(meshes.add(Cylinder::new(0.016, barrel_len))),
-                    MeshMaterial3d(body_mat),
-                    Transform::from_xyz(0.0, 0.02, -(body_len * 0.5 + barrel_len * 0.45))
-                        .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
-                ));
-                w.spawn((
-                    Mesh3d(meshes.add(Cuboid::new(0.032, 0.032, body_len * 0.45))),
-                    MeshMaterial3d(accent_mat),
-                    Transform::from_xyz(0.0, 0.058, -0.02),
-                ));
-            });
-        });
 }
 
 #[derive(SystemParam)]
@@ -9597,12 +9354,9 @@ fn hero_preview_system(
                             &mut commands,
                             root_ent,
                             h_ent,
-                            prev_root.weapon_kind,
                             wm,
                             &sc.asset_server,
                             &config.weapon_tuner,
-                            &mut sc.meshes,
-                            &mut sc.materials,
                         );
                     }
                 }
@@ -9708,12 +9462,9 @@ fn hero_preview_system(
                             &mut commands,
                             root_ent,
                             h_ent,
-                            b_hero.weapon_kind,
                             wm,
                             &sc.asset_server,
                             &config.weapon_tuner,
-                            &mut sc.meshes,
-                            &mut sc.materials,
                         );
                     }
                 }
@@ -10713,21 +10464,6 @@ fn sync_remote_players_system(
                                 || n.contains("finger")
                                 || n.contains("twist");
                             if is_hand && is_left && !is_finger {
-                                let w_mat = res.materials.add(StandardMaterial {
-                                    base_color: match rp.weapon_kind {
-                                        WeaponKind::AutomaticRifle => Color::srgb(0.14, 0.15, 0.18),
-                                        WeaponKind::Sniper => Color::srgb(0.16, 0.22, 0.18),
-                                        WeaponKind::Shotgun => Color::srgb(0.35, 0.22, 0.14),
-                                        WeaponKind::Throwable => Color::srgb(0.80, 0.38, 0.10),
-                                        WeaponKind::Pistol => Color::srgb(0.24, 0.26, 0.30),
-                                        WeaponKind::ElectricBeam => Color::srgb(0.20, 0.78, 1.00),
-                                        WeaponKind::FlameBeam => Color::srgb(1.00, 0.42, 0.10),
-                                        WeaponKind::SpinningBlade => Color::srgb(0.95, 0.22, 0.45),
-                                    },
-                                    metallic: 0.75,
-                                    perceptual_roughness: 0.35,
-                                    ..default()
-                                });
                                 let rp_hero_cfg = res
                                     .config
                                     .heroes
@@ -10739,14 +10475,14 @@ fn sync_remote_players_system(
                                 } else {
                                     &rp_hero_cfg.weapon_models.primary
                                 };
-                                commands.entity(h_ent).insert(RemoteWeaponAttached).with_children(|parent| {
-                                    if custom_glb_exists(&rp_w_model.model_path) {
-                                        let mut glb = glb_model_bundle(
-                                            &res.asset_server,
-                                            &rp_w_model.model_path,
-                                            &rp_w_model.model_transform,
-                                        );
-                                        glb.1 = model_transform_to_bevy(&rp_w_model.model_transform);
+                                if custom_glb_exists(&rp_w_model.model_path) {
+                                    let mut glb = glb_model_bundle(
+                                        &res.asset_server,
+                                        &rp_w_model.model_path,
+                                        &rp_w_model.model_transform,
+                                    );
+                                    glb.1 = model_transform_to_bevy(&rp_w_model.model_transform);
+                                    commands.entity(h_ent).insert(RemoteWeaponAttached).with_children(|parent| {
                                         parent
                                             .spawn((
                                                 HorizontalWeaponAlign {
@@ -10759,19 +10495,8 @@ fn sync_remote_players_system(
                                             .with_children(|w| {
                                                 w.spawn(glb);
                                             });
-                                    } else {
-                                        parent.spawn((
-                                            HorizontalWeaponAlign {
-                                                root_entity: root_ent,
-                                                hand_entity: h_ent,
-                                            },
-                                            Mesh3d(res.meshes.add(Cuboid::new(0.06, 0.09, 0.52))),
-                                            MeshMaterial3d(w_mat),
-                                            Transform::from_xyz(0.0, 0.03, -0.22)
-                                                .with_scale(Vec3::splat(res.config.weapon_tuner.initial_scale)),
-                                        ));
-                                    }
-                                });
+                                    });
+                                }
                             }
                         }
                     }
@@ -14494,45 +14219,91 @@ fn update_hero_stamina_hud_system(
 }
 
 
+fn twist_around_y(q: Quat) -> Quat {
+    let t = Quat::from_xyzw(0.0, q.y, 0.0, q.w);
+    if t.length_squared() > 1e-8 {
+        t.normalize()
+    } else {
+        Quat::IDENTITY
+    }
+}
+
+fn model_space_rot_to_soldier_root(
+    start_entity: Entity,
+    soldier_marker_q: &Query<(), With<SoldierMarker>>,
+    parents_q: &Query<&ChildOf>,
+    tf_q: &Query<&Transform, Without<SoldierSpineRootBone>>,
+) -> Quat {
+    let mut acc = Quat::IDENTITY;
+    let mut cur = start_entity;
+    for _ in 0..32 {
+        if soldier_marker_q.contains(cur) {
+            break;
+        }
+        if let Ok(tf) = tf_q.get(cur) {
+            acc = tf.rotation * acc;
+        }
+        if let Ok(parent) = parents_q.get(cur) {
+            cur = parent.parent();
+        } else {
+            break;
+        }
+    }
+    acc
+}
+
 fn compensate_upper_body_hips_twist_system(
     time: Res<Time>,
     config: Res<GameConfig>,
     match_flow: Res<ClientMatchFlow>,
     mut render_state: ResMut<ClientRenderState>,
-    hips_q: Query<&Transform, (With<SoldierHipsBone>, Without<SoldierSpineRootBone>)>,
-    mut spine_q: Query<&mut Transform, (With<SoldierSpineRootBone>, Without<SoldierHipsBone>)>,
+    soldier_marker_q: Query<(), With<SoldierMarker>>,
+    parents_q: Query<&ChildOf>,
+    hips_q: Query<Entity, (With<SoldierHipsBone>, Without<SoldierSpineRootBone>)>,
+    tf_q: Query<&Transform, Without<SoldierSpineRootBone>>,
+    mut spine_q: Query<(Entity, &mut Transform), (With<SoldierSpineRootBone>, Without<SoldierHipsBone>)>,
 ) {
     if !match_flow.is_in_game() {
         return;
     }
-    let Ok(hips_tf) = hips_q.single() else {
+    let Ok(hips_ent) = hips_q.single() else {
         return;
     };
-    let Ok(mut spine_tf) = spine_q.single_mut() else {
+    let Ok((spine_ent, mut spine_tf)) = spine_q.single_mut() else {
         return;
     };
 
-    let (hips_yaw, _, _) = hips_tf.rotation.to_euler(EulerRot::YXZ);
-    if !render_state.traversal_active && render_state.current_locomotion == "idle" {
-        render_state.neutral_hips_yaw = Some(hips_yaw);
+    let q_hips_model = model_space_rot_to_soldier_root(hips_ent, &soldier_marker_q, &parents_q, &tf_q);
+    let q_spine_parent_model = if let Ok(parent) = parents_q.get(spine_ent) {
+        model_space_rot_to_soldier_root(parent.parent(), &soldier_marker_q, &parents_q, &tf_q)
+    } else {
+        q_hips_model
+    };
+
+    let cur_twist = twist_around_y(q_hips_model);
+    if !render_state.traversal_active
+        && (render_state.current_locomotion == "idle"
+            || (render_state.neutral_hips_twist.is_none()
+                && render_state.current_locomotion.ends_with("_forward")))
+    {
+        render_state.neutral_hips_twist = Some(cur_twist);
     }
 
     if !render_state.traversal_active
         && render_state.previous_upper_anim != render_state.current_locomotion
     {
-        if let Some(neutral) = render_state.neutral_hips_yaw {
-            let mut delta_yaw = hips_yaw - neutral;
-            while delta_yaw > std::f32::consts::PI {
-                delta_yaw -= std::f32::consts::TAU;
+        if let Some(neutral_twist) = render_state.neutral_hips_twist {
+            let mut delta_twist = neutral_twist * cur_twist.inverse();
+            if delta_twist.w < 0.0 {
+                delta_twist = -delta_twist;
             }
-            while delta_yaw < -std::f32::consts::PI {
-                delta_yaw += std::f32::consts::TAU;
-            }
-            spine_tf.rotation = Quat::from_rotation_y(-delta_yaw) * spine_tf.rotation;
+            let local_yaw_comp =
+                q_spine_parent_model.inverse() * delta_twist * q_spine_parent_model;
+            spine_tf.rotation = local_yaw_comp * spine_tf.rotation;
         }
     }
 
-    // چرخش نرم بالاتنه در محور عمودی (Pitch) به سمت هدف سه‌بعدی (aim_hit_pos)
+    // چرخش نرم بالاتنه در محور عمودی (Pitch) به سمت هدف سه‌بعدی (aim_hit_pos) در فضای ریشه هیرو
     let can_pitch = !render_state.is_dead
         && !render_state.traversal_active
         && !render_state.current_locomotion.starts_with("climbing_");
@@ -14548,7 +14319,9 @@ fn compensate_upper_body_hips_twist_system(
     let alpha = (1.0 - (-16.0 * time.delta_secs()).exp()).clamp(0.0, 1.0);
     render_state.smoothed_aim_pitch += (target_pitch - render_state.smoothed_aim_pitch) * alpha;
     if render_state.smoothed_aim_pitch.abs() > 0.001 {
-        spine_tf.rotation = Quat::from_rotation_x(-render_state.smoothed_aim_pitch) * spine_tf.rotation;
+        let model_pitch = Quat::from_rotation_x(-render_state.smoothed_aim_pitch);
+        let local_pitch = q_spine_parent_model.inverse() * model_pitch * q_spine_parent_model;
+        spine_tf.rotation = local_pitch * spine_tf.rotation;
     }
 }
 

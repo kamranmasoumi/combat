@@ -704,12 +704,15 @@ GameConfig(
             weapon_models: HeroWeaponModelsConfig(
                 primary: WeaponModelDef(
                     model_path: "models/weapons/vanguard_rifle.glb",
-                    model_transform: ModelTransformConfig(location: (0.0, -0.2, 0.0), rotation: (0.0, -90.0, 0.0), scale: (0.5, 0.5, 0.5)),
+                    model_transform: ModelTransformConfig(location: (0.0, -0.3, 0.0), rotation: (0.0, -90.0, 0.0), scale: (0.5, 0.5, 0.5)),
                 ),
                 pistol: WeaponModelDef(
                     model_path: "models/weapons/frost_pistol.glb",
                     model_transform: ModelTransformConfig(location: (0.0, 0.0, -0.2), rotation: (0.0, -90.0, 0.0), scale: (0.2, 0.2, 0.2)),
                 ),
+                run_upper_anim: "idle",
+                sprint_offset: (0.0, 0.0, 0.0),
+                sprint_rotation_deg: (-90.0, 90.0, 0.0),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -1018,6 +1021,9 @@ GameConfig(
                     model_path: "models/weapons/frost_pistol.glb",
                     model_transform: ModelTransformConfig(location: (0.0, 0.0, -0.2), rotation: (0.0, -90.0, 0.0), scale: (0.2, 0.2, 0.2)),
                 ),
+                run_upper_anim: "rifle_aiming_idle",
+                sprint_offset: (0.0, 0.0, 0.0),
+                sprint_rotation_deg: (0.0, 0.0, 0.0),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -1319,13 +1325,16 @@ GameConfig(
             ),
             weapon_models: HeroWeaponModelsConfig(
                 primary: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/iron_breaker.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, -0.1, 0.0), rotation: (0.0, 90.0, 0.0), scale: (1.0, 1.0, 1.0)),
                 ),
                 pistol: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/frost_pistol.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, -0.2), rotation: (0.0, -90.0, 0.0), scale: (0.2, 0.2, 0.2)),
                 ),
+                run_upper_anim: "idle",
+                sprint_offset: (0.0, 0.0, 0.0),
+                sprint_rotation_deg: (0.0, 0.0, 0.0),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -1627,13 +1636,16 @@ GameConfig(
             ),
             weapon_models: HeroWeaponModelsConfig(
                 primary: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/pyro_grenadier.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, -90.0, 0.0), scale: (1.0, 1.0, 1.0)),
                 ),
                 pistol: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/frost_pistol.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, -0.2), rotation: (0.0, -90.0, 0.0), scale: (0.2, 0.2, 0.2)),
                 ),
+                run_upper_anim: "idle",
+                sprint_offset: (0.0, 0.0, 0.0),
+                sprint_rotation_deg: (0.0, 0.0, 0.0),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -1935,13 +1947,16 @@ GameConfig(
             ),
             weapon_models: HeroWeaponModelsConfig(
                 primary: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/venom_alchemist.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, -90.0, 0.0), scale: (1.0, 1.0, 1.0)),
                 ),
                 pistol: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/frost_pistol.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, -0.2), rotation: (0.0, -90.0, 0.0), scale: (0.2, 0.2, 0.2)),
                 ),
+                run_upper_anim: "idle",
+                sprint_offset: (0.0, 0.0, 0.0),
+                sprint_rotation_deg: (0.0, 0.0, 0.0),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -2250,6 +2265,9 @@ GameConfig(
                     model_path: "",
                     model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
                 ),
+                run_upper_anim: "same",
+                sprint_offset: (0.0, 0.0, 0.0),
+                sprint_rotation_deg: (-22.0, 58.0, 0.0),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -2551,13 +2569,16 @@ GameConfig(
             ),
             weapon_models: HeroWeaponModelsConfig(
                 primary: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/blaze_pyromancer.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, -90.0, 0.0), scale: (0.7, 0.7, 0.7)),
                 ),
                 pistol: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/frost_pistol.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, -0.2), rotation: (0.0, -90.0, 0.0), scale: (0.2, 0.2, 0.2)),
                 ),
+                run_upper_anim: "idle",
+                sprint_offset: (0.0, 0.0, 0.0),
+                sprint_rotation_deg: (0.0, 0.0, 0.0),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -2866,6 +2887,9 @@ GameConfig(
                     model_path: "",
                     model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
                 ),
+                run_upper_anim: "same",
+                sprint_offset: (0.0, 0.0, 0.0),
+                sprint_rotation_deg: (-22.0, 58.0, 0.0),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(
@@ -3236,7 +3260,7 @@ GameConfig(
                 hovered_tint_emissive_rgb: (2.2, 0.18, 0.15),
             ),
             "centaur_conqueror": NeutralCreepTypeDef(
-                model_path: "soldier_1.glb",
+                model_path: "soldier.glb",
                 scale: 0.94,
                 collider_radius: 0.44,
                 hitbox_height: 2.20,
@@ -3262,7 +3286,7 @@ GameConfig(
                 hovered_tint_emissive_rgb: (2.2, 0.18, 0.15),
             ),
             "hellbear_smasher": NeutralCreepTypeDef(
-                model_path: "soldier_1.glb",
+                model_path: "soldier.glb",
                 scale: 0.98,
                 collider_radius: 0.46,
                 hitbox_height: 2.30,
@@ -3383,7 +3407,7 @@ GameConfig(
         ],
     ),
     animations: AnimationConfig(
-        model_path: "hero_1.glb",
+        model_path: "soldier.glb",
         death_blend_ms: 80,
         traversal_blend_ms: 60,
         locomotion_blend_ms: 140,

@@ -346,6 +346,7 @@ GameConfig(
     ),
     weather: WeatherConfig(
         initial_weather: Clear,
+        weather_cycle_start_secs: 900.0,
         clear_min_duration_secs: 90.0,
         clear_max_duration_secs: 165.0,
         rainy_min_duration_secs: 65.0,

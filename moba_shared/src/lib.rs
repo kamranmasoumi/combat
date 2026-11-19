@@ -235,6 +235,7 @@ pub enum WeatherKind {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WeatherConfig {
     pub initial_weather: WeatherKind,
+    pub weather_cycle_start_secs: f32,
     pub clear_min_duration_secs: f32,
     pub clear_max_duration_secs: f32,
     pub rainy_min_duration_secs: f32,
@@ -723,6 +724,7 @@ impl GameConfig {
 
     pub fn validate_weather(&self) {
         let w = &self.weather;
+        assert!(w.weather_cycle_start_secs.is_finite() && w.weather_cycle_start_secs >= 0.0, "weather.weather_cycle_start_secs نمی‌تواند منفی یا نامعتبر باشد");
         assert!(w.clear_min_duration_secs >= 5.0 && w.clear_max_duration_secs >= w.clear_min_duration_secs, "بازه زمانی آب و هوای صاف نامعتبر است");
         assert!(w.rainy_min_duration_secs >= 5.0 && w.rainy_max_duration_secs >= w.rainy_min_duration_secs, "بازه زمانی آب و هوای بارانی نامعتبر است");
         assert!(w.snowy_min_duration_secs >= 5.0 && w.snowy_max_duration_secs >= w.snowy_min_duration_secs, "بازه زمانی آب و هوای برفی نامعتبر است");
@@ -13569,28 +13571,33 @@ pub fn step_weather_and_environment_system(
     }
 
     let dt = time.delta_secs();
-    world.weather_remaining_secs -= dt;
-    if world.weather_remaining_secs <= 0.0 {
-        let (next_w, next_dur) = world.pick_next_weather(&config);
-        world.current_weather = next_w;
-        world.weather_remaining_secs = next_dur;
-        if next_w == WeatherKind::Rainy {
-            let min_l = config.weather.lightning_min_interval_secs;
-            let max_l = config.weather.lightning_max_interval_secs;
-            world.lightning_cooldown_secs =
-                min_l + (max_l - min_l).max(0.0) * world.next_rand();
+    if world.match_elapsed_secs < config.weather.weather_cycle_start_secs {
+        world.current_weather = config.weather.initial_weather;
+        world.weather_remaining_secs = 0.0;
+    } else {
+        world.weather_remaining_secs -= dt;
+        if world.weather_remaining_secs <= 0.0 {
+            let (next_w, next_dur) = world.pick_next_weather(&config);
+            world.current_weather = next_w;
+            world.weather_remaining_secs = next_dur;
+            if next_w == WeatherKind::Rainy {
+                let min_l = config.weather.lightning_min_interval_secs;
+                let max_l = config.weather.lightning_max_interval_secs;
+                world.lightning_cooldown_secs =
+                    min_l + (max_l - min_l).max(0.0) * world.next_rand();
+            }
         }
-    }
 
-    if world.current_weather == WeatherKind::Rainy {
-        world.lightning_cooldown_secs -= dt;
-        if world.lightning_cooldown_secs <= 0.0 {
-            let intensity = 0.85 + 0.30 * world.next_rand();
-            world.pending_fx.push(GameplayFxEvent::LightningStrike { intensity });
-            let min_l = config.weather.lightning_min_interval_secs;
-            let max_l = config.weather.lightning_max_interval_secs;
-            world.lightning_cooldown_secs =
-                min_l + (max_l - min_l).max(0.0) * world.next_rand();
+        if world.current_weather == WeatherKind::Rainy {
+            world.lightning_cooldown_secs -= dt;
+            if world.lightning_cooldown_secs <= 0.0 {
+                let intensity = 0.85 + 0.30 * world.next_rand();
+                world.pending_fx.push(GameplayFxEvent::LightningStrike { intensity });
+                let min_l = config.weather.lightning_min_interval_secs;
+                let max_l = config.weather.lightning_max_interval_secs;
+                world.lightning_cooldown_secs =
+                    min_l + (max_l - min_l).max(0.0) * world.next_rand();
+            }
         }
     }
 

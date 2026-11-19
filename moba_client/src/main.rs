@@ -268,6 +268,7 @@ fn main() {
         .insert_resource(LatestAncients::default())
         .insert_resource(LatestActiveTeleports::default())
         .insert_resource(LatestMatchResult::default())
+        .insert_resource(PostMatchFlowState::default())
         .insert_resource(ChatUiState::default())
         .insert_resource(ClientPingState::default())
         .insert_resource(LatestPauseState::default())
@@ -1136,10 +1137,13 @@ fn on_enter_ingame_connect_system(
     mut config: ResMut<GameConfig>,
     mut net: ResMut<ClientNetwork>,
     mut pending: ResMut<PendingMatchConnection>,
+    mut post_match: ResMut<PostMatchFlowState>,
     mut match_flow: ResMut<ClientMatchFlow>,
     mut match_result: ResMut<LatestMatchResult>,
     mut cam_q: Query<&mut Camera, With<Camera3d>>,
 ) {
+    post_match.started = false;
+    post_match.countdown_secs = 5.0;
     for mut cam in &mut cam_q {
         cam.is_active = true;
     }
@@ -8883,6 +8887,21 @@ struct LatestActiveTeleports(Vec<ActiveTeleportSnapshot>);
 #[derive(Resource, Default)]
 struct LatestMatchResult(Option<TeamId>);
 
+#[derive(Resource)]
+struct PostMatchFlowState {
+    started: bool,
+    countdown_secs: f32,
+}
+
+impl Default for PostMatchFlowState {
+    fn default() -> Self {
+        Self {
+            started: false,
+            countdown_secs: 5.0,
+        }
+    }
+}
+
 #[derive(SystemParam)]
 struct SnapshotHudSyncParams<'w, 's> {
     hero_hud: ResMut<'w, LatestHeroSnapshot>,
@@ -13376,6 +13395,8 @@ fn end_of_match_overlay_system(
     match_result: Res<LatestMatchResult>,
     hero_hud: Res<LatestHeroSnapshot>,
     top_bar: Res<LatestTopBarState>,
+    mut post_match: ResMut<PostMatchFlowState>,
+    mut next_screen: ResMut<NextState<AppScreenState>>,
     mut root_q: Query<(&mut Node, &mut BackgroundColor), With<EndOfMatchOverlayRoot>>,
     mut card_q: Query<(&mut BorderColor, &mut BackgroundColor), (With<EndOfMatchBannerCard>, Without<EndOfMatchOverlayRoot>)>,
     mut title_q: Query<(&mut Text, &mut TextColor), With<EndOfMatchTitleText>>,
@@ -13392,6 +13413,16 @@ fn end_of_match_overlay_system(
     if !match_flow.is_in_game() {
         root_node.display = Display::None;
         return;
+    }
+
+    if !post_match.started {
+        post_match.started = true;
+        post_match.countdown_secs = 5.0;
+    } else {
+        post_match.countdown_secs = (post_match.countdown_secs - time.delta_secs()).max(0.0);
+        if post_match.countdown_secs <= 0.0 {
+            next_screen.set(AppScreenState::PreGame);
+        }
     }
 
     root_node.display = Display::Flex;
@@ -13420,7 +13451,8 @@ fn end_of_match_overlay_system(
     }
 
     if let Ok(mut sub) = sub_q.single_mut() {
-        **sub = format!("{:?} TEAM WINS — ENEMY ANCIENT DESTROYED", winner);
+        let secs_left = post_match.countdown_secs.ceil() as u32;
+        **sub = format!("{:?} TEAM WINS — RETURNING TO MENU IN {}s", winner, secs_left);
     }
 
     if let Ok(mut stats) = stats_q.single_mut() {

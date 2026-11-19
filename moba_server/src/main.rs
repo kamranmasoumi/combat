@@ -210,16 +210,45 @@ fn post_json_to_django_async(base_http_url: &str, path: &str, json_body: String)
             .or_else(|| url.strip_prefix("https://"))
             .unwrap_or(&url);
         let host_port = addr.split('/').next().unwrap_or(addr);
-        if let Ok(mut stream) = TcpStream::connect(host_port) {
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-            let req = format!(
-                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                path,
-                host_port,
-                json_body.len(),
-                json_body
-            );
-            let _ = stream.write_all(req.as_bytes());
+        let req = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            path,
+            host_port,
+            json_body.len(),
+            json_body
+        );
+
+        for attempt in 1..=3 {
+            match TcpStream::connect(host_port) {
+                Ok(mut stream) => {
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    if let Err(e) = stream.write_all(req.as_bytes()).and_then(|_| stream.flush()) {
+                        eprintln!(
+                            "[DJANGO HTTP ERROR] {} (attempt {}/3) write failed: {:?}",
+                            path, attempt, e
+                        );
+                    } else {
+                        let mut resp = String::new();
+                        let _ = stream.read_to_string(&mut resp);
+                        let status_line = resp.lines().next().unwrap_or("");
+                        if status_line.contains(" 200 ") || status_line.contains(" 201 ") {
+                            return;
+                        }
+                        eprintln!(
+                            "[DJANGO HTTP ERROR] {} (attempt {}/3) unexpected response: {}",
+                            path, attempt, status_line
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[DJANGO CONNECT ERROR] {} -> {} (attempt {}/3): {:?}",
+                        host_port, path, attempt, e
+                    );
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
         }
     });
 }

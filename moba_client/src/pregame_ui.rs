@@ -339,7 +339,7 @@ fn on_enter_pregame(
         state.server_starting = false;
         state.queue_players = 0;
         state.confirm_modal = None;
-        backend.fetch_active_match(tok);
+        backend.restore_session(tok);
     }
     state.ui_dirty = true;
 }

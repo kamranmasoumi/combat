@@ -535,7 +535,7 @@ GameConfig(
             model_path: "hero_1.glb",
             portrait_path: "portraits/vanguard.png",
             team: Dawn,
-            starting_gold: 600,
+            starting_gold: 60000,
             xp_gain_radius: 26.0,
             max_hp: 500.0,
             hp_regen_per_sec: 1.6,

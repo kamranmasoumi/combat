@@ -3923,7 +3923,7 @@ fn weapon_live_calibration_system(
 // -----------------------------------------------------------------------------
 
 #[derive(SystemParam)]
-struct SampleInputExtraParams<'w> {
+struct SampleInputExtraParams<'w, 's> {
     render_state: Res<'w, ClientRenderState>,
     courier_ctrl: ResMut<'w, CourierControlState>,
     inspected: ResMut<'w, InspectedUnit>,
@@ -3933,6 +3933,7 @@ struct SampleInputExtraParams<'w> {
     audio_q: ResMut<'w, AudioEventQueue>,
     vfx_q: ResMut<'w, VfxEventQueue>,
     teleport_preview: ResMut<'w, TeleportPreviewState>,
+    soldier_root_query: Query<'w, 's, &'static GlobalTransform, With<SoldierMarker>>,
 }
 
 fn client_sample_input_system(
@@ -4017,7 +4018,17 @@ fn client_sample_input_system(
         }
     }
 
-    let client_muzzle_world_pos = muzzle_query.single().ok().map(|gtf| gtf.translation());
+    let client_muzzle_world_pos = match (muzzle_query.single(), ex.soldier_root_query.single()) {
+        (Ok(muzzle_gtf), Ok(root_gtf)) => {
+            let offset = muzzle_gtf.translation() - root_gtf.translation();
+            if offset.length_squared() <= 16.0 {
+                Some(offset)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
 
     let alt_held = keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight);
     let hero_action_taken = wasd_pressed

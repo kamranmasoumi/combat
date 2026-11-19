@@ -7041,7 +7041,21 @@ impl AuthoritativeWorldState {
         }
     }
 
-    pub fn set_slot_input(&mut self, slot_index: usize, cmd: ClientInputCommand) {
+    pub fn set_slot_input(&mut self, slot_index: usize, mut cmd: ClientInputCommand) {
+        if !cmd.move_input.is_finite() {
+            cmd.move_input = Vec3::ZERO;
+        }
+        if !cmd.aim_ray_origin.is_finite()
+            || !cmd.aim_ray_dir.is_finite()
+            || cmd.aim_ray_dir.length_squared() <= 1e-6
+        {
+            cmd.has_aim_ray = false;
+            cmd.aim_ray_origin = Vec3::ZERO;
+            cmd.aim_ray_dir = Vec3::NEG_Y;
+        }
+        if cmd.client_muzzle_world_pos.map_or(false, |v| !v.is_finite()) {
+            cmd.client_muzzle_world_pos = None;
+        }
         if let Some(p) = self.players.get_mut(slot_index) {
             if let Some(ref mut prev) = p.active_input {
                 prev.accumulate_from(cmd);
@@ -8107,14 +8121,48 @@ fn resolve_muzzle_pos(
     world: &AuthoritativeWorldState,
     input: &ClientInputCommand,
     config: &GameConfig,
+    physics_world: &CustomPhysicsWorld,
 ) -> Vec3 {
-    if let Some(muzzle_pos) = input.client_muzzle_world_pos {
-        muzzle_pos
-    } else {
-        world.soldier_pos
-            + Vec3::new(0.0, config.combat.fallback_muzzle_offset_y, 0.0)
-            + world.aim_world_dir * config.combat.fallback_muzzle_forward
+    let hero_scale = config.active_hero(world.hero_index).hero_scale.max(0.25);
+    let fallback = world.soldier_pos
+        + Vec3::new(0.0, config.combat.fallback_muzzle_offset_y * hero_scale, 0.0)
+        + world.aim_world_dir * (config.combat.fallback_muzzle_forward * hero_scale);
+
+    let Some(raw_offset) = input.client_muzzle_world_pos else {
+        return fallback;
+    };
+    if !raw_offset.is_finite() {
+        return fallback;
     }
+
+    // محدودسازی شعاع افقی و ارتفاع سر لوله برای حفظ Server Authority
+    let max_horiz = (config.combat.fallback_muzzle_forward * 2.0 * hero_scale).max(1.8 * hero_scale);
+    let mut horiz = Vec2::new(raw_offset.x, raw_offset.z);
+    let horiz_len = horiz.length();
+    if horiz_len > max_horiz && horiz_len > f32::EPSILON {
+        horiz *= max_horiz / horiz_len;
+    }
+    let clamped_y = raw_offset.y.clamp(0.35 * hero_scale, 2.25 * hero_scale);
+    let candidate = world.soldier_pos + Vec3::new(horiz.x, clamped_y, horiz.y);
+
+    // بررسی برخورد با دیوار بین سینه هیرو و سر لوله تا کلاینت نتواند از پشت دیوار شلیک کند
+    let chest_y = if world.effective_stance == Stance::Crouch {
+        config.combat.hero_crouch_aim_chest_height
+    } else {
+        config.combat.hero_stand_aim_chest_height
+    } * hero_scale;
+    let chest_pos = world.soldier_pos + Vec3::new(0.0, chest_y, 0.0);
+    let to_muzzle = candidate - chest_pos;
+    let dist = to_muzzle.length();
+    if dist > 0.05 {
+        let dir = to_muzzle / dist;
+        let query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
+        if let Some((_ent, hit)) = physics_world.cast_ray(chest_pos, dir, dist, query_groups, |_| true) {
+            return chest_pos + dir * (hit.toi - 0.08).max(0.0);
+        }
+    }
+
+    candidate
 }
 
 fn spawn_shared_physics_actors_system(mut commands: Commands, config: Res<GameConfig>) {
@@ -8577,7 +8625,11 @@ fn shared_drive_single_player(
 
     if !world.is_dead {
       if let Some((c_click, c_move)) = world.active_teleport.as_ref().map(|tp| (tp.cancel_on_left_click, tp.cancel_on_move)) {
-        let flat_mv = Vec3::new(input.move_input.x, 0.0, input.move_input.z);
+        let flat_mv = if input.move_input.is_finite() {
+            Vec3::new(input.move_input.x, 0.0, input.move_input.z)
+        } else {
+            Vec3::ZERO
+        };
         let cancel_click = c_click
             && (input.fire_just_pressed || input.fire_held);
         let cancel_move = c_move && flat_mv != Vec3::ZERO;
@@ -8750,8 +8802,14 @@ fn shared_drive_single_player(
         };
 
         // ۵. هدف‌گیری ۳بعدی دقیق روی سطوح مختلف و قفل نرم روی هیروی دشمن (ایستاده، نشسته یا پشت سنگر)
+        let max_aim_origin_dist = config.combat.aim_lock_ray_max_distance.max(120.0);
         if !world.traversal.is_active
             && input.has_aim_ray
+            && input.aim_ray_origin.is_finite()
+            && input.aim_ray_dir.is_finite()
+            && input.aim_ray_dir.length_squared() > 1e-6
+            && (input.aim_ray_origin - world.soldier_pos).length_squared()
+                <= max_aim_origin_dist * max_aim_origin_dist
             && input.aim_ray_dir.y.abs() > config.physics.aim_ray_min_dir_y_epsilon
         {
             let ray_dir = input.aim_ray_dir.normalize();
@@ -9028,7 +9086,11 @@ fn shared_drive_single_player(
         }
 
         // ۶. بردار حرکت ۸ جهته و انتخاب انیمیشن پایین‌تنه
-        let flat_input = Vec3::new(input.move_input.x, 0.0, input.move_input.z);
+        let flat_input = if input.move_input.is_finite() {
+            Vec3::new(input.move_input.x, 0.0, input.move_input.z)
+        } else {
+            Vec3::ZERO
+        };
         world.is_moving = flat_input != Vec3::ZERO;
         world.move_input = flat_input;
 
@@ -9164,7 +9226,7 @@ fn shared_drive_single_player(
     }
 
     // ۹. شلیک گلوله و پرتاب نارنجک
-    step_shooting_and_grenade_spawn(commands, world, input, config, dt);
+    step_shooting_and_grenade_spawn(commands, world, input, config, physics_world, dt);
 }
 
 fn find_nearest_climbable_mountain(config: &GameConfig, attach_dist: f32, pos: Vec3) -> Option<(usize, Vec3, Vec3)> {
@@ -10129,6 +10191,7 @@ fn step_shooting_and_grenade_spawn(
     world: &mut AuthoritativeWorldState,
     input: &ClientInputCommand,
     config: &GameConfig,
+    physics_world: &CustomPhysicsWorld,
     dt: f32,
 ) {
     world.fire_cooldown_remaining = (world.fire_cooldown_remaining - dt).max(0.0);
@@ -10216,7 +10279,7 @@ fn step_shooting_and_grenade_spawn(
             world.ammo_in_mag = world.beam_charge.ceil() as u32;
             let dur = config.exact_anim_duration("firing_rifle");
             world.firing_anim_remaining = Some(dur);
-            let muzzle_pos = resolve_muzzle_pos(world, input, config);
+            let muzzle_pos = resolve_muzzle_pos(world, input, config, physics_world);
             let to_aim = world.aim_hit_pos - muzzle_pos;
             let beam_dir = if !world.aim_locked_on_enemy && !input.vertical_aim_held {
                 let flat = Vec3::new(to_aim.x, 0.0, to_aim.z);
@@ -10280,7 +10343,7 @@ fn step_shooting_and_grenade_spawn(
             world.firing_anim_remaining = None;
         }
 
-        let muzzle_pos = resolve_muzzle_pos(world, input, config);
+        let muzzle_pos = resolve_muzzle_pos(world, input, config, physics_world);
         let to_aim = world.aim_hit_pos - muzzle_pos;
         let shot_dir = if !world.aim_locked_on_enemy && !input.vertical_aim_held {
             let flat = Vec3::new(to_aim.x, 0.0, to_aim.z);
@@ -12019,7 +12082,7 @@ fn shared_authoritative_react_system(
             world.swap_slot_in(slot_idx);
         }
         if let Some(input) = world.active_input.clone() {
-            let muzzle_pos = resolve_muzzle_pos(&world, &input, &config);
+            let muzzle_pos = resolve_muzzle_pos(&world, &input, &config, &physics_world);
             let raw_target = world.aim_hit_pos;
             let world_laser_hit = compute_laser_hit(
                 &physics_world,

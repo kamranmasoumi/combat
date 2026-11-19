@@ -130,6 +130,9 @@ pub enum ClientAudioEvent {
     TraversalMove {
         anim_name: String,
     },
+    WaterSubmerge {
+        pos: Vec3,
+    },
     SwingStart,
     SwingEnd,
     SwingLand,
@@ -144,6 +147,10 @@ pub enum ClientAudioEvent {
     CourierDeath,
     CourierRespawn,
     MatchStarted,
+    HeroSelected,
+    TeamPing,
+    GamePaused,
+    UnpauseCountdownTick,
     MatchEnded {
         victory: bool,
     },
@@ -185,6 +192,7 @@ pub struct AudioEventQueue(pub Vec<ClientAudioEvent>);
 #[derive(Resource, Default)]
 pub struct AudioFrameContext {
     pub in_game: bool,
+    pub in_hero_select: bool,
     pub listener_pos: Vec3,
     pub hero_pos: Vec3,
     pub hero_hp_ratio: f32,
@@ -234,6 +242,9 @@ struct TaggedAudio {
 struct BackgroundMusicLoop;
 
 #[derive(Component)]
+struct HeroSelectMusicLoop;
+
+#[derive(Component)]
 struct RainAmbienceLoop;
 
 #[derive(Component)]
@@ -247,6 +258,9 @@ struct CreepMarchLoop;
 
 #[derive(Component)]
 struct SwingAirLoop;
+
+#[derive(Component)]
+struct SwimmingLoop;
 
 #[derive(Component)]
 struct TeleportLoopAudio {
@@ -267,8 +281,6 @@ struct LowHpVignetteEdge;
 #[derive(Resource, Default)]
 struct AudioRuntimeTimers {
     step_timer: f32,
-    step_index: usize,
-    swim_timer: f32,
     shallow_water_timer: f32,
     heartbeat_timer: f32,
     low_hp_duck_factor: f32,
@@ -277,15 +289,40 @@ struct AudioRuntimeTimers {
     prev_locomotion: String,
     listener_spawned: bool,
     music_spawned: bool,
+    hero_select_music_spawned: bool,
     courier_loop_spawned: bool,
     creep_loop_spawned: bool,
     swing_air_loop_spawned: bool,
+    swim_loop_spawned: bool,
     ambient_spawned: bool,
     rain_loop_spawned: bool,
     snow_loop_spawned: bool,
     rain_audio_blend: f32,
     snow_audio_blend: f32,
     pending_thunder_timers: Vec<(f32, f32)>,
+    rng_state: u64,
+}
+
+fn pick_random_sound<'a>(
+    list: &'a [String],
+    timers: &mut AudioRuntimeTimers,
+    seed_bits: u64,
+) -> Option<&'a str> {
+    if list.is_empty() {
+        return None;
+    }
+    if timers.rng_state == 0 {
+        timers.rng_state = 0x9E37_79B9_7F4A_7C15_u64 ^ seed_bits.max(1);
+    }
+    let mut x = timers.rng_state ^ seed_bits;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    if x == 0 {
+        x = 0xD1B5_4A32_D192_ED03;
+    }
+    timers.rng_state = x;
+    Some(list[(x as usize) % list.len()].as_str())
 }
 
 pub struct MobaAudioPlugin;
@@ -528,26 +565,29 @@ fn process_audio_events_system(
                 );
             }
             ClientAudioEvent::BulletImpact { pos, surface } => {
-                let (path, vol) = match surface {
-                    ImpactSurface::StoneWall => (&a.impact_stone_wall_sound, a.impact_stone_wall_volume),
-                    ImpactSurface::Turret => (&a.impact_turret_sound, a.impact_turret_volume),
-                    ImpactSurface::Character => (&a.impact_character_sound, a.impact_character_volume),
-                    ImpactSurface::Building => (&a.impact_building_sound, a.impact_building_volume),
-                    ImpactSurface::Water => (&a.impact_water_sound, a.impact_water_volume),
+                let (list, vol) = match surface {
+                    ImpactSurface::StoneWall => (&a.impact_stone_wall_sounds, a.impact_stone_wall_volume),
+                    ImpactSurface::Tree => (&a.impact_tree_sounds, a.impact_tree_volume),
+                    ImpactSurface::Turret => (&a.impact_turret_sounds, a.impact_turret_volume),
+                    ImpactSurface::Character => (&a.impact_character_sounds, a.impact_character_volume),
+                    ImpactSurface::Building => (&a.impact_building_sounds, a.impact_building_volume),
+                    ImpactSurface::Water => (&a.impact_water_sounds, a.impact_water_volume),
                 };
-                play_spatial_sound(
-                    &mut commands,
-                    &asset_server,
-                    &mut cache,
-                    &settings,
-                    &config,
-                    ctx.listener_pos,
-                    pos,
-                    duck,
-                    AudioCategory::Weapons,
-                    path,
-                    vol,
-                );
+                if let Some(path) = pick_random_sound(list, &mut timers, time.elapsed_secs_f64().to_bits()) {
+                    play_spatial_sound(
+                        &mut commands,
+                        &asset_server,
+                        &mut cache,
+                        &settings,
+                        &config,
+                        ctx.listener_pos,
+                        pos,
+                        duck,
+                        AudioCategory::Weapons,
+                        path,
+                        vol,
+                    );
+                }
             }
             ClientAudioEvent::GrenadeBeep { pos } => {
                 play_spatial_sound(
@@ -622,6 +662,21 @@ fn process_audio_events_system(
                 };
                 play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Movement, path, vol);
             }
+            ClientAudioEvent::WaterSubmerge { pos } => {
+                play_spatial_sound(
+                    &mut commands,
+                    &asset_server,
+                    &mut cache,
+                    &settings,
+                    &config,
+                    ctx.listener_pos,
+                    pos,
+                    duck,
+                    AudioCategory::Movement,
+                    &a.water_submerge_sound,
+                    a.water_submerge_volume,
+                );
+            }
             ClientAudioEvent::SwingStart => {
                 play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Movement, &a.swing_start_sound, a.swing_start_volume);
             }
@@ -651,6 +706,18 @@ fn process_audio_events_system(
             }
             ClientAudioEvent::MatchStarted => {
                 play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.match_start_sound, a.match_start_volume);
+            }
+            ClientAudioEvent::HeroSelected => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.hero_select_pick_sound, a.hero_select_pick_volume);
+            }
+            ClientAudioEvent::TeamPing => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.team_ping_sound, a.team_ping_volume);
+            }
+            ClientAudioEvent::GamePaused => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.game_pause_sound, a.game_pause_volume);
+            }
+            ClientAudioEvent::UnpauseCountdownTick => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Alerts, &a.unpause_countdown_sound, a.unpause_countdown_volume);
             }
             ClientAudioEvent::MatchEnded { victory } => {
                 let (path, vol) = if victory { (&a.victory_sound, a.victory_volume) } else { (&a.defeat_sound, a.defeat_volume) };
@@ -854,25 +921,9 @@ fn update_locomotion_and_low_hp_audio_system(
 
     // ۲. صدای ردپا، دویدن در آب کم‌عمق و شنا
     let loco = ctx.current_locomotion.as_str();
-    let is_swimming = !ctx.traversal_active && loco == "swimming";
     let is_moving_ground = !ctx.traversal_active && (loco.starts_with("run_") || loco.starts_with("walk_"));
 
-    if is_swimming {
-        timers.swim_timer -= dt;
-        if timers.swim_timer <= 0.0 {
-            timers.swim_timer = a.swim_interval_secs;
-            play_2d_sound(
-                &mut commands,
-                &asset_server,
-                &mut cache,
-                &settings,
-                timers.low_hp_duck_factor,
-                AudioCategory::Movement,
-                &a.swim_stroke_sound,
-                a.swim_stroke_volume,
-            );
-        }
-    } else if is_moving_ground && ctx.in_water {
+    if is_moving_ground && ctx.in_water {
         timers.shallow_water_timer -= dt;
         if timers.shallow_water_timer <= 0.0 {
             timers.shallow_water_timer = a.shallow_water_step_interval_secs;
@@ -892,9 +943,17 @@ fn update_locomotion_and_low_hp_audio_system(
         timers.step_timer -= dt;
         if timers.step_timer <= 0.0 {
             timers.step_timer = a.footstep_interval_secs * rate_mult;
-            if !a.footstep_sounds.is_empty() {
-                let path = &a.footstep_sounds[timers.step_index % a.footstep_sounds.len()];
-                timers.step_index = (timers.step_index + 1) % a.footstep_sounds.len();
+            let (step_list, base_vol) = match ctx.current_weather {
+                Some(WeatherKind::Rainy) if !a.rain_footstep_sounds.is_empty() => {
+                    (&a.rain_footstep_sounds, a.rain_footstep_volume)
+                }
+                Some(WeatherKind::Snowy) if !a.snow_footstep_sounds.is_empty() => {
+                    (&a.snow_footstep_sounds, a.snow_footstep_volume)
+                }
+                _ => (&a.footstep_sounds, a.footstep_volume),
+            };
+            let seed_bits = time.elapsed_secs_f64().to_bits();
+            if let Some(path) = pick_random_sound(step_list, &mut timers, seed_bits) {
                 play_2d_sound(
                     &mut commands,
                     &asset_server,
@@ -903,13 +962,12 @@ fn update_locomotion_and_low_hp_audio_system(
                     timers.low_hp_duck_factor,
                     AudioCategory::Movement,
                     path,
-                    if loco.starts_with("walk_crouching") { a.footstep_volume * a.crouch_footstep_volume_multiplier } else { a.footstep_volume },
+                    if loco.starts_with("walk_crouching") { base_vol * a.crouch_footstep_volume_multiplier } else { base_vol },
                 );
             }
         }
     } else {
         timers.step_timer = 0.05;
-        timers.swim_timer = 0.05;
         timers.shallow_water_timer = 0.05;
     }
 
@@ -918,8 +976,10 @@ fn update_locomotion_and_low_hp_audio_system(
 
 #[derive(SystemParam)]
 struct WeatherAudioLoops<'w, 's> {
-    rain_loop_q: Query<'w, 's, Option<&'static mut AudioSink>, (With<RainAmbienceLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<SnowAmbienceLoop>, Without<TeleportLoopAudio>)>,
-    snow_loop_q: Query<'w, 's, Option<&'static mut AudioSink>, (With<SnowAmbienceLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<TeleportLoopAudio>)>,
+    rain_loop_q: Query<'w, 's, Option<&'static mut AudioSink>, (With<RainAmbienceLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<SnowAmbienceLoop>, Without<TeleportLoopAudio>, Without<SwimmingLoop>, Without<HeroSelectMusicLoop>)>,
+    snow_loop_q: Query<'w, 's, Option<&'static mut AudioSink>, (With<SnowAmbienceLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<TeleportLoopAudio>, Without<SwimmingLoop>, Without<HeroSelectMusicLoop>)>,
+    swim_loop_q: Query<'w, 's, Option<&'static mut AudioSink>, (With<SwimmingLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<SnowAmbienceLoop>, Without<TeleportLoopAudio>, Without<HeroSelectMusicLoop>)>,
+    hero_select_loop_q: Query<'w, 's, (Entity, Option<&'static mut AudioSink>), (With<HeroSelectMusicLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<SnowAmbienceLoop>, Without<TeleportLoopAudio>, Without<SwimmingLoop>)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -936,10 +996,10 @@ fn update_loops_and_ambient_zones_system(
     mut listener_q: Query<&mut Transform, With<SpatialListener>>,
     mut courier_loop_q: Query<(&mut Transform, Option<&mut SpatialAudioSink>), (With<CourierFlyLoop>, Without<SpatialListener>, Without<CreepMarchLoop>)>,
     mut creep_loop_q: Query<(&mut Transform, Option<&mut SpatialAudioSink>), (With<CreepMarchLoop>, Without<SpatialListener>, Without<CourierFlyLoop>)>,
-    mut ambient_q: Query<(&AmbientZoneLoop, Option<&mut AudioSink>), (Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<SnowAmbienceLoop>)>,
+    mut ambient_q: Query<(&AmbientZoneLoop, Option<&mut AudioSink>), (Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<SnowAmbienceLoop>, Without<SwimmingLoop>, Without<HeroSelectMusicLoop>)>,
     mut weather_loops: WeatherAudioLoops,
-    mut swing_air_q: Query<Option<&mut AudioSink>, (With<SwingAirLoop>, Without<AmbientZoneLoop>, Without<TeleportLoopAudio>)>,
-    mut teleport_loop_q: Query<(&TeleportLoopAudio, &mut Transform, Option<&mut SpatialAudioSink>), (Without<SpatialListener>, Without<CourierFlyLoop>, Without<CreepMarchLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>)>,
+    mut swing_air_q: Query<Option<&mut AudioSink>, (With<SwingAirLoop>, Without<AmbientZoneLoop>, Without<TeleportLoopAudio>, Without<SwimmingLoop>, Without<HeroSelectMusicLoop>)>,
+    mut teleport_loop_q: Query<(&TeleportLoopAudio, &mut Transform, Option<&mut SpatialAudioSink>), (Without<SpatialListener>, Without<CourierFlyLoop>, Without<CreepMarchLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<SwimmingLoop>, Without<HeroSelectMusicLoop>)>,
 ) {
     let a = &config.audio;
     let duck = if timers.low_hp_duck_factor > 0.0 {
@@ -978,6 +1038,30 @@ fn update_loops_and_ambient_zones_system(
             0.0
         };
         sink.set_volume(Volume::Linear(target_vol));
+    }
+
+    // ۱.۸. لوپ موزیک پس‌زمینه فاز انتخاب هیرو (با اتمام فاز انتخاب هیرو قطع می‌شود)
+    if ctx.in_hero_select && !timers.hero_select_music_spawned {
+        if let Some(handle) = cache.get_or_load(&a.hero_select_music_sound, &asset_server) {
+            let vol = settings.effective_gain(AudioCategory::Music, 1.0) * a.hero_select_music_volume;
+            commands.spawn((
+                HeroSelectMusicLoop,
+                AudioPlayer::new(handle),
+                PlaybackSettings::LOOP.with_volume(Volume::Linear(vol)),
+            ));
+            timers.hero_select_music_spawned = true;
+        }
+    }
+    for (ent, sink_opt) in &mut weather_loops.hero_select_loop_q {
+        if ctx.in_hero_select {
+            if let Some(mut sink) = sink_opt {
+                let vol = settings.effective_gain(AudioCategory::Music, 1.0) * a.hero_select_music_volume;
+                sink.set_volume(Volume::Linear(vol));
+            }
+        } else {
+            commands.entity(ent).despawn();
+            timers.hero_select_music_spawned = false;
+        }
     }
 
     // ۲. لوپ موزیک پس‌زمینه بازی
@@ -1162,6 +1246,30 @@ fn update_loops_and_ambient_zones_system(
             * w_cfg.snow_loop_volume
             * timers.snow_audio_blend;
         sink.set_volume(Volume::Linear(vol));
+    }
+
+    // ۸. لوپ صدای شنا کردن هیرو در آب عمیق
+    if ctx.in_game && !timers.swim_loop_spawned {
+        if let Some(handle) = cache.get_or_load(&a.swim_loop_sound, &asset_server) {
+            commands.spawn((
+                SwimmingLoop,
+                AudioPlayer::new(handle),
+                PlaybackSettings::LOOP.with_volume(Volume::Linear(0.0)),
+            ));
+            timers.swim_loop_spawned = true;
+        }
+    }
+    if let Ok(Some(mut sink)) = weather_loops.swim_loop_q.single_mut() {
+        let is_swimming = ctx.in_game
+            && !ctx.hero_is_dead
+            && !ctx.traversal_active
+            && ctx.current_locomotion == "swimming";
+        let target_vol = if is_swimming {
+            settings.effective_gain(AudioCategory::Movement, duck) * a.swim_loop_volume
+        } else {
+            0.0
+        };
+        sink.set_volume(Volume::Linear(target_vol));
     }
 }
 

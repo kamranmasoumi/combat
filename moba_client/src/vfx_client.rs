@@ -1611,7 +1611,7 @@ fn process_vfx_events_system(
                 let profile = config.resolve_bullet_vfx(&vfx_source);
                 let (effect_h, lifetime) = match surface {
                     ImpactSurface::Character => (handles.blood_burst.clone(), 0.70),
-                    ImpactSurface::StoneWall | ImpactSurface::Building => {
+                    ImpactSurface::StoneWall | ImpactSurface::Building | ImpactSurface::Tree => {
                         (handles.stone_dust.clone(), 0.85)
                     }
                     ImpactSurface::Turret => (handles.metal_sparks.clone(), 0.55),

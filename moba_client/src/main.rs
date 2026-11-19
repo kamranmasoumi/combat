@@ -4279,6 +4279,7 @@ fn client_receive_snapshot_and_sync_system(
         let minimap_ent_opt = hud_sync.minimap_root_q.single().ok();
         for pg in snap.recent_pings {
             if hud_sync.ping_state.seen_ids.insert(pg.id) {
+                fx_res.audio_q.0.push(ClientAudioEvent::TeamPing);
                 spawn_team_ping_visuals(
                     &mut commands,
                     &config,
@@ -4682,6 +4683,7 @@ fn spawn_fx_from_server_event(
                 intensity,
             );
             if intensity >= 1.35 {
+                audio_q.0.push(ClientAudioEvent::WaterSubmerge { pos });
                 vfx_q.0.push(ClientVfxEvent::WaterSplash { pos, intensity });
             }
         }
@@ -9609,9 +9611,13 @@ fn match_overlay_ui_system(
     mut net: ResMut<ClientNetwork>,
     mut match_flow: ResMut<ClientMatchFlow>,
     mut ui: MatchOverlayUiQueries,
+    mut audio_ctx: ResMut<AudioFrameContext>,
+    mut audio_q: ResMut<AudioEventQueue>,
     mut last_rebuild_key: Local<String>,
+    mut prev_picked_heroes: Local<Vec<Option<String>>>,
 ) {
     let phase = match_flow.current_phase();
+    audio_ctx.in_hero_select = phase == MatchPhase::HeroSelect;
     let now = time.elapsed_secs();
 
     if let Ok((mut root_node, mut root_bg)) = ui.overlay_q.single_mut() {
@@ -9752,6 +9758,20 @@ fn match_overlay_ui_system(
     let Some(snap) = &match_flow.snapshot else {
         return;
     };
+    if phase == MatchPhase::HeroSelect {
+        if prev_picked_heroes.len() != snap.players.len() {
+            *prev_picked_heroes = snap.players.iter().map(|pl| pl.selected_hero_id.clone()).collect();
+        } else {
+            for (idx, pl) in snap.players.iter().enumerate() {
+                if prev_picked_heroes[idx].is_none() && pl.selected_hero_id.is_some() {
+                    audio_q.0.push(ClientAudioEvent::HeroSelected);
+                }
+                prev_picked_heroes[idx] = pl.selected_hero_id.clone();
+            }
+        }
+    } else if !prev_picked_heroes.is_empty() {
+        prev_picked_heroes.clear();
+    }
 
     if let Ok(mut b) = ui.badge_q.single_mut() {
         let s = match snap.phase {
@@ -16180,6 +16200,7 @@ fn update_scoreboard_ui_system(
 #[derive(SystemParam)]
 struct AudioSyncStateParams<'w> {
     config: Res<'w, GameConfig>,
+    pause_state: Res<'w, LatestPauseState>,
     match_flow: Res<'w, ClientMatchFlow>,
     render_state: Res<'w, ClientRenderState>,
     hero_hud: Res<'w, LatestHeroSnapshot>,
@@ -16199,6 +16220,10 @@ struct AudioSyncStateParams<'w> {
 #[derive(Default)]
 struct AudioTransitionTracker {
     prev_in_game: bool,
+    match_start_played: bool,
+    prev_match_elapsed_secs: f32,
+    prev_pause_phase: Option<PausePhase>,
+    prev_unpause_countdown_sec: Option<u32>,
     prev_dead: bool,
     prev_courier_dead: bool,
     prev_weapon: Option<ActiveWeaponSlot>,
@@ -16270,7 +16295,33 @@ fn sync_audio_context_system(
 
     if !tr.prev_in_game {
         tr.prev_in_game = true;
-        p.audio_q.0.push(ClientAudioEvent::MatchStarted);
+    }
+    let first_wave_t = p.config.creeps.first_wave_delay_secs;
+    let cur_elapsed = p.top_bar.match_elapsed_secs;
+    if !tr.match_start_played && cur_elapsed >= first_wave_t {
+        tr.match_start_played = true;
+        if tr.prev_match_elapsed_secs < first_wave_t || cur_elapsed < first_wave_t + 3.0 {
+            p.audio_q.0.push(ClientAudioEvent::MatchStarted);
+        }
+    }
+    tr.prev_match_elapsed_secs = cur_elapsed;
+
+    let cur_pause = p.pause_state.0.phase;
+    if tr.prev_pause_phase != Some(cur_pause) {
+        if cur_pause == PausePhase::Paused && tr.prev_pause_phase.is_some() {
+            p.audio_q.0.push(ClientAudioEvent::GamePaused);
+        }
+        if cur_pause != PausePhase::UnpauseCountdown {
+            tr.prev_unpause_countdown_sec = None;
+        }
+        tr.prev_pause_phase = Some(cur_pause);
+    }
+    if cur_pause == PausePhase::UnpauseCountdown {
+        let sec = p.pause_state.0.countdown_remaining_secs.ceil().max(1.0) as u32;
+        if tr.prev_unpause_countdown_sec != Some(sec) {
+            tr.prev_unpause_countdown_sec = Some(sec);
+            p.audio_q.0.push(ClientAudioEvent::UnpauseCountdownTick);
+        }
     }
 
     if p.render_state.is_dead && !tr.prev_dead {

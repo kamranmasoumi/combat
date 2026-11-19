@@ -108,13 +108,18 @@ pub struct AudioConfig {
     pub grenade_water_explosion_volume: f32,
     pub footstep_sounds: Vec<String>,
     pub footstep_volume: f32,
+    pub rain_footstep_sounds: Vec<String>,
+    pub rain_footstep_volume: f32,
+    pub snow_footstep_sounds: Vec<String>,
+    pub snow_footstep_volume: f32,
     pub crouch_footstep_volume_multiplier: f32,
     pub footstep_interval_secs: f32,
     pub weapon_switch_sound: String,
     pub weapon_switch_volume: f32,
-    pub swim_stroke_sound: String,
-    pub swim_stroke_volume: f32,
-    pub swim_interval_secs: f32,
+    pub water_submerge_sound: String,
+    pub water_submerge_volume: f32,
+    pub swim_loop_sound: String,
+    pub swim_loop_volume: f32,
     pub shallow_water_step_sound: String,
     pub shallow_water_step_volume: f32,
     pub shallow_water_step_interval_secs: f32,
@@ -134,15 +139,17 @@ pub struct AudioConfig {
     pub primary_reload_volume: f32,
     pub pistol_reload_sound: String,
     pub pistol_reload_volume: f32,
-    pub impact_stone_wall_sound: String,
+    pub impact_stone_wall_sounds: Vec<String>,
     pub impact_stone_wall_volume: f32,
-    pub impact_turret_sound: String,
+    pub impact_tree_sounds: Vec<String>,
+    pub impact_tree_volume: f32,
+    pub impact_turret_sounds: Vec<String>,
     pub impact_turret_volume: f32,
-    pub impact_character_sound: String,
+    pub impact_character_sounds: Vec<String>,
     pub impact_character_volume: f32,
-    pub impact_building_sound: String,
+    pub impact_building_sounds: Vec<String>,
     pub impact_building_volume: f32,
-    pub impact_water_sound: String,
+    pub impact_water_sounds: Vec<String>,
     pub impact_water_volume: f32,
     pub creep_fire_sound: String,
     pub creep_fire_volume: f32,
@@ -181,6 +188,16 @@ pub struct AudioConfig {
     pub courier_fly_loop_volume: f32,
     pub match_start_sound: String,
     pub match_start_volume: f32,
+    pub hero_select_music_sound: String,
+    pub hero_select_music_volume: f32,
+    pub hero_select_pick_sound: String,
+    pub hero_select_pick_volume: f32,
+    pub team_ping_sound: String,
+    pub team_ping_volume: f32,
+    pub game_pause_sound: String,
+    pub game_pause_volume: f32,
+    pub unpause_countdown_sound: String,
+    pub unpause_countdown_volume: f32,
     pub background_music_sound: String,
     pub background_music_volume: f32,
     pub shop_add_cart_sound: String,
@@ -789,7 +806,8 @@ impl GameConfig {
         assert!(a.spatial_scale > 0.0, "audio.spatial_scale باید بزرگ‌تر از صفر باشد");
         assert!(a.max_hearing_distance > 1.0, "audio.max_hearing_distance باید بزرگ‌تر از 1 باشد");
         assert!(a.footstep_interval_secs > 0.05, "audio.footstep_interval_secs نامعتبر است");
-        assert!(a.swim_interval_secs > 0.05, "audio.swim_interval_secs نامعتبر است");
+        assert!(!a.swim_loop_sound.trim().is_empty(), "audio.swim_loop_sound نمی‌تواند خالی باشد");
+        assert!(!a.water_submerge_sound.trim().is_empty(), "audio.water_submerge_sound نمی‌تواند خالی باشد");
         assert!(a.shallow_water_step_interval_secs > 0.05, "audio.shallow_water_step_interval_secs نامعتبر است");
         assert!(a.creep_fire_max_concurrent > 0, "audio.creep_fire_max_concurrent باید حداقل 1 باشد");
         assert!(a.low_hp_threshold_ratio > 0.0 && a.low_hp_threshold_ratio < 1.0, "audio.low_hp_threshold_ratio باید بین 0 و 1 باشد");
@@ -799,6 +817,11 @@ impl GameConfig {
         assert!(a.swing_air_loop_volume >= 0.0, "audio.swing_air_loop_volume نمی‌تواند منفی باشد");
         assert!(a.swing_end_volume >= 0.0, "audio.swing_end_volume نمی‌تواند منفی باشد");
         assert!(a.swing_land_volume >= 0.0, "audio.swing_land_volume نمی‌تواند منفی باشد");
+        assert!(a.hero_select_music_volume >= 0.0, "audio.hero_select_music_volume نمی‌تواند منفی باشد");
+        assert!(a.hero_select_pick_volume >= 0.0, "audio.hero_select_pick_volume نمی‌تواند منفی باشد");
+        assert!(a.team_ping_volume >= 0.0, "audio.team_ping_volume نمی‌تواند منفی باشد");
+        assert!(a.game_pause_volume >= 0.0, "audio.game_pause_volume نمی‌تواند منفی باشد");
+        assert!(a.unpause_countdown_volume >= 0.0, "audio.unpause_countdown_volume نمی‌تواند منفی باشد");
         for (hid, hw) in &a.hero_weapons {
             assert!(hw.primary_fire_volume >= 0.0, "primary_fire_volume برای '{}' نمی‌تواند منفی باشد", hid);
             assert!(hw.pistol_fire_volume >= 0.0, "pistol_fire_volume برای '{}' نمی‌تواند منفی باشد", hid);
@@ -2267,6 +2290,7 @@ impl ClientInputCommand {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImpactSurface {
     StoneWall,
+    Tree,
     Turret,
     Character,
     Building,
@@ -10636,6 +10660,7 @@ fn shared_authoritative_react_system(
     turret_query: Query<(Entity, &PhysicsTurret)>,
     barracks_query: Query<(Entity, &PhysicsBarracks)>,
     ancient_query: Query<(Entity, &PhysicsAncient)>,
+    tree_query: Query<(), With<PhysicsTree>>,
 ) {
     if match_state
         .as_ref()
@@ -11255,7 +11280,11 @@ fn shared_authoritative_react_system(
 
         if let Some((hit_entity, impact_pos, _)) = ray_hit {
             let mut target_destroyed = false;
-            let mut impact_surface = ImpactSurface::StoneWall;
+            let mut impact_surface = if tree_query.contains(hit_entity) {
+                ImpactSurface::Tree
+            } else {
+                ImpactSurface::StoneWall
+            };
             if let Some(&tur_idx) = turret_idx_by_entity.get(&hit_entity) {
                 impact_surface = ImpactSurface::Turret;
                 let turret_team = world.turrets[tur_idx].team;

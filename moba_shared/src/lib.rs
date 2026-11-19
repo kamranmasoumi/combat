@@ -1674,6 +1674,7 @@ pub struct CreepConfig {
     pub armor_upgrade_per_step: f32,
     pub fire_rate_multiplier_per_step: f32,
     pub min_fire_rate_secs: f32,
+    pub gold_upgrade_per_step: u32,
     pub wave_spawn_spacing: f32,
     pub move_speed: f32,
     pub fire_rate_secs: f32,
@@ -10572,7 +10573,7 @@ fn apply_aoe_explosion(
                 world.creeps[c_idx].is_dead = true;
                 world.creeps[c_idx].anim_state = CreepAnimState::Die;
                 world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
-                let gold_bounty = c_stats.gold_bounty;
+                let gold_bounty = lane_creep_gold_bounty(config, world.match_elapsed_secs, world.creeps[c_idx].camp_index.is_none(), c_stats.gold_bounty);
                 let xp_bounty = c_stats.xp_bounty;
                 if let Some(o_slot) = owner_slot {
                     if let Some(killer) = world.players.iter_mut().find(|p| p.slot_index == o_slot) {
@@ -11170,7 +11171,7 @@ fn shared_authoritative_react_system(
                 world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
                 let creep_pos = world.creeps[c_idx].pos;
                 let creep_team = world.creeps[c_idx].team;
-                let gold_bounty = c_stats.gold_bounty;
+                let gold_bounty = lane_creep_gold_bounty(&config, world.match_elapsed_secs, world.creeps[c_idx].camp_index.is_none(), c_stats.gold_bounty);
                 let xp_bounty = c_stats.xp_bounty;
                 let is_deny = bullet.owner_team == creep_team;
 
@@ -11846,7 +11847,7 @@ fn shared_authoritative_react_system(
                 world.creeps[c_idx].anim_state = CreepAnimState::Die;
                 world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
                 let cpos = world.creeps[c_idx].pos;
-                let gb = c_stats.gold_bounty;
+                let gb = lane_creep_gold_bounty(&config, world.match_elapsed_secs, world.creeps[c_idx].camp_index.is_none(), c_stats.gold_bounty);
                 let xb = c_stats.xp_bounty;
                 let w_inner = &mut *world;
                 if let Some(killer) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
@@ -12014,7 +12015,7 @@ fn shared_authoritative_react_system(
                     world.creeps[c_idx].is_dead = true;
                     world.creeps[c_idx].anim_state = CreepAnimState::Die;
                     world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
-                    let gold_bounty = c_stats.gold_bounty;
+                    let gold_bounty = lane_creep_gold_bounty(&config, world.match_elapsed_secs, world.creeps[c_idx].camp_index.is_none(), c_stats.gold_bounty);
                     let xp_bounty = c_stats.xp_bounty;
                     if let Some(o_slot) = pool.owner_slot {
                         if let Some(killer) = world.players.iter_mut().find(|p| p.slot_index == o_slot) {
@@ -12402,6 +12403,19 @@ fn resolve_creep_stats<'a>(config: &'a GameConfig, creep_type_id: Option<&str>) 
 
 /// محاسبه ارتقای زمان‌محور سربازان لاین (هر ۱۰ دقیقه تعداد، هر ۷ دقیقه ویژگی‌ها)
 /// بازگشت: (hp_bonus, armor_bonus, damage_bonus, fire_rate_mult)
+pub fn lane_creep_gold_bounty(
+    config: &GameConfig,
+    match_elapsed_secs: f32,
+    is_lane_creep: bool,
+    base_gold: u32,
+) -> u32 {
+    if !is_lane_creep {
+        return base_gold;
+    }
+    let steps = (match_elapsed_secs.max(0.0) / config.creeps.stat_upgrade_interval_secs).floor() as u32;
+    base_gold + steps.saturating_mul(config.creeps.gold_upgrade_per_step)
+}
+
 pub fn lane_creep_time_scaling(
     config: &GameConfig,
     match_elapsed_secs: f32,

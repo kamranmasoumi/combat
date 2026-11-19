@@ -571,58 +571,67 @@ def abandon_active_matches_for_player(player: Player) -> dict:
     abandoned_count = 0
     rooms_closed = 0
 
-    for part in participants:
-        room = part.match_room
-        is_lobby = getattr(room, "is_custom_lobby", False)
-        part.status = MatchParticipant.STATUS_ABANDONED
-        part.is_winner = False
-        part.mmr_delta = 0 if is_lobby else -25
-        part.left_at = now
-        part.save(update_fields=["status", "is_winner", "mmr_delta", "left_at"])
+    rooms_to_terminate = []
+    with transaction.atomic():
+        for part in participants:
+            room = part.match_room
+            is_lobby = getattr(room, "is_custom_lobby", False)
+            part.status = MatchParticipant.STATUS_ABANDONED
+            part.is_winner = False
+            part.mmr_delta = 0 if is_lobby else -25
+            part.left_at = now
+            part.save(update_fields=["status", "is_winner", "mmr_delta", "left_at"])
 
-        delete_ticket_from_redis(part.ticket_id)
-        abandoned_count += 1
+            delete_ticket_from_redis(part.ticket_id)
+            abandoned_count += 1
 
-        if not is_lobby:
-            # اعمال جریمه ترک بازی فقط برای بازی‌های غیر لابی
-            player.losses += 1
-            player.abandoned_count += 1
-            player.mmr = max(0, player.mmr - 25)
-            player.rank_tier = compute_rank_tier_from_mmr(player.mmr)
-            player.save(
-                update_fields=["losses", "abandoned_count", "mmr", "rank_tier"]
-            )
-            print(
-                f"[MATCH ABANDON] Player {player.username} ({player.user_id}) ABANDONED room {room.room_id} (-25 MMR -> {player.mmr}).",
-                flush=True,
-            )
-        else:
-            print(
-                f"[LOBBY MATCH LEAVE] Player {player.username} ({player.user_id}) left custom lobby room {room.room_id} (0 MMR change).",
-                flush=True,
-            )
+            if not is_lobby:
+                player.losses += 1
+                player.abandoned_count += 1
+                player.mmr = max(0, player.mmr - 25)
+                player.rank_tier = compute_rank_tier_from_mmr(player.mmr)
+                player.save(
+                    update_fields=["losses", "abandoned_count", "mmr", "rank_tier"]
+                )
+                print(
+                    f"[MATCH ABANDON] Player {player.username} ({player.user_id}) ABANDONED room {room.room_id} (-25 MMR -> {player.mmr}).",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[LOBBY MATCH LEAVE] Player {player.username} ({player.user_id}) left custom lobby room {room.room_id} (0 MMR change).",
+                    flush=True,
+                )
 
-        # بررسی اینکه آیا بازیکنان دیگری هنوز در این اتاق فعال هستند یا همه Abandon کرده‌اند
-        remaining_active = (
-            MatchParticipant.objects.filter(match_room=room)
-            .exclude(status=MatchParticipant.STATUS_ABANDONED)
-            .exists()
-        )
-        if not remaining_active:
-            room.status = GameMatchRoom.STATUS_CANCELED
-            room.finished_at = now
-            room.save(update_fields=["status", "finished_at"])
-            terminate_game_server_instance(
-                port=room.server_port,
-                room_id=room.room_id,
-                player_count=room.max_players,
-                process_pid=room.process_pid,
+            remaining_active = (
+                MatchParticipant.objects.filter(match_room=room)
+                .exclude(status=MatchParticipant.STATUS_ABANDONED)
+                .exists()
             )
-            rooms_closed += 1
-            print(
-                f"[MATCH ROOM CLOSED] All players abandoned room {room.room_id}; server on port {room.server_port} terminated.",
-                flush=True,
-            )
+            if not remaining_active:
+                room.status = GameMatchRoom.STATUS_CANCELED
+                room.finished_at = now
+                room.save(update_fields=["status", "finished_at"])
+                rooms_to_terminate.append(
+                    (room.server_port, room.room_id, room.max_players, room.process_pid)
+                )
+                rooms_closed += 1
+                print(
+                    f"[MATCH ROOM CLOSED] All players abandoned room {room.room_id}; scheduling termination on port {room.server_port}.",
+                    flush=True,
+                )
+
+    for srv_port, r_id, p_cnt, pid in rooms_to_terminate:
+        threading.Thread(
+            target=terminate_game_server_instance,
+            kwargs={
+                "port": srv_port,
+                "room_id": r_id,
+                "player_count": p_cnt,
+                "process_pid": pid,
+            },
+            daemon=True,
+        ).start()
 
     return {
         "abandoned_matches": abandoned_count,

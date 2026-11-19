@@ -334,6 +334,7 @@ fn on_enter_pregame(
         }
     } else if let Some(tok) = state.access_token.clone() {
         state.tab = PreGameTab::Hub;
+        state.active_match = None;
         state.is_loading = false;
         state.server_starting = false;
         state.queue_players = 0;

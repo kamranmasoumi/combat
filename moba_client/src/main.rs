@@ -1141,6 +1141,12 @@ fn on_enter_ingame_connect_system(
     if let Some(info) = pending.0.take() {
         config.network.server_public_addr = info.server_addr.clone();
         config.network.server_bind_addr = info.server_addr;
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in info.ticket_id.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        config.network.client_id = (hash % 900_000_000) + 1_000;
         let (client, transport) = create_shared_renet_client(&config.network);
         net.client = client;
         net.transport = transport;
@@ -1200,9 +1206,11 @@ fn spawn_ingame_exit_button_ui(commands: &mut Commands) {
 }
 
 fn on_exit_ingame_system(
+    mut net: ResMut<ClientNetwork>,
     mut cam_q: Query<&mut Camera, With<Camera3d>>,
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
+    net.client.disconnect();
     for mut cam in &mut cam_q {
         cam.is_active = false;
     }
@@ -4149,6 +4157,7 @@ struct TurretFxResources<'w, 's> {
     vfx_q: ResMut<'w, VfxEventQueue>,
     turret_gun_q: Query<'w, 's, &'static mut TurretGunBone>,
     turret_muzzle_q: Query<'w, 's, (&'static TurretMuzzlePoint, &'static GlobalTransform)>,
+    next_screen: ResMut<'w, NextState<AppScreenState>>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -4204,7 +4213,10 @@ fn client_receive_snapshot_and_sync_system(
 
     net.client.update(delta);
     if let Err(e) = net.transport.update(delta, &mut net.client) {
-        panic!("خطای بحرانی ترنسپورت Renet در کلاینت: {}", e);
+        error!("خطای ترنسپورت Renet در کلاینت: {}", e);
+        net.client.disconnect();
+        fx_res.next_screen.set(AppScreenState::PreGame);
+        return;
     }
 
     let mut latest_snapshot: Option<ServerWorldSnapshot> = None;

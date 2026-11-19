@@ -51,7 +51,7 @@ mod pregame_ui;
 mod vfx_client;
 use backend_client::BackendClient;
 use pregame_ui::{AppScreenState, PendingMatchConnection, PreGamePlugin, PreGameSessionState};
-use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, MobaVfxPlugin, TeleportPortalMaterial, TeleportPortalUniforms, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms, WeatherVfxState};
+use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, FlameBeamMaterial, FlameBeamUniforms, MobaVfxPlugin, TeleportPortalMaterial, TeleportPortalUniforms, ToxicPoolMaterial, ToxicPoolUniforms, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms, WeatherVfxState};
 mod shop_client;
 use audio_client::{ActiveBeamAudio, AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
 use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, TeleportPreviewState, VerticalAimKeyState};
@@ -635,7 +635,7 @@ struct SwingPulleyWheel {
 #[derive(Component)]
 struct ToxicPoolVisual {
     id: u64,
-    mat_handle: Handle<StandardMaterial>,
+    mat_handle: Handle<ToxicPoolMaterial>,
     bubble_timer: f32,
 }
 
@@ -648,7 +648,12 @@ struct ToxicBubbleParticle {
 #[derive(Component)]
 struct ElectricBeamVisual {
     id: u64,
+    is_flame: bool,
     mesh_handle: Handle<Mesh>,
+    flame_mat: Option<Handle<FlameBeamMaterial>>,
+    muzzle_light: Option<Entity>,
+    impact_light: Option<Entity>,
+    particle_emit_timer: f32,
 }
 
 #[derive(Component)]
@@ -2994,6 +2999,7 @@ fn sync_toxic_pools_visual_system(
     mut render_state: ResMut<ClientRenderState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut toxic_materials: ResMut<Assets<ToxicPoolMaterial>>,
     mut pool_q: Query<(Entity, &mut ToxicPoolVisual, &mut Transform)>,
     mut bubble_q: Query<(Entity, &mut ToxicBubbleParticle, &mut Transform), Without<ToxicPoolVisual>>,
 ) {
@@ -3026,9 +3032,9 @@ fn sync_toxic_pools_visual_system(
             let pulse = 0.94 + 0.06 * (t_secs * 5.5 + snap.id as f32).sin();
             tf.translation = snap.pos + Vec3::Y * 0.06;
             tf.scale = Vec3::new(snap.radius * pulse, 1.0, snap.radius * pulse);
-            if let Some(mut mat) = materials.get_mut(&pool_vis.mat_handle) {
-                mat.base_color = Color::srgba(0.16, 0.95, 0.24, 0.42 * frac);
-                mat.emissive = LinearRgba::new(0.45 * frac, 3.8 * frac, 0.55 * frac, 1.0);
+            if let Some(mut mat) = toxic_materials.get_mut(&pool_vis.mat_handle) {
+                mat.uniforms.params.x = t_secs;
+                mat.uniforms.params.y = frac;
             }
             pool_vis.bubble_timer -= dt;
             if pool_vis.bubble_timer <= 0.0 {
@@ -3062,12 +3068,12 @@ fn sync_toxic_pools_visual_system(
 
     for snap in &render_state.toxic_pools {
         if !existing_ids.contains(&snap.id) {
-            let mat_handle = materials.add(StandardMaterial {
-                base_color: Color::srgba(0.16, 0.95, 0.24, 0.42),
-                emissive: LinearRgba::new(0.45, 3.8, 0.55, 1.0),
-                alpha_mode: AlphaMode::Blend,
-                unlit: true,
-                ..default()
+            let mat_handle = toxic_materials.add(ToxicPoolMaterial {
+                uniforms: ToxicPoolUniforms {
+                    core_color: Vec4::new(0.10, 0.72, 0.14, 1.0),
+                    edge_color: Vec4::new(0.42, 1.0, 0.22, 1.0),
+                    params: Vec4::new(t_secs, 1.0, (snap.id as f32) * 0.73, 2.4),
+                },
             });
             commands.spawn((
                 ToxicPoolVisual {
@@ -3075,7 +3081,7 @@ fn sync_toxic_pools_visual_system(
                     mat_handle: mat_handle.clone(),
                     bubble_timer: 0.05,
                 },
-                Mesh3d(meshes.add(Cylinder::new(1.0, 0.05))),
+                Mesh3d(meshes.add(Plane3d::default().mesh().size(2.0, 2.0))),
                 MeshMaterial3d(mat_handle),
                 Transform::from_translation(snap.pos + Vec3::Y * 0.06)
                     .with_scale(Vec3::new(snap.radius, 1.0, snap.radius)),
@@ -3086,6 +3092,7 @@ fn sync_toxic_pools_visual_system(
 }
 
 
+#[allow(clippy::too_many_arguments)]
 fn sync_electric_beams_visual_system(
     mut commands: Commands,
     time: Res<Time>,
@@ -3093,20 +3100,32 @@ fn sync_electric_beams_visual_system(
     render_state: Res<ClientRenderState>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut beam_q: Query<(Entity, &ElectricBeamVisual, &mut Visibility)>,
+    mut flame_materials: ResMut<Assets<FlameBeamMaterial>>,
+    mut vfx_q: ResMut<VfxEventQueue>,
+    cam_q: Query<&Transform, (With<Camera3d>, Without<PointLight>)>,
+    mut light_q: Query<(&mut Transform, &mut PointLight), Without<Camera3d>>,
+    mut beam_q: Query<(Entity, &mut ElectricBeamVisual, &mut Visibility)>,
 ) {
     if !match_flow.is_in_game() {
-        for (ent, _, _) in &beam_q {
+        for (ent, beam_vis, _) in &beam_q {
+            if let Some(le) = beam_vis.muzzle_light {
+                commands.entity(le).despawn();
+            }
+            if let Some(ie) = beam_vis.impact_light {
+                commands.entity(ie).despawn();
+            }
             commands.entity(ent).despawn();
         }
         return;
     }
 
     let t_sec = time.elapsed_secs();
+    let dt = time.delta_secs();
+    let cam_pos = cam_q.iter().next().map_or(Vec3::new(0.0, 18.0, 12.0), |tf| tf.translation);
     let mut existing = Vec::new();
 
-    for (ent, beam_vis, mut vis) in &mut beam_q {
-        if let Some(snap) = render_state.electric_beams.iter().find(|b| b.id == beam_vis.id) {
+    for (ent, mut beam_vis, mut vis) in &mut beam_q {
+        if let Some(snap) = render_state.electric_beams.iter().find(|b| b.id == beam_vis.id && b.is_flame == beam_vis.is_flame) {
             existing.push(beam_vis.id);
             let chord = snap.end_pos - snap.start_pos;
             let len = chord.length();
@@ -3121,17 +3140,17 @@ fn sync_electric_beams_visual_system(
             }
             let up_p = side.cross(dir).normalize_or_zero();
 
-            const SEGS: usize = 14;
-            const SIDES: usize = 5;
-            let mut spine = Vec::with_capacity(SEGS + 1);
-            for i in 0..=SEGS {
-                let u = i as f32 / SEGS as f32;
+            let segs: usize = if snap.is_flame { 18 } else { 14 };
+            let sides: usize = if snap.is_flame { 12 } else { 5 };
+            let mut spine = Vec::with_capacity(segs + 1);
+            for i in 0..=segs {
+                let u = i as f32 / segs as f32;
                 let base = snap.start_pos.lerp(snap.end_pos, u);
                 let env = (u * std::f32::consts::PI).sin();
                 let jitter = if snap.is_flame {
-                    let w1 = (u * 12.0 - t_sec * 28.0 + snap.id as f32 * 2.1).sin();
-                    let w2 = (u * 16.0 - t_sec * 22.0).cos();
-                    (side * w1 + up_p * (w2 + 0.35)) * (0.38 * u.sqrt())
+                    let w1 = (u * 8.5 - t_sec * 18.0 + snap.id as f32 * 2.1).sin();
+                    let w2 = (u * 11.0 - t_sec * 14.0).cos();
+                    (side * w1 + up_p * (w2 + 0.25)) * (0.28 * u.sqrt())
                 } else {
                     let j1 = (u * 23.0 + t_sec * 65.0 + snap.id as f32 * 3.1).sin();
                     let j2 = (u * 31.0 - t_sec * 52.0 + snap.id as f32 * 1.7).cos();
@@ -3140,14 +3159,16 @@ fn sync_electric_beams_visual_system(
                 spine.push(base + jitter);
             }
 
-            let mut positions = Vec::with_capacity((SEGS + 1) * SIDES);
-            let mut normals = Vec::with_capacity((SEGS + 1) * SIDES);
-            let mut indices = Vec::with_capacity(SEGS * SIDES * 6);
+            let mut positions = Vec::with_capacity((segs + 1) * sides);
+            let mut normals = Vec::with_capacity((segs + 1) * sides);
+            let mut uvs = Vec::with_capacity((segs + 1) * sides);
+            let mut indices = Vec::with_capacity(segs * sides * 6);
             for (i, &p) in spine.iter().enumerate() {
+                let v_coord = i as f32 / segs as f32;
                 let tang = if i == 0 {
                     (spine[1] - spine[0]).normalize_or_zero()
-                } else if i == SEGS {
-                    (spine[SEGS] - spine[SEGS - 1]).normalize_or_zero()
+                } else if i == segs {
+                    (spine[segs] - spine[segs - 1]).normalize_or_zero()
                 } else {
                     (spine[i + 1] - spine[i - 1]).normalize_or_zero()
                 };
@@ -3157,20 +3178,26 @@ fn sync_electric_beams_visual_system(
                     n1 = Vec3::X;
                 }
                 let n2 = n1.cross(td).normalize_or_zero();
-                for s in 0..SIDES {
-                    let ang = (s as f32 / SIDES as f32) * std::f32::consts::TAU;
+                for s in 0..sides {
+                    let u_coord = s as f32 / sides as f32;
+                    let ang = u_coord * std::f32::consts::TAU;
                     let norm = (n1 * ang.cos() + n2 * ang.sin()).normalize_or_zero();
-                    let r_here = if snap.is_flame { 0.08 + (i as f32 / SEGS as f32) * 0.42 } else { 0.055 };
+                    let r_here = if snap.is_flame {
+                        0.06 + v_coord.powf(0.82) * 0.52
+                    } else {
+                        0.055
+                    };
                     let v = p + norm * r_here;
                     positions.push([v.x, v.y, v.z]);
                     normals.push([norm.x, norm.y, norm.z]);
+                    uvs.push([u_coord, v_coord]);
                 }
             }
-            for i in 0..SEGS {
-                let ra = (i * SIDES) as u32;
-                let rb = ((i + 1) * SIDES) as u32;
-                for s in 0..SIDES {
-                    let sn = ((s + 1) % SIDES) as u32;
+            for i in 0..segs {
+                let ra = (i * sides) as u32;
+                let rb = ((i + 1) * sides) as u32;
+                for s in 0..sides {
+                    let sn = ((s + 1) % sides) as u32;
                     let su = s as u32;
                     indices.push(ra + su);
                     indices.push(rb + su);
@@ -3183,10 +3210,50 @@ fn sync_electric_beams_visual_system(
             if let Some(mut mesh) = meshes.get_mut(&beam_vis.mesh_handle) {
                 mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
                 mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
                 mesh.insert_indices(bevy::mesh::Indices::U32(indices));
             }
+
+            if snap.is_flame {
+                if let Some(ref fm_handle) = beam_vis.flame_mat {
+                    if let Some(mut fm) = flame_materials.get_mut(fm_handle) {
+                        fm.uniforms.camera_pos = Vec4::new(cam_pos.x, cam_pos.y, cam_pos.z, 1.0);
+                        fm.uniforms.params.x = t_sec;
+                        fm.uniforms.params.w = if snap.hit_any { 1.0 } else { 0.0 };
+                    }
+                }
+                let flicker = 0.82 + 0.36 * (t_sec * 37.0).sin() * (t_sec * 23.0).cos();
+                if let Some(le) = beam_vis.muzzle_light {
+                    if let Ok((mut ltf, mut pl)) = light_q.get_mut(le) {
+                        ltf.translation = snap.start_pos.lerp(snap.end_pos, 0.28);
+                        pl.intensity = 18000.0 * flicker;
+                    }
+                }
+                if let Some(ie) = beam_vis.impact_light {
+                    if let Ok((mut itf, mut pl)) = light_q.get_mut(ie) {
+                        itf.translation = snap.end_pos + Vec3::Y * 0.25;
+                        pl.intensity = if snap.hit_any { 24000.0 * flicker } else { 0.0 };
+                    }
+                }
+                beam_vis.particle_emit_timer -= dt;
+                if beam_vis.particle_emit_timer <= 0.0 {
+                    beam_vis.particle_emit_timer = 0.06;
+                    vfx_q.0.push(ClientVfxEvent::FlameStreamStep {
+                        start: snap.start_pos,
+                        end: snap.end_pos,
+                        hit_any: snap.hit_any,
+                    });
+                }
+            }
+
             *vis = Visibility::Visible;
         } else {
+            if let Some(le) = beam_vis.muzzle_light {
+                commands.entity(le).despawn();
+            }
+            if let Some(ie) = beam_vis.impact_light {
+                commands.entity(ie).despawn();
+            }
             commands.entity(ent).despawn();
         }
     }
@@ -3197,34 +3264,80 @@ fn sync_electric_beams_visual_system(
                 bevy::mesh::PrimitiveTopology::TriangleList,
                 bevy::asset::RenderAssetUsages::MAIN_WORLD | bevy::asset::RenderAssetUsages::RENDER_WORLD,
             ));
-            let mat = if snap.is_flame {
-                materials.add(StandardMaterial {
-                    base_color: Color::srgba(1.0, 0.45, 0.08, 0.92),
-                    emissive: LinearRgba::new(14.0, 4.5, 0.5, 1.0),
-                    alpha_mode: AlphaMode::Add,
-                    unlit: true,
-                    ..default()
-                })
+            if snap.is_flame {
+                let flame_mat = flame_materials.add(FlameBeamMaterial {
+                    uniforms: FlameBeamUniforms {
+                        core_color: Vec4::new(1.0, 0.94, 0.65, 1.0),
+                        edge_color: Vec4::new(1.0, 0.22, 0.02, 1.0),
+                        camera_pos: Vec4::new(cam_pos.x, cam_pos.y, cam_pos.z, 1.0),
+                        params: Vec4::new(t_sec, 4.4, 11.0, if snap.hit_any { 1.0 } else { 0.0 }),
+                    },
+                });
+                let muzzle_light = commands
+                    .spawn((
+                        PointLight {
+                            color: Color::srgb(1.0, 0.48, 0.10),
+                            intensity: 18000.0,
+                            range: 10.5,
+                            shadow_maps_enabled: false,
+                            ..default()
+                        },
+                        Transform::from_translation(snap.start_pos.lerp(snap.end_pos, 0.28)),
+                    ))
+                    .id();
+                let impact_light = commands
+                    .spawn((
+                        PointLight {
+                            color: Color::srgb(1.0, 0.38, 0.06),
+                            intensity: if snap.hit_any { 24000.0 } else { 0.0 },
+                            range: 12.0,
+                            shadow_maps_enabled: false,
+                            ..default()
+                        },
+                        Transform::from_translation(snap.end_pos + Vec3::Y * 0.25),
+                    ))
+                    .id();
+                commands.spawn((
+                    ElectricBeamVisual {
+                        id: snap.id,
+                        is_flame: true,
+                        mesh_handle: mesh_handle.clone(),
+                        flame_mat: Some(flame_mat.clone()),
+                        muzzle_light: Some(muzzle_light),
+                        impact_light: Some(impact_light),
+                        particle_emit_timer: 0.0,
+                    },
+                    Mesh3d(mesh_handle),
+                    MeshMaterial3d(flame_mat),
+                    Transform::IDENTITY,
+                    Visibility::Hidden,
+                    NotShadowCaster,
+                ));
             } else {
-                materials.add(StandardMaterial {
+                let mat = materials.add(StandardMaterial {
                     base_color: Color::srgba(0.55, 0.92, 1.0, 0.95),
                     emissive: LinearRgba::new(1.5, 7.5, 16.0, 1.0),
                     alpha_mode: AlphaMode::Add,
                     unlit: true,
                     ..default()
-                })
-            };
-            commands.spawn((
-                ElectricBeamVisual {
-                    id: snap.id,
-                    mesh_handle: mesh_handle.clone(),
-                },
-                Mesh3d(mesh_handle),
-                MeshMaterial3d(mat),
-                Transform::IDENTITY,
-                Visibility::Hidden,
-                NotShadowCaster,
-            ));
+                });
+                commands.spawn((
+                    ElectricBeamVisual {
+                        id: snap.id,
+                        is_flame: false,
+                        mesh_handle: mesh_handle.clone(),
+                        flame_mat: None,
+                        muzzle_light: None,
+                        impact_light: None,
+                        particle_emit_timer: 0.0,
+                    },
+                    Mesh3d(mesh_handle),
+                    MeshMaterial3d(mat),
+                    Transform::IDENTITY,
+                    Visibility::Hidden,
+                    NotShadowCaster,
+                ));
+            }
         }
     }
 }
@@ -4674,13 +4787,14 @@ fn spawn_fx_from_server_event(
             audio_q.0.push(ClientAudioEvent::GrenadeExploded {
                 pos,
                 in_water,
-                weapon_source,
+                weapon_source: weapon_source.clone(),
             });
             vfx_q.0.push(ClientVfxEvent::GrenadeExploded {
                 pos,
                 aoe_radius,
                 in_water,
                 water_y,
+                weapon_source,
             });
             shake.trauma = (shake.trauma + trauma_add).min(trauma_max);
         }

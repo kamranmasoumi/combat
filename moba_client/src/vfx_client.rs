@@ -181,6 +181,63 @@ impl Material for ElectricBulletMaterial {
     }
 }
 
+#[derive(ShaderType, Debug, Clone)]
+pub struct FlameBeamUniforms {
+    pub core_color: Vec4,
+    pub edge_color: Vec4,
+    pub camera_pos: Vec4,
+    pub params: Vec4,
+}
+
+#[derive(ShaderType, Debug, Clone)]
+pub struct ToxicPoolUniforms {
+    pub core_color: Vec4,
+    pub edge_color: Vec4,
+    pub params: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct ToxicPoolMaterial {
+    #[uniform(0)]
+    pub uniforms: ToxicPoolUniforms,
+}
+
+impl Material for ToxicPoolMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/vfx_toxic_pool.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Blend
+    }
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct FlameBeamMaterial {
+    #[uniform(0)]
+    pub uniforms: FlameBeamUniforms,
+}
+
+impl Material for FlameBeamMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/vfx_flame_beam.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Add
+    }
+}
+
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct FlameBulletMaterial {
     #[uniform(0)]
@@ -575,6 +632,7 @@ pub enum ClientVfxEvent {
         aoe_radius: f32,
         in_water: bool,
         water_y: f32,
+        weapon_source: Option<BulletVfxSource>,
     },
     SpawnPondAmbient {
         pos: Vec3,
@@ -585,6 +643,11 @@ pub enum ClientVfxEvent {
     WaterSplash {
         pos: Vec3,
         intensity: f32,
+    },
+    FlameStreamStep {
+        start: Vec3,
+        end: Vec3,
+        hit_any: bool,
     },
 }
 
@@ -620,6 +683,9 @@ struct HanabiEffectHandles {
     explosion_sparks: Handle<EffectAsset>,
     explosion_smoke: Handle<EffectAsset>,
     water_explosion_spray: Handle<EffectAsset>,
+    flame_beam_embers: Handle<EffectAsset>,
+    flame_beam_smoke: Handle<EffectAsset>,
+    toxic_splash_sparks: Handle<EffectAsset>,
     trail_mesh: Handle<Mesh>,
     muzzle_flash_mesh: Handle<Mesh>,
     shockwave_ring_mesh: Handle<Mesh>,
@@ -697,6 +763,8 @@ impl Plugin for MobaVfxPlugin {
             .add_plugins(MaterialPlugin::<VenomBulletMaterial>::default())
             .add_plugins(MaterialPlugin::<ElectricBulletMaterial>::default())
             .add_plugins(MaterialPlugin::<FlameBulletMaterial>::default())
+            .add_plugins(MaterialPlugin::<FlameBeamMaterial>::default())
+            .add_plugins(MaterialPlugin::<ToxicPoolMaterial>::default())
             .add_plugins(MaterialPlugin::<BladeBulletMaterial>::default())
             .add_plugins(MaterialPlugin::<PistolBulletMaterial>::default())
             .add_plugins(MaterialPlugin::<KineticBulletMaterial>::default())
@@ -1302,6 +1370,72 @@ fn init_hanabi_vfx_assets_system(
         explosion_sparks,
         explosion_smoke,
         water_explosion_spray,
+        flame_beam_embers: effects.add(build_burst_effect(
+            "flame_beam_embers",
+            4096,
+            10.0,
+            0.14,
+            2.2,
+            5.4,
+            0.22,
+            0.48,
+            Vec3::new(0.0, 4.5, 0.0),
+            2.8,
+            &[
+                (0.0, Vec4::new(7.5, 2.4, 0.25, 1.0)),
+                (0.45, Vec4::new(4.5, 0.9, 0.08, 0.9)),
+                (1.0, Vec4::new(1.8, 0.15, 0.0, 0.0)),
+            ],
+            &[
+                (0.0, Vec3::new(0.04, 0.09, 0.04)),
+                (0.5, Vec3::new(0.03, 0.07, 0.03)),
+                (1.0, Vec3::splat(0.01)),
+            ],
+        )),
+        flame_beam_smoke: effects.add(build_burst_effect(
+            "flame_beam_smoke",
+            4096,
+            6.0,
+            0.28,
+            0.9,
+            2.2,
+            0.35,
+            0.75,
+            Vec3::new(0.0, 3.2, 0.0),
+            3.5,
+            &[
+                (0.0, Vec4::new(0.32, 0.14, 0.06, 0.42)),
+                (0.35, Vec4::new(0.10, 0.08, 0.07, 0.34)),
+                (1.0, Vec4::new(0.04, 0.04, 0.04, 0.0)),
+            ],
+            &[
+                (0.0, Vec3::splat(0.14)),
+                (0.5, Vec3::splat(0.34)),
+                (1.0, Vec3::splat(0.58)),
+            ],
+        )),
+        toxic_splash_sparks: effects.add(build_burst_effect(
+            "toxic_splash_sparks",
+            4096,
+            22.0,
+            0.18,
+            2.4,
+            6.5,
+            0.28,
+            0.62,
+            Vec3::new(0.0, -11.0, 0.0),
+            2.2,
+            &[
+                (0.0, Vec4::new(2.2, 6.5, 0.6, 1.0)),
+                (0.45, Vec4::new(0.6, 3.8, 0.2, 0.9)),
+                (1.0, Vec4::new(0.15, 0.9, 0.05, 0.0)),
+            ],
+            &[
+                (0.0, Vec3::splat(0.11)),
+                (0.5, Vec3::splat(0.08)),
+                (1.0, Vec3::splat(0.02)),
+            ],
+        )),
         trail_mesh,
         muzzle_flash_mesh,
         shockwave_ring_mesh,
@@ -1789,6 +1923,7 @@ fn process_vfx_events_system(
                 aoe_radius,
                 in_water,
                 water_y,
+                weapon_source,
             } => {
                 let ge = &config.fx.grenade_explosion_vfx;
                 let seed = next_vfx_rand(&mut rng_seed) * 50.0;
@@ -1866,12 +2001,23 @@ fn process_vfx_events_system(
                         },
                     ));
                 } else {
-                    // ۱. گنبد آتش و پلاسمای انفجار با شیدر vfx_explosion_fireball.wesl
+                    let is_venom = matches!(
+                        weapon_source,
+                        Some(BulletVfxSource::Hero { ref hero_id, .. }) if hero_id == "hero_venom_alchemist"
+                    );
+                    let (core_rgb, edge_rgb, bloom_val) = if let Some(ref src) = weapon_source {
+                        let prof = config.resolve_bullet_vfx(src);
+                        (prof.core_color_rgb, prof.edge_color_rgb, prof.bloom_intensity)
+                    } else {
+                        (ge.fireball_core_rgb, ge.fireball_edge_rgb, ge.fireball_bloom_intensity)
+                    };
+
+                    // ۱. گنبد انفجار یا پاشش AOE با رنگ اختصاصی سلاح یا نارنجک
                     let fb_mat = mats.fireball_materials.add(ExplosionFireballMaterial {
                         uniforms: ExplosionFireballUniforms {
-                            core_color: Vec4::new(ge.fireball_core_rgb.0, ge.fireball_core_rgb.1, ge.fireball_core_rgb.2, 1.0),
-                            edge_color: Vec4::new(ge.fireball_edge_rgb.0, ge.fireball_edge_rgb.1, ge.fireball_edge_rgb.2, 1.0),
-                            params: Vec4::new(0.0, ge.fireball_bloom_intensity, seed, 0.0),
+                            core_color: Vec4::new(core_rgb.0, core_rgb.1, core_rgb.2, 1.0),
+                            edge_color: Vec4::new(edge_rgb.0, edge_rgb.1, edge_rgb.2, 1.0),
+                            params: Vec4::new(0.0, bloom_val, seed, 0.0),
                         },
                     });
                     commands.spawn((
@@ -1883,17 +2029,17 @@ fn process_vfx_events_system(
                         ExplosionFireballInstance {
                             timer: Timer::from_seconds(ge.fireball_duration_secs, TimerMode::Once),
                             start_scale: 0.35,
-                            end_scale: aoe_radius * 0.68,
+                            end_scale: aoe_radius * if is_venom { 0.55 } else { 0.68 },
                             mat_handle: fb_mat,
                         },
                     ));
 
-                    // ۲. حلقه موج شوک انفجار روی زمین
+                    // ۲. حلقه موج شوک روی زمین
                     let ring_mat = mats.shockwave_materials.add(ShockwaveRingMaterial {
                         uniforms: ShockwaveUniforms {
-                            core_color: Vec4::new(ge.fireball_core_rgb.0, ge.fireball_core_rgb.1, ge.fireball_core_rgb.2, 1.0),
-                            edge_color: Vec4::new(ge.fireball_edge_rgb.0, ge.fireball_edge_rgb.1, ge.fireball_edge_rgb.2, 1.0),
-                            params: Vec4::new(0.0, ge.fireball_bloom_intensity * 0.85, 14.0, 0.0),
+                            core_color: Vec4::new(core_rgb.0, core_rgb.1, core_rgb.2, 1.0),
+                            edge_color: Vec4::new(edge_rgb.0, edge_rgb.1, edge_rgb.2, 1.0),
+                            params: Vec4::new(0.0, bloom_val * 0.85, 14.0, 0.0),
                         },
                     });
                     commands.spawn((
@@ -1910,29 +2056,40 @@ fn process_vfx_events_system(
                         },
                     ));
 
-                    // ۳. جرقه‌های داغ و دود رشته‌ای طبیعی (Hanabi)
-                    commands.spawn((
-                        ParticleEffect::new(handles.explosion_sparks.clone()),
-                        Transform::from_translation(pos + Vec3::Y * 0.25),
-                        Visibility::default(),
-                        OneShotVfxDespawn {
-                            timer: Timer::from_seconds(0.85, TimerMode::Once),
-                        },
-                    ));
-                    commands.spawn((
-                        ParticleEffect::new(handles.explosion_smoke.clone()),
-                        Transform::from_translation(pos + Vec3::Y * 0.35),
-                        Visibility::default(),
-                        OneShotVfxDespawn {
-                            timer: Timer::from_seconds(1.65, TimerMode::Once),
-                        },
-                    ));
+                    // ۳. ذرات Hanabi متناسب با نوع انفجار (پاشش اسیدی یا جرقه و دود آتش)
+                    if is_venom {
+                        commands.spawn((
+                            ParticleEffect::new(handles.toxic_splash_sparks.clone()),
+                            Transform::from_translation(pos + Vec3::Y * 0.25),
+                            Visibility::default(),
+                            OneShotVfxDespawn {
+                                timer: Timer::from_seconds(0.85, TimerMode::Once),
+                            },
+                        ));
+                    } else {
+                        commands.spawn((
+                            ParticleEffect::new(handles.explosion_sparks.clone()),
+                            Transform::from_translation(pos + Vec3::Y * 0.25),
+                            Visibility::default(),
+                            OneShotVfxDespawn {
+                                timer: Timer::from_seconds(0.85, TimerMode::Once),
+                            },
+                        ));
+                        commands.spawn((
+                            ParticleEffect::new(handles.explosion_smoke.clone()),
+                            Transform::from_translation(pos + Vec3::Y * 0.35),
+                            Visibility::default(),
+                            OneShotVfxDespawn {
+                                timer: Timer::from_seconds(1.65, TimerMode::Once),
+                            },
+                        ));
+                    }
 
-                    // ۴. نور سینماتیک انفجار
+                    // ۴. نور لحظه‌ای متناسب با رنگ افکت
                     commands.spawn((
                         PointLight {
-                            color: Color::srgb(ge.fireball_core_rgb.0, ge.fireball_core_rgb.1, ge.fireball_core_rgb.2),
-                            intensity: 340_000.0,
+                            color: Color::srgb(core_rgb.0, core_rgb.1, core_rgb.2),
+                            intensity: if is_venom { 220_000.0 } else { 340_000.0 },
                             range: aoe_radius * 2.8,
                             shadow_maps_enabled: false,
                             ..default()
@@ -1940,7 +2097,7 @@ fn process_vfx_events_system(
                         Transform::from_translation(pos + Vec3::Y * 0.8),
                         OneShotLightFade {
                             timer: Timer::from_seconds(0.28, TimerMode::Once),
-                            initial_intensity: 340_000.0,
+                            initial_intensity: if is_venom { 220_000.0 } else { 340_000.0 },
                         },
                     ));
                 }
@@ -1951,6 +2108,45 @@ fn process_vfx_events_system(
                     Transform::from_translation(pos),
                     Visibility::default(),
                 ));
+            }
+            ClientVfxEvent::FlameStreamStep { start, end, hit_any } => {
+                if !is_near_camera(start) && !is_near_camera(end) {
+                    continue;
+                }
+                let mid_pos = start.lerp(end, 0.42);
+                if active_hanabi < MAX_ACTIVE_HANABI {
+                    active_hanabi += 1;
+                    commands.spawn((
+                        ParticleEffect::new(handles.flame_beam_embers.clone()),
+                        Transform::from_translation(mid_pos),
+                        Visibility::default(),
+                        OneShotVfxDespawn {
+                            timer: Timer::from_seconds(0.55, TimerMode::Once),
+                        },
+                    ));
+                }
+                if active_hanabi < MAX_ACTIVE_HANABI {
+                    active_hanabi += 1;
+                    commands.spawn((
+                        ParticleEffect::new(handles.flame_beam_smoke.clone()),
+                        Transform::from_translation(start.lerp(end, 0.72)),
+                        Visibility::default(),
+                        OneShotVfxDespawn {
+                            timer: Timer::from_seconds(0.85, TimerMode::Once),
+                        },
+                    ));
+                }
+                if hit_any && active_hanabi < MAX_ACTIVE_HANABI {
+                    active_hanabi += 1;
+                    commands.spawn((
+                        ParticleEffect::new(handles.flame_beam_embers.clone()),
+                        Transform::from_translation(end),
+                        Visibility::default(),
+                        OneShotVfxDespawn {
+                            timer: Timer::from_seconds(0.55, TimerMode::Once),
+                        },
+                    ));
+                }
             }
             ClientVfxEvent::WaterSplash { pos, intensity } => {
                 if !is_near_camera(pos) {

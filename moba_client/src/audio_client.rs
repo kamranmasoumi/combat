@@ -1,7 +1,7 @@
 use bevy::audio::{SpatialListener, Volume};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use moba_shared::{GameConfig, ImpactSurface, ItemsConfig, ShotAudioSource, WeaponKind, WeatherKind};
+use moba_shared::{BulletVfxSource, GameConfig, ImpactSurface, ItemsConfig, ShotAudioSource, WeaponKind, WeatherKind};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -110,6 +110,7 @@ pub enum ClientAudioEvent {
     BulletImpact {
         pos: Vec3,
         surface: ImpactSurface,
+        vfx_source: BulletVfxSource,
     },
     GrenadeBeep {
         pos: Vec3,
@@ -117,6 +118,7 @@ pub enum ClientAudioEvent {
     GrenadeExploded {
         pos: Vec3,
         in_water: bool,
+        weapon_source: Option<BulletVfxSource>,
     },
     LastHitGold,
     CreepDenied,
@@ -189,6 +191,15 @@ pub enum ClientAudioEvent {
 #[derive(Resource, Default)]
 pub struct AudioEventQueue(pub Vec<ClientAudioEvent>);
 
+#[derive(Clone, Debug)]
+pub struct ActiveBeamAudio {
+    pub id: u64,
+    pub hero_id: String,
+    pub start_pos: Vec3,
+    pub end_pos: Vec3,
+    pub hit_any: bool,
+}
+
 #[derive(Resource, Default)]
 pub struct AudioFrameContext {
     pub in_game: bool,
@@ -206,6 +217,7 @@ pub struct AudioFrameContext {
     pub active_courier_pos: Option<Vec3>,
     pub running_creeps_nearest_pos: Option<Vec3>,
     pub running_creeps_count: usize,
+    pub active_beams: Vec<ActiveBeamAudio>,
 }
 
 #[derive(Resource, Default)]
@@ -277,6 +289,13 @@ struct AmbientZoneLoop {
 }
 
 #[derive(Component)]
+struct BeamWeaponLoopAudio {
+    beam_id: u64,
+    hero_id: String,
+    is_impact: bool,
+}
+
+#[derive(Component)]
 struct LowHpVignetteEdge;
 
 #[derive(Resource, Default)]
@@ -341,6 +360,7 @@ impl Plugin for MobaAudioPlugin {
                     process_audio_events_system,
                     update_locomotion_and_low_hp_audio_system,
                     update_loops_and_ambient_zones_system,
+                    update_beam_weapon_loops_system,
                     sync_audio_sink_volumes_system,
                 )
                     .chain(),
@@ -565,7 +585,37 @@ fn process_audio_events_system(
                     a.turret_fire_volume,
                 );
             }
-            ClientAudioEvent::BulletImpact { pos, surface } => {
+            ClientAudioEvent::BulletImpact {
+                pos,
+                surface,
+                vfx_source,
+            } => {
+                if let BulletVfxSource::Hero {
+                    hero_id,
+                    weapon_kind,
+                } = vfx_source
+                {
+                    if let Some(hw) = a.hero_weapons.get(&hero_id) {
+                        let (path, base_vol) = if weapon_kind == WeaponKind::Pistol {
+                            (&hw.pistol_impact_sound, hw.pistol_impact_volume)
+                        } else {
+                            (&hw.primary_impact_sound, hw.primary_impact_volume)
+                        };
+                        play_spatial_sound(
+                            &mut commands,
+                            &asset_server,
+                            &mut cache,
+                            &settings,
+                            &config,
+                            ctx.listener_pos,
+                            pos,
+                            duck,
+                            AudioCategory::Weapons,
+                            path,
+                            base_vol,
+                        );
+                    }
+                }
                 let (list, vol) = match surface {
                     ImpactSurface::StoneWall => (&a.impact_stone_wall_sounds, a.impact_stone_wall_volume),
                     ImpactSurface::Tree => (&a.impact_tree_sounds, a.impact_tree_volume),
@@ -605,25 +655,56 @@ fn process_audio_events_system(
                     a.grenade_countdown_beep_volume,
                 );
             }
-            ClientAudioEvent::GrenadeExploded { pos, in_water } => {
-                let (sound_path, vol) = if in_water {
-                    (&a.grenade_water_explosion_sound, a.grenade_water_explosion_volume)
+            ClientAudioEvent::GrenadeExploded {
+                pos,
+                in_water,
+                weapon_source,
+            } => {
+                if let Some(BulletVfxSource::Hero {
+                    hero_id,
+                    weapon_kind,
+                }) = weapon_source
+                {
+                    if let Some(hw) = a.hero_weapons.get(&hero_id) {
+                        let (path, base_vol) = if weapon_kind == WeaponKind::Pistol {
+                            (&hw.pistol_impact_sound, hw.pistol_impact_volume)
+                        } else {
+                            (&hw.primary_impact_sound, hw.primary_impact_volume)
+                        };
+                        play_spatial_sound(
+                            &mut commands,
+                            &asset_server,
+                            &mut cache,
+                            &settings,
+                            &config,
+                            ctx.listener_pos,
+                            pos,
+                            duck,
+                            AudioCategory::Weapons,
+                            path,
+                            base_vol,
+                        );
+                    }
                 } else {
-                    (&a.grenade_explosion_sound, a.grenade_explosion_volume)
-                };
-                play_spatial_sound(
-                    &mut commands,
-                    &asset_server,
-                    &mut cache,
-                    &settings,
-                    &config,
-                    ctx.listener_pos,
-                    pos,
-                    duck,
-                    AudioCategory::Weapons,
-                    sound_path,
-                    vol,
-                );
+                    let (sound_path, vol) = if in_water {
+                        (&a.grenade_water_explosion_sound, a.grenade_water_explosion_volume)
+                    } else {
+                        (&a.grenade_explosion_sound, a.grenade_explosion_volume)
+                    };
+                    play_spatial_sound(
+                        &mut commands,
+                        &asset_server,
+                        &mut cache,
+                        &settings,
+                        &config,
+                        ctx.listener_pos,
+                        pos,
+                        duck,
+                        AudioCategory::Weapons,
+                        sound_path,
+                        vol,
+                    );
+                }
             }
             ClientAudioEvent::LastHitGold => {
                 play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.gold_gain_sound, a.gold_gain_volume);
@@ -981,6 +1062,7 @@ struct WeatherAudioLoops<'w, 's> {
     snow_loop_q: Query<'w, 's, Option<&'static mut AudioSink>, (With<SnowAmbienceLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<TeleportLoopAudio>, Without<SwimmingLoop>, Without<HeroSelectMusicLoop>)>,
     swim_loop_q: Query<'w, 's, Option<&'static mut AudioSink>, (With<SwimmingLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<SnowAmbienceLoop>, Without<TeleportLoopAudio>, Without<HeroSelectMusicLoop>)>,
     hero_select_loop_q: Query<'w, 's, (Entity, Option<&'static mut AudioSink>), (With<HeroSelectMusicLoop>, Without<AmbientZoneLoop>, Without<SwingAirLoop>, Without<RainAmbienceLoop>, Without<SnowAmbienceLoop>, Without<TeleportLoopAudio>, Without<SwimmingLoop>)>,
+    bg_music_loop_q: Query<'w, 's, Entity, With<BackgroundMusicLoop>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1065,8 +1147,13 @@ fn update_loops_and_ambient_zones_system(
         }
     }
 
-    // ۲. لوپ موزیک پس‌زمینه بازی (شروع از دقیقه یک / زمان اولین موج سربازان)
-    if ctx.in_game && !timers.music_spawned && ctx.match_elapsed_secs >= config.creeps.first_wave_delay_secs {
+    // ۲. لوپ موزیک پس‌زمینه بازی (شروع از زمان اولین موج سربازان و قطع کامل هنگام خروج به منو)
+    if !ctx.in_game {
+        for ent in &weather_loops.bg_music_loop_q {
+            commands.entity(ent).despawn();
+        }
+        timers.music_spawned = false;
+    } else if !timers.music_spawned && ctx.match_elapsed_secs >= config.creeps.first_wave_delay_secs {
         if let Some(handle) = cache.get_or_load(&a.background_music_sound, &asset_server) {
             let vol = settings.effective_gain(AudioCategory::Music, duck) * a.background_music_volume;
             commands.spawn((
@@ -1293,5 +1380,148 @@ fn sync_audio_sink_volumes_system(
     for (tag, mut sink) in &mut spatial_sinks {
         let eff = settings.effective_gain(tag.category, duck) * tag.base_gain;
         sink.set_volume(Volume::Linear(eff));
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn update_beam_weapon_loops_system(
+    mut commands: Commands,
+    config: Res<GameConfig>,
+    asset_server: Res<AssetServer>,
+    mut cache: ResMut<AudioAssetCache>,
+    settings: Res<AudioSettingsState>,
+    ctx: Res<AudioFrameContext>,
+    timers: Res<AudioRuntimeTimers>,
+    mut beam_loop_q: Query<(
+        Entity,
+        &BeamWeaponLoopAudio,
+        &mut Transform,
+        Option<&mut SpatialAudioSink>,
+    )>,
+) {
+    if !ctx.in_game || ctx.active_beams.is_empty() {
+        for (ent, _, _, _) in &beam_loop_q {
+            commands.entity(ent).despawn();
+        }
+        return;
+    }
+
+    let a = &config.audio;
+    let duck = if timers.low_hp_duck_factor > 0.0 {
+        timers.low_hp_duck_factor
+    } else {
+        1.0
+    };
+
+    let mut active_fire_keys: Vec<(u64, String)> = Vec::new();
+    let mut active_impact_keys: Vec<(u64, String)> = Vec::new();
+
+    for (ent, loop_audio, mut tf, sink_opt) in &mut beam_loop_q {
+        let matched = ctx
+            .active_beams
+            .iter()
+            .find(|b| b.id == loop_audio.beam_id && b.hero_id == loop_audio.hero_id);
+        let Some(beam) = matched else {
+            commands.entity(ent).despawn();
+            continue;
+        };
+        if loop_audio.is_impact && !beam.hit_any {
+            commands.entity(ent).despawn();
+            continue;
+        }
+
+        let world_pos = if loop_audio.is_impact {
+            beam.end_pos
+        } else {
+            beam.start_pos
+        };
+        tf.translation = world_pos * a.spatial_scale;
+
+        let mut target_vol = 0.0_f32;
+        if let Some(hw) = a.hero_weapons.get(&beam.hero_id) {
+            let base_vol = if loop_audio.is_impact {
+                hw.primary_impact_volume
+            } else {
+                hw.primary_fire_volume
+            };
+            let dist = ctx.listener_pos.distance(world_pos);
+            if dist < a.max_hearing_distance {
+                let atten = (1.0 - dist / a.max_hearing_distance).clamp(0.0, 1.0);
+                target_vol = settings.effective_gain(AudioCategory::Weapons, duck) * atten * base_vol;
+            }
+        }
+        if let Some(mut sink) = sink_opt {
+            sink.set_volume(Volume::Linear(target_vol));
+        }
+
+        if loop_audio.is_impact {
+            active_impact_keys.push((loop_audio.beam_id, loop_audio.hero_id.clone()));
+        } else {
+            active_fire_keys.push((loop_audio.beam_id, loop_audio.hero_id.clone()));
+        }
+    }
+
+    for beam in &ctx.active_beams {
+        let Some(hw) = a.hero_weapons.get(&beam.hero_id) else {
+            continue;
+        };
+
+        if !active_fire_keys
+            .iter()
+            .any(|(id, hid)| *id == beam.id && hid == &beam.hero_id)
+        {
+            if let Some(handle) = cache.get_or_load(&hw.primary_fire_sound, &asset_server) {
+                let dist = ctx.listener_pos.distance(beam.start_pos);
+                let atten = if dist < a.max_hearing_distance {
+                    (1.0 - dist / a.max_hearing_distance).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let vol = settings.effective_gain(AudioCategory::Weapons, duck)
+                    * atten
+                    * hw.primary_fire_volume;
+                commands.spawn((
+                    BeamWeaponLoopAudio {
+                        beam_id: beam.id,
+                        hero_id: beam.hero_id.clone(),
+                        is_impact: false,
+                    },
+                    AudioPlayer::new(handle),
+                    PlaybackSettings::LOOP
+                        .with_volume(Volume::Linear(vol))
+                        .with_spatial(true),
+                    Transform::from_translation(beam.start_pos * a.spatial_scale),
+                ));
+            }
+        }
+
+        if beam.hit_any
+            && !active_impact_keys
+                .iter()
+                .any(|(id, hid)| *id == beam.id && hid == &beam.hero_id)
+        {
+            if let Some(handle) = cache.get_or_load(&hw.primary_impact_sound, &asset_server) {
+                let dist = ctx.listener_pos.distance(beam.end_pos);
+                let atten = if dist < a.max_hearing_distance {
+                    (1.0 - dist / a.max_hearing_distance).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let vol = settings.effective_gain(AudioCategory::Weapons, duck)
+                    * atten
+                    * hw.primary_impact_volume;
+                commands.spawn((
+                    BeamWeaponLoopAudio {
+                        beam_id: beam.id,
+                        hero_id: beam.hero_id.clone(),
+                        is_impact: true,
+                    },
+                    AudioPlayer::new(handle),
+                    PlaybackSettings::LOOP
+                        .with_volume(Volume::Linear(vol))
+                        .with_spatial(true),
+                    Transform::from_translation(beam.end_pos * a.spatial_scale),
+                ));
+            }
+        }
     }
 }

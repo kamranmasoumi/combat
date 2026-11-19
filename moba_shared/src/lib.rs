@@ -62,8 +62,12 @@ pub struct ScoreboardConfig {
 pub struct HeroWeaponAudioDef {
     pub primary_fire_sound: String,
     pub primary_fire_volume: f32,
+    pub primary_impact_sound: String,
+    pub primary_impact_volume: f32,
     pub pistol_fire_sound: String,
     pub pistol_fire_volume: f32,
+    pub pistol_impact_sound: String,
+    pub pistol_impact_volume: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -823,8 +827,46 @@ impl GameConfig {
         assert!(a.game_pause_volume >= 0.0, "audio.game_pause_volume نمی‌تواند منفی باشد");
         assert!(a.unpause_countdown_volume >= 0.0, "audio.unpause_countdown_volume نمی‌تواند منفی باشد");
         for (hid, hw) in &a.hero_weapons {
-            assert!(hw.primary_fire_volume >= 0.0, "primary_fire_volume برای '{}' نمی‌تواند منفی باشد", hid);
-            assert!(hw.pistol_fire_volume >= 0.0, "pistol_fire_volume برای '{}' نمی‌تواند منفی باشد", hid);
+            assert!(
+                !hw.primary_fire_sound.trim().is_empty(),
+                "primary_fire_sound برای '{}' نمی‌تواند خالی باشد",
+                hid
+            );
+            assert!(
+                hw.primary_fire_volume.is_finite() && hw.primary_fire_volume >= 0.0,
+                "primary_fire_volume برای '{}' نمی‌تواند منفی یا نامعتبر باشد",
+                hid
+            );
+            assert!(
+                !hw.primary_impact_sound.trim().is_empty(),
+                "primary_impact_sound برای '{}' نمی‌تواند خالی باشد",
+                hid
+            );
+            assert!(
+                hw.primary_impact_volume.is_finite() && hw.primary_impact_volume >= 0.0,
+                "primary_impact_volume برای '{}' نمی‌تواند منفی یا نامعتبر باشد",
+                hid
+            );
+            assert!(
+                !hw.pistol_fire_sound.trim().is_empty(),
+                "pistol_fire_sound برای '{}' نمی‌تواند خالی باشد",
+                hid
+            );
+            assert!(
+                hw.pistol_fire_volume.is_finite() && hw.pistol_fire_volume >= 0.0,
+                "pistol_fire_volume برای '{}' نمی‌تواند منفی یا نامعتبر باشد",
+                hid
+            );
+            assert!(
+                !hw.pistol_impact_sound.trim().is_empty(),
+                "pistol_impact_sound برای '{}' نمی‌تواند خالی باشد",
+                hid
+            );
+            assert!(
+                hw.pistol_impact_volume.is_finite() && hw.pistol_impact_volume >= 0.0,
+                "pistol_impact_volume برای '{}' نمی‌تواند منفی یا نامعتبر باشد",
+                hid
+            );
         }
         for hero in &self.heroes {
             assert!(
@@ -2350,6 +2392,7 @@ pub enum GameplayFxEvent {
         water_y: f32,
         trauma_add: f32,
         trauma_max: f32,
+        weapon_source: Option<BulletVfxSource>,
     },
     SlideDust {
         pos: Vec3,
@@ -2410,9 +2453,11 @@ pub struct BulletSnapshot {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ElectricBeamSnapshot {
     pub id: u64,
+    pub hero_id: String,
     pub start_pos: Vec3,
     pub end_pos: Vec3,
     pub hit_target: bool,
+    pub hit_any: bool,
     pub is_flame: bool,
 }
 
@@ -10486,6 +10531,7 @@ fn apply_aoe_explosion(
     owner_team: TeamId,
     dmg: f32,
     aoe_radius: f32,
+    weapon_source: Option<BulletVfxSource>,
 ) {
     // ۱. صدمه به اهداف تمرینی داخل شعاع AOE
     for idx in 0..world.targets.len() {
@@ -10622,6 +10668,7 @@ fn apply_aoe_explosion(
         water_y: water_hit.map(|(wy, _)| wy).unwrap_or(pos.y),
         trauma_add: config.combat.grenade_explosion_trauma_add,
         trauma_max: config.combat.grenade_explosion_trauma_max,
+        weapon_source,
     });
 }
 
@@ -10761,10 +10808,11 @@ fn shared_authoritative_react_system(
             owner_team,
             dmg,
             aoe_radius,
+            None,
         );
     }
 
-    let mut aoe_bullet_explosions: Vec<(Vec3, Option<usize>, TeamId, f32, f32)> = Vec::new();
+    let mut aoe_bullet_explosions: Vec<(Vec3, Option<usize>, TeamId, f32, f32, BulletVfxSource)> = Vec::new();
     let mut spawned_toxic_pools: Vec<ActiveToxicPool> = Vec::new();
     world.bullets_snapshot.clear();
     let bullet_query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
@@ -10923,6 +10971,7 @@ fn shared_authoritative_react_system(
                     bullet.owner_team,
                     bullet.damage,
                     bullet.aoe_radius,
+                    bullet.vfx_source.clone(),
                 ));
                 if bullet.toxic_pool_duration_secs > 0.0 {
                     let pool_id = world.next_entity_id;
@@ -11015,6 +11064,7 @@ fn shared_authoritative_react_system(
                     bullet.owner_team,
                     bullet.damage,
                     bullet.aoe_radius,
+                    bullet.vfx_source.clone(),
                 ));
                 if bullet.toxic_pool_duration_secs > 0.0 {
                     let pool_id = world.next_entity_id;
@@ -11060,6 +11110,7 @@ fn shared_authoritative_react_system(
                     water_y: cour_pos.y,
                     trauma_add: config.combat.shot_fire_trauma_add,
                     trauma_max: config.combat.shot_fire_trauma_max,
+                    weapon_source: None,
                 });
             }
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
@@ -11121,6 +11172,7 @@ fn shared_authoritative_react_system(
                     bullet.owner_team,
                     bullet.damage,
                     bullet.aoe_radius,
+                    bullet.vfx_source.clone(),
                 ));
                 if bullet.toxic_pool_duration_secs > 0.0 {
                     let pool_id = world.next_entity_id;
@@ -11413,6 +11465,7 @@ fn shared_authoritative_react_system(
                             water_y: anc_pos.y,
                             trauma_add: config.combat.grenade_explosion_trauma_add,
                             trauma_max: config.combat.grenade_explosion_trauma_max,
+                            weapon_source: None,
                         });
                     }
                 }
@@ -11476,6 +11529,7 @@ fn shared_authoritative_react_system(
                     bullet.owner_team,
                     bullet.damage,
                     bullet.aoe_radius,
+                    bullet.vfx_source.clone(),
                 ));
                 if bullet.toxic_pool_duration_secs > 0.0 {
                     let pool_id = world.next_entity_id;
@@ -11534,6 +11588,7 @@ fn shared_authoritative_react_system(
                             bullet.owner_team,
                             bullet.damage,
                             bullet.aoe_radius,
+                            bullet.vfx_source.clone(),
                         ));
                         if bullet.toxic_pool_duration_secs > 0.0 {
                             let pool_id = world.next_entity_id;
@@ -11584,6 +11639,7 @@ fn shared_authoritative_react_system(
                         bullet.owner_team,
                         bullet.damage,
                         bullet.aoe_radius,
+                        bullet.vfx_source.clone(),
                     ));
                     if bullet.toxic_pool_duration_secs > 0.0 {
                         let pool_id = world.next_entity_id;
@@ -11613,7 +11669,7 @@ fn shared_authoritative_react_system(
         }
     }
 
-    for (pos, owner_slot, owner_team, dmg, aoe_radius) in aoe_bullet_explosions {
+    for (pos, owner_slot, owner_team, dmg, aoe_radius, vfx_source) in aoe_bullet_explosions {
         apply_aoe_explosion(
             &mut commands,
             &config,
@@ -11624,28 +11680,53 @@ fn shared_authoritative_react_system(
             owner_team,
             dmg,
             aoe_radius,
+            Some(vfx_source),
         );
     }
 
 
     world.electric_beams_snapshot.clear();
-    let beam_requests: Vec<(usize, TeamId, Vec3, Vec3, f32, f32, f32, f32, f32, bool)> = if !world.players.is_empty() {
+    let beam_requests: Vec<(usize, String, TeamId, Vec3, Vec3, f32, f32, f32, f32, f32, bool)> = if !world.players.is_empty() {
         world
             .players
             .iter()
             .filter_map(|p| {
                 p.active_beam_request.map(|(mpos, bdir, mrange, bdps, bslow, barm, bdur, bflame)| {
-                    (p.slot_index, p.hero_team, mpos, bdir, mrange, bdps, bslow, barm, bdur, bflame)
+                    (
+                        p.slot_index,
+                        config.active_hero(p.hero_index).id.clone(),
+                        p.hero_team,
+                        mpos,
+                        bdir,
+                        mrange,
+                        bdps,
+                        bslow,
+                        barm,
+                        bdur,
+                        bflame,
+                    )
                 })
             })
             .collect()
     } else if let Some((mpos, bdir, mrange, bdps, bslow, barm, bdur, bflame)) = world.active_beam_request {
-        vec![(world.active_slot, world.hero_team, mpos, bdir, mrange, bdps, bslow, barm, bdur, bflame)]
+        vec![(
+            world.active_slot,
+            config.active_hero(world.hero_index).id.clone(),
+            world.hero_team,
+            mpos,
+            bdir,
+            mrange,
+            bdps,
+            bslow,
+            barm,
+            bdur,
+            bflame,
+        )]
     } else {
         Vec::new()
     };
 
-    for (owner_slot, owner_team, muzzle_pos, beam_dir, max_range, beam_dps, slow_ratio, armor_red, debuff_dur, is_flame) in beam_requests {
+    for (owner_slot, hero_id, owner_team, muzzle_pos, beam_dir, max_range, beam_dps, slow_ratio, armor_red, debuff_dur, is_flame) in beam_requests {
         let mut best_toi = max_range;
         let mut hit_hero: Option<usize> = None;
         let mut hit_creep: Option<usize> = None;
@@ -11847,20 +11928,70 @@ fn shared_authoritative_react_system(
                 world.creeps[c_idx].anim_state = CreepAnimState::Die;
                 world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
                 let cpos = world.creeps[c_idx].pos;
+                let creep_team = world.creeps[c_idx].team;
                 let gb = lane_creep_gold_bounty(&config, world.match_elapsed_secs, world.creeps[c_idx].camp_index.is_none(), c_stats.gold_bounty);
                 let xb = c_stats.xp_bounty;
-                let w_inner = &mut *world;
-                if let Some(killer) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
-                    killer.last_hits += 1;
-                    killer.hero_gold += gb;
-                    w_inner.pending_fx.push(GameplayFxEvent::LastHitGold { pos: cpos, gold: gb });
-                }
-                let eligible: Vec<usize> = world.players.iter().enumerate().filter(|(_, p)| !p.is_dead && p.hero_team == owner_team && p.soldier_pos.distance(cpos) <= p.hero_xp_gain_radius).map(|(i, _)| i).collect();
-                if !eligible.is_empty() {
-                    let share = xb / (eligible.len() as u32);
+                let is_deny = owner_team == creep_team;
+
+                if is_deny {
+                    if let Some(denier) = world.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        denier.denies += 1;
+                    }
+                    world.pending_fx.push(GameplayFxEvent::CreepDenied { pos: cpos });
+                    let total_denied_xp =
+                        ((xb as f32) * config.creeps.deny_enemy_xp_multiplier).round() as u32;
+                    let eligible_indices: Vec<usize> = world
+                        .players
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            !p.is_dead
+                                && p.hero_team != creep_team
+                                && p.soldier_pos.distance(cpos) <= p.hero_xp_gain_radius
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !eligible_indices.is_empty() && total_denied_xp > 0 {
+                        let share = total_denied_xp / (eligible_indices.len() as u32);
+                        let w_inner = &mut *world;
+                        for idx in eligible_indices {
+                            grant_xp_to_player_slot(
+                                &mut w_inner.players[idx],
+                                share,
+                                &config,
+                                &mut w_inner.pending_fx,
+                            );
+                        }
+                    }
+                } else {
                     let w_inner = &mut *world;
-                    for idx in eligible {
-                        grant_xp_to_player_slot(&mut w_inner.players[idx], share, &config, &mut w_inner.pending_fx);
+                    if let Some(killer) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
+                        killer.last_hits += 1;
+                        killer.hero_gold += gb;
+                        w_inner.pending_fx.push(GameplayFxEvent::LastHitGold { pos: cpos, gold: gb });
+                    }
+                    let eligible: Vec<usize> = world
+                        .players
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            !p.is_dead
+                                && p.hero_team == owner_team
+                                && p.soldier_pos.distance(cpos) <= p.hero_xp_gain_radius
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !eligible.is_empty() {
+                        let share = xb / (eligible.len() as u32);
+                        let w_inner = &mut *world;
+                        for idx in eligible {
+                            grant_xp_to_player_slot(
+                                &mut w_inner.players[idx],
+                                share,
+                                &config,
+                                &mut w_inner.pending_fx,
+                            );
+                        }
                     }
                 }
             }
@@ -11900,9 +12031,11 @@ fn shared_authoritative_react_system(
 
         world.electric_beams_snapshot.push(ElectricBeamSnapshot {
             id: owner_slot as u64,
+            hero_id,
             start_pos: muzzle_pos,
             end_pos,
             hit_target: hit_any_target,
+            hit_any: hit_any_target || hit_world_ent.is_some(),
             is_flame,
         });
     }

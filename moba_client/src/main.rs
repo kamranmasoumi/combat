@@ -53,7 +53,7 @@ use backend_client::BackendClient;
 use pregame_ui::{AppScreenState, PendingMatchConnection, PreGamePlugin, PreGameSessionState};
 use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, MobaVfxPlugin, TeleportPortalMaterial, TeleportPortalUniforms, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms, WeatherVfxState};
 mod shop_client;
-use audio_client::{AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
+use audio_client::{ActiveBeamAudio, AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
 use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, TeleportPreviewState, VerticalAimKeyState};
 
 
@@ -1207,10 +1207,22 @@ fn spawn_ingame_exit_button_ui(commands: &mut Commands) {
 
 fn on_exit_ingame_system(
     mut net: ResMut<ClientNetwork>,
+    mut audio_ctx: ResMut<AudioFrameContext>,
+    mut audio_q: ResMut<AudioEventQueue>,
     mut cam_q: Query<&mut Camera, With<Camera3d>>,
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     net.client.disconnect();
+    audio_ctx.in_game = false;
+    audio_ctx.in_hero_select = false;
+    audio_ctx.active_beams.clear();
+    audio_ctx.active_courier_pos = None;
+    audio_ctx.running_creeps_nearest_pos = None;
+    audio_ctx.running_creeps_count = 0;
+    audio_ctx.swing_in_air = false;
+    audio_ctx.traversal_active = false;
+    audio_ctx.current_weather = None;
+    audio_q.0.clear();
     for mut cam in &mut cam_q {
         cam.is_active = false;
     }
@@ -4637,6 +4649,7 @@ fn spawn_fx_from_server_event(
             audio_q.0.push(ClientAudioEvent::BulletImpact {
                 pos: impact_pos,
                 surface,
+                vfx_source: vfx_source.clone(),
             });
             vfx_q.0.push(ClientVfxEvent::BulletImpact {
                 pos: impact_pos,
@@ -4656,8 +4669,13 @@ fn spawn_fx_from_server_event(
             water_y,
             trauma_add,
             trauma_max,
+            weapon_source,
         } => {
-            audio_q.0.push(ClientAudioEvent::GrenadeExploded { pos, in_water });
+            audio_q.0.push(ClientAudioEvent::GrenadeExploded {
+                pos,
+                in_water,
+                weapon_source,
+            });
             vfx_q.0.push(ClientVfxEvent::GrenadeExploded {
                 pos,
                 aoe_radius,
@@ -16300,6 +16318,19 @@ fn sync_audio_context_system(
     }
     p.audio_ctx.running_creeps_nearest_pos = nearest_creep.map(|(_, pos)| pos);
     p.audio_ctx.running_creeps_count = running_count;
+
+    p.audio_ctx.active_beams.clear();
+    if in_game {
+        for b in &p.render_state.electric_beams {
+            p.audio_ctx.active_beams.push(ActiveBeamAudio {
+                id: b.id,
+                hero_id: b.hero_id.clone(),
+                start_pos: b.start_pos,
+                end_pos: b.end_pos,
+                hit_any: b.hit_any,
+            });
+        }
+    }
 
     if !in_game {
         tr.prev_in_game = false;

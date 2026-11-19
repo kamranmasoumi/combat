@@ -193,6 +193,7 @@ pub struct AudioEventQueue(pub Vec<ClientAudioEvent>);
 pub struct AudioFrameContext {
     pub in_game: bool,
     pub in_hero_select: bool,
+    pub match_elapsed_secs: f32,
     pub listener_pos: Vec3,
     pub hero_pos: Vec3,
     pub hero_hp_ratio: f32,
@@ -1064,8 +1065,8 @@ fn update_loops_and_ambient_zones_system(
         }
     }
 
-    // ۲. لوپ موزیک پس‌زمینه بازی
-    if ctx.in_game && !timers.music_spawned {
+    // ۲. لوپ موزیک پس‌زمینه بازی (شروع از دقیقه یک / زمان اولین موج سربازان)
+    if ctx.in_game && !timers.music_spawned && ctx.match_elapsed_secs >= config.creeps.first_wave_delay_secs {
         if let Some(handle) = cache.get_or_load(&a.background_music_sound, &asset_server) {
             let vol = settings.effective_gain(AudioCategory::Music, duck) * a.background_music_volume;
             commands.spawn((

@@ -16242,6 +16242,7 @@ fn sync_audio_context_system(
 ) {
     let in_game = p.match_flow.is_in_game();
     p.audio_ctx.in_game = in_game;
+    p.audio_ctx.match_elapsed_secs = p.top_bar.match_elapsed_secs;
     p.audio_ctx.hero_pos = p.render_state.soldier_pos;
     p.audio_ctx.listener_pos = p
         .camera_control

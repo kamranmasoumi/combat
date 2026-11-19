@@ -2880,16 +2880,16 @@ GameConfig(
             ),
             weapon_models: HeroWeaponModelsConfig(
                 primary: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/razor_disc.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, -0.1, 0.0), rotation: (0.0, -90.0, 0.0), scale: (0.5, 0.5, 0.5)),
                 ),
                 pistol: WeaponModelDef(
-                    model_path: "",
-                    model_transform: ModelTransformConfig(location: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0), scale: (1.0, 1.0, 1.0)),
+                    model_path: "models/weapons/frost_pistol.glb",
+                    model_transform: ModelTransformConfig(location: (0.0, 0.0, -0.2), rotation: (0.0, -90.0, 0.0), scale: (0.2, 0.2, 0.2)),
                 ),
-                run_upper_anim: "same",
+                run_upper_anim: "idle",
                 sprint_offset: (0.0, 0.0, 0.0),
-                sprint_rotation_deg: (-22.0, 58.0, 0.0),
+                sprint_rotation_deg: (-90.0, 90.0, 0.0),
             ),
             bullet_vfx: HeroBulletVfxConfig(
                 primary: WeaponVfxProfile(

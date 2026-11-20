@@ -1,11 +1,15 @@
 use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use moba_shared::{
-    create_shared_renet_server, parse_server_cli_args, step_couriers_system, step_shadow_blade_system, step_teleports_system,
-    step_weather_and_environment_system,
-    try_buy_cart, try_buy_item, try_cancel_teleport, try_courier_deliver, try_courier_move_to,
-    try_courier_return_to_fountain, try_cycle_item_mode, try_sell_courier_item, try_sell_item,
-    try_activate_shadow_blade, try_start_teleport, try_swap_inventory_slots, AuthoritativeMatchState,
+    create_shared_renet_server, parse_server_cli_args, step_couriers_system,
+    step_shadow_blade_system, step_teleports_system, step_weather_and_environment_system,
+    try_activate_shadow_blade, try_buy_cart, try_buy_item, try_cancel_teleport,
+    try_courier_deliver, try_courier_move_to, try_courier_return_to_fountain, try_cycle_item_mode,
+    try_sell_courier_item, try_sell_item, try_start_teleport, try_swap_inventory_slots,
+    try_buy_recipe, try_move_courier_item_to_stash, try_move_hero_item_to_stash,
+    try_move_stash_item_to_courier, try_move_stash_item_to_hero, try_sell_stash_item,
+    try_take_all_stash_to_hero, try_transfer_courier_item_to_hero,
+    try_transfer_hero_item_to_courier, AuthoritativeMatchState,
     AuthoritativeWorldState, ClientInputCommand, ClientLobbyMessage, CustomPhysicsWorld,
     GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase, MobaPhysicsSet, MobaSharedPhysicsPlugin,
     PhysicsRole, PhysicsSoldier, ServerLobbyPacket, ServerMatchMessage, TeamId,
@@ -566,7 +570,7 @@ fn server_network_receive_system(
                     ClientLobbyMessage::CourierDeliver => {
                         if match_state.phase == MatchPhase::InGame {
                             if let Some(slot_idx) = match_state.slot_for_client(client_id) {
-                                try_courier_deliver(&mut world, slot_idx);
+                                try_courier_deliver(&mut world, slot_idx, &config, &items_config);
                             }
                         }
                     }
@@ -581,6 +585,110 @@ fn server_network_receive_system(
                         if match_state.phase == MatchPhase::InGame {
                             if let Some(slot_idx) = match_state.slot_for_client(client_id) {
                                 try_courier_move_to(&mut world, slot_idx, world_pos, &config);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::TransferHeroItemToCourier { hero_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_transfer_hero_item_to_courier(
+                                    &mut world,
+                                    slot_idx,
+                                    hero_slot,
+                                    &config,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::TransferCourierItemToHero { courier_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_transfer_courier_item_to_hero(
+                                    &mut world,
+                                    slot_idx,
+                                    courier_slot,
+                                    &config,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::BuyRecipe { item_id } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_buy_recipe(&mut world, slot_idx, &item_id, &config, &items_config);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::MoveHeroItemToStash { hero_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_move_hero_item_to_stash(
+                                    &mut world,
+                                    slot_idx,
+                                    hero_slot,
+                                    &config,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::MoveStashItemToHero { stash_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_move_stash_item_to_hero(
+                                    &mut world,
+                                    slot_idx,
+                                    stash_slot,
+                                    &config,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::MoveCourierItemToStash { courier_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_move_courier_item_to_stash(
+                                    &mut world,
+                                    slot_idx,
+                                    courier_slot,
+                                    &config,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::MoveStashItemToCourier { stash_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_move_stash_item_to_courier(
+                                    &mut world,
+                                    slot_idx,
+                                    stash_slot,
+                                    &config,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::SellStashItem { stash_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_sell_stash_item(&mut world, slot_idx, stash_slot, &items_config);
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::TakeAllStashToHero => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_take_all_stash_to_hero(
+                                    &mut world,
+                                    slot_idx,
+                                    &config,
+                                    &items_config,
+                                );
                             }
                         }
                     }

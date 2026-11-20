@@ -1,6 +1,22 @@
 ItemsConfig(
     max_inventory_slots: 6,
+    max_stash_slots: 6,
     sell_refund_ratio: 0.50,
+    shop_ui: (
+        shop_panel_width_px: 920.0,
+        shop_panel_height_px: 660.0,
+        catalog_column_width_px: 440.0,
+        inspector_column_width_px: 436.0,
+        tooltip_width_px: 300.0,
+        drag_threshold_px: 6.0,
+        courier_world_drop_radius: 2.8,
+        hero_world_drop_radius: 2.0,
+        hero_to_courier_transfer_radius: 3.2,
+        pyramid_node_size_px: 46.0,
+        pyramid_connector_thickness_px: 2.0,
+        shop_error_toast_secs: 3.0,
+        hud_inventory_left_px: 592.0,
+    ),
     teleport: (
         item_id: "town_portal_scroll",
         shortcut_key: "T",
@@ -856,10 +872,7 @@ ItemsConfig(
                 ItemModeDef(
                     name: "Agility",
                     color_rgb: (0.20, 0.88, 0.95),
-                    stackable: false,
-            dedicated_tp_slot: false,
-            active_ability: None,
-            stats: ItemStatsModifier(
+                    stats: ItemStatsModifier(
                         move_speed_pct: 0.18,
                         primary_fire_rate_pct: 0.0,
                         primary_damage_bonus: 0.0,
@@ -885,10 +898,7 @@ ItemsConfig(
                 ItemModeDef(
                     name: "Fortress",
                     color_rgb: (0.25, 0.88, 0.48),
-                    stackable: false,
-            dedicated_tp_slot: false,
-            active_ability: None,
-            stats: ItemStatsModifier(
+                    stats: ItemStatsModifier(
                         move_speed_pct: -0.06,
                         primary_fire_rate_pct: 0.0,
                         primary_damage_bonus: 0.0,
@@ -914,10 +924,7 @@ ItemsConfig(
                 ItemModeDef(
                     name: "Overdrive",
                     color_rgb: (0.98, 0.42, 0.20),
-                    stackable: false,
-            dedicated_tp_slot: false,
-            active_ability: None,
-            stats: ItemStatsModifier(
+                    stats: ItemStatsModifier(
                         move_speed_pct: 0.0,
                         primary_fire_rate_pct: 0.20,
                         primary_damage_bonus: 0.0,

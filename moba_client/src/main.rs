@@ -15,7 +15,10 @@ use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalA
 use bevy::diagnostic::{DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::SystemParam;
 use bevy::render::diagnostic::RenderDiagnosticsPlugin;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::ui::{Pressed, RelativeCursorPosition};
+use bevy::ui_widgets::Button as UiButton;
 use bevy::transform::TransformSystems;
 use bevy::window::{CursorOptions, MonitorSelection, PresentMode, PrimaryWindow, WindowMode, WindowResolution};
 use moba_shared::{
@@ -54,7 +57,7 @@ use pregame_ui::{AppScreenState, PendingMatchConnection, PreGamePlugin, PreGameS
 use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, FlameBeamMaterial, FlameBeamUniforms, MobaVfxPlugin, TeleportPortalMaterial, TeleportPortalUniforms, ToxicPoolMaterial, ToxicPoolUniforms, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms, WeatherVfxState};
 mod shop_client;
 use audio_client::{ActiveBeamAudio, AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
-use shop_client::{spawn_item_icon_badge, CourierControlState, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, TeleportPreviewState, VerticalAimKeyState};
+use shop_client::{spawn_item_icon_badge, CourierControlState, InventoryDragDropBridge, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, TeleportPreviewState, VerticalAimKeyState, WorldDropTarget};
 
 
 #[cfg(not(debug_assertions))]
@@ -200,6 +203,10 @@ fn main() {
             courier_order: CourierOrder::Idle,
             courier_in_fountain: true,
             courier_inventory: Vec::new(),
+            stash: Vec::new(),
+            shop_notice_seq: 0,
+            shop_notice_text: String::new(),
+            shop_notice_is_error: false,
             teleport_cooldown_remaining: 0.0,
             is_teleporting: false,
             teleport_progress: 0.0,
@@ -410,7 +417,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system, teleport_preview_and_input_system.before(minimap_interaction_system), sync_active_teleports_visual_system, sync_invisibility_visual_system)
+            (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, update_inventory_world_drop_target_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system, teleport_preview_and_input_system.before(minimap_interaction_system), sync_active_teleports_visual_system, sync_invisibility_visual_system)
                 .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
@@ -535,6 +542,7 @@ struct VisualTarget {
 }
 
 #[derive(Resource, Clone)]
+#[allow(dead_code)]
 struct SharedFxAssets {
     bullet_mesh: Handle<Mesh>,
     bullet_mat: Handle<StandardMaterial>,
@@ -578,6 +586,7 @@ struct NetworkBulletVisual {
 }
 
 #[derive(Component)]
+#[allow(dead_code)]
 struct NetworkGrenadeVisual {
     server_id: u64,
     spawn_time: f32,
@@ -679,6 +688,7 @@ struct WaterfallMistParticle {
 }
 
 #[derive(Resource)]
+#[allow(dead_code)]
 struct SharedWaterFoamTexture(Handle<Image>);
 
 #[derive(Component)]
@@ -993,6 +1003,7 @@ struct ClientRenderState {
     is_dead: bool,
     death_anim_name: String,
     in_water: bool,
+    #[allow(dead_code)]
     local_wade_ripple_timer: f32,
     fx_rng_seed: u32,
 }
@@ -1175,7 +1186,8 @@ struct InGameExitMenuBtn;
 fn spawn_ingame_exit_button_ui(commands: &mut Commands) {
     commands
         .spawn((
-            Interaction::default(),
+            UiButton,
+            Hovered::default(),
             InGameExitMenuBtn,
             GlobalZIndex(210),
             Node {
@@ -1262,20 +1274,16 @@ fn ingame_exit_button_system(
     pregame_state: Res<PreGameSessionState>,
     match_result: Res<LatestMatchResult>,
     mut next_screen: ResMut<NextState<AppScreenState>>,
-    mut exit_btn_q: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<InGameExitMenuBtn>)>,
+    mut exit_btn_q: Query<(&Hovered, Has<Pressed>, &mut BackgroundColor), With<InGameExitMenuBtn>>,
 ) {
     let mut want_exit = match_result.0.is_some() && keys.just_pressed(KeyCode::Escape);
-    for (inter, mut bg) in &mut exit_btn_q {
-        match *inter {
-            Interaction::Pressed => {
-                want_exit = true;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.32, 0.08, 0.11, 0.96);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.18, 0.05, 0.07, 0.88);
-            }
+    for (hovered, pressed, mut bg) in &mut exit_btn_q {
+        if pressed {
+            want_exit = true;
+        } else if hovered.get() {
+            bg.0 = Color::srgba(0.32, 0.08, 0.11, 0.96);
+        } else {
+            bg.0 = Color::srgba(0.18, 0.05, 0.07, 0.88);
         }
     }
     if want_exit {
@@ -4068,8 +4076,9 @@ struct SampleInputExtraParams<'w, 's> {
     prediction: ResMut<'w, ClientPhysicsPredictionState>,
     hero_hud: Res<'w, LatestHeroSnapshot>,
     audio_q: ResMut<'w, AudioEventQueue>,
-    vfx_q: ResMut<'w, VfxEventQueue>,
     teleport_preview: ResMut<'w, TeleportPreviewState>,
+    drag_bridge: ResMut<'w, InventoryDragDropBridge>,
+    hero_hud_rel_q: Query<'w, 's, &'static RelativeCursorPosition, With<HeroHudRoot>>,
     soldier_root_query: Query<'w, 's, &'static GlobalTransform, With<SoldierMarker>>,
 }
 
@@ -4078,7 +4087,7 @@ fn client_sample_input_system(
     match_result: Res<LatestMatchResult>,
     pause_state: Res<LatestPauseState>,
     chat_state: Res<ChatUiState>,
-    shop_ui: Res<ShopUiState>,
+    mut shop_ui: ResMut<ShopUiState>,
     settings_ui: Res<SettingsUiState>,
     vertical_aim_key: Res<VerticalAimKeyState>,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -4125,6 +4134,10 @@ fn client_sample_input_system(
     if keyboard.pressed(KeyCode::KeyD) {
         move_vec.x += 1.0;
     }
+    if ex.drag_bridge.clear_hero_move_target {
+        ex.hero_move_target.0 = None;
+        ex.drag_bridge.clear_hero_move_target = false;
+    }
     let wasd_pressed = move_vec.length_squared() > 0.01;
     if wasd_pressed {
         ex.hero_move_target.0 = None;
@@ -4167,6 +4180,20 @@ fn client_sample_input_system(
         _ => None,
     };
 
+    let over_hero_hud = ex.hero_hud_rel_q.single().is_ok_and(|rel| {
+        rel.normalized
+            .is_some_and(|p| (-0.5..=0.5).contains(&p.x) && (-0.5..=0.5).contains(&p.y))
+    });
+    let ui_blocks_pointer = shop_ui.is_open
+        || settings_ui.is_open
+        || shop_ui.is_pointer_over_hud_ui
+        || over_hero_hud
+        || shop_ui.pending_sell_slot.is_some()
+        || shop_ui.is_dragging_item
+        || shop_ui.suppress_world_click_this_frame
+        || camera_control.is_pointer_over_minimap
+        || camera_control.is_dragging_minimap;
+
     let alt_held = keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight);
     let hero_action_taken = wasd_pressed
         || keyboard.just_pressed(KeyCode::Space)
@@ -4174,10 +4201,7 @@ fn client_sample_input_system(
         || keyboard.just_pressed(KeyCode::KeyE)
         || keyboard.just_pressed(KeyCode::KeyF)
         || (!alt_held
-            && !shop_ui.is_open
-            && !settings_ui.is_open
-            && !camera_control.is_pointer_over_minimap
-            && !camera_control.is_dragging_minimap
+            && !ui_blocks_pointer
             && mouse_button.just_pressed(MouseButton::Left));
     if hero_action_taken && !shop_ui.is_open && !settings_ui.is_open {
         ex.courier_ctrl.selected = false;
@@ -4196,22 +4220,17 @@ fn client_sample_input_system(
         space_held: keyboard.pressed(KeyCode::Space),
         vertical_aim_held: !shop_ui.is_open
             && !settings_ui.is_open
+            && !shop_ui.is_dragging_item
             && vertical_aim_key.binding.pressed(&keyboard, &mouse_button),
         switch_weapon_just_pressed: keyboard.just_pressed(KeyCode::KeyE),
         fire_just_pressed: !alt_held
-            && !shop_ui.is_open
-            && !settings_ui.is_open
-            && !camera_control.is_pointer_over_minimap
-            && !camera_control.is_dragging_minimap
+            && !ui_blocks_pointer
             && !ex.teleport_preview.active
             && !ex.teleport_preview.suppress_fire_this_frame
             && !ex.teleport_preview.wait_left_release_after_confirm
             && mouse_button.just_pressed(MouseButton::Left),
         fire_held: !alt_held
-            && !shop_ui.is_open
-            && !settings_ui.is_open
-            && !camera_control.is_pointer_over_minimap
-            && !camera_control.is_dragging_minimap
+            && !ui_blocks_pointer
             && !ex.teleport_preview.active
             && !ex.teleport_preview.suppress_fire_this_frame
             && !ex.teleport_preview.wait_left_release_after_confirm
@@ -4248,6 +4267,7 @@ fn client_sample_input_system(
         ex.prediction.latest_input = Some(cmd);
     }
     ex.teleport_preview.suppress_fire_this_frame = false;
+    shop_ui.suppress_world_click_this_frame = false;
     if !mouse_button.pressed(MouseButton::Left) {
         ex.teleport_preview.wait_left_release_after_confirm = false;
     }
@@ -5530,10 +5550,16 @@ fn cursor_reticle_system(
     };
     let in_game = match_flow.is_in_game();
 
+    let ui_cursor_needed = !in_game
+        || shop_ui.is_open
+        || settings_ui.is_open
+        || shop_ui.pending_sell_slot.is_some()
+        || shop_ui.is_pointer_over_hud_ui
+        || shop_ui.is_dragging_item;
+
     if config.cursor_reticle.hide_os_cursor_in_game {
-        let desired_visible = !in_game || shop_ui.is_open || settings_ui.is_open;
-        if cursor_options.visible != desired_visible {
-            cursor_options.visible = desired_visible;
+        if cursor_options.visible != ui_cursor_needed {
+            cursor_options.visible = ui_cursor_needed;
         }
     }
 
@@ -5541,7 +5567,7 @@ fn cursor_reticle_system(
         return;
     };
 
-    if !in_game || shop_ui.is_open || settings_ui.is_open {
+    if ui_cursor_needed {
         if *root_vis != Visibility::Hidden {
             *root_vis = Visibility::Hidden;
         }
@@ -7825,6 +7851,7 @@ fn spawn_hero_hud_ui(commands: &mut Commands) {
     commands
         .spawn((
             HeroHudRoot,
+            RelativeCursorPosition::default(),
             Node {
                 position_type: PositionType::Absolute,
                 left: px(16.0),
@@ -9134,7 +9161,8 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
                                     Color::srgb(0.95, 0.34, 0.34)
                                 };
                                 cards.spawn((
-                                    Interaction::default(),
+                                    UiButton,
+            Hovered::default(),
                                     HeroPickButton { hero_index: idx },
                                     Node {
                                         width: percent(100),
@@ -9220,7 +9248,8 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
                         });
 
                         list.spawn((
-                            Interaction::default(),
+                            UiButton,
+            Hovered::default(),
                             HeroLockInButton,
                             Node {
                                 width: percent(100),
@@ -9430,8 +9459,6 @@ struct ShowcaseAssetsParams<'w, 's> {
     clip_assets: Res<'w, Assets<AnimationClip>>,
     animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
     hero_anim_cache: ResMut<'w, HeroModelAnimCache>,
-    meshes: ResMut<'w, Assets<Mesh>>,
-    materials: ResMut<'w, Assets<StandardMaterial>>,
     children_query: Query<'w, 's, &'static Children>,
     hand_query: Query<'w, 's, (Entity, &'static Name), Without<ShowcaseWeaponAttached>>,
     anim_player_query: Query<'w, 's, (Entity, &'static mut AnimationPlayer, Option<&'static AnimationGraphHandle>)>,
@@ -9750,9 +9777,9 @@ struct MatchOverlayUiQueries<'w, 's> {
     hs_root_q: Query<'w, 's, &'static mut Node, (With<HeroSelectWorkspaceRoot>, Without<MatchDynamicContentRoot>, Without<MatchOverlayRoot>, Without<MatchTimerFillBar>, Without<MatchBottomBarFill>)>,
     specs_root_q: Query<'w, 's, Entity, With<HeroSpecsPanelRoot>>,
     draft_strip_q: Query<'w, 's, Entity, With<DraftStripRoot>>,
-    hero_btn_q: Query<'w, 's, (&'static Interaction, &'static HeroPickButton, &'static mut BackgroundColor, &'static mut BorderColor), (Without<MatchOverlayRoot>, Without<HeroLockInButton>, Without<MatchTimerFillBar>)>,
+    hero_btn_q: Query<'w, 's, (&'static Hovered, Has<Pressed>, &'static HeroPickButton, &'static mut BackgroundColor, &'static mut BorderColor), (Without<MatchOverlayRoot>, Without<HeroLockInButton>, Without<MatchTimerFillBar>)>,
     hero_badge_q: Query<'w, 's, (&'static HeroPickStatusBadge, &'static mut Text, &'static mut TextColor), (Without<MatchPhaseBadgeText>, Without<MatchPhaseHeaderText>, Without<MatchTurnBannerText>, Without<MatchTimerText>, Without<MatchBottomStatusText>)>,
-    lock_btn_q: Query<'w, 's, (&'static Interaction, &'static mut BackgroundColor, &'static mut BorderColor), (With<HeroLockInButton>, Without<MatchOverlayRoot>, Without<MatchTimerFillBar>)>,
+    lock_btn_q: Query<'w, 's, (&'static Hovered, Has<Pressed>, &'static mut BackgroundColor, &'static mut BorderColor), (With<HeroLockInButton>, Without<MatchOverlayRoot>, Without<MatchTimerFillBar>)>,
     lock_txt_q: Query<'w, 's, &'static mut Text, (With<HeroLockInButtonText>, Without<HeroPickStatusBadge>, Without<MatchPhaseBadgeText>, Without<MatchPhaseHeaderText>, Without<MatchTurnBannerText>, Without<MatchTimerText>, Without<MatchBottomStatusText>)>,
     pulse_dots_q: Query<'w, 's, (&'static PulseAnimatedDot, &'static mut BackgroundColor), (Without<MatchOverlayRoot>, Without<HeroLockInButton>, Without<HeroPickButton>, Without<MatchTimerFillBar>)>,
     children_q: Query<'w, 's, &'static Children>,
@@ -9766,7 +9793,6 @@ fn despawn_children_of(commands: &mut Commands, parent: Entity, children_q: &Que
     }
 }
 
-#[allow(deprecated)]
 fn match_overlay_ui_system(
     mut commands: Commands,
     time: Res<Time>,
@@ -9832,12 +9858,12 @@ fn match_overlay_ui_system(
         .as_ref()
         .is_some_and(|s| s.current_pick_slot == match_flow.your_slot);
 
-    for (interaction, btn, mut bg, mut border) in &mut ui.hero_btn_q {
+    for (hovered, pressed, btn, mut bg, mut border) in &mut ui.hero_btn_q {
         let hero = config.active_hero(btn.hero_index);
         let is_selected = btn.hero_index == match_flow.preview_hero_index;
         let is_taken = taken_ids.contains(&hero.id);
 
-        if *interaction == Interaction::Pressed {
+        if pressed {
             match_flow.preview_hero_index = btn.hero_index;
         }
 
@@ -9851,7 +9877,7 @@ fn match_overlay_ui_system(
                 Color::srgba(0.10, 0.08, 0.10, 0.65),
                 Color::srgba(0.55, 0.25, 0.28, 0.55),
             )
-        } else if *interaction == Interaction::Hovered {
+        } else if hovered.get() {
             (
                 Color::srgba(0.12, 0.22, 0.34, 0.94),
                 Color::srgb(0.45, 0.82, 0.98),
@@ -9885,9 +9911,9 @@ fn match_overlay_ui_system(
 
     let preview_hero = config.active_hero(match_flow.preview_hero_index);
     let preview_taken = taken_ids.contains(&preview_hero.id);
-    if let Ok((interaction, mut bg, mut border)) = ui.lock_btn_q.single_mut() {
+    if let Ok((hovered, pressed, mut bg, mut border)) = ui.lock_btn_q.single_mut() {
         let can_lock = phase == MatchPhase::HeroSelect && is_my_turn && !preview_taken;
-        if *interaction == Interaction::Pressed && can_lock {
+        if pressed && can_lock {
             if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::SelectHero {
                 hero_id: preview_hero.id.clone(),
             }) {
@@ -9896,7 +9922,7 @@ fn match_overlay_ui_system(
         }
         let (b_bg, b_bd) = if !can_lock {
             (Color::srgba(0.16, 0.18, 0.22, 0.80), Color::srgba(0.40, 0.44, 0.50, 0.55))
-        } else if *interaction == Interaction::Hovered {
+        } else if hovered.get() {
             (Color::srgb(0.16, 0.62, 0.38), Color::srgb(0.45, 1.0, 0.72))
         } else {
             (Color::srgb(0.10, 0.48, 0.30), Color::srgb(0.24, 0.92, 0.58))
@@ -10536,8 +10562,6 @@ struct RemoteAssetsParams<'w> {
     hero_anim_cache: ResMut<'w, HeroModelAnimCache>,
     match_flow: Res<'w, ClientMatchFlow>,
     remote_players: Res<'w, LatestRemotePlayers>,
-    meshes: ResMut<'w, Assets<Mesh>>,
-    materials: ResMut<'w, Assets<StandardMaterial>>,
 }
 
 #[derive(SystemParam)]
@@ -11254,7 +11278,6 @@ struct CreepAssetParams<'w> {
     gltf_assets: Res<'w, Assets<Gltf>>,
     animation_graphs: ResMut<'w, Assets<AnimationGraph>>,
     creep_anim_cache: ResMut<'w, CreepModelAnimCache>,
-    meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
 }
 
@@ -12495,6 +12518,7 @@ struct OverheadTurretHpFill {
 }
 
 #[derive(Component)]
+#[allow(dead_code)]
 struct OverheadTurretShieldBadge {
     turret_index: usize,
 }
@@ -12514,6 +12538,7 @@ struct TurretAnimationAssets {
 }
 
 #[derive(Component)]
+#[allow(dead_code)]
 struct TurretAnimPlayer {
     turret_index: usize,
     playing_idle: bool,
@@ -13518,64 +13543,79 @@ fn spawn_chat_ui(commands: &mut Commands) {
             GlobalZIndex(210),
             Node {
                 position_type: PositionType::Absolute,
-                left: px(16.0),
-                bottom: px(208.0),
-                width: px(450.0),
+                left: px(0.0),
+                right: px(0.0),
+                bottom: px(262.0),
+                width: percent(100),
                 flex_direction: FlexDirection::Column,
-                row_gap: px(6.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::FlexEnd,
                 display: Display::None,
                 ..default()
             },
         ))
-        .with_children(|root| {
-            root.spawn((
-                ChatMessagesColumn,
-                Pickable::IGNORE,
-                Node {
-                    width: percent(100),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: px(4.0),
-                    ..default()
-                },
-            ));
-
-            root.spawn((
-                ChatInputRow,
-                Pickable::IGNORE,
-                Node {
-                    width: percent(100),
-                    padding: UiRect::axes(px(10.0), px(7.0)),
-                    column_gap: px(8.0),
-                    align_items: AlignItems::Center,
-                    border: UiRect::all(px(1.5)),
-                    border_radius: BorderRadius::all(px(6.0)),
-                    display: Display::None,
-                    ..default()
-                },
-                BorderColor::all(Color::srgba(0.22, 0.78, 0.65, 0.90)),
-                BackgroundColor(Color::srgba(0.04, 0.06, 0.10, 0.90)),
-            ))
-            .with_children(|row| {
-                row.spawn((
-                    ChatModeBadgeText,
-                    Text::new("[TEAM]"),
-                    TextFont {
-                        font_size: FontSize::Px(12.5),
+        .with_children(|outer| {
+            outer
+                .spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: px(500.0),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(6.0),
                         ..default()
                     },
-                    TextColor(Color::srgb(0.24, 0.92, 0.70)),
-                ));
+                ))
+                .with_children(|root| {
+                    root.spawn((
+                        ChatMessagesColumn,
+                        Pickable::IGNORE,
+                        Node {
+                            width: percent(100),
+                            flex_direction: FlexDirection::Column,
+                            align_items: AlignItems::Center,
+                            row_gap: px(4.0),
+                            ..default()
+                        },
+                    ));
 
-                row.spawn((
-                    ChatDraftText,
-                    Text::new("|"),
-                    TextFont {
-                        font_size: FontSize::Px(13.0),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.95, 0.97, 1.0)),
-                ));
-            });
+                    root.spawn((
+                        ChatInputRow,
+                        Pickable::IGNORE,
+                        Node {
+                            width: percent(100),
+                            padding: UiRect::axes(px(10.0), px(7.0)),
+                            column_gap: px(8.0),
+                            align_items: AlignItems::Center,
+                            border: UiRect::all(px(1.5)),
+                            border_radius: BorderRadius::all(px(6.0)),
+                            display: Display::None,
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.22, 0.78, 0.65, 0.90)),
+                        BackgroundColor(Color::srgba(0.04, 0.06, 0.10, 0.90)),
+                    ))
+                    .with_children(|row| {
+                        row.spawn((
+                            ChatModeBadgeText,
+                            Text::new("[TEAM]"),
+                            TextFont {
+                                font_size: FontSize::Px(12.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.24, 0.92, 0.70)),
+                        ));
+
+                        row.spawn((
+                            ChatDraftText,
+                            Text::new("|"),
+                            TextFont {
+                                font_size: FontSize::Px(13.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.95, 0.97, 1.0)),
+                        ));
+                    });
+                });
         });
 }
 
@@ -14991,6 +15031,8 @@ fn sync_shop_context_and_network_system(
         || ctx.courier_order != hero_hud.0.courier_order
         || ctx.courier_in_fountain != hero_hud.0.courier_in_fountain
         || ctx.courier_inventory != hero_hud.0.courier_inventory
+        || ctx.stash != hero_hud.0.stash
+        || ctx.shop_notice_seq != hero_hud.0.shop_notice_seq
         || ctx.inspected_inventory != insp_inv
         || ctx.inspected_is_read_only != insp_ro
     {
@@ -15014,6 +15056,10 @@ fn sync_shop_context_and_network_system(
         ctx.courier_order = hero_hud.0.courier_order;
         ctx.courier_in_fountain = hero_hud.0.courier_in_fountain;
         ctx.courier_inventory = hero_hud.0.courier_inventory.clone();
+        ctx.stash = hero_hud.0.stash.clone();
+        ctx.shop_notice_seq = hero_hud.0.shop_notice_seq;
+        ctx.shop_notice_text = hero_hud.0.shop_notice_text.clone();
+        ctx.shop_notice_is_error = hero_hud.0.shop_notice_is_error;
         ctx.inspected_inventory = insp_inv;
         ctx.inspected_is_read_only = insp_ro;
     }
@@ -15447,6 +15493,9 @@ fn courier_manual_move_input_system(
 ) {
     if !match_flow.is_in_game()
         || guards.shop_ui.is_open
+        || guards.shop_ui.is_pointer_over_hud_ui
+        || guards.shop_ui.pending_sell_slot.is_some()
+        || guards.shop_ui.is_dragging_item
         || guards.settings_ui.is_open
         || guards.chat_state.is_open
         || guards.camera_control.is_pointer_over_minimap
@@ -15578,6 +15627,71 @@ fn courier_manual_move_input_system(
             *inspected = InspectedUnit::OwnHero;
             hero_move_target.0 = Some(hit_world);
         }
+    }
+}
+
+/// تشخیص هدف رهاسازی درگ و دراپ آیتم روی مدل سه‌بعدی کوریر یا هیرو در دنیای بازی (باگ ۵)
+fn update_inventory_world_drop_target_system(
+    match_flow: Res<ClientMatchFlow>,
+    items_cfg: Res<ItemsConfig>,
+    render_state: Res<ClientRenderState>,
+    latest_couriers: Res<LatestCouriers>,
+    mut drag_bridge: ResMut<InventoryDragDropBridge>,
+    window_q: Query<&Window, With<PrimaryWindow>>,
+    cam_q: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
+    hero_hud_rel_q: Query<&RelativeCursorPosition, With<HeroHudRoot>>,
+) {
+    if !match_flow.is_in_game() || !drag_bridge.is_dragging {
+        drag_bridge.hovered_world_target = None;
+        return;
+    }
+
+    if drag_bridge.drag_source_is_courier {
+        let over_hero_hud = hero_hud_rel_q.single().is_ok_and(|rel| {
+            rel.normalized
+                .is_some_and(|p| (-0.5..=0.5).contains(&p.x) && (-0.5..=0.5).contains(&p.y))
+        });
+        if over_hero_hud && !render_state.is_dead {
+            drag_bridge.hovered_world_target = Some(WorldDropTarget::Hero);
+            return;
+        }
+    }
+
+    let Ok(window) = window_q.single() else {
+        drag_bridge.hovered_world_target = None;
+        return;
+    };
+    let Some(cursor_pos) = window.cursor_position() else {
+        drag_bridge.hovered_world_target = None;
+        return;
+    };
+    let Ok((camera, cam_gt)) = cam_q.single() else {
+        drag_bridge.hovered_world_target = None;
+        return;
+    };
+    let Ok(ray) = camera.viewport_to_world(cam_gt, cursor_pos) else {
+        drag_bridge.hovered_world_target = None;
+        return;
+    };
+    let ray_dir = *ray.direction;
+
+    if !drag_bridge.drag_source_is_courier {
+        let my_slot = match_flow.your_slot;
+        let hit_courier = latest_couriers.0.iter().any(|c| {
+            Some(c.owner_slot) == my_slot
+                && c.is_visible
+                && !c.is_dead
+                && ray_point_distance(ray.origin, ray_dir, c.pos).0
+                    <= items_cfg.shop_ui.courier_world_drop_radius
+        });
+        drag_bridge.hovered_world_target = hit_courier.then_some(WorldDropTarget::Courier);
+    } else if !render_state.is_dead {
+        let hero_center = render_state.soldier_pos + Vec3::Y * 1.0;
+        let hit_hero = ray_point_distance(ray.origin, ray_dir, hero_center).0
+            <= items_cfg.shop_ui.hero_world_drop_radius;
+        drag_bridge.hovered_world_target = hit_hero.then_some(WorldDropTarget::Hero);
+    } else {
+        drag_bridge.hovered_world_target = None;
     }
 }
 

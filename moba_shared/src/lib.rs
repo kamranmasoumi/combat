@@ -212,10 +212,18 @@ pub struct AudioConfig {
     pub shop_sell_volume: f32,
     pub shop_combine_sound: String,
     pub shop_combine_volume: f32,
+    pub not_enough_gold_sound: String,
+    pub not_enough_gold_volume: f32,
     pub shop_open_sound: String,
     pub shop_open_volume: f32,
     pub shop_close_sound: String,
     pub shop_close_volume: f32,
+    pub shop_enter_sound: String,
+    pub shop_enter_volume: f32,
+    pub shop_exit_sound: String,
+    pub shop_exit_volume: f32,
+    pub inventory_full_sound: String,
+    pub inventory_full_volume: f32,
     pub empty_gun_click_sound: String,
     pub empty_gun_click_volume: f32,
     pub empty_grenade_click_sound: String,
@@ -828,6 +836,14 @@ impl GameConfig {
         assert!(a.team_ping_volume >= 0.0, "audio.team_ping_volume نمی‌تواند منفی باشد");
         assert!(a.game_pause_volume >= 0.0, "audio.game_pause_volume نمی‌تواند منفی باشد");
         assert!(a.unpause_countdown_volume >= 0.0, "audio.unpause_countdown_volume نمی‌تواند منفی باشد");
+        assert!(!a.not_enough_gold_sound.trim().is_empty(), "audio.not_enough_gold_sound نمی‌تواند خالی باشد");
+        assert!(a.not_enough_gold_volume.is_finite() && a.not_enough_gold_volume >= 0.0, "audio.not_enough_gold_volume نمی‌تواند منفی یا نامعتبر باشد");
+        assert!(!a.shop_enter_sound.trim().is_empty(), "audio.shop_enter_sound نمی‌تواند خالی باشد");
+        assert!(a.shop_enter_volume.is_finite() && a.shop_enter_volume >= 0.0, "audio.shop_enter_volume نامعتبر است");
+        assert!(!a.shop_exit_sound.trim().is_empty(), "audio.shop_exit_sound نمی‌تواند خالی باشد");
+        assert!(a.shop_exit_volume.is_finite() && a.shop_exit_volume >= 0.0, "audio.shop_exit_volume نامعتبر است");
+        assert!(!a.inventory_full_sound.trim().is_empty(), "audio.inventory_full_sound نمی‌تواند خالی باشد");
+        assert!(a.inventory_full_volume.is_finite() && a.inventory_full_volume >= 0.0, "audio.inventory_full_volume نامعتبر است");
         for (hid, hw) in &a.hero_weapons {
             assert!(
                 !hw.primary_fire_sound.trim().is_empty(),
@@ -2652,6 +2668,15 @@ pub enum ClientLobbyMessage {
     CourierDeliver,
     CourierReturnToFountain,
     CourierMoveTo { world_pos: Vec3 },
+    TransferHeroItemToCourier { hero_slot: usize },
+    TransferCourierItemToHero { courier_slot: usize },
+    BuyRecipe { item_id: String },
+    MoveHeroItemToStash { hero_slot: usize },
+    MoveStashItemToHero { stash_slot: usize },
+    MoveCourierItemToStash { courier_slot: usize },
+    MoveStashItemToCourier { stash_slot: usize },
+    SellStashItem { stash_slot: usize },
+    TakeAllStashToHero,
     StartTeleport {
         inv_index: usize,
         target_pos: Vec3,
@@ -3019,6 +3044,8 @@ pub enum CourierOrder {
     ReturnToFountain,
     MoveTo,
     DeliverToHero,
+    DeliverSlotToHero { courier_slot: usize },
+    PickupStashThenDeliver,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3098,6 +3125,10 @@ pub struct HeroSnapshot {
     pub courier_order: CourierOrder,
     pub courier_in_fountain: bool,
     pub courier_inventory: Vec<InventoryItemState>,
+    pub stash: Vec<InventoryItemState>,
+    pub shop_notice_seq: u64,
+    pub shop_notice_text: String,
+    pub shop_notice_is_error: bool,
     pub teleport_cooldown_remaining: f32,
     pub is_teleporting: bool,
     pub teleport_progress: f32,
@@ -6053,7 +6084,7 @@ impl SharedFogOfWar {
         }
     }
 
-    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, allied_creeps: &[Vec3], match_elapsed_secs: f32, weather: WeatherKind) {
+    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, hero_alive: bool, allied_creeps: &[Vec3], match_elapsed_secs: f32, weather: WeatherKind) {
         self.visible_now.fill(false);
 
         let struct_mult = config.effective_vision_multiplier(match_elapsed_secs, config.day_night.night_turret_vision_multiplier);
@@ -6073,7 +6104,9 @@ impl SharedFogOfWar {
                 0.0
             };
 
-        self.reveal_from_source(config, hero_pos, hero_range, 240);
+        if hero_alive {
+            self.reveal_from_source(config, hero_pos, hero_range, 240);
+        }
 
         let allied = self.allied_sources.clone();
         for (src_pos, src_range) in allied {
@@ -6335,6 +6368,11 @@ pub struct PlayerSlotState {
     pub courier_order: CourierOrder,
     pub courier_target_pos: Vec3,
     pub courier_inventory: Vec<InventoryItemState>,
+    pub stash: Vec<InventoryItemState>,
+    pub shop_notice_seq: u64,
+    pub shop_notice_text: String,
+    pub shop_notice_is_error: bool,
+    pub pending_hero_to_courier_slot: Option<usize>,
     pub fog_of_war: SharedFogOfWar,
     pub in_water: bool,
     pub water_splash_cooldown: f32,
@@ -7284,6 +7322,11 @@ impl AuthoritativeWorldState {
                 courier_order: CourierOrder::Idle,
                 courier_target_pos: Vec3::new(spawn_pos.x, hero.courier.fly_height, spawn_pos.z),
                 courier_inventory: Vec::new(),
+                stash: Vec::new(),
+                shop_notice_seq: 0,
+                shop_notice_text: String::new(),
+                shop_notice_is_error: false,
+                pending_hero_to_courier_slot: None,
                 fog_of_war: SharedFogOfWar::from_config(config, lp.team),
                 in_water: false,
                 water_splash_cooldown: 0.0,
@@ -7432,6 +7475,10 @@ impl AuthoritativeWorldState {
             snap.hero.courier_order = me.courier_order;
             snap.hero.courier_in_fountain = fountain_regen_bonus_for_pos(config, me.hero_team, me.courier_pos) > 0.0;
             snap.hero.courier_inventory = me.courier_inventory.clone();
+            snap.hero.stash = me.stash.clone();
+            snap.hero.shop_notice_seq = me.shop_notice_seq;
+            snap.hero.shop_notice_text = me.shop_notice_text.clone();
+            snap.hero.shop_notice_is_error = me.shop_notice_is_error;
         }
         for p in &self.players {
             let hero_cfg = config.active_hero(p.hero_index);
@@ -7834,6 +7881,10 @@ impl AuthoritativeWorldState {
                 courier_order: CourierOrder::Idle,
                 courier_in_fountain: false,
                 courier_inventory: Vec::new(),
+                stash: Vec::new(),
+                shop_notice_seq: 0,
+                shop_notice_text: String::new(),
+                shop_notice_is_error: false,
                 teleport_cooldown_remaining: self.teleport_cooldown_remaining.max(0.0),
                 is_teleporting: self.active_teleport.is_some(),
                 teleport_progress: self
@@ -8549,10 +8600,34 @@ fn shared_authoritative_drive_system(
     for (soldier_marker, mut soldier_tf, mut controller) in &mut soldier_query {
         let slot_idx = soldier_marker.slot_index;
         let has_slots = !world.players.is_empty();
+        let mut auto_courier_move: Option<Vec3> = None;
         if has_slots {
+            if let Some(p) = world.players.get_mut(slot_idx) {
+                if p.pending_hero_to_courier_slot.is_some() {
+                    let manual_move = p.active_input.as_ref().is_some_and(|inp| {
+                        inp.move_input.is_finite()
+                            && (inp.move_input.x.abs() > 0.01 || inp.move_input.z.abs() > 0.01)
+                    });
+                    if p.is_dead || p.courier_is_dead || p.active_teleport.is_some() || manual_move {
+                        p.pending_hero_to_courier_slot = None;
+                    } else {
+                        let delta = Vec3::new(
+                            p.courier_pos.x - p.soldier_pos.x,
+                            0.0,
+                            p.courier_pos.z - p.soldier_pos.z,
+                        );
+                        if delta.length() > 0.2 {
+                            auto_courier_move = Some(delta.normalize());
+                        }
+                    }
+                }
+            }
             world.swap_slot_in(slot_idx);
         }
-        if let Some(input) = world.active_input.clone() {
+        if let Some(mut input) = world.active_input.clone() {
+            if let Some(dir) = auto_courier_move {
+                input.move_input = dir;
+            }
             shared_drive_single_player(
                 &mut commands,
                 dt,
@@ -12344,10 +12419,15 @@ fn shared_authoritative_react_system(
             let elapsed_secs = world.match_elapsed_secs;
             let courier_mult = config.effective_vision_multiplier(elapsed_secs, config.day_night.night_courier_vision_multiplier);
             let cur_weather = world.current_weather;
-            world.hero_vision_range = config.hero_effective_vision(hero, elapsed_secs, cur_weather);
+            let hero_alive = !world.is_dead;
+            world.hero_vision_range = if hero_alive {
+                config.hero_effective_vision(hero, elapsed_secs, cur_weather)
+            } else {
+                0.0
+            };
             world
                 .fog_of_war
-                .update_for_hero(&config, hero_pos, hero, &allied_creep_positions, elapsed_secs, cur_weather);
+                .update_for_hero(&config, hero_pos, hero, hero_alive, &allied_creep_positions, elapsed_secs, cur_weather);
             for (c_pos, c_range) in allied_courier_vision {
                 world.fog_of_war.reveal_from_source(&config, c_pos, c_range * courier_mult, 48);
             }

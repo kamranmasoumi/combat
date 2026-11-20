@@ -162,6 +162,10 @@ pub enum ClientAudioEvent {
     ShopBuy,
     ShopCombine,
     ShopSell,
+    ShopEnter,
+    ShopExit,
+    InventoryFull,
+    NotEnoughGold,
     TeleportLoopStart {
         slot_index: usize,
         origin_pos: Vec3,
@@ -822,6 +826,18 @@ fn process_audio_events_system(
             }
             ClientAudioEvent::ShopSell => {
                 play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_sell_sound, a.shop_sell_volume);
+            }
+            ClientAudioEvent::ShopEnter => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_enter_sound, a.shop_enter_volume);
+            }
+            ClientAudioEvent::ShopExit => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.shop_exit_sound, a.shop_exit_volume);
+            }
+            ClientAudioEvent::InventoryFull => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.inventory_full_sound, a.inventory_full_volume);
+            }
+            ClientAudioEvent::NotEnoughGold => {
+                play_2d_sound(&mut commands, &asset_server, &mut cache, &settings, duck, AudioCategory::Ui, &a.not_enough_gold_sound, a.not_enough_gold_volume);
             }
             ClientAudioEvent::TeleportLoopStart {
                 slot_index,

@@ -2,7 +2,10 @@ use crate::backend_client::sanitize_ascii_msg;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::app::AppExit;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::ui::Pressed;
+use bevy::ui_widgets::Button as UiButton;
 use bevy::window::{CursorOptions, PrimaryWindow};
 use std::f32::consts::TAU;
 
@@ -705,13 +708,13 @@ fn handle_pregame_buttons_system(
     mut pending_conn: ResMut<PendingMatchConnection>,
     mut next_screen: ResMut<NextState<AppScreenState>>,
     mut exit_ev: MessageWriter<AppExit>,
-    mut btn_q: Query<(&Interaction, &PreGameBtnAction, &mut BackgroundColor), Changed<Interaction>>,
+    mut btn_q: Query<(&Hovered, Has<Pressed>, &PreGameBtnAction, &mut BackgroundColor), Or<(Changed<Hovered>, Added<Pressed>)>>,
 ) {
-    for (interaction, action, mut bg) in &mut btn_q {
-        if *interaction == Interaction::Hovered {
+    for (hovered, pressed, action, mut bg) in &mut btn_q {
+        if hovered.get() && !pressed {
             bg.0 = bg.0.lighter(0.08);
         }
-        if *interaction != Interaction::Pressed {
+        if !pressed {
             continue;
         }
         state.ui_dirty = true;
@@ -1153,7 +1156,8 @@ fn spawn_nav_pill(
 ) {
     parent
         .spawn((
-            Interaction::default(),
+            UiButton,
+            Hovered::default(),
             Node {
                 padding: UiRect::axes(Val::Px(16.0), Val::Px(8.0)),
                 flex_direction: FlexDirection::Row,
@@ -1830,7 +1834,8 @@ fn spawn_team_slots_panel(
                 } else {
                     panel
                         .spawn((
-                            Interaction::default(),
+                            UiButton,
+            Hovered::default(),
                             Node {
                                 width: Val::Percent(100.0),
                                 padding: UiRect::axes(Val::Px(12.0), Val::Px(10.0)),
@@ -1917,7 +1922,8 @@ fn spawn_history_screen(parent: &mut ChildSpawnerCommands, state: &PreGameSessio
                         };
                         let selected = idx == state.selected_history_idx;
                         list.spawn((
-                            Interaction::default(),
+                            UiButton,
+            Hovered::default(),
                             Node {
                                 width: Val::Percent(100.0),
                                 padding: UiRect::axes(Val::Px(14.0), Val::Px(10.0)),
@@ -2060,7 +2066,8 @@ fn spawn_input_box(
     };
     parent
         .spawn((
-            Interaction::default(),
+            UiButton,
+            Hovered::default(),
             Node {
                 width: Val::Percent(100.0),
                 padding: UiRect::axes(Val::Px(14.0), Val::Px(10.0)),
@@ -2107,7 +2114,8 @@ fn spawn_action_button(
 ) {
     parent
         .spawn((
-            Interaction::default(),
+            UiButton,
+            Hovered::default(),
             Node {
                 padding: UiRect::axes(Val::Px(22.0), Val::Px(11.0)),
                 justify_content: JustifyContent::Center,

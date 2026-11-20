@@ -277,6 +277,17 @@ pub struct PartyState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(crate = "ureq::serde")]
+pub struct LobbyInviteInfo {
+    pub lobby_id: String,
+    pub lobby_title: String,
+    #[serde(default)]
+    pub has_password: bool,
+    pub from_user_id: String,
+    pub from_username: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
 pub struct PartyInviteInfo {
     pub invite_id: String,
     pub party_id: String,
@@ -394,6 +405,7 @@ pub enum BackendAsyncEvent {
         message: String,
     },
     PartyInviteCleared(String),
+    LobbyInviteReceived(LobbyInviteInfo),
     PartyInviteResult {
         target_user_id: String,
         accepted: bool,
@@ -1307,6 +1319,11 @@ impl BackendClient {
                                         accepted,
                                         message,
                                     });
+                                }
+                                "lobby_invite_received" => {
+                                    if let Ok(inv) = serde_json::from_value::<LobbyInviteInfo>(v.clone()) {
+                                        let _ = tx.send(BackendAsyncEvent::LobbyInviteReceived(inv));
+                                    }
                                 }
                                 "party_invite_cleared" => {
                                     let iid = v

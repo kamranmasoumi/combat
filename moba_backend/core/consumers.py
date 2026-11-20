@@ -1077,7 +1077,7 @@ class MatchmakingConsumer(AsyncWebsocketConsumer):
                 text_data=json.dumps(
                     {
                         "event": "error",
-                        "message": "شما در حال حاضر یک نبرد فعال دارید و نمی‌توانید وارد صف نبرد جدید شوید.",
+                        "message": "You already have an active match and cannot join a new queue.",
                         "active_match": active_match,
                     }
                 )
@@ -1159,7 +1159,7 @@ class MatchmakingConsumer(AsyncWebsocketConsumer):
                             "type": "queue.status",
                             "payload": {
                                 "event": "error",
-                                "message": "خطا در راه‌اندازی سرویس سرور بازی؛ دوباره تلاش کنید",
+                                "message": "Failed to start the game server; please try again.",
                             },
                         },
                     )
@@ -1316,7 +1316,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             await self.send_json(
                 {
                     "event": "error",
-                    "message": "شما یک نبرد فعال دارید و نمی‌توانید وارد بخش لابی شوید.",
+                    "message": "You have an active match and cannot enter custom lobbies.",
                 }
             )
             await self.close(code=4003)
@@ -1340,7 +1340,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             {
                 "event": "lobby_list",
                 "lobbies": lobbies_snapshot,
-                "message": "لیست لابی‌ها بروزرسانی شد.",
+                "message": "Lobby list updated.",
             }
         )
 
@@ -1380,6 +1380,8 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             await self._handle_member_leave(is_disconnect=False)
         elif action == "start_match":
             await self._handle_start_match()
+        elif action == "update_settings":
+            await self._handle_update_settings(msg)
 
     async def _broadcast_lobby_list_to_browsers(self) -> None:
         async with _LOBBY_LOCK:
@@ -1425,7 +1427,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             {
                 "event": "lobby_list",
                 "lobbies": lobbies_snapshot,
-                "message": "لیست لابی‌ها بروزرسانی شد.",
+                "message": "Lobby list updated.",
             }
         )
 
@@ -1442,14 +1444,14 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             await self.send_json(
                 {
                     "event": "error",
-                    "message": "شما در حال حاضر یک نبرد فعال دارید و مجاز به ساخت لابی نیستید.",
+                    "message": "You have an active match and cannot create a lobby.",
                 }
             )
             return
 
         title = str(msg.get("title", "")).strip()[:36]
         if not title:
-            title = f"لابی {self.player.username}"
+            title = f"{self.player.username}'s Room"
 
         password = str(msg.get("password", "")).strip()[:24]
         try:
@@ -1461,7 +1463,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             await self.send_json(
                 {
                     "event": "error",
-                    "message": "ظرفیت لابی باید یکی از اعداد زوج ۲، ۴، ۶، ۸ یا ۱۰ باشد.",
+                    "message": "Lobby capacity must be 2, 4, 6, 8, or 10 players.",
                 }
             )
             return
@@ -1473,7 +1475,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                     await self.send_json(
                         {
                             "event": "error",
-                            "message": "شما هم‌اکنون در یک لابی حضور دارید.",
+                            "message": "You are already inside a lobby.",
                         }
                     )
                     return
@@ -1501,8 +1503,8 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 members=[host_member],
                 chat_history=[
                     {
-                        "sender": "سیستم",
-                        "text": f"لابی «{title}» با ظرفیت {max_players} نفر توسط {self.player.username} ساخته شد.",
+                        "sender": "SYSTEM",
+                        "text": f"Lobby '{title}' ({max_players} players) created by {self.player.username}.",
                         "is_system": True,
                     }
                 ],
@@ -1517,7 +1519,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             {
                 "event": "lobby_state",
                 "lobby": detail,
-                "message": "لابی با موفقیت ساخته شد.",
+                "message": "Lobby created successfully.",
             }
         )
         await self._broadcast_lobby_list_to_browsers()
@@ -1537,7 +1539,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             await self.send_json(
                 {
                     "event": "error",
-                    "message": "شما در حال حاضر یک نبرد فعال دارید و نمی‌توانید وارد لابی شوید.",
+                    "message": "You have an active match and cannot join a lobby.",
                 }
             )
             return
@@ -1548,7 +1550,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                     await self.send_json(
                         {
                             "event": "error",
-                            "message": "شما هم‌اکنون داخل یک لابی هستید.",
+                            "message": "You are already in a lobby.",
                         }
                     )
                     return
@@ -1558,7 +1560,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": "لابی مورد نظر یافت نشد یا بسته شده است.",
+                        "message": "Lobby not found or has been closed.",
                     }
                 )
                 return
@@ -1567,7 +1569,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": "این لابی در حال شروع بازی است و امکان ورود وجود ندارد.",
+                        "message": "This lobby is already starting the match.",
                     }
                 )
                 return
@@ -1576,7 +1578,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": "ظرفیت این لابی تکمیل شده است.",
+                        "message": "This lobby is already full.",
                     }
                 )
                 return
@@ -1585,7 +1587,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": "گذرواژه واردشده نادرست است.",
+                        "message": "Incorrect lobby password.",
                     }
                 )
                 return
@@ -1595,7 +1597,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": "جایگاه خالی در لابی یافت نشد.",
+                        "message": "No free slot available in this lobby.",
                     }
                 )
                 return
@@ -1614,8 +1616,8 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             )
             lobby.chat_history.append(
                 {
-                    "sender": "سیستم",
-                    "text": f"{self.player.username} به لابی پیوست.",
+                    "sender": "SYSTEM",
+                    "text": f"{self.player.username} joined the lobby.",
                     "is_system": True,
                 }
             )
@@ -1628,7 +1630,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 {
                     "event": "lobby_state",
                     "lobby": detail,
-                    "message": f"{self.player.username} وارد لابی شد.",
+                    "message": f"{self.player.username} entered the lobby.",
                 },
             )
 
@@ -1671,7 +1673,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                     await self.send_json(
                         {
                             "event": "error",
-                            "message": "این جایگاه توسط بازیکن دیگری اشغال شده است.",
+                            "message": "This slot is already occupied by another player.",
                         }
                     )
                     return
@@ -1682,7 +1684,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                     await self.send_json(
                         {
                             "event": "error",
-                            "message": "ظرفیت این تیم تکمیل است.",
+                            "message": "This team is already full.",
                         }
                     )
                     return
@@ -1693,11 +1695,11 @@ class LobbyConsumer(AsyncWebsocketConsumer):
 
             member.team_id = target_team
             member.slot_index = chosen_slot
-            team_title = "سپاه روشنایی (تیم ۱)" if target_team == 1 else "سپاه تاریکی (تیم ۲)"
+            team_title = "Team Alpha" if target_team == 1 else "Team Omega"
             lobby.chat_history.append(
                 {
-                    "sender": "سیستم",
-                    "text": f"{self.player.username} به {team_title} (جایگاه {chosen_slot + 1}) منتقل شد.",
+                    "sender": "SYSTEM",
+                    "text": f"{self.player.username} moved to {team_title} (Slot {chosen_slot + 1}).",
                     "is_system": True,
                 }
             )
@@ -1707,7 +1709,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 {
                     "event": "lobby_state",
                     "lobby": detail,
-                    "message": f"جایگاه {self.player.username} بروزرسانی شد.",
+                    "message": f"{self.player.username}'s slot updated.",
                 },
             )
 
@@ -1772,7 +1774,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": "فقط سازنده لابی مجاز به اخراج بازیکن است.",
+                        "message": "Only the lobby host can kick players.",
                     }
                 )
                 return
@@ -1781,7 +1783,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": "در حین شروع بازی امکان اخراج بازیکن وجود ندارد.",
+                        "message": "Cannot kick players while the match is starting.",
                     }
                 )
                 return
@@ -1801,8 +1803,8 @@ class LobbyConsumer(AsyncWebsocketConsumer):
 
             lobby.chat_history.append(
                 {
-                    "sender": "سیستم",
-                    "text": f"{kicked_member.username} توسط سازنده از لابی اخراج شد.",
+                    "sender": "SYSTEM",
+                    "text": f"{kicked_member.username} was kicked from the lobby by the host.",
                     "is_system": True,
                 }
             )
@@ -1818,7 +1820,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 {
                     "event": "lobby_state",
                     "lobby": detail,
-                    "message": f"{kicked_member.username} از لابی اخراج شد.",
+                    "message": f"{kicked_member.username} was kicked from the lobby.",
                 },
             )
 
@@ -1830,7 +1832,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                     "payload": {
                         "event": "kicked_from_lobby",
                         "lobbies": lobbies_snapshot,
-                        "message": f"شما توسط سازنده لابی ({self.player.username}) از لابی حذف شدید.",
+                        "message": f"You were removed from the lobby by {self.player.username}.",
                     },
                 },
             )
@@ -1857,7 +1859,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": "بازی در حال راه‌اندازی است؛ امکان حذف یا ترک لابی وجود ندارد.",
+                        "message": "Match is starting; cannot leave or close the lobby.",
                     }
                 )
                 return
@@ -1881,8 +1883,8 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 ]
                 lobby.chat_history.append(
                     {
-                        "sender": "سیستم",
-                        "text": f"{self.player.username} لابی را ترک کرد.",
+                        "sender": "SYSTEM",
+                        "text": f"{self.player.username} left the lobby.",
                         "is_system": True,
                     }
                 )
@@ -1892,7 +1894,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                     {
                         "event": "lobby_state",
                         "lobby": detail,
-                        "message": f"{self.player.username} از لابی خارج شد.",
+                        "message": f"{self.player.username} left the lobby.",
                     },
                 )
 
@@ -1910,7 +1912,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                         "type": "lobby.closed",
                         "payload": {
                             "event": "lobby_closed",
-                            "message": f"لابی «{lobby_title}» به دلیل خروج سازنده ({self.player.username}) منحل شد.",
+                            "message": f"Lobby '{lobby_title}' was disbanded because host ({self.player.username}) left.",
                         },
                     },
                 )
@@ -1919,10 +1921,54 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 {
                     "event": "left_lobby",
                     "lobbies": lobbies_snapshot,
-                    "message": "شما از لابی خارج شدید.",
+                    "message": "You left the lobby.",
                 }
             )
 
+        await self._broadcast_lobby_list_to_browsers()
+
+    async def _handle_update_settings(self, msg: dict) -> None:
+        assert self.player is not None
+        if not self.current_lobby_id:
+            return
+        async with _LOBBY_LOCK:
+            lobby = _ACTIVE_LOBBIES.get(self.current_lobby_id)
+            if not lobby or lobby.host_user_id != self.player.user_id or lobby.is_starting:
+                return
+            new_title = str(msg.get("title", "")).strip()[:36]
+            if new_title:
+                lobby.title = new_title
+            if "password" in msg:
+                lobby.password = str(msg.get("password", "")).strip()[:24]
+            try:
+                new_cap = int(msg.get("max_players", lobby.max_players))
+            except Exception:
+                new_cap = lobby.max_players
+            if new_cap in ALLOWED_LOBBY_CAPACITIES and new_cap >= len(lobby.members):
+                lobby.max_players = new_cap
+                half = new_cap // 2
+                # اطمینان از معتبر بودن شماره اسلات اعضا پس از تغییر ظرفیت
+                for m in lobby.members:
+                    if m.slot_index >= half:
+                        free = _find_first_free_slot(lobby)
+                        if free:
+                            m.team_id, m.slot_index = free
+            lobby.chat_history.append(
+                {
+                    "sender": "SYSTEM",
+                    "text": f"Lobby settings updated by {self.player.username}.",
+                    "is_system": True,
+                }
+            )
+            detail = _serialize_lobby_detail(lobby)
+            await self._broadcast_to_lobby_members(
+                lobby,
+                {
+                    "event": "lobby_state",
+                    "lobby": detail,
+                    "message": "Lobby settings updated.",
+                },
+            )
         await self._broadcast_lobby_list_to_browsers()
 
     async def _handle_start_match(self) -> None:
@@ -1940,7 +1986,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": "فقط سازنده لابی مجاز به شروع نبرد است.",
+                        "message": "Only the lobby host can start the match.",
                     }
                 )
                 return
@@ -1952,7 +1998,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": f"ظرفیت لابی هنوز تکمیل نشده است ({len(lobby.members)} از {lobby.max_players} نفر).",
+                        "message": f"Lobby is not full yet ({len(lobby.members)}/{lobby.max_players} players).",
                     }
                 )
                 return
@@ -1964,7 +2010,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 await self.send_json(
                     {
                         "event": "error",
-                        "message": f"هر تیم باید دقیقاً دارای {half} بازیکن باشد.",
+                        "message": f"Each team must have exactly {half} players.",
                     }
                 )
                 return
@@ -1973,8 +2019,8 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             lobby.is_starting = True
             lobby.chat_history.append(
                 {
-                    "sender": "سیستم",
-                    "text": "ظرفیت تکمیل شد! در حال راه‌اندازی سرور اختصاصی نبرد...",
+                    "sender": "SYSTEM",
+                    "text": "Lobby full! Starting dedicated match server...",
                     "is_system": True,
                 }
             )
@@ -1990,7 +2036,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                 {
                     "event": "lobby_starting",
                     "lobby": detail,
-                    "message": "در حال راه‌اندازی سرور نبرد... لطفاً شکیبا باشید.",
+                    "message": "Starting match server... Please wait.",
                 },
             )
 
@@ -2008,7 +2054,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                         {
                             "event": "lobby_state",
                             "lobby": detail,
-                            "message": "هیچ پورت آزادی روی سرور یافت نشد؛ دوباره تلاش کنید.",
+                            "message": "No free server port available; please try again.",
                         },
                     )
             return
@@ -2053,7 +2099,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
                         {
                             "event": "lobby_state",
                             "lobby": detail,
-                            "message": "خطا در راه‌اندازی سرور بازی؛ مجدداً تلاش کنید.",
+                            "message": "Failed to start game server; please try again.",
                         },
                     )
             return
@@ -2479,6 +2525,8 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
             await self._handle_start_party_matchmaking()
         elif action == "cancel_party_matchmaking":
             await self._handle_cancel_party_matchmaking()
+        elif action == "invite_to_lobby":
+            await self._handle_invite_to_lobby(msg)
 
     async def _handle_refresh_social(self) -> None:
         assert self.player is not None
@@ -3450,6 +3498,51 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                         },
                     },
                 )
+
+    async def _handle_invite_to_lobby(self, msg: dict) -> None:
+        assert self.player is not None
+        target_uid = str(msg.get("target_user_id", "")).strip()
+        lobby_id = str(msg.get("lobby_id", "")).strip()
+        lobby_title = str(msg.get("lobby_title", "")).strip()[:36]
+        if not target_uid or not lobby_id or target_uid == self.player.user_id:
+            return
+        async with _LOBBY_LOCK:
+            lb_obj = _ACTIVE_LOBBIES.get(lobby_id)
+            has_password = bool(lb_obj.password) if lb_obj else False
+        async with _SOCIAL_LOCK:
+            target_sess = _ONLINE_USERS.get(target_uid)
+        if not target_sess or not target_sess.channel_name:
+            await self.send_json(
+                {
+                    "event": "notification",
+                    "kind": "error",
+                    "title": "PLAYER OFFLINE",
+                    "message": "Target player is currently offline.",
+                }
+            )
+            return
+        await self.channel_layer.send(
+            target_sess.channel_name,
+            {
+                "type": "social.event",
+                "payload": {
+                    "event": "lobby_invite_received",
+                    "lobby_id": lobby_id,
+                    "lobby_title": lobby_title or f"{self.player.username}'s Room",
+                    "has_password": has_password,
+                    "from_user_id": self.player.user_id,
+                    "from_username": self.player.username,
+                },
+            },
+        )
+        await self.send_json(
+            {
+                "event": "notification",
+                "kind": "info",
+                "title": "LOBBY INVITE SENT",
+                "message": f"Invited {target_sess.username} to lobby.",
+            }
+        )
 
     async def social_event(self, event: dict) -> None:
         await self.send_json(event["payload"])

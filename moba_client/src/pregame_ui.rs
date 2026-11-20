@@ -1,7 +1,8 @@
 use crate::backend_client::{
     clear_persisted_session, load_persisted_session, sanitize_ascii_msg, ActiveMatchInfo,
     BackendAsyncEvent, BackendClient, FriendsSnapshot, LobbyDetail, LobbySummary,
-    MatchHistoryResponse, PartyInviteInfo, PartyState, PlayerProfile, PlayerSearchResult,
+    LobbyInviteInfo, MatchHistoryResponse, PartyInviteInfo, PartyState, PlayerProfile,
+    PlayerSearchResult,
 };
 use bevy::animation::RepeatAnimation;
 use bevy::app::AppExit;
@@ -56,6 +57,7 @@ pub enum FocusedInput {
     LobbyPassword,
     JoinPassword,
     LobbyChat,
+    LobbySearch,
     FriendSearch,
     PartyChat,
 }
@@ -112,12 +114,22 @@ pub struct PreGameSessionState {
     // Custom Lobby state
     pub lobbies: Vec<LobbySummary>,
     pub current_lobby: Option<LobbyDetail>,
+    pub create_lobby_modal_open: bool,
+    pub edit_lobby_settings_open: bool,
+    pub create_password_visible: bool,
+    pub pending_create_lobby: Option<(String, String, usize)>,
+    pub pending_join_lobby: Option<(String, String)>,
+    pub lobby_invite_modal_open: bool,
+    pub pending_lobby_invites: Vec<LobbyInviteInfo>,
     pub create_title: String,
     pub create_password: String,
     pub create_capacity: usize,
     pub join_target_lobby_id: Option<String>,
     pub join_password_input: String,
     pub lobby_chat_input: String,
+    pub lobby_search_input: String,
+    pub lobby_hide_full_locked: bool,
+    pub selected_lobby_id: Option<String>,
     // Match History state
     pub history: Option<MatchHistoryResponse>,
     pub selected_history_idx: usize,
@@ -168,12 +180,22 @@ impl Default for PreGameSessionState {
             party_chat_input: String::new(),
             lobbies: Vec::new(),
             current_lobby: None,
+            create_lobby_modal_open: false,
+            edit_lobby_settings_open: false,
+            create_password_visible: false,
+            pending_create_lobby: None,
+            pending_join_lobby: None,
+            lobby_invite_modal_open: false,
+            pending_lobby_invites: Vec::new(),
             create_title: String::new(),
             create_password: String::new(),
             create_capacity: 2,
             join_target_lobby_id: None,
             join_password_input: String::new(),
             lobby_chat_input: String::new(),
+            lobby_search_input: String::new(),
+            lobby_hide_full_locked: false,
+            selected_lobby_id: None,
             history: None,
             selected_history_idx: 0,
             confirm_modal: None,
@@ -259,7 +281,20 @@ enum PreGameBtnAction {
     SendPartyChat,
     DismissNotification(u64),
     // Custom Lobby actions
+    OpenCreateLobbyModal,
+    CloseLobbyModal,
+    ToggleCreatePasswordVisibility,
+    OpenLobbySettingsModal,
+    SaveLobbySettings,
+    SwapLobbyTeam,
+    OpenLobbyInviteModal,
+    CloseLobbyInviteModal,
+    SendLobbyInvite(String),
+    RespondLobbyInvite { lobby_id: String, accept: bool },
     RefreshLobbies,
+    ToggleHideFullLobbies,
+    SelectLobbyRow(String),
+    JoinSelectedLobby,
     SelectLobbyCapacity(usize),
     CreateLobby,
     OpenJoinLobby { lobby_id: String, has_password: bool },
@@ -1089,16 +1124,45 @@ fn poll_backend_events_system(
                     state.ui_dirty = true;
                 }
             }
+            BackendAsyncEvent::LobbyInviteReceived(inv) => {
+                state
+                    .pending_lobby_invites
+                    .retain(|x| x.lobby_id != inv.lobby_id);
+                let title = format!("LOBBY INVITE // {}", inv.from_username.to_uppercase());
+                let msg = format!("{} invited you to {}", inv.from_username, inv.lobby_title);
+                state.pending_lobby_invites.push(inv);
+                push_notification(&mut state, "party_joined", &title, &msg, notif_dur);
+            }
             BackendAsyncEvent::LobbyList { lobbies, message } => {
                 state.is_loading = false;
                 state.lobbies = lobbies;
-                if !message.is_empty() && state.tab == PreGameTab::LobbyBrowser {
+                if let Some((title, pw, cap)) = state.pending_create_lobby.take() {
+                    state.is_loading = true;
+                    state.loading_label = "CREATING CUSTOM LOBBY".to_string();
+                    backend.send_lobby_action(serde_json::json!({
+                        "action": "create_lobby",
+                        "title": title,
+                        "password": pw,
+                        "max_players": cap,
+                    }));
+                } else if let Some((lid, pw)) = state.pending_join_lobby.take() {
+                    state.is_loading = true;
+                    state.loading_label = "JOINING LOBBY".to_string();
+                    backend.send_lobby_action(serde_json::json!({
+                        "action": "join_lobby",
+                        "lobby_id": lid,
+                        "password": pw,
+                    }));
+                } else if !message.is_empty() && state.tab == PreGameTab::LobbyBrowser {
                     set_toast(&mut state, &message, false);
                 }
                 state.ui_dirty = true;
             }
             BackendAsyncEvent::LobbyState { lobby, message } => {
                 state.is_loading = false;
+                state.create_lobby_modal_open = false;
+                state.edit_lobby_settings_open = false;
+                state.lobby_invite_modal_open = false;
                 state.current_lobby = Some(lobby);
                 state.join_target_lobby_id = None;
                 state.join_password_input.clear();
@@ -1177,7 +1241,7 @@ fn handle_pregame_keyboard_system(
     mut key_events: MessageReader<KeyboardInput>,
     keys: Res<ButtonInput<KeyCode>>,
     config: Res<GameConfig>,
-    backend: Res<BackendClient>,
+    mut backend: ResMut<BackendClient>,
     mut state: ResMut<PreGameSessionState>,
 ) {
     if state.confirm_modal.is_some() {
@@ -1188,6 +1252,20 @@ fn handle_pregame_keyboard_system(
         return;
     }
 
+    if keys.just_pressed(KeyCode::Escape) {
+        if state.create_lobby_modal_open || state.edit_lobby_settings_open {
+            state.create_lobby_modal_open = false;
+            state.edit_lobby_settings_open = false;
+            state.focused = FocusedInput::None;
+            state.ui_dirty = true;
+            return;
+        }
+        if state.lobby_invite_modal_open {
+            state.lobby_invite_modal_open = false;
+            state.ui_dirty = true;
+            return;
+        }
+    }
     if keys.just_pressed(KeyCode::Escape) && state.join_target_lobby_id.is_some() {
         state.join_target_lobby_id = None;
         state.focused = FocusedInput::None;
@@ -1233,7 +1311,7 @@ fn handle_pregame_keyboard_system(
                     FocusedInput::LobbyTitle => 32,
                     FocusedInput::LobbyPassword | FocusedInput::JoinPassword => 24,
                     FocusedInput::LobbyChat | FocusedInput::PartyChat => 110,
-                    FocusedInput::FriendSearch => 32,
+                    FocusedInput::FriendSearch | FocusedInput::LobbySearch => 32,
                     FocusedInput::None => 0,
                 };
                 let only_digits = state.focused == FocusedInput::Otp;
@@ -1331,11 +1409,20 @@ fn handle_pregame_keyboard_system(
             }
             FocusedInput::JoinPassword => {
                 if let Some(lid) = state.join_target_lobby_id.clone() {
-                    backend.send_lobby_action(serde_json::json!({
-                        "action": "join_lobby",
-                        "lobby_id": lid,
-                        "password": state.join_password_input.trim()
-                    }));
+                    let pw = state.join_password_input.trim().to_string();
+                    state.is_loading = true;
+                    state.loading_label = "JOINING CUSTOM LOBBY".to_string();
+                    if matches!(state.tab, PreGameTab::LobbyBrowser | PreGameTab::LobbyRoom) {
+                        backend.send_lobby_action(serde_json::json!({
+                            "action": "join_lobby",
+                            "lobby_id": lid,
+                            "password": pw
+                        }));
+                    } else if let Some(tok) = state.access_token.clone() {
+                        state.pending_join_lobby = Some((lid, pw));
+                        backend.connect_lobby_ws(tok);
+                    }
+                    state.ui_dirty = true;
                 }
             }
             _ => {}
@@ -1353,6 +1440,7 @@ fn active_input_mut(state: &mut PreGameSessionState) -> &mut String {
         FocusedInput::JoinPassword => &mut state.join_password_input,
         FocusedInput::LobbyChat => &mut state.lobby_chat_input,
         FocusedInput::FriendSearch => &mut state.friend_search_input,
+        FocusedInput::LobbySearch => &mut state.lobby_search_input,
         FocusedInput::PartyChat => &mut state.party_chat_input,
         FocusedInput::None => &mut state.email_input,
     }
@@ -1727,13 +1815,202 @@ fn handle_pregame_buttons_system(
             state.create_capacity = cap;
             state.ui_dirty = true;
         }
-        PreGameBtnAction::CreateLobby => {
+        PreGameBtnAction::OpenCreateLobbyModal => {
+            if state.active_match.is_some() {
+                push_notification(
+                    &mut state,
+                    "error",
+                    "ACTIVE MATCH",
+                    "Finish or abandon your active match before creating a lobby.",
+                    notif_dur,
+                );
+                return;
+            }
+            if state.create_title.trim().is_empty() {
+                let uname = state
+                    .profile
+                    .as_ref()
+                    .map(|p| p.username.as_str())
+                    .unwrap_or("SOLDIER");
+                state.create_title = format!("{}'s Room", uname);
+            }
+            state.create_lobby_modal_open = true;
+            state.edit_lobby_settings_open = false;
+            state.focused = FocusedInput::LobbyTitle;
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::CloseLobbyModal => {
+            state.create_lobby_modal_open = false;
+            state.edit_lobby_settings_open = false;
+            state.focused = FocusedInput::None;
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::ToggleCreatePasswordVisibility => {
+            state.create_password_visible = !state.create_password_visible;
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::OpenLobbySettingsModal => {
+            if let Some((title, cap)) = state
+                .current_lobby
+                .as_ref()
+                .map(|lb| (lb.title.clone(), lb.max_players))
+            {
+                state.create_title = title;
+                state.create_capacity = cap;
+                state.edit_lobby_settings_open = true;
+                state.focused = FocusedInput::LobbyTitle;
+                state.ui_dirty = true;
+            }
+        }
+        PreGameBtnAction::SaveLobbySettings => {
+            state.is_loading = true;
+            state.loading_label = "SAVING LOBBY SETTINGS".to_string();
             backend.send_lobby_action(serde_json::json!({
-                "action": "create_lobby",
+                "action": "update_settings",
                 "title": state.create_title.trim(),
                 "password": state.create_password.trim(),
                 "max_players": state.create_capacity,
             }));
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::SwapLobbyTeam => {
+            if let Some(ref lb) = state.current_lobby {
+                let my_uid = state
+                    .profile
+                    .as_ref()
+                    .map(|p| p.user_id.as_str())
+                    .unwrap_or("");
+                if let Some(me) = lb.members.iter().find(|m| m.user_id == my_uid) {
+                    let target_team = if me.team_id == 1 { 2 } else { 1 };
+                    backend.send_lobby_action(serde_json::json!({
+                        "action": "switch_team",
+                        "team_id": target_team,
+                        "slot_index": -1
+                    }));
+                }
+            }
+        }
+        PreGameBtnAction::OpenLobbyInviteModal => {
+            if let Some(tok) = state.access_token.clone() {
+                backend.fetch_friends(tok);
+            }
+            state.lobby_invite_modal_open = true;
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::CloseLobbyInviteModal => {
+            state.lobby_invite_modal_open = false;
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::SendLobbyInvite(target_uid) => {
+            if let Some(ref lb) = state.current_lobby {
+                backend.send_social_action(serde_json::json!({
+                    "action": "invite_to_lobby",
+                    "target_user_id": target_uid,
+                    "lobby_id": lb.lobby_id,
+                    "lobby_title": lb.title
+                }));
+                state.lobby_invite_modal_open = false;
+                state.ui_dirty = true;
+            }
+        }
+        PreGameBtnAction::RespondLobbyInvite { lobby_id, accept } => {
+            let needs_pw = state
+                .pending_lobby_invites
+                .iter()
+                .find(|x| x.lobby_id == lobby_id)
+                .map(|x| x.has_password)
+                .unwrap_or(false);
+            state
+                .pending_lobby_invites
+                .retain(|x| x.lobby_id != lobby_id);
+            if accept {
+                if needs_pw {
+                    state.join_target_lobby_id = Some(lobby_id);
+                    state.join_password_input.clear();
+                    state.focused = FocusedInput::JoinPassword;
+                } else if let Some(tok) = state.access_token.clone() {
+                    state.is_loading = true;
+                    state.loading_label = "JOINING CUSTOM LOBBY".to_string();
+                    if matches!(state.tab, PreGameTab::LobbyBrowser | PreGameTab::LobbyRoom) {
+                        backend.send_lobby_action(serde_json::json!({
+                            "action": "join_lobby",
+                            "lobby_id": lobby_id,
+                            "password": ""
+                        }));
+                    } else {
+                        state.pending_join_lobby = Some((lobby_id, String::new()));
+                        backend.connect_lobby_ws(tok);
+                    }
+                }
+            }
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::ToggleHideFullLobbies => {
+            state.lobby_hide_full_locked = !state.lobby_hide_full_locked;
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::SelectLobbyRow(lid) => {
+            state.selected_lobby_id = Some(lid);
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::JoinSelectedLobby => {
+            let Some(ref sel_id) = state.selected_lobby_id else {
+                push_notification(
+                    &mut state,
+                    "info",
+                    "SELECT A LOBBY",
+                    "Click a lobby row first to join.",
+                    notif_dur,
+                );
+                return;
+            };
+            if let Some(lb) = state.lobbies.iter().find(|l| &l.lobby_id == sel_id).cloned() {
+                if lb.current_players >= lb.max_players {
+                    push_notification(
+                        &mut state,
+                        "error",
+                        "LOBBY FULL",
+                        "This lobby is already full.",
+                        notif_dur,
+                    );
+                    return;
+                }
+                if lb.has_password {
+                    state.join_target_lobby_id = Some(lb.lobby_id);
+                    state.join_password_input.clear();
+                    state.focused = FocusedInput::JoinPassword;
+                    state.ui_dirty = true;
+                } else {
+                    state.is_loading = true;
+                    state.loading_label = "JOINING CUSTOM LOBBY".to_string();
+                    backend.send_lobby_action(serde_json::json!({
+                        "action": "join_lobby",
+                        "lobby_id": lb.lobby_id,
+                        "password": ""
+                    }));
+                    state.ui_dirty = true;
+                }
+            }
+        }
+        PreGameBtnAction::CreateLobby => {
+            let Some(tok) = state.access_token.clone() else { return };
+            let title = state.create_title.trim().to_string();
+            let pw = state.create_password.trim().to_string();
+            let cap = state.create_capacity;
+            state.is_loading = true;
+            state.loading_label = "CREATING CUSTOM LOBBY".to_string();
+            if matches!(state.tab, PreGameTab::LobbyBrowser | PreGameTab::LobbyRoom) {
+                backend.send_lobby_action(serde_json::json!({
+                    "action": "create_lobby",
+                    "title": title,
+                    "password": pw,
+                    "max_players": cap,
+                }));
+            } else {
+                state.pending_create_lobby = Some((title, pw, cap));
+                backend.connect_lobby_ws(tok);
+            }
+            state.ui_dirty = true;
         }
         PreGameBtnAction::OpenJoinLobby {
             lobby_id,
@@ -1754,11 +2031,20 @@ fn handle_pregame_buttons_system(
         }
         PreGameBtnAction::ConfirmJoinLobby => {
             if let Some(lid) = state.join_target_lobby_id.clone() {
-                backend.send_lobby_action(serde_json::json!({
-                    "action": "join_lobby",
-                    "lobby_id": lid,
-                    "password": state.join_password_input.trim()
-                }));
+                let pw = state.join_password_input.trim().to_string();
+                state.is_loading = true;
+                state.loading_label = "JOINING CUSTOM LOBBY".to_string();
+                if matches!(state.tab, PreGameTab::LobbyBrowser | PreGameTab::LobbyRoom) {
+                    backend.send_lobby_action(serde_json::json!({
+                        "action": "join_lobby",
+                        "lobby_id": lid,
+                        "password": pw
+                    }));
+                } else if let Some(tok) = state.access_token.clone() {
+                    state.pending_join_lobby = Some((lid, pw));
+                    backend.connect_lobby_ws(tok);
+                }
+                state.ui_dirty = true;
             }
         }
         PreGameBtnAction::CancelJoinModal => {
@@ -1954,7 +2240,19 @@ fn rebuild_pregame_ui_system(
             PreGameTab::MatchHistory => spawn_history_screen(parent, &state),
         }
 
-        if !state.pending_party_invites.is_empty() || !state.notifications.is_empty() {
+        if state.create_lobby_modal_open || state.edit_lobby_settings_open {
+            spawn_create_or_edit_lobby_modal(parent, &state);
+        }
+        if state.join_target_lobby_id.is_some() {
+            spawn_join_password_modal(parent, &state);
+        }
+        if state.lobby_invite_modal_open {
+            spawn_lobby_invite_modal(parent, &state);
+        }
+        if !state.pending_party_invites.is_empty()
+            || !state.pending_lobby_invites.is_empty()
+            || !state.notifications.is_empty()
+        {
             spawn_notification_stack(parent, &state);
         }
 
@@ -3181,7 +3479,7 @@ fn spawn_hub_screen(
                         spawn_sized_button(
                             btns,
                             "CREATE LOBBY",
-                            PreGameBtnAction::SwitchTab(PreGameTab::LobbyBrowser),
+                            PreGameBtnAction::OpenCreateLobbyModal,
                             Color::srgba(0.04, 0.24, 0.22, 0.92),
                             Color::srgb(0.24, 0.92, 0.76),
                             218.0,
@@ -3670,6 +3968,66 @@ fn spawn_notification_stack(parent: &mut ChildSpawnerCommands, state: &PreGameSe
             ..default()
         })
         .with_children(|stack| {
+            for linv in state.pending_lobby_invites.iter().take(2) {
+                stack
+                    .spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            padding: UiRect::all(Val::Px(12.0)),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(8.0),
+                            border: UiRect::all(Val::Px(1.5)),
+                            border_radius: BorderRadius::all(Val::Px(6.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.04, 0.14, 0.18, 0.96)),
+                        BorderColor::all(Color::srgb(0.32, 0.94, 0.84)),
+                        PulseGlowNode { speed: 4.0 },
+                    ))
+                    .with_children(|card| {
+                        card.spawn((
+                            Text::new(format!("LOBBY INVITE // {}", linv.from_username.to_uppercase())),
+                            TextFont { font_size: FontSize::Px(12.5), ..default() },
+                            TextColor(Color::srgb(0.38, 0.96, 0.86)),
+                        ));
+                        card.spawn((
+                            Text::new(format!("Room: {}", linv.lobby_title)),
+                            TextFont { font_size: FontSize::Px(12.0), ..default() },
+                            TextColor(Color::srgb(0.90, 0.96, 0.96)),
+                        ));
+                        card.spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(8.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            spawn_sized_button(
+                                row,
+                                "JOIN LOBBY",
+                                PreGameBtnAction::RespondLobbyInvite {
+                                    lobby_id: linv.lobby_id.clone(),
+                                    accept: true,
+                                },
+                                Color::srgb(0.10, 0.48, 0.30),
+                                Color::srgb(0.32, 0.98, 0.64),
+                                116.0,
+                                28.0,
+                            );
+                            spawn_sized_button(
+                                row,
+                                "DECLINE",
+                                PreGameBtnAction::RespondLobbyInvite {
+                                    lobby_id: linv.lobby_id.clone(),
+                                    accept: false,
+                                },
+                                Color::srgb(0.46, 0.14, 0.16),
+                                Color::srgb(0.96, 0.38, 0.40),
+                                104.0,
+                                28.0,
+                            );
+                        });
+                    });
+            }
             for inv in state.pending_party_invites.iter().take(2) {
                 stack
                     .spawn((
@@ -4037,196 +4395,734 @@ fn spawn_menu_input(
         });
 }
 
+fn spawn_join_password_modal(parent: &mut ChildSpawnerCommands, state: &PreGameSessionState) {
+    let Some(ref target_lid) = state.join_target_lobby_id else {
+        return;
+    };
+    parent
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.01, 0.03, 0.04, 0.76)),
+        ))
+        .with_children(|ov| {
+            ov.spawn((
+                Node {
+                    width: Val::Px(420.0),
+                    padding: UiRect::all(Val::Px(22.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(14.0),
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(8.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.025, 0.088, 0.105, 0.98)),
+                BorderColor::all(Color::srgb(0.98, 0.82, 0.32)),
+            ))
+            .with_children(|modal| {
+                modal.spawn((
+                    Text::new(format!("PRIVATE LOBBY // #{}", target_lid)),
+                    TextFont { font_size: FontSize::Px(17.0), ..default() },
+                    TextColor(Color::srgb(0.98, 0.86, 0.40)),
+                ));
+                modal.spawn((
+                    Text::new("This custom lobby is password-protected. Enter the password to join."),
+                    TextFont { font_size: FontSize::Px(12.5), ..default() },
+                    TextColor(Color::srgb(0.80, 0.90, 0.90)),
+                ));
+                spawn_menu_input(
+                    modal,
+                    "LOBBY PASSWORD",
+                    &state.join_password_input,
+                    "Enter password...",
+                    state.focused == FocusedInput::JoinPassword,
+                    FocusedInput::JoinPassword,
+                    true,
+                );
+                modal
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::SpaceBetween,
+                        column_gap: Val::Px(10.0),
+                        ..default()
+                    })
+                    .with_children(|btns| {
+                        spawn_sized_button(
+                            btns,
+                            "CANCEL",
+                            PreGameBtnAction::CancelJoinModal,
+                            Color::srgb(0.12, 0.20, 0.24),
+                            Color::srgb(0.42, 0.62, 0.66),
+                            175.0,
+                            40.0,
+                        );
+                        spawn_sized_button(
+                            btns,
+                            "JOIN LOBBY",
+                            PreGameBtnAction::ConfirmJoinLobby,
+                            Color::srgba(0.66, 0.48, 0.10, 0.96),
+                            Color::srgb(1.0, 0.86, 0.36),
+                            190.0,
+                            40.0,
+                        );
+                    });
+            });
+        });
+}
+
 fn spawn_lobby_browser_screen(parent: &mut ChildSpawnerCommands, state: &PreGameSessionState) {
-    let cyan = Color::srgb(0.32, 0.72, 0.98);
-    let emerald = Color::srgb(0.16, 0.86, 0.58);
-    let gold = Color::srgb(0.98, 0.80, 0.26);
+    let gold = Color::srgb(0.98, 0.82, 0.30);
+    let q_lower = state.lobby_search_input.trim().to_ascii_lowercase();
+    let filtered: Vec<&LobbySummary> = state
+        .lobbies
+        .iter()
+        .filter(|lb| {
+            if state.lobby_hide_full_locked
+                && (lb.current_players >= lb.max_players || lb.has_password)
+            {
+                return false;
+            }
+            if !q_lower.is_empty() {
+                let title_m = lb.title.to_ascii_lowercase().contains(&q_lower);
+                let id_m = lb.lobby_id.to_ascii_lowercase().contains(&q_lower);
+                let host_m = lb.host_username.to_ascii_lowercase().contains(&q_lower);
+                return title_m || id_m || host_m;
+            }
+            true
+        })
+        .collect();
 
     parent
         .spawn(Node {
-            width: Val::Percent(94.0),
-            max_width: Val::Px(1120.0),
-            flex_direction: FlexDirection::Row,
-            column_gap: Val::Px(20.0),
-            align_items: AlignItems::Stretch,
+            width: Val::Percent(100.0),
+            flex_grow: 1.0,
+            padding: UiRect::axes(Val::Px(24.0), Val::Px(16.0)),
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::SpaceBetween,
+            row_gap: Val::Px(12.0),
             ..default()
         })
-        .with_children(|row| {
-            // ستون چپ: لیست لابی‌های فعال
-            row.spawn((
+        .with_children(|wrap| {
+            // ۱. نوار هدر CUSTOM LOBBIES + جستجو + فیلتر + REFRESH
+            wrap.spawn((
                 Node {
-                    flex_grow: 1.0,
-                    padding: UiRect::all(Val::Px(20.0)),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(12.0),
+                    width: Val::Percent(100.0),
+                    padding: UiRect::axes(Val::Px(16.0), Val::Px(10.0)),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(12.0),
                     border: UiRect::all(Val::Px(1.5)),
-                    border_radius: BorderRadius::all(Val::Px(16.0)),
+                    border_radius: BorderRadius::all(Val::Px(5.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.035, 0.105, 0.115, 0.90)),
-                BorderColor::all(cyan.with_alpha(0.55)),
+                BackgroundColor(Color::srgba(0.025, 0.088, 0.102, 0.92)),
+                BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.65)),
             ))
-            .with_children(|left| {
-                left.spawn(Node {
+            .with_children(|hdr| {
+                hdr.spawn((
+                    Text::new("CUSTOM LOBBIES"),
+                    TextFont { font_size: FontSize::Px(20.0), ..default() },
+                    TextColor(Color::WHITE),
+                ));
+
+                hdr.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(12.0),
+                    ..default()
+                })
+                .with_children(|controls| {
+                    controls
+                        .spawn(Node {
+                            width: Val::Px(250.0),
+                            ..default()
+                        })
+                        .with_children(|sw| {
+                            spawn_menu_input(
+                                sw,
+                                "",
+                                &state.lobby_search_input,
+                                "Search lobby name or ID...",
+                                state.focused == FocusedInput::LobbySearch,
+                                FocusedInput::LobbySearch,
+                                false,
+                            );
+                        });
+
+                    spawn_sized_button(
+                        controls,
+                        if state.lobby_hide_full_locked {
+                            "[x] HIDE FULL / LOCKED"
+                        } else {
+                            "[ ] HIDE FULL / LOCKED"
+                        },
+                        PreGameBtnAction::ToggleHideFullLobbies,
+                        if state.lobby_hide_full_locked {
+                            Color::srgb(0.08, 0.30, 0.28)
+                        } else {
+                            Color::srgba(0.04, 0.12, 0.14, 0.90)
+                        },
+                        Color::srgba(0.32, 0.74, 0.74, 0.70),
+                        168.0,
+                        36.0,
+                    );
+
+                    spawn_sized_button(
+                        controls,
+                        "REFRESH",
+                        PreGameBtnAction::RefreshLobbies,
+                        Color::srgb(0.07, 0.24, 0.26),
+                        Color::srgb(0.30, 0.86, 0.80),
+                        104.0,
+                        36.0,
+                    );
+                });
+            });
+
+            // ۲. جدول لیست لابی‌ها
+            wrap.spawn((
+                Node {
                     width: Val::Percent(100.0),
+                    flex_grow: 1.0,
+                    padding: UiRect::all(Val::Px(10.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(6.0),
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.02, 0.070, 0.084, 0.88)),
+                BorderColor::all(Color::srgba(0.24, 0.62, 0.60, 0.55)),
+            ))
+            .with_children(|table| {
+                // هدر ستون‌ها
+                table
+                    .spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            border: UiRect::bottom(Val::Px(1.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.28, 0.68, 0.66, 0.45)),
+                    ))
+                    .with_children(|th| {
+                        for (label, pct) in [
+                            ("LOBBY NAME", 28.0),
+                            ("HOST", 16.0),
+                            ("GAME MODE", 20.0),
+                            ("MAP", 18.0),
+                            ("PLAYERS", 10.0),
+                            ("STATUS", 8.0),
+                        ] {
+                            th.spawn(Node {
+                                width: Val::Percent(pct),
+                                ..default()
+                            })
+                            .with_children(|c| {
+                                c.spawn((
+                                    Text::new(label),
+                                    TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                    TextColor(Color::srgb(0.62, 0.82, 0.80)),
+                                ));
+                            });
+                        }
+                    });
+
+                if filtered.is_empty() {
+                    table
+                        .spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_grow: 1.0,
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        })
+                        .with_children(|empty| {
+                            empty.spawn((
+                                Text::new("No custom lobbies available. Click CREATE LOBBY below to host a match!"),
+                                TextFont { font_size: FontSize::Px(14.0), ..default() },
+                                TextColor(Color::srgb(0.68, 0.82, 0.82)),
+                            ));
+                        });
+                } else {
+                    for lb in filtered.iter().take(9) {
+                        let is_full = lb.current_players >= lb.max_players;
+                        let is_selected = state
+                            .selected_lobby_id
+                            .as_ref()
+                            .is_some_and(|s| s == &lb.lobby_id);
+                        let half = (lb.max_players / 2).max(1);
+
+                        let (row_bg, row_border) = if is_selected {
+                            (
+                                Color::srgba(0.18, 0.16, 0.06, 0.92),
+                                gold,
+                            )
+                        } else if is_full {
+                            (
+                                Color::srgba(0.03, 0.08, 0.10, 0.72),
+                                Color::srgba(0.22, 0.36, 0.38, 0.40),
+                            )
+                        } else {
+                            (
+                                Color::srgba(0.035, 0.11, 0.13, 0.88),
+                                Color::srgba(0.24, 0.56, 0.56, 0.45),
+                            )
+                        };
+
+                        let txt_col = if is_selected {
+                            gold
+                        } else if is_full {
+                            Color::srgb(0.55, 0.64, 0.66)
+                        } else {
+                            Color::srgb(0.92, 0.97, 0.96)
+                        };
+
+                        table
+                            .spawn((
+                                UiButton,
+                                Hovered::default(),
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    height: Val::Px(46.0),
+                                    padding: UiRect::axes(Val::Px(14.0), Val::Px(6.0)),
+                                    flex_direction: FlexDirection::Row,
+                                    align_items: AlignItems::Center,
+                                    border: UiRect::all(Val::Px(if is_selected { 1.5 } else { 1.0 })),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(row_bg),
+                                BorderColor::all(row_border),
+                                PreGameBtnAction::SelectLobbyRow(lb.lobby_id.clone()),
+                            ))
+                            .with_children(|row| {
+                                let lock_tag = if lb.has_password { " [LOCK]" } else { "" };
+                                let cells = [
+                                    (format!("{}{}", lb.title, lock_tag), 28.0, txt_col),
+                                    (lb.host_username.clone(), 16.0, txt_col),
+                                    (format!("{}v{} JUNGLE SKIRMISH", half, half), 20.0, txt_col),
+                                    ("ANCIENT RIVER TEMPLE".to_string(), 18.0, txt_col),
+                                    (
+                                        format!("{} / {}", lb.current_players, lb.max_players),
+                                        10.0,
+                                        txt_col,
+                                    ),
+                                    (
+                                        if is_full { "FULL" } else { "OPEN" }.to_string(),
+                                        8.0,
+                                        if is_full {
+                                            Color::srgb(0.96, 0.38, 0.40)
+                                        } else {
+                                            Color::srgb(0.32, 0.96, 0.58)
+                                        },
+                                    ),
+                                ];
+                                for (val, pct, col) in cells {
+                                    row.spawn(Node {
+                                        width: Val::Percent(pct),
+                                        ..default()
+                                    })
+                                    .with_children(|c| {
+                                        c.spawn((
+                                            Text::new(val),
+                                            TextFont { font_size: FontSize::Px(13.0), ..default() },
+                                            TextColor(col),
+                                        ));
+                                    });
+                                }
+                            });
+                    }
+                }
+            });
+
+            // ۳. نوار پایینی: BACK TO MENU | CREATE LOBBY + JOIN LOBBY
+            wrap.spawn(Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|bottom| {
+                spawn_sized_button(
+                    bottom,
+                    "BACK TO MENU",
+                    PreGameBtnAction::SwitchTab(PreGameTab::Hub),
+                    Color::srgba(0.05, 0.14, 0.16, 0.92),
+                    Color::srgba(0.36, 0.62, 0.64, 0.75),
+                    190.0,
+                    54.0,
+                );
+
+                bottom
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        column_gap: Val::Px(12.0),
+                        ..default()
+                    })
+                    .with_children(|right| {
+                        spawn_sized_button(
+                            right,
+                            "CREATE LOBBY",
+                            PreGameBtnAction::OpenCreateLobbyModal,
+                            Color::srgba(0.04, 0.24, 0.22, 0.92),
+                            Color::srgb(0.24, 0.92, 0.76),
+                            210.0,
+                            56.0,
+                        );
+                        spawn_sized_button(
+                            right,
+                            "JOIN LOBBY",
+                            PreGameBtnAction::JoinSelectedLobby,
+                            Color::srgba(0.68, 0.48, 0.10, 0.96),
+                            Color::srgb(1.0, 0.86, 0.36),
+                            210.0,
+                            56.0,
+                        );
+                    });
+            });
+        });
+}
+
+fn spawn_create_or_edit_lobby_modal(parent: &mut ChildSpawnerCommands, state: &PreGameSessionState) {
+    let is_edit = state.edit_lobby_settings_open;
+    let title_txt = if is_edit { "LOBBY SETTINGS" } else { "CREATE CUSTOM LOBBY" };
+    let submit_txt = if is_edit { "SAVE SETTINGS" } else { "CREATE LOBBY" };
+    let submit_act = if is_edit {
+        PreGameBtnAction::SaveLobbySettings
+    } else {
+        PreGameBtnAction::CreateLobby
+    };
+    let half = state.create_capacity / 2;
+
+    parent
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.01, 0.03, 0.04, 0.72)),
+        ))
+        .with_children(|ov| {
+            ov.spawn((
+                Node {
+                    width: Val::Px(460.0),
+                    padding: UiRect::all(Val::Px(24.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(14.0),
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(8.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.025, 0.088, 0.105, 0.97)),
+                BorderColor::all(Color::srgb(0.24, 0.76, 0.72)),
+            ))
+            .with_children(|modal| {
+                // Header + X close
+                modal
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::SpaceBetween,
+                        align_items: AlignItems::Center,
+                        padding: UiRect::bottom(Val::Px(8.0)),
+                        border: UiRect::bottom(Val::Px(1.0)),
+                        ..default()
+                    })
+                    .with_children(|hdr| {
+                        hdr.spawn((
+                            Text::new(title_txt),
+                            TextFont { font_size: FontSize::Px(20.0), ..default() },
+                            TextColor(Color::srgb(0.95, 0.99, 0.98)),
+                        ));
+                        spawn_sized_button(
+                            hdr,
+                            "X",
+                            PreGameBtnAction::CloseLobbyModal,
+                            Color::srgba(0.10, 0.20, 0.24, 0.90),
+                            Color::srgb(0.40, 0.72, 0.72),
+                            30.0,
+                            28.0,
+                        );
+                    });
+
+                // LOBBY NAME
+                spawn_menu_input(
+                    modal,
+                    "LOBBY NAME",
+                    &state.create_title,
+                    "Enter room name...",
+                    state.focused == FocusedInput::LobbyTitle,
+                    FocusedInput::LobbyTitle,
+                    false,
+                );
+
+                // LOBBY PASSWORD (Optional) with SHOW/HIDE toggle
+                modal
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::FlexEnd,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|pw_row| {
+                        spawn_menu_input(
+                            pw_row,
+                            "LOBBY PASSWORD (Optional)",
+                            &state.create_password,
+                            "Leave empty for open lobby",
+                            state.focused == FocusedInput::LobbyPassword,
+                            FocusedInput::LobbyPassword,
+                            !state.create_password_visible,
+                        );
+                        spawn_sized_button(
+                            pw_row,
+                            if state.create_password_visible { "HIDE" } else { "SHOW" },
+                            PreGameBtnAction::ToggleCreatePasswordVisibility,
+                            Color::srgb(0.06, 0.18, 0.22),
+                            Color::srgb(0.28, 0.74, 0.74),
+                            62.0,
+                            36.0,
+                        );
+                    });
+
+                // FORMAT / CAPACITY
+                modal
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(6.0),
+                        ..default()
+                    })
+                    .with_children(|cap_col| {
+                        cap_col.spawn((
+                            Text::new(format!("FORMAT ({}v{} JUNGLE SKIRMISH)", half, half)),
+                            TextFont { font_size: FontSize::Px(11.0), ..default() },
+                            TextColor(Color::srgb(0.68, 0.86, 0.84)),
+                        ));
+                        cap_col
+                            .spawn(Node {
+                                width: Val::Percent(100.0),
+                                flex_direction: FlexDirection::Row,
+                                justify_content: JustifyContent::SpaceBetween,
+                                column_gap: Val::Px(6.0),
+                                ..default()
+                            })
+                            .with_children(|row| {
+                                for cap in [2usize, 4, 6, 8, 10] {
+                                    let sel = state.create_capacity == cap;
+                                    let h = cap / 2;
+                                    spawn_sized_button(
+                                        row,
+                                        &format!("{}v{}", h, h),
+                                        PreGameBtnAction::SelectLobbyCapacity(cap),
+                                        if sel {
+                                            Color::srgb(0.09, 0.42, 0.36)
+                                        } else {
+                                            Color::srgb(0.04, 0.12, 0.15)
+                                        },
+                                        if sel {
+                                            Color::srgb(0.32, 0.96, 0.82)
+                                        } else {
+                                            Color::srgba(0.24, 0.50, 0.52, 0.65)
+                                        },
+                                        76.0,
+                                        34.0,
+                                    );
+                                }
+                            });
+                    });
+
+                // MAP
+                modal
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(4.0),
+                        ..default()
+                    })
+                    .with_children(|mcol| {
+                        mcol.spawn((
+                            Text::new("MAP"),
+                            TextFont { font_size: FontSize::Px(11.0), ..default() },
+                            TextColor(Color::srgb(0.68, 0.86, 0.84)),
+                        ));
+                        mcol.spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                height: Val::Px(36.0),
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(1.0)),
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.02, 0.07, 0.09, 0.92)),
+                            BorderColor::all(Color::srgba(0.24, 0.56, 0.58, 0.65)),
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("ANCIENT RIVER TEMPLE"),
+                                TextFont { font_size: FontSize::Px(13.0), ..default() },
+                                TextColor(Color::srgb(0.88, 0.96, 0.95)),
+                            ));
+                        });
+                    });
+
+                // Footer: CANCEL + CREATE LOBBY
+                modal
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::SpaceBetween,
+                        column_gap: Val::Px(12.0),
+                        margin: UiRect::top(Val::Px(4.0)),
+                        ..default()
+                    })
+                    .with_children(|btns| {
+                        spawn_sized_button(
+                            btns,
+                            "CANCEL",
+                            PreGameBtnAction::CloseLobbyModal,
+                            Color::srgba(0.06, 0.16, 0.19, 0.94),
+                            Color::srgb(0.32, 0.58, 0.62),
+                            198.0,
+                            44.0,
+                        );
+                        spawn_sized_button(
+                            btns,
+                            submit_txt,
+                            submit_act,
+                            Color::srgba(0.66, 0.48, 0.10, 0.96),
+                            Color::srgb(1.0, 0.86, 0.36),
+                            198.0,
+                            44.0,
+                        );
+                    });
+            });
+        });
+}
+
+fn spawn_lobby_invite_modal(parent: &mut ChildSpawnerCommands, state: &PreGameSessionState) {
+    let online_friends: Vec<_> = state
+        .friends
+        .friends
+        .iter()
+        .filter(|f| f.online)
+        .collect();
+    parent
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.01, 0.03, 0.04, 0.72)),
+        ))
+        .with_children(|ov| {
+            ov.spawn((
+                Node {
+                    width: Val::Px(380.0),
+                    padding: UiRect::all(Val::Px(20.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(10.0),
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(8.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.025, 0.088, 0.105, 0.97)),
+                BorderColor::all(Color::srgb(0.28, 0.88, 0.78)),
+            ))
+            .with_children(|card| {
+                card.spawn(Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
                     justify_content: JustifyContent::SpaceBetween,
                     align_items: AlignItems::Center,
                     ..default()
                 })
                 .with_children(|hdr| {
                     hdr.spawn((
-                        Text::new("ACTIVE LOBBIES"),
-                        TextFont { font_size: FontSize::Px(18.0), ..default() },
-                        TextColor(Color::WHITE),
+                        Text::new("INVITE FRIEND TO LOBBY"),
+                        TextFont { font_size: FontSize::Px(15.0), ..default() },
+                        TextColor(Color::srgb(0.98, 0.86, 0.40)),
                     ));
-                    spawn_action_button(hdr, "REFRESH", cyan, PreGameBtnAction::RefreshLobbies);
+                    spawn_sized_button(
+                        hdr,
+                        "X",
+                        PreGameBtnAction::CloseLobbyInviteModal,
+                        Color::srgb(0.40, 0.12, 0.14),
+                        Color::srgb(0.92, 0.36, 0.38),
+                        28.0,
+                        26.0,
+                    );
                 });
 
-                if state.lobbies.is_empty() {
-                    left.spawn((
-                        Text::new("NO LOBBIES YET"),
-                        TextFont { font_size: FontSize::Px(14.0), ..default() },
-                        TextColor(Color::srgb(0.55, 0.65, 0.78)),
+                if online_friends.is_empty() {
+                    card.spawn((
+                        Text::new("No online friends available to invite right now."),
+                        TextFont { font_size: FontSize::Px(12.5), ..default() },
+                        TextColor(Color::srgb(0.68, 0.80, 0.80)),
                     ));
                 } else {
-                    for lb in &state.lobbies {
-                        left.spawn((
+                    for f in online_friends.iter().take(7) {
+                        card.spawn((
                             Node {
                                 width: Val::Percent(100.0),
-                                padding: UiRect::axes(Val::Px(14.0), Val::Px(10.0)),
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(7.0)),
+                                flex_direction: FlexDirection::Row,
                                 justify_content: JustifyContent::SpaceBetween,
                                 align_items: AlignItems::Center,
-                                border: UiRect::all(Val::Px(1.0)),
-                                border_radius: BorderRadius::all(Val::Px(10.0)),
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
                                 ..default()
                             },
-                            BackgroundColor(Color::srgba(0.08, 0.12, 0.19, 0.92)),
-                            BorderColor::all(Color::srgba(0.30, 0.42, 0.60, 0.5)),
+                            BackgroundColor(Color::srgba(0.05, 0.14, 0.17, 0.92)),
                         ))
-                        .with_children(|item| {
-                            item.spawn(Node {
-                                flex_direction: FlexDirection::Row,
-                                align_items: AlignItems::Center,
-                                column_gap: Val::Px(10.0),
-                                ..default()
-                            })
-                            .with_children(|info| {
-                                if lb.has_password {
-                                    info.spawn((
-                                        Node {
-                                            width: Val::Px(12.0),
-                                            height: Val::Px(12.0),
-                                            border_radius: BorderRadius::all(Val::Px(3.0)),
-                                            ..default()
-                                        },
-                                        BackgroundColor(gold),
-                                    ));
-                                }
-                                info.spawn((
-                                    Text::new(format!("{}  ({}/{})", lb.title, lb.current_players, lb.max_players)),
-                                    TextFont { font_size: FontSize::Px(15.0), ..default() },
-                                    TextColor(Color::WHITE),
-                                ));
-                            });
-
-                            spawn_action_button(
-                                item,
-                                "JOIN",
-                                emerald,
-                                PreGameBtnAction::OpenJoinLobby {
-                                    lobby_id: lb.lobby_id.clone(),
-                                    has_password: lb.has_password,
-                                },
+                        .with_children(|row| {
+                            row.spawn((
+                                Text::new(format!("{} ({} MMR)", f.username, f.mmr)),
+                                TextFont { font_size: FontSize::Px(13.0), ..default() },
+                                TextColor(Color::WHITE),
+                            ));
+                            spawn_sized_button(
+                                row,
+                                "INVITE",
+                                PreGameBtnAction::SendLobbyInvite(f.user_id.clone()),
+                                Color::srgb(0.10, 0.44, 0.34),
+                                Color::srgb(0.30, 0.96, 0.76),
+                                72.0,
+                                26.0,
                             );
                         });
                     }
                 }
-
-                // مودال ورود با رمز عبور
-                if state.join_target_lobby_id.is_some() {
-                    left.spawn((
-                        Node {
-                            width: Val::Percent(100.0),
-                            padding: UiRect::all(Val::Px(14.0)),
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(10.0),
-                            border: UiRect::all(Val::Px(1.5)),
-                            border_radius: BorderRadius::all(Val::Px(12.0)),
-                            ..default()
-                        },
-                        BackgroundColor(Color::srgba(0.10, 0.14, 0.22, 0.98)),
-                        BorderColor::all(gold),
-                    ))
-                    .with_children(|modal| {
-                        spawn_input_box(
-                            modal,
-                            "LOBBY PASSWORD",
-                            &state.join_password_input,
-                            "------",
-                            state.focused == FocusedInput::JoinPassword,
-                            PreGameBtnAction::FocusField(FocusedInput::JoinPassword),
-                        );
-                        modal.spawn(Node {
-                            flex_direction: FlexDirection::Row,
-                            column_gap: Val::Px(10.0),
-                            ..default()
-                        })
-                        .with_children(|btns| {
-                            spawn_action_button(btns, "ENTER", emerald, PreGameBtnAction::ConfirmJoinLobby);
-                            spawn_action_button(btns, "CANCEL", Color::srgb(0.85, 0.28, 0.30), PreGameBtnAction::CancelJoinModal);
-                        });
-                    });
-                }
-            });
-
-            // ستون راست: ساخت لابی جدید
-            row.spawn((
-                Node {
-                    width: Val::Px(340.0),
-                    padding: UiRect::all(Val::Px(22.0)),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(14.0),
-                    border: UiRect::all(Val::Px(1.5)),
-                    border_radius: BorderRadius::all(Val::Px(16.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.035, 0.105, 0.115, 0.90)),
-                BorderColor::all(emerald.with_alpha(0.55)),
-            ))
-            .with_children(|right| {
-                right.spawn((
-                    Text::new("CREATE LOBBY"),
-                    TextFont { font_size: FontSize::Px(18.0), ..default() },
-                    TextColor(Color::WHITE),
-                ));
-                spawn_input_box(
-                    right,
-                    "TITLE",
-                    &state.create_title,
-                    "Simorgh Room",
-                    state.focused == FocusedInput::LobbyTitle,
-                    PreGameBtnAction::FocusField(FocusedInput::LobbyTitle),
-                );
-                spawn_input_box(
-                    right,
-                    "PASSWORD (OPT)",
-                    &state.create_password,
-                    "Optional",
-                    state.focused == FocusedInput::LobbyPassword,
-                    PreGameBtnAction::FocusField(FocusedInput::LobbyPassword),
-                );
-                right.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(6.0),
-                    ..default()
-                })
-                .with_children(|caps| {
-                    for &cap in &[2usize, 4, 6, 8, 10] {
-                        let active = state.create_capacity == cap;
-                        spawn_nav_pill(caps, &cap.to_string(), active, PreGameBtnAction::SelectLobbyCapacity(cap));
-                    }
-                });
-                spawn_action_button(right, "CREATE", emerald, PreGameBtnAction::CreateLobby);
             });
         });
 }
@@ -4241,120 +5137,312 @@ fn spawn_lobby_room_screen(parent: &mut ChildSpawnerCommands, state: &PreGameSes
         .map(|p| p.user_id.as_str())
         .unwrap_or("");
     let is_host = lobby.host_user_id == my_uid;
-    let dawn_col = Color::srgb(0.16, 0.85, 0.62);
-    let dusk_col = Color::srgb(0.95, 0.28, 0.30);
-    let gold = Color::srgb(0.98, 0.80, 0.26);
-    let half = lobby.max_players / 2;
+    let alpha_col = Color::srgb(0.24, 0.92, 0.74);
+    let omega_col = Color::srgb(0.96, 0.68, 0.24);
+    let gold = Color::srgb(0.98, 0.82, 0.30);
+    let half = (lobby.max_players / 2).max(1);
 
     parent
         .spawn(Node {
-            width: Val::Percent(94.0),
-            max_width: Val::Px(1140.0),
+            width: Val::Percent(100.0),
+            flex_grow: 1.0,
+            padding: UiRect::axes(Val::Px(22.0), Val::Px(14.0)),
             flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(14.0),
+            justify_content: JustifyContent::SpaceBetween,
+            row_gap: Val::Px(12.0),
             ..default()
         })
         .with_children(|wrap| {
-            // هدر اتاق لابی
+            // ۱. نوار هدر اتاق لابی (دقیقاً مطابق طرح مرجع)
             wrap.spawn((
                 Node {
                     width: Val::Percent(100.0),
-                    padding: UiRect::axes(Val::Px(18.0), Val::Px(12.0)),
+                    padding: UiRect::axes(Val::Px(18.0), Val::Px(10.0)),
+                    flex_direction: FlexDirection::Row,
                     justify_content: JustifyContent::SpaceBetween,
                     align_items: AlignItems::Center,
                     border: UiRect::all(Val::Px(1.5)),
-                    border_radius: BorderRadius::all(Val::Px(14.0)),
+                    border_radius: BorderRadius::all(Val::Px(5.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.035, 0.105, 0.115, 0.90)),
-                BorderColor::all(gold.with_alpha(0.55)),
+                BackgroundColor(Color::srgba(0.025, 0.088, 0.102, 0.92)),
+                BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.65)),
             ))
             .with_children(|hdr| {
-                hdr.spawn((
-                    Text::new(format!("{}  -  {}/{}", lobby.title, lobby.members.len(), lobby.max_players)),
-                    TextFont { font_size: FontSize::Px(18.0), ..default() },
-                    TextColor(Color::WHITE),
-                ));
+                // عنوان + وضعیت قفل
                 hdr.spawn(Node {
                     flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
                     column_gap: Val::Px(10.0),
                     ..default()
                 })
-                .with_children(|btns| {
-                    if state.server_starting || lobby.is_starting {
-                        spawn_conceptual_loader(btns, "STARTING SERVER", gold);
-                    } else {
-                        if is_host {
-                            spawn_action_button(btns, "START MATCH", dawn_col, PreGameBtnAction::StartLobbyMatch);
-                        }
-                        spawn_action_button(btns, "LEAVE", dusk_col, PreGameBtnAction::LeaveLobby);
+                .with_children(|title_grp| {
+                    title_grp.spawn((
+                        Text::new(lobby.title.clone()),
+                        TextFont { font_size: FontSize::Px(19.0), ..default() },
+                        TextColor(Color::WHITE),
+                    ));
+                    if lobby.has_password {
+                        title_grp.spawn((
+                            Text::new("[PRIVATE]"),
+                            TextFont { font_size: FontSize::Px(11.5), ..default() },
+                            TextColor(gold),
+                        ));
                     }
                 });
+
+                // متادیتای وسط: LOBBY ID | GAME MODE | MAP
+                hdr.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(28.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|meta| {
+                    for (k, v) in [
+                        ("LOBBY ID", format!("#{}", lobby.lobby_id)),
+                        ("GAME MODE", format!("{}v{} JUNGLE SKIRMISH", half, half)),
+                        ("MAP", "ANCIENT RIVER TEMPLE".to_string()),
+                    ] {
+                        meta.spawn(Node {
+                            flex_direction: FlexDirection::Column,
+                            ..default()
+                        })
+                        .with_children(|col| {
+                            col.spawn((
+                                Text::new(k),
+                                TextFont { font_size: FontSize::Px(10.0), ..default() },
+                                TextColor(Color::srgb(0.60, 0.78, 0.76)),
+                            ));
+                            col.spawn((
+                                Text::new(v),
+                                TextFont { font_size: FontSize::Px(13.0), ..default() },
+                                TextColor(Color::srgb(0.94, 0.98, 0.98)),
+                            ));
+                        });
+                    }
+                });
+
+                spawn_sized_button(
+                    hdr,
+                    "LEAVE LOBBY",
+                    PreGameBtnAction::LeaveLobby,
+                    Color::srgba(0.46, 0.12, 0.14, 0.94),
+                    Color::srgb(0.94, 0.36, 0.38),
+                    132.0,
+                    36.0,
+                );
             });
 
-            // دو تیم در کنار هم + چت
+            // ۲. بخش میانی: TEAM ALPHA  <-- VS + SWAP TEAMS -->  TEAM OMEGA
+            wrap.spawn(Node {
+                width: Val::Percent(100.0),
+                flex_grow: 1.0,
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(22.0),
+                ..default()
+            })
+            .with_children(|arena| {
+                spawn_team_slots_panel(
+                    arena,
+                    "TEAM ALPHA",
+                    1,
+                    half,
+                    lobby,
+                    is_host,
+                    my_uid,
+                    alpha_col,
+                );
+
+                // ستون وسط: نشان VS + دکمه SWAP TEAMS
+                arena
+                    .spawn(Node {
+                        width: Val::Px(116.0),
+                        flex_direction: FlexDirection::Column,
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        row_gap: Val::Px(14.0),
+                        ..default()
+                    })
+                    .with_children(|mid| {
+                        mid.spawn((
+                            Node {
+                                width: Val::Px(74.0),
+                                height: Val::Px(74.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(2.5)),
+                                border_radius: BorderRadius::all(Val::Px(12.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.05, 0.12, 0.14, 0.94)),
+                            BorderColor::all(gold),
+                        ))
+                        .with_children(|vs| {
+                            vs.spawn((
+                                Text::new("VS"),
+                                TextFont { font_size: FontSize::Px(28.0), ..default() },
+                                TextColor(Color::srgb(0.98, 0.94, 0.82)),
+                            ));
+                        });
+                        spawn_sized_button(
+                            mid,
+                            "SWAP TEAMS",
+                            PreGameBtnAction::SwapLobbyTeam,
+                            Color::srgba(0.05, 0.18, 0.20, 0.92),
+                            Color::srgb(0.32, 0.84, 0.82),
+                            114.0,
+                            38.0,
+                        );
+                    });
+
+                spawn_team_slots_panel(
+                    arena,
+                    "TEAM OMEGA",
+                    2,
+                    half,
+                    lobby,
+                    is_host,
+                    my_uid,
+                    omega_col,
+                );
+            });
+
+            // ۳. بخش پایینی: چپ (LOBBY CHAT) | راست (LOBBY SETTINGS + START MATCH)
             wrap.spawn(Node {
                 width: Val::Percent(100.0),
                 flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::FlexEnd,
                 column_gap: Val::Px(16.0),
                 ..default()
             })
-            .with_children(|cols| {
-                spawn_team_slots_panel(cols, "DAWN (TEAM 1)", 1, half, lobby, is_host, my_uid, dawn_col);
-                spawn_team_slots_panel(cols, "DUSK (TEAM 2)", 2, half, lobby, is_host, my_uid, dusk_col);
-
-                // پنل چت لابی
-                cols.spawn((
-                    Node {
-                        width: Val::Px(320.0),
-                        padding: UiRect::all(Val::Px(14.0)),
-                        flex_direction: FlexDirection::Column,
-                        justify_content: JustifyContent::SpaceBetween,
-                        row_gap: Val::Px(10.0),
-                        border: UiRect::all(Val::Px(1.5)),
-                        border_radius: BorderRadius::all(Val::Px(14.0)),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(0.035, 0.105, 0.115, 0.90)),
-                    BorderColor::all(Color::srgba(0.32, 0.44, 0.62, 0.55)),
-                ))
-                .with_children(|chat| {
-                    chat.spawn(Node {
-                        flex_direction: FlexDirection::Column,
-                        row_gap: Val::Px(4.0),
-                        ..default()
-                    })
-                    .with_children(|msgs| {
-                        let start = lobby.chat_messages.len().saturating_sub(10);
+            .with_children(|bottom| {
+                // LOBBY CHAT
+                bottom
+                    .spawn((
+                        Node {
+                            width: Val::Px(440.0),
+                            padding: UiRect::all(Val::Px(12.0)),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(6.0),
+                            border: UiRect::all(Val::Px(1.5)),
+                            border_radius: BorderRadius::all(Val::Px(5.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.025, 0.085, 0.10, 0.92)),
+                        BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.60)),
+                    ))
+                    .with_children(|chat| {
+                        chat.spawn((
+                            Text::new("LOBBY CHAT"),
+                            TextFont { font_size: FontSize::Px(12.5), ..default() },
+                            TextColor(Color::srgb(0.84, 0.95, 0.94)),
+                        ));
+                        let start = lobby.chat_messages.len().saturating_sub(5);
                         for m in &lobby.chat_messages[start..] {
-                            let col = if m.is_system { gold } else { Color::srgb(0.86, 0.92, 0.98) };
-                            msgs.spawn((
+                            let col = if m.is_system {
+                                gold
+                            } else {
+                                Color::srgb(0.88, 0.96, 0.96)
+                            };
+                            chat.spawn((
                                 Text::new(format!("{}: {}", m.sender, m.text)),
-                                TextFont { font_size: FontSize::Px(12.5), ..default() },
+                                TextFont { font_size: FontSize::Px(11.5), ..default() },
                                 TextColor(col),
                             ));
                         }
+                        chat.spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::FlexEnd,
+                            column_gap: Val::Px(8.0),
+                            margin: UiRect::top(Val::Px(4.0)),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            spawn_menu_input(
+                                row,
+                                "",
+                                &state.lobby_chat_input,
+                                "Type a message...",
+                                state.focused == FocusedInput::LobbyChat,
+                                FocusedInput::LobbyChat,
+                                false,
+                            );
+                            spawn_sized_button(
+                                row,
+                                "SEND",
+                                PreGameBtnAction::SendLobbyChat,
+                                Color::srgb(0.09, 0.34, 0.36),
+                                Color::srgb(0.32, 0.88, 0.84),
+                                72.0,
+                                36.0,
+                            );
+                        });
                     });
 
-                    spawn_input_box(
-                        chat,
-                        "CHAT",
-                        &state.lobby_chat_input,
-                        "Message...",
-                        state.focused == FocusedInput::LobbyChat,
-                        PreGameBtnAction::FocusField(FocusedInput::LobbyChat),
-                    );
-                    spawn_action_button(chat, "SEND", Color::srgb(0.32, 0.72, 0.98), PreGameBtnAction::SendLobbyChat);
-                });
+                // راست: LOBBY SETTINGS + START MATCH
+                bottom
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::FlexEnd,
+                        column_gap: Val::Px(12.0),
+                        ..default()
+                    })
+                    .with_children(|btns| {
+                        if state.server_starting || lobby.is_starting {
+                            spawn_conceptual_loader(btns, "STARTING SERVER", gold);
+                        } else if is_host {
+                            spawn_sized_button(
+                                btns,
+                                "LOBBY SETTINGS",
+                                PreGameBtnAction::OpenLobbySettingsModal,
+                                Color::srgba(0.04, 0.22, 0.20, 0.92),
+                                Color::srgb(0.24, 0.92, 0.76),
+                                200.0,
+                                58.0,
+                            );
+                            spawn_sized_button(
+                                btns,
+                                "START MATCH",
+                                PreGameBtnAction::StartLobbyMatch,
+                                Color::srgba(0.68, 0.48, 0.10, 0.96),
+                                Color::srgb(1.0, 0.86, 0.36),
+                                232.0,
+                                58.0,
+                            );
+                        } else {
+                            btns.spawn((
+                                Node {
+                                    padding: UiRect::axes(Val::Px(22.0), Val::Px(16.0)),
+                                    border: UiRect::all(Val::Px(1.5)),
+                                    border_radius: BorderRadius::all(Val::Px(5.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.03, 0.10, 0.12, 0.90)),
+                                BorderColor::all(Color::srgba(0.32, 0.76, 0.74, 0.65)),
+                            ))
+                            .with_children(|w| {
+                                w.spawn((
+                                    Text::new("WAITING FOR HOST TO START..."),
+                                    TextFont { font_size: FontSize::Px(14.0), ..default() },
+                                    TextColor(gold),
+                                ));
+                            });
+                        }
+                    });
             });
         });
 }
 
 fn spawn_team_slots_panel(
     parent: &mut ChildSpawnerCommands,
-    title: &str,
+    team_name: &str,
     team_id: i32,
-    half: usize,
+    slots_per_team: usize,
     lobby: &LobbyDetail,
     is_host: bool,
     my_uid: &str,
@@ -4363,85 +5451,186 @@ fn spawn_team_slots_panel(
     parent
         .spawn((
             Node {
-                flex_grow: 1.0,
-                padding: UiRect::all(Val::Px(16.0)),
+                width: Val::Px(400.0),
+                padding: UiRect::all(Val::Px(12.0)),
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(10.0),
+                row_gap: Val::Px(8.0),
                 border: UiRect::all(Val::Px(1.5)),
-                border_radius: BorderRadius::all(Val::Px(14.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.035, 0.105, 0.115, 0.90)),
-            BorderColor::all(accent.with_alpha(0.6)),
+            BackgroundColor(Color::srgba(0.025, 0.082, 0.098, 0.90)),
+            BorderColor::all(accent.with_alpha(0.70)),
         ))
         .with_children(|panel| {
-            panel.spawn((
-                Text::new(title),
-                TextFont { font_size: FontSize::Px(16.0), ..default() },
-                TextColor(accent),
-            ));
+            // هدر تیم
+            panel
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                        flex_direction: FlexDirection::Row,
+                        justify_content: JustifyContent::SpaceBetween,
+                        align_items: AlignItems::Center,
+                        border: UiRect::bottom(Val::Px(1.5)),
+                        ..default()
+                    },
+                    BorderColor::all(accent.with_alpha(0.60)),
+                ))
+                .with_children(|hdr| {
+                    hdr.spawn((
+                        Text::new(team_name),
+                        TextFont { font_size: FontSize::Px(15.0), ..default() },
+                        TextColor(accent),
+                    ));
+                    hdr.spawn((
+                        Text::new(format!("{}v{}", slots_per_team, slots_per_team)),
+                        TextFont { font_size: FontSize::Px(13.0), ..default() },
+                        TextColor(Color::srgb(0.84, 0.92, 0.92)),
+                    ));
+                });
 
-            for slot_idx in 0..half {
+            // اسلات‌های بازیکنان
+            for slot_idx in 0..slots_per_team {
                 let occupant = lobby
                     .members
                     .iter()
                     .find(|m| m.team_id == team_id && m.slot_index == slot_idx);
+
                 if let Some(m) = occupant {
+                    let is_me = m.user_id == my_uid;
                     panel
                         .spawn((
                             Node {
                                 width: Val::Percent(100.0),
-                                padding: UiRect::axes(Val::Px(12.0), Val::Px(10.0)),
+                                height: Val::Px(46.0),
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                                flex_direction: FlexDirection::Row,
+                                justify_content: JustifyContent::SpaceBetween,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(1.5)),
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.05, 0.16, 0.18, 0.94)),
+                            BorderColor::all(if is_me {
+                                Color::srgb(0.32, 0.96, 0.82)
+                            } else {
+                                accent.with_alpha(0.75)
+                            }),
+                        ))
+                        .with_children(|row| {
+                            row.spawn(Node {
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                column_gap: Val::Px(8.0),
+                                ..default()
+                            })
+                            .with_children(|left| {
+                                let tag = if m.is_host { "HOST" } else { "PLR" };
+                                left.spawn((
+                                    Text::new(tag),
+                                    TextFont { font_size: FontSize::Px(10.5), ..default() },
+                                    TextColor(if m.is_host {
+                                        Color::srgb(0.98, 0.84, 0.34)
+                                    } else {
+                                        Color::srgb(0.65, 0.82, 0.82)
+                                    }),
+                                ));
+                                left.spawn((
+                                    Text::new(m.username.clone()),
+                                    TextFont { font_size: FontSize::Px(13.5), ..default() },
+                                    TextColor(Color::WHITE),
+                                ));
+                            });
+
+                            row.spawn(Node {
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                column_gap: Val::Px(6.0),
+                                ..default()
+                            })
+                            .with_children(|right| {
+                                right
+                                    .spawn((
+                                        Node {
+                                            padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),
+                                            border: UiRect::all(Val::Px(1.0)),
+                                            border_radius: BorderRadius::all(Val::Px(3.0)),
+                                            ..default()
+                                        },
+                                        BackgroundColor(Color::srgba(0.08, 0.36, 0.22, 0.92)),
+                                        BorderColor::all(Color::srgb(0.28, 0.94, 0.60)),
+                                    ))
+                                    .with_children(|rdy| {
+                                        rdy.spawn((
+                                            Text::new("READY"),
+                                            TextFont { font_size: FontSize::Px(10.5), ..default() },
+                                            TextColor(Color::srgb(0.76, 1.0, 0.84)),
+                                        ));
+                                    });
+                                if is_host && !is_me {
+                                    spawn_sized_button(
+                                        right,
+                                        "KICK",
+                                        PreGameBtnAction::KickLobbyPlayer(m.user_id.clone()),
+                                        Color::srgb(0.48, 0.12, 0.14),
+                                        Color::srgb(0.94, 0.36, 0.38),
+                                        48.0,
+                                        24.0,
+                                    );
+                                }
+                            });
+                        });
+                } else {
+                    // اسلات خالی: + JOIN SLOT و دکمه INVITE
+                    panel
+                        .spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                height: Val::Px(46.0),
+                                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                                flex_direction: FlexDirection::Row,
                                 justify_content: JustifyContent::SpaceBetween,
                                 align_items: AlignItems::Center,
                                 border: UiRect::all(Val::Px(1.0)),
-                                border_radius: BorderRadius::all(Val::Px(9.0)),
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
                                 ..default()
                             },
-                            BackgroundColor(accent.with_alpha(0.14)),
-                            BorderColor::all(accent.with_alpha(0.6)),
+                            BackgroundColor(Color::srgba(0.03, 0.09, 0.11, 0.84)),
+                            BorderColor::all(Color::srgba(0.24, 0.48, 0.50, 0.45)),
                         ))
                         .with_children(|row| {
-                            let tag = if m.is_host { "* " } else { "" };
                             row.spawn((
-                                Text::new(format!("{}{}", tag, m.username)),
-                                TextFont { font_size: FontSize::Px(14.5), ..default() },
-                                TextColor(Color::WHITE),
-                            ));
-                            if is_host && m.user_id != my_uid {
-                                spawn_action_button(
-                                    row,
-                                    "KICK",
-                                    Color::srgb(0.90, 0.25, 0.28),
-                                    PreGameBtnAction::KickLobbyPlayer(m.user_id.clone()),
-                                );
-                            }
-                        });
-                } else {
-                    panel
-                        .spawn((
-                            UiButton,
-            Hovered::default(),
-                            Node {
-                                width: Val::Percent(100.0),
-                                padding: UiRect::axes(Val::Px(12.0), Val::Px(10.0)),
-                                border: UiRect::all(Val::Px(1.0)),
-                                border_radius: BorderRadius::all(Val::Px(9.0)),
-                                ..default()
-                            },
-                            BackgroundColor(Color::srgba(0.08, 0.11, 0.17, 0.7)),
-                            BorderColor::all(Color::srgba(0.30, 0.38, 0.52, 0.45)),
-                            PreGameBtnAction::SwitchLobbySlot {
-                                team_id,
-                                slot_index: slot_idx,
-                            },
-                        ))
-                        .with_children(|slot| {
-                            slot.spawn((
-                                Text::new(format!("+ SLOT {}", slot_idx + 1)),
-                                TextFont { font_size: FontSize::Px(13.5), ..default() },
-                                TextColor(Color::srgb(0.55, 0.65, 0.78)),
-                            ));
+                                UiButton,
+                                Hovered::default(),
+                                Node {
+                                    padding: UiRect::axes(Val::Px(6.0), Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::NONE),
+                                BorderColor::all(Color::NONE),
+                                PreGameBtnAction::SwitchLobbySlot {
+                                    team_id,
+                                    slot_index: slot_idx,
+                                },
+                            ))
+                            .with_children(|jb| {
+                                jb.spawn((
+                                    Text::new("+ JOIN SLOT"),
+                                    TextFont { font_size: FontSize::Px(12.5), ..default() },
+                                    TextColor(Color::srgb(0.74, 0.88, 0.88)),
+                                ));
+                            });
+                            spawn_sized_button(
+                                row,
+                                "INVITE",
+                                PreGameBtnAction::OpenLobbyInviteModal,
+                                Color::srgba(0.07, 0.22, 0.25, 0.92),
+                                Color::srgb(0.28, 0.72, 0.74),
+                                76.0,
+                                28.0,
+                            );
                         });
                 }
             }

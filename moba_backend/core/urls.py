@@ -12,5 +12,11 @@ urlpatterns = [
     path("match/player-state/", views.update_player_connection_state_view, name="update_player_connection_state"),
     path("match/abandon/", views.abandon_match_view, name="abandon_match"),
     path("match/report-result/", views.report_match_result_view, name="report_match_result"),
-    path("match/history/", views.match_history_view, name="match-history")
+    path("match/history/", views.match_history_view, name="match-history"),
+    # Friends & Social HTTP APIs
+    path("friends/", views.friends_list_view, name="friends_list"),
+    path("friends/search/", views.friends_search_view, name="friends_search"),
+    path("friends/request/", views.send_friend_request_view, name="friends_request"),
+    path("friends/respond/", views.respond_friend_request_view, name="friends_respond"),
+    path("friends/remove/", views.remove_friend_view, name="friends_remove"),
 ]

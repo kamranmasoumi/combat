@@ -104,6 +104,8 @@ pub struct MatchHistoryPlayerRow {
     pub denies: i32,
     pub gold_coins: i32,
     pub status: String,
+    #[serde(default)]
+    pub party_group_id: String,
     pub is_me: bool,
 }
 
@@ -112,6 +114,10 @@ pub struct MatchHistoryPlayerRow {
 pub struct MatchHistoryEntry {
     pub room_id: String,
     pub is_custom_lobby: bool,
+    #[serde(default)]
+    pub is_party_match: bool,
+    #[serde(default)]
+    pub party_group_id: String,
     pub outcome: String,
     pub team_id: i32,
     pub winner_team: i32,
@@ -178,6 +184,107 @@ pub struct LobbyDetail {
     pub is_starting: bool,
     pub members: Vec<LobbyMemberInfo>,
     pub chat_messages: Vec<LobbyChatMsg>,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct FriendEntry {
+    pub user_id: String,
+    pub username: String,
+    pub mmr: i32,
+    pub rank_tier: String,
+    #[serde(default)]
+    pub online: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub in_party: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct FriendRequestEntry {
+    pub request_id: i64,
+    pub user_id: String,
+    pub username: String,
+    pub mmr: i32,
+    pub rank_tier: String,
+    #[serde(default)]
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct PlayerSearchResult {
+    pub user_id: String,
+    pub username: String,
+    pub mmr: i32,
+    pub rank_tier: String,
+    #[serde(default)]
+    pub online: bool,
+    #[serde(default)]
+    pub relationship: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct FriendsSnapshot {
+    #[serde(default)]
+    pub friends: Vec<FriendEntry>,
+    #[serde(default)]
+    pub incoming_requests: Vec<FriendRequestEntry>,
+    #[serde(default)]
+    pub outgoing_requests: Vec<FriendRequestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct PartyMemberInfo {
+    pub user_id: String,
+    pub username: String,
+    pub mmr: i32,
+    pub rank_tier: String,
+    #[serde(default)]
+    pub is_leader: bool,
+    #[serde(default)]
+    pub is_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct PartyChatMsg {
+    pub sender: String,
+    pub text: String,
+    #[serde(default)]
+    pub is_system: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct PartyState {
+    pub party_id: String,
+    pub leader_user_id: String,
+    pub game_mode: String,
+    pub max_size: usize,
+    #[serde(default)]
+    pub is_queuing: bool,
+    #[serde(default)]
+    pub members: Vec<PartyMemberInfo>,
+    #[serde(default)]
+    pub chat_messages: Vec<PartyChatMsg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct PartyInviteInfo {
+    pub invite_id: String,
+    pub party_id: String,
+    pub from_user_id: String,
+    pub from_username: String,
+    pub game_mode: String,
+    #[serde(default)]
+    pub expires_in_secs: u64,
 }
 
 // =============================================================================
@@ -257,6 +364,48 @@ pub enum BackendAsyncEvent {
     },
     LobbyError(String),
     LobbyWsClosed,
+    // Friends HTTP & Social/Party WebSocket Events
+    FriendsLoaded(FriendsSnapshot),
+    FriendSearchResults(Vec<PlayerSearchResult>),
+    FriendActionDone {
+        message: String,
+        snapshot: FriendsSnapshot,
+    },
+    FriendActionError(String),
+    FriendPresenceUpdated {
+        user_id: String,
+        username: String,
+        online: bool,
+        status: String,
+        in_party: bool,
+    },
+    SocialSnapshot {
+        friends: FriendsSnapshot,
+        party: Option<PartyState>,
+        pending_invites: Vec<PartyInviteInfo>,
+    },
+    PartyStateUpdated(PartyState),
+    PartyCleared {
+        reason: String,
+    },
+    PartyInviteReceived {
+        invite: PartyInviteInfo,
+        title: String,
+        message: String,
+    },
+    PartyInviteCleared(String),
+    PartyInviteResult {
+        target_user_id: String,
+        accepted: bool,
+        message: String,
+    },
+    SocialNotification {
+        kind: String,
+        title: String,
+        message: String,
+    },
+    PartyQueueCanceled(String),
+    SocialWsClosed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +463,7 @@ pub struct BackendClient {
     pub rx: Arc<Mutex<Receiver<BackendAsyncEvent>>>,
     mm_ws_tx: Option<Sender<String>>,
     lobby_ws_tx: Option<Sender<String>>,
+    social_ws_tx: Option<Sender<String>>,
 }
 
 impl BackendClient {
@@ -326,6 +476,7 @@ impl BackendClient {
             rx: Arc::new(Mutex::new(rx)),
             mm_ws_tx: None,
             lobby_ws_tx: None,
+            social_ws_tx: None,
         }
     }
 
@@ -343,11 +494,15 @@ impl BackendClient {
     // سرویس‌های HTTP
     // -------------------------------------------------------------------------
 
-    pub fn request_otp(&self, email: String) {
+    pub fn request_otp(&self, email: String, mode: String, username: String) {
         let url = format!("{}/api/v1/auth/request-otp/", self.http_base);
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let body = serde_json::json!({ "email": email });
+            let body = serde_json::json!({
+                "email": email,
+                "mode": mode,
+                "username": username
+            });
             match ureq::post(&url)
                 .timeout(Duration::from_secs(8))
                 .send_json(body)
@@ -813,6 +968,474 @@ impl BackendClient {
 
     pub fn send_lobby_action(&self, payload: serde_json::Value) {
         if let Some(ref tx) = self.lobby_ws_tx {
+            let _ = tx.send(payload.to_string());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // سرویس‌های HTTP دوستان (Friends REST API)
+    // -------------------------------------------------------------------------
+
+    pub fn fetch_friends(&self, access_token: String) {
+        let url = format!("{}/api/v1/friends/", self.http_base);
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let resp = ureq::get(&url)
+                .set("Authorization", &format!("Bearer {}", access_token))
+                .call();
+            match resp {
+                Ok(r) => match r.into_json::<FriendsSnapshot>() {
+                    Ok(snap) => {
+                        let _ = tx.send(BackendAsyncEvent::FriendsLoaded(snap));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
+                            "Failed to parse friends: {}",
+                            e
+                        )));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(BackendAsyncEvent::FriendActionError(extract_ureq_error(e)));
+                }
+            }
+        });
+    }
+
+    pub fn search_players(&self, access_token: String, query: String) {
+        let encoded: String = query
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let url = format!("{}/api/v1/friends/search/?q={}", self.http_base, encoded);
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let resp = ureq::get(&url)
+                .set("Authorization", &format!("Bearer {}", access_token))
+                .call();
+            match resp {
+                Ok(r) => match r.into_string() {
+                    Ok(body) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                            let results: Vec<PlayerSearchResult> = v
+                                .get("results")
+                                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                                .unwrap_or_default();
+                            let _ = tx.send(BackendAsyncEvent::FriendSearchResults(results));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
+                            "Search error: {}",
+                            e
+                        )));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(BackendAsyncEvent::FriendActionError(extract_ureq_error(e)));
+                }
+            }
+        });
+    }
+
+    pub fn send_friend_request(&self, access_token: String, target_user_id: String) {
+        let url = format!("{}/api/v1/friends/request/", self.http_base);
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let body = serde_json::json!({ "target_user_id": target_user_id }).to_string();
+            let resp = ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", access_token))
+                .set("Content-Type", "application/json")
+                .send_string(&body);
+            match resp {
+                Ok(r) => {
+                    if let Ok(text) = r.into_string() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let msg = v
+                                .get("message")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("Friend request sent.")
+                                .to_string();
+                            let snap: FriendsSnapshot =
+                                serde_json::from_value(v).unwrap_or_default();
+                            let _ = tx.send(BackendAsyncEvent::FriendActionDone {
+                                message: msg,
+                                snapshot: snap,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(BackendAsyncEvent::FriendActionError(extract_ureq_error(e)));
+                }
+            }
+        });
+    }
+
+    pub fn respond_friend_request(&self, access_token: String, request_id: i64, accept: bool) {
+        let url = format!("{}/api/v1/friends/respond/", self.http_base);
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let body = serde_json::json!({
+                "request_id": request_id,
+                "accept": accept
+            })
+            .to_string();
+            let resp = ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", access_token))
+                .set("Content-Type", "application/json")
+                .send_string(&body);
+            match resp {
+                Ok(r) => {
+                    if let Ok(text) = r.into_string() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let msg = v
+                                .get("message")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("Friend request updated.")
+                                .to_string();
+                            let snap: FriendsSnapshot =
+                                serde_json::from_value(v).unwrap_or_default();
+                            let _ = tx.send(BackendAsyncEvent::FriendActionDone {
+                                message: msg,
+                                snapshot: snap,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(BackendAsyncEvent::FriendActionError(extract_ureq_error(e)));
+                }
+            }
+        });
+    }
+
+    pub fn remove_friend(&self, access_token: String, friend_user_id: String) {
+        let url = format!("{}/api/v1/friends/remove/", self.http_base);
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let body = serde_json::json!({ "friend_user_id": friend_user_id }).to_string();
+            let resp = ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", access_token))
+                .set("Content-Type", "application/json")
+                .send_string(&body);
+            match resp {
+                Ok(r) => {
+                    if let Ok(text) = r.into_string() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let snap: FriendsSnapshot =
+                                serde_json::from_value(v).unwrap_or_default();
+                            let _ = tx.send(BackendAsyncEvent::FriendActionDone {
+                                message: "Friend removed.".to_string(),
+                                snapshot: snap,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(BackendAsyncEvent::FriendActionError(extract_ureq_error(e)));
+                }
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // وب‌سوکت دائمی دوستان، حضور آنلاین و پارتی (/ws/social/)
+    // -------------------------------------------------------------------------
+
+    pub fn is_social_ws_connected(&self) -> bool {
+        self.social_ws_tx.is_some()
+    }
+
+    pub fn connect_social_ws(&mut self, access_token: String) {
+        if self.social_ws_tx.is_some() {
+            return;
+        }
+        let ws_url = format!("{}/ws/social/?token={}", self.ws_base, access_token);
+        let tx = self.tx.clone();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+        self.social_ws_tx = Some(cmd_tx);
+
+        thread::spawn(move || {
+            let Ok((mut socket, _)) = tungstenite::connect(ws_url.as_str()) else {
+                let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
+                return;
+            };
+            set_ws_nonblocking(&mut socket);
+            let mut last_ping = std::time::Instant::now();
+
+            loop {
+                if last_ping.elapsed() >= Duration::from_secs(15) {
+                    last_ping = std::time::Instant::now();
+                    if socket.send(Message::Ping(Vec::new().into())).is_err() {
+                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
+                        break;
+                    }
+                }
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    if cmd == "__CLOSE__" {
+                        let _ = socket.close(None);
+                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
+                        return;
+                    }
+                    let _ = socket.send(Message::Text(cmd.into()));
+                }
+
+                match socket.read() {
+                    Ok(Message::Text(txt)) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(txt.as_str()) {
+                            let ev = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
+                            match ev {
+                                "social_snapshot" => {
+                                    let friends: FriendsSnapshot =
+                                        serde_json::from_value(v.clone()).unwrap_or_default();
+                                    let party: Option<PartyState> = v
+                                        .get("party")
+                                        .and_then(|x| {
+                                            if x.is_null() {
+                                                None
+                                            } else {
+                                                serde_json::from_value(x.clone()).ok()
+                                            }
+                                        });
+                                    let pending_invites: Vec<PartyInviteInfo> = v
+                                        .get("pending_invites")
+                                        .and_then(|x| serde_json::from_value(x.clone()).ok())
+                                        .unwrap_or_default();
+                                    let _ = tx.send(BackendAsyncEvent::SocialSnapshot {
+                                        friends,
+                                        party,
+                                        pending_invites,
+                                    });
+                                }
+                                "friends_updated" => {
+                                    let snap: FriendsSnapshot =
+                                        serde_json::from_value(v).unwrap_or_default();
+                                    let _ = tx.send(BackendAsyncEvent::FriendsLoaded(snap));
+                                }
+                                "friend_presence" => {
+                                    let user_id = v
+                                        .get("user_id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let username = v
+                                        .get("username")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let online =
+                                        v.get("online").and_then(|x| x.as_bool()).unwrap_or(false);
+                                    let status = v
+                                        .get("status")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("offline")
+                                        .to_string();
+                                    let in_party = v
+                                        .get("in_party")
+                                        .and_then(|x| x.as_bool())
+                                        .unwrap_or(false);
+                                    let _ = tx.send(BackendAsyncEvent::FriendPresenceUpdated {
+                                        user_id,
+                                        username,
+                                        online,
+                                        status,
+                                        in_party,
+                                    });
+                                }
+                                "party_state" => {
+                                    if let Some(pv) = v.get("party") {
+                                        if let Ok(ps) =
+                                            serde_json::from_value::<PartyState>(pv.clone())
+                                        {
+                                            let _ =
+                                                tx.send(BackendAsyncEvent::PartyStateUpdated(ps));
+                                        }
+                                    }
+                                }
+                                "party_left" | "party_kicked" => {
+                                    let msg = v
+                                        .get("message")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("Left party.")
+                                        .to_string();
+                                    let _ =
+                                        tx.send(BackendAsyncEvent::PartyCleared { reason: msg });
+                                }
+                                "party_invite_received" => {
+                                    if let Some(iv) = v.get("invite") {
+                                        if let Ok(inv) =
+                                            serde_json::from_value::<PartyInviteInfo>(iv.clone())
+                                        {
+                                            let title = v
+                                                .get("title")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or("PARTY INVITE")
+                                                .to_string();
+                                            let message = v
+                                                .get("message")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or("Squad invite received.")
+                                                .to_string();
+                                            let _ =
+                                                tx.send(BackendAsyncEvent::PartyInviteReceived {
+                                                    invite: inv,
+                                                    title,
+                                                    message,
+                                                });
+                                        }
+                                    }
+                                }
+                                "party_invite_result" => {
+                                    let target_user_id = v
+                                        .get("target_user_id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let accepted = v
+                                        .get("accepted")
+                                        .and_then(|x| x.as_bool())
+                                        .unwrap_or(false);
+                                    let message = v
+                                        .get("message")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("Invite response received.")
+                                        .to_string();
+                                    let _ = tx.send(BackendAsyncEvent::PartyInviteResult {
+                                        target_user_id,
+                                        accepted,
+                                        message,
+                                    });
+                                }
+                                "party_invite_cleared" => {
+                                    let iid = v
+                                        .get("invite_id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let _ = tx.send(BackendAsyncEvent::PartyInviteCleared(iid));
+                                }
+                                "notification" => {
+                                    let kind = v
+                                        .get("kind")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("info")
+                                        .to_string();
+                                    let title = v
+                                        .get("title")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("NOTICE")
+                                        .to_string();
+                                    let message = v
+                                        .get("message")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let _ = tx.send(BackendAsyncEvent::SocialNotification {
+                                        kind,
+                                        title,
+                                        message,
+                                    });
+                                }
+                                "party_queue_canceled" => {
+                                    let msg = v
+                                        .get("message")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("Party matchmaking canceled.")
+                                        .to_string();
+                                    let _ = tx.send(BackendAsyncEvent::PartyQueueCanceled(msg));
+                                }
+                                // Party Matchmaking events routed through /ws/social/
+                                "queued" => {
+                                    let p_in = v
+                                        .get("players_in_queue")
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(1)
+                                        as usize;
+                                    let req = v
+                                        .get("required_players")
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(2)
+                                        as usize;
+                                    let _ = tx.send(BackendAsyncEvent::QueueStatus {
+                                        players_in_queue: p_in,
+                                        required_players: req,
+                                    });
+                                }
+                                "starting_server" => {
+                                    let room_id = v
+                                        .get("room_id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let port =
+                                        v.get("port").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+                                    let p_in = v
+                                        .get("players_in_queue")
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(2)
+                                        as usize;
+                                    let req = v
+                                        .get("required_players")
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(2)
+                                        as usize;
+                                    let _ = tx.send(BackendAsyncEvent::StartingGameServer {
+                                        room_id,
+                                        port,
+                                        players_in_queue: p_in,
+                                        required_players: req,
+                                    });
+                                }
+                                "match_found" => {
+                                    if let Some(info) = parse_match_found_payload(&v) {
+                                        let _ = tx.send(BackendAsyncEvent::MatchFound(info));
+                                    }
+                                }
+                                "error" => {
+                                    let msg = v
+                                        .get("message")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("Social error.")
+                                        .to_string();
+                                    let _ = tx.send(BackendAsyncEvent::SocialNotification {
+                                        kind: "error".to_string(),
+                                        title: "ERROR".to_string(),
+                                        message: msg,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) => {
+                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(ref e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => {
+                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn disconnect_social_ws(&mut self) {
+        if let Some(tx) = self.social_ws_tx.take() {
+            let _ = tx.send("__CLOSE__".to_string());
+        }
+    }
+
+    pub fn send_social_action(&self, payload: serde_json::Value) {
+        if let Some(ref tx) = self.social_ws_tx {
             let _ = tx.send(payload.to_string());
         }
     }

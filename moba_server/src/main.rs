@@ -414,6 +414,25 @@ fn server_network_receive_system(
                             });
 
                             if let (true, Some(t)) = (room_matches, ticket_opt) {
+                                let stale_cids: Vec<ClientId> = auth_state
+                                    .verified_clients
+                                    .iter()
+                                    .filter(|(&cid, info)| cid != client_id && info.user_id == t.user_id)
+                                    .map(|(&cid, _)| cid)
+                                    .collect();
+                                for old_cid in stale_cids {
+                                    auth_state.verified_clients.remove(&old_cid);
+                                    if let Some(old_slot) = match_state.on_client_disconnected(old_cid) {
+                                        if match_state.phase == MatchPhase::InGame {
+                                            world.set_slot_connected(old_slot, false, &config);
+                                        }
+                                    }
+                                    net_inner.server.disconnect(old_cid);
+                                    println!(
+                                        "[AUTH RECONNECT] نشست قبلی {} برای بازیکن {} جایگزین شد.",
+                                        old_cid, t.username
+                                    );
+                                }
                                 if let Some(slot_idx) = match_state.on_client_connected_with_user(
                                     client_id,
                                     Some(&t.user_id),

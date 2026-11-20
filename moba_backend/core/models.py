@@ -86,6 +86,7 @@ class OtpVerification(models.Model):
     id = models.BigAutoField(primary_key=True)
     email = models.EmailField("ایمیل", max_length=128, db_index=True)
     otp_code = models.CharField("کد ۶ رقمی OTP", max_length=6)
+    username = models.CharField("نام کاربری انتخابی در ثبت‌نام", max_length=64, blank=True, default="")
     is_used = models.BooleanField("استفاده‌شده", default=False)
     created_at = models.DateTimeField("زمان صدور", auto_now_add=True)
     expires_at = models.DateTimeField("زمان انقضا")
@@ -283,6 +284,7 @@ class MatchParticipant(models.Model):
     gold_coins = models.IntegerField("طلای نهایی (Gold)", default=0)
     is_winner = models.BooleanField("برنده مسابقه", default=False)
     mmr_delta = models.IntegerField("تغییر امتیاز MMR", default=0)
+    party_group_id = models.CharField("شناسه گروه پارتی", max_length=64, blank=True, default="", db_index=True)
     joined_at = models.DateTimeField("زمان ورود به مچ", auto_now_add=True)
     left_at = models.DateTimeField(
         "زمان خروج / پایان", null=True, blank=True
@@ -296,3 +298,59 @@ class MatchParticipant(models.Model):
 
     def __str__(self) -> str:
         return f"{self.player.username} در {self.match_room.room_id} (تیم {self.team_id} - وضعیت: {self.status})"
+
+
+class Friendship(models.Model):
+    """
+    جدول اختصاصی دوستی‌ها و درخواست‌های دوستی بین بازیکنان
+    """
+
+    STATUS_PENDING = "pending"
+    STATUS_ACCEPTED = "accepted"
+    STATUS_DECLINED = "declined"
+    STATUS_BLOCKED = "blocked"
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "در انتظار تایید (Pending)"),
+        (STATUS_ACCEPTED, "تایید شده (Accepted)"),
+        (STATUS_DECLINED, "رد شده (Declined)"),
+        (STATUS_BLOCKED, "مسدود شده (Blocked)"),
+    ]
+
+    id = models.BigAutoField(primary_key=True)
+    requester = models.ForeignKey(
+        Player,
+        verbose_name="درخواست‌دهنده",
+        on_delete=models.CASCADE,
+        related_name="sent_friend_requests",
+    )
+    addressee = models.ForeignKey(
+        Player,
+        verbose_name="دریافت‌کننده",
+        on_delete=models.CASCADE,
+        related_name="received_friend_requests",
+    )
+    status = models.CharField(
+        "وضعیت دوستی",
+        max_length=16,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING,
+        db_index=True,
+    )
+    created_at = models.DateTimeField("زمان ایجاد", auto_now_add=True)
+    updated_at = models.DateTimeField("آخرین بروزرسانی", auto_now=True)
+
+    class Meta:
+        db_table = "moba_friendships"
+        verbose_name = "رابطه دوستی"
+        verbose_name_plural = "۶. دوستان و درخواست‌های دوستی (Friendships)"
+        ordering = ["-updated_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["requester", "addressee"],
+                name="unique_moba_friendship_pair",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.requester.username} -> {self.addressee.username} [{self.status}]"

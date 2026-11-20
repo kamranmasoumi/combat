@@ -329,8 +329,36 @@ pub struct TelemetryConfig {
     pub high_ping_critical_ms: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MenuSoldierSlotTransform {
+    pub position: [f32; 3],
+    pub yaw_deg: f32,
+    pub scale: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MainMenuConfig {
+    pub background_image_path: String,
+    pub soldier_model_path: String,
+    pub soldier_idle_animation: String,
+    pub party_max_size: usize,
+    pub notification_duration_secs: f32,
+    pub party_invite_timeout_secs: f32,
+    pub camera_position: [f32; 3],
+    pub camera_look_at: [f32; 3],
+    pub camera_fov_deg: f32,
+    pub key_light_illuminance: f32,
+    pub key_light_direction: [f32; 3],
+    pub rim_light_intensity: f32,
+    pub rim_light_position: [f32; 3],
+    pub ambient_light_brightness: f32,
+    pub squad_slots: Vec<MenuSoldierSlotTransform>,
+    pub game_modes: Vec<String>,
+}
+
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
+    pub main_menu: MainMenuConfig,
     pub weather: WeatherConfig,
     pub day_night: DayNightConfig,
     pub telemetry: TelemetryConfig,
@@ -844,6 +872,25 @@ impl GameConfig {
         assert!(a.shop_exit_volume.is_finite() && a.shop_exit_volume >= 0.0, "audio.shop_exit_volume نامعتبر است");
         assert!(!a.inventory_full_sound.trim().is_empty(), "audio.inventory_full_sound نمی‌تواند خالی باشد");
         assert!(a.inventory_full_volume.is_finite() && a.inventory_full_volume >= 0.0, "audio.inventory_full_volume نامعتبر است");
+
+        let mm = &self.main_menu;
+        assert!(!mm.background_image_path.trim().is_empty(), "main_menu.background_image_path نمی‌تواند خالی باشد");
+        assert!(!mm.soldier_model_path.trim().is_empty(), "main_menu.soldier_model_path نمی‌تواند خالی باشد");
+        assert!(!mm.soldier_idle_animation.trim().is_empty(), "main_menu.soldier_idle_animation نمی‌تواند خالی باشد");
+        assert!(mm.party_max_size >= 2 && mm.party_max_size <= 5, "main_menu.party_max_size باید بین ۲ تا ۵ باشد");
+        assert!(mm.squad_slots.len() >= mm.party_max_size, "main_menu.squad_slots باید حداقل به تعداد party_max_size جایگاه داشته باشد");
+        assert!(mm.notification_duration_secs.is_finite() && mm.notification_duration_secs > 0.0, "main_menu.notification_duration_secs نامعتبر است");
+        assert!(mm.party_invite_timeout_secs.is_finite() && mm.party_invite_timeout_secs > 0.0, "main_menu.party_invite_timeout_secs نامعتبر است");
+        assert!(mm.camera_fov_deg.is_finite() && mm.camera_fov_deg > 10.0 && mm.camera_fov_deg < 120.0, "main_menu.camera_fov_deg نامعتبر است");
+        assert!(mm.key_light_illuminance.is_finite() && mm.key_light_illuminance >= 0.0, "main_menu.key_light_illuminance نامعتبر است");
+        assert!(mm.rim_light_intensity.is_finite() && mm.rim_light_intensity >= 0.0, "main_menu.rim_light_intensity نامعتبر است");
+        assert!(mm.ambient_light_brightness.is_finite() && mm.ambient_light_brightness >= 0.0, "main_menu.ambient_light_brightness نامعتبر است");
+        assert!(!mm.game_modes.is_empty(), "main_menu.game_modes نمی‌تواند خالی باشد");
+        for (i, slot) in mm.squad_slots.iter().enumerate() {
+            assert!(slot.scale.is_finite() && slot.scale > 0.0, "main_menu.squad_slots[{}].scale نامعتبر است", i);
+            assert!(slot.yaw_deg.is_finite(), "main_menu.squad_slots[{}].yaw_deg نامعتبر است", i);
+            assert!(slot.position.iter().all(|v| v.is_finite()), "main_menu.squad_slots[{}].position نامعتبر است", i);
+        }
         for (hid, hw) in &a.hero_weapons {
             assert!(
                 !hw.primary_fire_sound.trim().is_empty(),

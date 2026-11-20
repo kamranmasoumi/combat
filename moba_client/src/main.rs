@@ -1161,12 +1161,11 @@ fn on_enter_ingame_connect_system(
     if let Some(info) = pending.0.take() {
         config.network.server_public_addr = info.server_addr.clone();
         config.network.server_bind_addr = info.server_addr;
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for b in info.ticket_id.as_bytes() {
-            hash ^= *b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        config.network.client_id = (hash % 900_000_000) + 1_000;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(101);
+        config.network.client_id = (nanos % 900_000_000) + 1_000;
         let (client, transport) = create_shared_renet_client(&config.network);
         net.client = client;
         net.transport = transport;
@@ -1234,6 +1233,7 @@ fn on_exit_ingame_system(
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     net.client.disconnect();
+    net.transport.disconnect();
     audio_ctx.in_game = false;
     audio_ctx.in_hero_select = false;
     audio_ctx.active_beams.clear();
@@ -1270,18 +1270,21 @@ fn sync_hud_phase_visibility_system(
 
 fn ingame_exit_button_system(
     keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
     backend: Res<BackendClient>,
     pregame_state: Res<PreGameSessionState>,
     match_result: Res<LatestMatchResult>,
     mut next_screen: ResMut<NextState<AppScreenState>>,
-    mut exit_btn_q: Query<(&Hovered, Has<Pressed>, &mut BackgroundColor), With<InGameExitMenuBtn>>,
+    mut exit_btn_q: Query<(&Hovered, &mut BackgroundColor), With<InGameExitMenuBtn>>,
 ) {
     let mut want_exit = match_result.0.is_some() && keys.just_pressed(KeyCode::Escape);
-    for (hovered, pressed, mut bg) in &mut exit_btn_q {
-        if pressed {
-            want_exit = true;
-        } else if hovered.get() {
+    let left_clicked = mouse.just_pressed(MouseButton::Left);
+    for (hovered, mut bg) in &mut exit_btn_q {
+        if hovered.get() {
             bg.0 = Color::srgba(0.32, 0.08, 0.11, 0.96);
+            if left_clicked {
+                want_exit = true;
+            }
         } else {
             bg.0 = Color::srgba(0.18, 0.05, 0.07, 0.88);
         }

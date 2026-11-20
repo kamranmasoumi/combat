@@ -13,13 +13,17 @@ from typing import Dict, List, Optional
 from urllib.parse import parse_qs
 
 import redis
+from asgiref.sync import async_to_sync
 from channels.db import database_sync_to_async
+from channels.layers import get_channel_layer
+from django.db.models import Q
 from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
 from .models import (
+    Friendship,
     GameMatchRoom,
     MatchParticipant,
     Player,
@@ -36,6 +40,7 @@ class QueuedPlayerEntry:
     channel_name: str
     player_pk: int
     client_ip: str = ""
+    party_group_id: str = ""
 
 
 # صف جهانی Matchmaking و قفل همگام‌سازی در حافظه ASGI
@@ -954,6 +959,7 @@ def _create_match_records_and_spawn(
             slot_index=idx,
             team_id=team_id,
             status=MatchParticipant.STATUS_CONNECTED,
+            party_group_id=entry.party_group_id,
         )
 
         store_ticket_in_redis(
@@ -2073,4 +2079,1383 @@ class LobbyConsumer(AsyncWebsocketConsumer):
 
     async def lobby_closed(self, event: dict) -> None:
         self.current_lobby_id = None
+        await self.send_json(event["payload"])
+
+
+# ============================================================================
+# سیستم جامع دوستان، وضعیت آنلاین (Presence)، پارتی (Party) و نوتیفیکیشن زنده
+# ============================================================================
+
+PARTY_DEFAULT_MAX_SIZE = 5
+PARTY_INVITE_TTL_SECS = 60.0
+
+
+@dataclass
+class OnlineUserSession:
+    user_id: str
+    username: str
+    mmr: int
+    rank_tier: str
+    player_pk: int
+    channel_name: str
+    client_ip: str = ""
+    status: str = "online"  # online | in_party | in_queue | in_match
+    party_id: Optional[str] = None
+
+
+@dataclass
+class PartyMember:
+    user_id: str
+    username: str
+    mmr: int
+    rank_tier: str
+    player_pk: int
+    channel_name: str
+    client_ip: str = ""
+    is_ready: bool = False
+
+
+@dataclass
+class PartyRoom:
+    party_id: str
+    leader_user_id: str
+    game_mode: str
+    max_size: int
+    members: List[PartyMember]
+    chat_history: List[dict]
+    is_queuing: bool = False
+
+
+@dataclass
+class PartyInvite:
+    invite_id: str
+    party_id: str
+    from_user_id: str
+    from_username: str
+    to_user_id: str
+    game_mode: str
+    created_at: float
+    expires_at: float
+
+
+_SOCIAL_LOCK = asyncio.Lock()
+_ONLINE_USERS: Dict[str, OnlineUserSession] = {}
+_ACTIVE_PARTIES: Dict[str, PartyRoom] = {}
+_PENDING_PARTY_INVITES: Dict[str, PartyInvite] = {}
+
+
+def get_player_presence_snapshot(user_id: str) -> dict:
+    """
+    استعلام سریع وضعیت آنلاین بازیکن برای استفاده در ویوهای HTTP (بدون قفل مسدودکننده)
+    """
+    sess = _ONLINE_USERS.get(user_id)
+    if not sess:
+        return {"online": False, "status": "offline", "party_id": None}
+    return {
+        "online": True,
+        "status": sess.status,
+        "party_id": sess.party_id,
+    }
+
+
+def push_social_event_to_user_sync(user_id: str, payload: dict) -> bool:
+    """
+    ارسال آنی رویداد/نوتیفیکیشن وب‌سوکت از داخل ویوهای HTTP جنگو به بازیکن آنلاین
+    """
+    sess = _ONLINE_USERS.get(user_id)
+    if not sess or not sess.channel_name:
+        return False
+    layer = get_channel_layer()
+    if layer is None:
+        return False
+    try:
+        async_to_sync(layer.send)(
+            sess.channel_name,
+            {
+                "type": "social.event",
+                "payload": payload,
+            },
+        )
+        return True
+    except Exception as exc:
+        print(f"[SOCIAL PUSH WARNING] Failed pushing to {user_id}: {exc}", flush=True)
+        return False
+
+
+def _serialize_party_state(party: PartyRoom) -> dict:
+    return {
+        "party_id": party.party_id,
+        "leader_user_id": party.leader_user_id,
+        "game_mode": party.game_mode,
+        "max_size": party.max_size,
+        "is_queuing": party.is_queuing,
+        "members": [
+            {
+                "user_id": m.user_id,
+                "username": m.username,
+                "mmr": m.mmr,
+                "rank_tier": m.rank_tier,
+                "is_leader": m.user_id == party.leader_user_id,
+                "is_ready": m.is_ready,
+            }
+            for m in party.members
+        ],
+        "chat_messages": party.chat_history[-35:],
+    }
+
+
+def _serialize_party_invite(inv: PartyInvite) -> dict:
+    remaining = max(0, int(inv.expires_at - time.monotonic()))
+    return {
+        "invite_id": inv.invite_id,
+        "party_id": inv.party_id,
+        "from_user_id": inv.from_user_id,
+        "from_username": inv.from_username,
+        "game_mode": inv.game_mode,
+        "expires_in_secs": remaining,
+    }
+
+
+def _prune_expired_invites() -> None:
+    now = time.monotonic()
+    expired = [
+        iid for iid, inv in _PENDING_PARTY_INVITES.items() if inv.expires_at <= now
+    ]
+    for iid in expired:
+        _PENDING_PARTY_INVITES.pop(iid, None)
+
+
+def build_friends_payload_for_player(player: Player) -> dict:
+    """
+    ساخت لیست کامل دوستان، درخواست‌های ورودی و خروجی همراه با وضعیت آنلاین لحظه‌ای
+    """
+    friendships = list(
+        Friendship.objects.select_related("requester", "addressee").filter(
+            Q(requester=player) | Q(addressee=player)
+        )
+    )
+
+    friends = []
+    incoming = []
+    outgoing = []
+
+    for f in friendships:
+        other = f.addressee if f.requester_id == player.id else f.requester
+        pres = get_player_presence_snapshot(other.user_id)
+        if f.status == Friendship.STATUS_ACCEPTED:
+            friends.append(
+                {
+                    "user_id": other.user_id,
+                    "username": other.username,
+                    "mmr": other.mmr,
+                    "rank_tier": other.rank_tier,
+                    "online": pres["online"],
+                    "status": pres["status"],
+                    "in_party": pres["party_id"] is not None,
+                }
+            )
+        elif f.status == Friendship.STATUS_PENDING:
+            item = {
+                "request_id": f.id,
+                "user_id": other.user_id,
+                "username": other.username,
+                "mmr": other.mmr,
+                "rank_tier": other.rank_tier,
+                "online": pres["online"],
+            }
+            if f.addressee_id == player.id:
+                incoming.append(item)
+            else:
+                outgoing.append(item)
+
+    # مرتب‌سازی: ابتدا آنلاین‌ها و سپس بر اساس MMR
+    friends.sort(key=lambda x: (not x["online"], -x["mmr"], x["username"].lower()))
+    return {
+        "friends": friends,
+        "incoming_requests": incoming,
+        "outgoing_requests": outgoing,
+    }
+
+
+@database_sync_to_async
+def _build_friends_payload_async(player: Player) -> dict:
+    return build_friends_payload_for_player(player)
+
+
+@database_sync_to_async
+def _get_friend_user_ids_async(player_pk: int) -> List[str]:
+    qs = Friendship.objects.select_related("requester", "addressee").filter(
+        Q(requester_id=player_pk) | Q(addressee_id=player_pk),
+        status=Friendship.STATUS_ACCEPTED,
+    )
+    out: List[str] = []
+    for f in qs:
+        other = f.addressee if f.requester_id == player_pk else f.requester
+        out.append(other.user_id)
+    return out
+
+
+class SocialPartyConsumer(AsyncWebsocketConsumer):
+    """
+    وب‌سوکت جامع دوستان، وضعیت آنلاین، پارتی (تا ۵ نفر)، نوتیفیکیشن‌های زنده و صف گروهی:
+    ws://<host>/ws/social/?token=<access_token>
+    """
+
+    player: Optional[Player] = None
+    last_chat_ts: float = 0.0
+
+    async def connect(self) -> None:
+        query_string = self.scope.get("query_string", b"").decode("utf-8")
+        params = parse_qs(query_string)
+        token_str = params.get("token", [""])[0].strip()
+
+        if not token_str:
+            headers = dict(self.scope.get("headers", []))
+            auth_val = headers.get(b"authorization", b"").decode("utf-8")
+            if auth_val.startswith("Bearer "):
+                token_str = auth_val[7:].strip()
+
+        self.player = await _authenticate_ws_token(token_str)
+        if not self.player:
+            await self.close(code=4001)
+            return
+
+        client_info = self.scope.get("client")
+        client_ip = client_info[0] if client_info and len(client_info) > 0 else ""
+
+        await self.accept()
+
+        party_payload = None
+        pending_invites_payload = []
+
+        async with _SOCIAL_LOCK:
+            _prune_expired_invites()
+            existing_party_id = None
+            prev = _ONLINE_USERS.get(self.player.user_id)
+            if prev and prev.party_id and prev.party_id in _ACTIVE_PARTIES:
+                existing_party_id = prev.party_id
+
+            _ONLINE_USERS[self.player.user_id] = OnlineUserSession(
+                user_id=self.player.user_id,
+                username=self.player.username,
+                mmr=self.player.mmr,
+                rank_tier=self.player.rank_tier,
+                player_pk=self.player.pk,
+                channel_name=self.channel_name,
+                client_ip=client_ip,
+                status="in_party" if existing_party_id else "online",
+                party_id=existing_party_id,
+            )
+
+            if existing_party_id:
+                party = _ACTIVE_PARTIES.get(existing_party_id)
+                if party:
+                    for m in party.members:
+                        if m.user_id == self.player.user_id:
+                            m.channel_name = self.channel_name
+                            m.client_ip = client_ip
+                            break
+                    party_payload = _serialize_party_state(party)
+
+            for inv in _PENDING_PARTY_INVITES.values():
+                if inv.to_user_id == self.player.user_id:
+                    pending_invites_payload.append(_serialize_party_invite(inv))
+
+        friends_data = await _build_friends_payload_async(self.player)
+        await self.send_json(
+            {
+                "event": "social_snapshot",
+                "friends": friends_data["friends"],
+                "incoming_requests": friends_data["incoming_requests"],
+                "outgoing_requests": friends_data["outgoing_requests"],
+                "party": party_payload,
+                "pending_invites": pending_invites_payload,
+            }
+        )
+
+        await self._broadcast_presence_to_friends(
+            online=True,
+            status="in_party" if party_payload else "online",
+            in_party=party_payload is not None,
+        )
+
+    async def disconnect(self, close_code: int) -> None:
+        if not self.player:
+            return
+
+        uid = self.player.user_id
+        party_to_leave: Optional[str] = None
+        became_offline = False
+
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(uid)
+            if sess and sess.channel_name == self.channel_name:
+                party_to_leave = sess.party_id
+                _ONLINE_USERS.pop(uid, None)
+                became_offline = True
+
+        if party_to_leave:
+            await self._remove_user_from_party(uid, reason="disconnected")
+
+        if became_offline:
+            await self._broadcast_presence_to_friends(
+                online=False, status="offline", in_party=False
+            )
+
+    async def send_json(self, payload: dict) -> None:
+        await self.send(text_data=json.dumps(payload))
+
+    async def _broadcast_presence_to_friends(
+        self, online: bool, status: str, in_party: bool
+    ) -> None:
+        if not self.player:
+            return
+        friend_ids = await _get_friend_user_ids_async(self.player.pk)
+        targets = []
+        async with _SOCIAL_LOCK:
+            for fid in friend_ids:
+                fsess = _ONLINE_USERS.get(fid)
+                if fsess and fsess.channel_name:
+                    targets.append(fsess.channel_name)
+
+        payload = {
+            "event": "friend_presence",
+            "user_id": self.player.user_id,
+            "username": self.player.username,
+            "online": online,
+            "status": status,
+            "in_party": in_party,
+        }
+        for ch in targets:
+            await self.channel_layer.send(
+                ch,
+                {
+                    "type": "social.event",
+                    "payload": payload,
+                },
+            )
+
+    async def _broadcast_to_party(self, party: PartyRoom, payload: dict) -> None:
+        for m in list(party.members):
+            if m.channel_name:
+                await self.channel_layer.send(
+                    m.channel_name,
+                    {
+                        "type": "social.event",
+                        "payload": payload,
+                    },
+                )
+
+    async def receive(
+        self, text_data: Optional[str] = None, bytes_data: Optional[bytes] = None
+    ) -> None:
+        if not text_data or not self.player:
+            return
+        try:
+            msg = json.loads(text_data)
+        except Exception:
+            return
+
+        action = str(msg.get("action", "")).strip()
+        if action == "refresh_social":
+            await self._handle_refresh_social()
+        elif action == "invite_to_party":
+            await self._handle_invite_to_party(msg)
+        elif action == "respond_party_invite":
+            await self._handle_respond_party_invite(msg)
+        elif action == "toggle_ready":
+            await self._handle_toggle_ready()
+        elif action == "set_game_mode":
+            await self._handle_set_game_mode(msg)
+        elif action == "kick_party_member":
+            await self._handle_kick_party_member(msg)
+        elif action == "promote_leader":
+            await self._handle_promote_leader(msg)
+        elif action == "leave_party":
+            await self._remove_user_from_party(self.player.user_id, reason="left")
+        elif action == "party_chat":
+            await self._handle_party_chat(msg)
+        elif action == "start_party_matchmaking":
+            await self._handle_start_party_matchmaking()
+        elif action == "cancel_party_matchmaking":
+            await self._handle_cancel_party_matchmaking()
+
+    async def _handle_refresh_social(self) -> None:
+        assert self.player is not None
+        party_payload = None
+        pending_invites_payload = []
+        async with _SOCIAL_LOCK:
+            _prune_expired_invites()
+            sess = _ONLINE_USERS.get(self.player.user_id)
+            if sess and sess.party_id and sess.party_id in _ACTIVE_PARTIES:
+                party_payload = _serialize_party_state(_ACTIVE_PARTIES[sess.party_id])
+            for inv in _PENDING_PARTY_INVITES.values():
+                if inv.to_user_id == self.player.user_id:
+                    pending_invites_payload.append(_serialize_party_invite(inv))
+        friends_data = await _build_friends_payload_async(self.player)
+        await self.send_json(
+            {
+                "event": "social_snapshot",
+                "friends": friends_data["friends"],
+                "incoming_requests": friends_data["incoming_requests"],
+                "outgoing_requests": friends_data["outgoing_requests"],
+                "party": party_payload,
+                "pending_invites": pending_invites_payload,
+            }
+        )
+
+    async def _handle_invite_to_party(self, msg: dict) -> None:
+        assert self.player is not None
+        target_uid = str(msg.get("target_user_id", "")).strip()
+        requested_mode = str(msg.get("game_mode", "5v5 JUNGLE SKIRMISH")).strip()[:40]
+        if not target_uid or target_uid == self.player.user_id:
+            return
+
+        client_info = self.scope.get("client")
+        client_ip = client_info[0] if client_info and len(client_info) > 0 else ""
+
+        active_match = await _get_active_match_for_player_async(
+            self.player, client_ip=client_ip
+        )
+        if active_match:
+            await self.send_json(
+                {
+                    "event": "notification",
+                    "kind": "error",
+                    "title": "ACTIVE MATCH",
+                    "message": "Finish or abandon your active match before forming a party.",
+                }
+            )
+            return
+
+        target_channel = None
+        invite_payload = None
+        party_state_payload = None
+
+        async with _SOCIAL_LOCK:
+            _prune_expired_invites()
+            me_sess = _ONLINE_USERS.get(self.player.user_id)
+            target_sess = _ONLINE_USERS.get(target_uid)
+            if not me_sess:
+                return
+            if not target_sess:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "PLAYER OFFLINE",
+                        "message": "Target player is currently offline.",
+                    }
+                )
+                return
+
+            # ایجاد خودکار پارتی در صورتی که بازیکن هنوز در پارتی نباشد
+            party = _ACTIVE_PARTIES.get(me_sess.party_id) if me_sess.party_id else None
+            if party is None:
+                party_id = f"pty_{secrets.randbelow(90000) + 10000}"
+                while party_id in _ACTIVE_PARTIES:
+                    party_id = f"pty_{secrets.randbelow(90000) + 10000}"
+                party = PartyRoom(
+                    party_id=party_id,
+                    leader_user_id=self.player.user_id,
+                    game_mode=requested_mode or "5v5 JUNGLE SKIRMISH",
+                    max_size=PARTY_DEFAULT_MAX_SIZE,
+                    members=[
+                        PartyMember(
+                            user_id=self.player.user_id,
+                            username=self.player.username,
+                            mmr=self.player.mmr,
+                            rank_tier=self.player.rank_tier,
+                            player_pk=self.player.pk,
+                            channel_name=self.channel_name,
+                            client_ip=client_ip,
+                            is_ready=False,
+                        )
+                    ],
+                    chat_history=[
+                        {
+                            "sender": "SYSTEM",
+                            "text": f"{self.player.username} formed a squad.",
+                            "is_system": True,
+                        }
+                    ],
+                )
+                _ACTIVE_PARTIES[party_id] = party
+                me_sess.party_id = party_id
+                me_sess.status = "in_party"
+
+            if party.leader_user_id != self.player.user_id:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "LEADER ONLY",
+                        "message": "Only the party leader can invite players.",
+                    }
+                )
+                return
+
+            if party.is_queuing:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "IN QUEUE",
+                        "message": "Cancel matchmaking before inviting more squadmates.",
+                    }
+                )
+                return
+
+            if len(party.members) >= party.max_size:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "PARTY FULL",
+                        "message": f"Squad is full ({party.max_size}/{party.max_size}).",
+                    }
+                )
+                return
+
+            if any(m.user_id == target_uid for m in party.members):
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "info",
+                        "title": "ALREADY IN SQUAD",
+                        "message": f"{target_sess.username} is already in your party.",
+                    }
+                )
+                return
+
+            # حذف دعوت‌های تکراری قبلی همین پارتی به همین کاربر
+            for iid, inv in list(_PENDING_PARTY_INVITES.items()):
+                if inv.party_id == party.party_id and inv.to_user_id == target_uid:
+                    _PENDING_PARTY_INVITES.pop(iid, None)
+
+            now = time.monotonic()
+            invite_id = f"inv_{secrets.token_hex(6)}"
+            invite = PartyInvite(
+                invite_id=invite_id,
+                party_id=party.party_id,
+                from_user_id=self.player.user_id,
+                from_username=self.player.username,
+                to_user_id=target_uid,
+                game_mode=party.game_mode,
+                created_at=now,
+                expires_at=now + PARTY_INVITE_TTL_SECS,
+            )
+            _PENDING_PARTY_INVITES[invite_id] = invite
+            target_channel = target_sess.channel_name
+            invite_payload = _serialize_party_invite(invite)
+            party_state_payload = _serialize_party_state(party)
+
+        if party_state_payload:
+            await self.send_json(
+                {
+                    "event": "party_state",
+                    "party": party_state_payload,
+                }
+            )
+            await self.send_json(
+                {
+                    "event": "notification",
+                    "kind": "info",
+                    "title": "INVITE SENT",
+                    "message": f"Squad invite sent to {target_sess.username}.",
+                }
+            )
+
+        if target_channel and invite_payload:
+            await self.channel_layer.send(
+                target_channel,
+                {
+                    "type": "social.event",
+                    "payload": {
+                        "event": "party_invite_received",
+                        "invite": invite_payload,
+                        "title": "PARTY INVITE",
+                        "message": f"{self.player.username} invited you to join their squad ({invite_payload['game_mode']}).",
+                    },
+                },
+            )
+
+    async def _handle_respond_party_invite(self, msg: dict) -> None:
+        assert self.player is not None
+        invite_id = str(msg.get("invite_id", "")).strip()
+        accept = bool(msg.get("accept", False))
+
+        client_info = self.scope.get("client")
+        client_ip = client_info[0] if client_info and len(client_info) > 0 else ""
+
+        if accept:
+            active_match = await _get_active_match_for_player_async(
+                self.player, client_ip=client_ip
+            )
+            if active_match:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "ACTIVE MATCH",
+                        "message": "Cannot join a party while you have an active match.",
+                    }
+                )
+                return
+
+        inviter_channel = None
+        joined_party_members: List[PartyMember] = []
+        joined_party_detail: Optional[dict] = None
+        old_party_id_to_leave: Optional[str] = None
+
+        async with _SOCIAL_LOCK:
+            _prune_expired_invites()
+            inv = _PENDING_PARTY_INVITES.pop(invite_id, None)
+            if not inv or inv.to_user_id != self.player.user_id:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "INVITE EXPIRED",
+                        "message": "This party invite has expired or is no longer valid.",
+                    }
+                )
+                return
+
+            inviter_sess = _ONLINE_USERS.get(inv.from_user_id)
+            if inviter_sess:
+                inviter_channel = inviter_sess.channel_name
+
+            if not accept:
+                await self.send_json(
+                    {
+                        "event": "party_invite_cleared",
+                        "invite_id": invite_id,
+                    }
+                )
+            else:
+                party = _ACTIVE_PARTIES.get(inv.party_id)
+                if not party:
+                    await self.send_json(
+                        {
+                            "event": "notification",
+                            "kind": "error",
+                            "title": "PARTY CLOSED",
+                            "message": "The party no longer exists.",
+                        }
+                    )
+                    return
+
+                if party.is_queuing:
+                    await self.send_json(
+                        {
+                            "event": "notification",
+                            "kind": "error",
+                            "title": "PARTY IN QUEUE",
+                            "message": "This party is already searching for a match.",
+                        }
+                    )
+                    return
+
+                if len(party.members) >= party.max_size:
+                    await self.send_json(
+                        {
+                            "event": "notification",
+                            "kind": "error",
+                            "title": "PARTY FULL",
+                            "message": "The squad is already full.",
+                        }
+                    )
+                    return
+
+                me_sess = _ONLINE_USERS.get(self.player.user_id)
+                if me_sess and me_sess.party_id and me_sess.party_id != party.party_id:
+                    old_party_id_to_leave = me_sess.party_id
+
+        if old_party_id_to_leave:
+            await self._remove_user_from_party(self.player.user_id, reason="switched")
+
+        if not accept:
+            if inviter_channel:
+                await self.channel_layer.send(
+                    inviter_channel,
+                    {
+                        "type": "social.event",
+                        "payload": {
+                            "event": "party_invite_result",
+                            "target_user_id": self.player.user_id,
+                            "accepted": False,
+                            "message": f"{self.player.username} declined your party invite.",
+                        },
+                    },
+                )
+            return
+
+        async with _SOCIAL_LOCK:
+            party = _ACTIVE_PARTIES.get(inv.party_id)
+            if not party or len(party.members) >= party.max_size:
+                return
+            if not any(m.user_id == self.player.user_id for m in party.members):
+                party.members.append(
+                    PartyMember(
+                        user_id=self.player.user_id,
+                        username=self.player.username,
+                        mmr=self.player.mmr,
+                        rank_tier=self.player.rank_tier,
+                        player_pk=self.player.pk,
+                        channel_name=self.channel_name,
+                        client_ip=client_ip,
+                        is_ready=False,
+                    )
+                )
+                party.chat_history.append(
+                    {
+                        "sender": "SYSTEM",
+                        "text": f"{self.player.username} joined the squad.",
+                        "is_system": True,
+                    }
+                )
+            me_sess = _ONLINE_USERS.get(self.player.user_id)
+            if me_sess:
+                me_sess.party_id = party.party_id
+                me_sess.status = "in_party"
+
+            joined_party_members = list(party.members)
+            joined_party_detail = _serialize_party_state(party)
+
+        if joined_party_detail:
+            for m in joined_party_members:
+                if m.channel_name:
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {
+                                "event": "party_state",
+                                "party": joined_party_detail,
+                            },
+                        },
+                    )
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {
+                                "event": "notification",
+                                "kind": "party_joined",
+                                "title": "SQUAD UPDATED",
+                                "message": f"{self.player.username} joined the party ({len(joined_party_members)}/{joined_party_detail['max_size']}).",
+                            },
+                        },
+                    )
+            await self._broadcast_presence_to_friends(
+                online=True, status="in_party", in_party=True
+            )
+
+    async def _handle_toggle_ready(self) -> None:
+        assert self.player is not None
+        detail = None
+        members = []
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(self.player.user_id)
+            if not sess or not sess.party_id:
+                return
+            party = _ACTIVE_PARTIES.get(sess.party_id)
+            if not party or party.is_queuing:
+                return
+            for m in party.members:
+                if m.user_id == self.player.user_id:
+                    m.is_ready = not m.is_ready
+                    break
+            detail = _serialize_party_state(party)
+            members = list(party.members)
+
+        if detail:
+            for m in members:
+                if m.channel_name:
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {"event": "party_state", "party": detail},
+                        },
+                    )
+
+    async def _handle_set_game_mode(self, msg: dict) -> None:
+        assert self.player is not None
+        mode = str(msg.get("game_mode", "")).strip()[:40]
+        if not mode:
+            return
+        detail = None
+        members = []
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(self.player.user_id)
+            if not sess or not sess.party_id:
+                return
+            party = _ACTIVE_PARTIES.get(sess.party_id)
+            if not party or party.leader_user_id != self.player.user_id or party.is_queuing:
+                return
+            party.game_mode = mode
+            party.chat_history.append(
+                {
+                    "sender": "SYSTEM",
+                    "text": f"Mode changed to {mode}.",
+                    "is_system": True,
+                }
+            )
+            detail = _serialize_party_state(party)
+            members = list(party.members)
+
+        if detail:
+            for m in members:
+                if m.channel_name:
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {"event": "party_state", "party": detail},
+                        },
+                    )
+
+    async def _handle_kick_party_member(self, msg: dict) -> None:
+        assert self.player is not None
+        target_uid = str(msg.get("target_user_id", "")).strip()
+        if not target_uid or target_uid == self.player.user_id:
+            return
+
+        kicked_member: Optional[PartyMember] = None
+        detail = None
+        remaining_members: List[PartyMember] = []
+
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(self.player.user_id)
+            if not sess or not sess.party_id:
+                return
+            party = _ACTIVE_PARTIES.get(sess.party_id)
+            if not party or party.leader_user_id != self.player.user_id or party.is_queuing:
+                return
+            for m in party.members:
+                if m.user_id == target_uid:
+                    kicked_member = m
+                    break
+            if not kicked_member:
+                return
+            party.members = [m for m in party.members if m.user_id != target_uid]
+            party.chat_history.append(
+                {
+                    "sender": "SYSTEM",
+                    "text": f"{kicked_member.username} was removed from the squad.",
+                    "is_system": True,
+                }
+            )
+            ksess = _ONLINE_USERS.get(target_uid)
+            if ksess:
+                ksess.party_id = None
+                ksess.status = "online"
+
+            detail = _serialize_party_state(party)
+            remaining_members = list(party.members)
+
+        if kicked_member and kicked_member.channel_name:
+            await self.channel_layer.send(
+                kicked_member.channel_name,
+                {
+                    "type": "social.event",
+                    "payload": {
+                        "event": "party_kicked",
+                        "title": "REMOVED FROM PARTY",
+                        "message": f"You were removed from the squad by {self.player.username}.",
+                    },
+                },
+            )
+        if detail:
+            for m in remaining_members:
+                if m.channel_name:
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {"event": "party_state", "party": detail},
+                        },
+                    )
+
+    async def _handle_promote_leader(self, msg: dict) -> None:
+        assert self.player is not None
+        target_uid = str(msg.get("target_user_id", "")).strip()
+        if not target_uid or target_uid == self.player.user_id:
+            return
+        detail = None
+        members = []
+        new_leader_name = ""
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(self.player.user_id)
+            if not sess or not sess.party_id:
+                return
+            party = _ACTIVE_PARTIES.get(sess.party_id)
+            if not party or party.leader_user_id != self.player.user_id:
+                return
+            target_m = next((m for m in party.members if m.user_id == target_uid), None)
+            if not target_m:
+                return
+            party.leader_user_id = target_uid
+            new_leader_name = target_m.username
+            party.chat_history.append(
+                {
+                    "sender": "SYSTEM",
+                    "text": f"{new_leader_name} is now the squad leader.",
+                    "is_system": True,
+                }
+            )
+            detail = _serialize_party_state(party)
+            members = list(party.members)
+
+        if detail:
+            for m in members:
+                if m.channel_name:
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {"event": "party_state", "party": detail},
+                        },
+                    )
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {
+                                "event": "notification",
+                                "kind": "info",
+                                "title": "NEW SQUAD LEADER",
+                                "message": f"{new_leader_name} is now the party leader.",
+                            },
+                        },
+                    )
+
+    async def _handle_party_chat(self, msg: dict) -> None:
+        assert self.player is not None
+        now = time.monotonic()
+        if now - self.last_chat_ts < 0.3:
+            return
+        self.last_chat_ts = now
+
+        raw = str(msg.get("text", "")).strip()
+        clean = "".join(ch for ch in raw if ch.isprintable())[:140]
+        if not clean:
+            return
+
+        detail = None
+        members = []
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(self.player.user_id)
+            if not sess or not sess.party_id:
+                return
+            party = _ACTIVE_PARTIES.get(sess.party_id)
+            if not party:
+                return
+            party.chat_history.append(
+                {
+                    "sender": self.player.username,
+                    "text": clean,
+                    "is_system": False,
+                }
+            )
+            if len(party.chat_history) > 50:
+                party.chat_history = party.chat_history[-50:]
+            detail = _serialize_party_state(party)
+            members = list(party.members)
+
+        if detail:
+            for m in members:
+                if m.channel_name:
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {"event": "party_state", "party": detail},
+                        },
+                    )
+
+    async def _remove_user_from_party(self, user_id: str, reason: str = "left") -> None:
+        leaver_channel = None
+        leaver_name = user_id
+        remaining_members: List[PartyMember] = []
+        updated_detail = None
+        canceled_queue_channels: List[str] = []
+
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(user_id)
+            party_id = sess.party_id if sess else None
+            if not party_id:
+                # جستجوی ایمن در صورت دیسکانکت
+                for pid, p in list(_ACTIVE_PARTIES.items()):
+                    if any(m.user_id == user_id for m in p.members):
+                        party_id = pid
+                        break
+            if not party_id:
+                return
+
+            party = _ACTIVE_PARTIES.get(party_id)
+            if not party:
+                if sess:
+                    sess.party_id = None
+                    sess.status = "online"
+                return
+
+            for m in party.members:
+                if m.user_id == user_id:
+                    leaver_channel = m.channel_name
+                    leaver_name = m.username
+                    break
+
+            was_queuing = party.is_queuing
+            party.members = [m for m in party.members if m.user_id != user_id]
+            if sess:
+                sess.party_id = None
+                sess.status = "online"
+
+            if was_queuing:
+                party.is_queuing = False
+                canceled_queue_channels = [m.channel_name for m in party.members if m.channel_name]
+                # پاک‌سازی صف مچ‌میکینگ برای اعضای پارتی
+                member_ids = {m.user_id for m in party.members} | {user_id}
+                async with _QUEUE_LOCK:
+                    _WAITING_QUEUE[:] = [
+                        q for q in _WAITING_QUEUE if q.user_id not in member_ids
+                    ]
+
+            if len(party.members) == 0:
+                _ACTIVE_PARTIES.pop(party_id, None)
+            else:
+                if party.leader_user_id == user_id:
+                    party.leader_user_id = party.members[0].user_id
+                    party.chat_history.append(
+                        {
+                            "sender": "SYSTEM",
+                            "text": f"{leaver_name} left. {party.members[0].username} is now leader.",
+                            "is_system": True,
+                        }
+                    )
+                else:
+                    party.chat_history.append(
+                        {
+                            "sender": "SYSTEM",
+                            "text": f"{leaver_name} left the squad.",
+                            "is_system": True,
+                        }
+                    )
+                for m in party.members:
+                    ms = _ONLINE_USERS.get(m.user_id)
+                    if ms:
+                        ms.status = "in_party"
+                updated_detail = _serialize_party_state(party)
+                remaining_members = list(party.members)
+
+        if reason == "left" and leaver_channel:
+            await self.channel_layer.send(
+                leaver_channel,
+                {
+                    "type": "social.event",
+                    "payload": {
+                        "event": "party_left",
+                        "message": "You left the party.",
+                    },
+                },
+            )
+            await self._broadcast_presence_to_friends(
+                online=True, status="online", in_party=False
+            )
+
+        for ch in canceled_queue_channels:
+            await self.channel_layer.send(
+                ch,
+                {
+                    "type": "social.event",
+                    "payload": {
+                        "event": "party_queue_canceled",
+                        "message": f"Matchmaking canceled because {leaver_name} left the squad.",
+                    },
+                },
+            )
+
+        if updated_detail:
+            for m in remaining_members:
+                if m.channel_name:
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {"event": "party_state", "party": updated_detail},
+                        },
+                    )
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {
+                                "event": "notification",
+                                "kind": "party_left",
+                                "title": "SQUAD MEMBER LEFT",
+                                "message": f"{leaver_name} left the party.",
+                            },
+                        },
+                    )
+
+    async def _handle_start_party_matchmaking(self) -> None:
+        assert self.player is not None
+        party_members_copy: List[PartyMember] = []
+        party_id_copy: Optional[str] = None
+        party_detail: Optional[dict] = None
+
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(self.player.user_id)
+            if not sess or not sess.party_id:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "NO ACTIVE PARTY",
+                        "message": "You are not currently in a party.",
+                    }
+                )
+                return
+            party = _ACTIVE_PARTIES.get(sess.party_id)
+            if not party:
+                return
+            if party.leader_user_id != self.player.user_id:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "LEADER ONLY",
+                        "message": "Only the party leader can start matchmaking.",
+                    }
+                )
+                return
+            if party.is_queuing:
+                return
+
+            not_ready = [m.username for m in party.members if len(party.members) > 1 and not m.is_ready]
+            if not_ready:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "SQUAD NOT READY",
+                        "message": f"Waiting for ready check: {', '.join(not_ready)}",
+                    }
+                )
+                return
+
+            party.is_queuing = True
+            party_id_copy = party.party_id
+            party_members_copy = list(party.members)
+            for m in party.members:
+                ms = _ONLINE_USERS.get(m.user_id)
+                if ms:
+                    ms.status = "in_queue"
+            party_detail = _serialize_party_state(party)
+
+        required = max(
+            len(party_members_copy),
+            int(getattr(settings, "MATCHMAKING_PLAYERS_PER_MATCH", 2)),
+        )
+
+        # اعلام ورود کل پارتی به صف مچ‌میکینگ
+        if party_detail:
+            for m in party_members_copy:
+                if m.channel_name:
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {"event": "party_state", "party": party_detail},
+                        },
+                    )
+
+        matched_batch: Optional[List[QueuedPlayerEntry]] = None
+        queue_snapshot: List[QueuedPlayerEntry] = []
+        party_uids = {m.user_id for m in party_members_copy}
+
+        async with _QUEUE_LOCK:
+            _WAITING_QUEUE[:] = [
+                q for q in _WAITING_QUEUE if q.user_id not in party_uids
+            ]
+            for m in party_members_copy:
+                _WAITING_QUEUE.append(
+                    QueuedPlayerEntry(
+                        user_id=m.user_id,
+                        username=m.username,
+                        mmr=m.mmr,
+                        channel_name=m.channel_name,
+                        player_pk=m.player_pk,
+                        client_ip=m.client_ip,
+                        party_group_id=party_id_copy or "",
+                    )
+                )
+
+            if len(_WAITING_QUEUE) >= required:
+                matched_batch = _WAITING_QUEUE[:required]
+                del _WAITING_QUEUE[:required]
+            else:
+                queue_snapshot = list(_WAITING_QUEUE)
+
+        if matched_batch is not None:
+            port = find_available_udp_port()
+            room_id = f"room-{secrets.randbelow(900) + 100}-{secrets.token_hex(2)}"
+            first_ip = matched_batch[0].client_ip if matched_batch else ""
+            server_host = resolve_game_server_host(first_ip)
+
+            # قرار دادن هر گروه پارتی در یک تیم واحد (هیچ‌گاه اعضای یک پارتی مقابل هم قرار نگیرند)
+            half_team = (required + 1) // 2
+            explicit_teams: Dict[str, int] = {}
+            groups: Dict[str, List[QueuedPlayerEntry]] = {}
+            for entry in matched_batch:
+                gkey = entry.party_group_id or f"solo:{entry.user_id}"
+                groups.setdefault(gkey, []).append(entry)
+            ordered_groups = sorted(groups.values(), key=lambda g: -len(g))
+            t1_count = 0
+            t2_count = 0
+            for grp in ordered_groups:
+                if t1_count + len(grp) <= half_team:
+                    chosen_team = 1
+                    t1_count += len(grp)
+                elif t2_count + len(grp) <= half_team:
+                    chosen_team = 2
+                    t2_count += len(grp)
+                elif t1_count <= t2_count:
+                    chosen_team = 1
+                    t1_count += len(grp)
+                else:
+                    chosen_team = 2
+                    t2_count += len(grp)
+                for entry in grp:
+                    explicit_teams[entry.user_id] = chosen_team
+
+            for entry in matched_batch:
+                await self.channel_layer.send(
+                    entry.channel_name,
+                    {
+                        "type": "social.event" if entry.user_id in party_uids else "queue.status",
+                        "payload": {
+                            "event": "starting_server",
+                            "room_id": room_id,
+                            "port": port,
+                            "players_in_queue": required,
+                            "required_players": required,
+                        },
+                    },
+                )
+
+            assignments = await _create_match_records_and_spawn(
+                matched_entries=matched_batch,
+                port=port,
+                room_id=room_id,
+                server_host=server_host,
+                player_count=required,
+                explicit_teams=explicit_teams,
+            )
+
+            server_ready = await wait_for_udp_server_ready(port, timeout_sec=30.0)
+            async with _SOCIAL_LOCK:
+                if party_id_copy and party_id_copy in _ACTIVE_PARTIES:
+                    _ACTIVE_PARTIES[party_id_copy].is_queuing = False
+                for m in party_members_copy:
+                    ms = _ONLINE_USERS.get(m.user_id)
+                    if ms:
+                        ms.status = "in_match" if server_ready else "in_party"
+
+            if not server_ready:
+                await _mark_room_finished(room_id)
+                for entry in matched_batch:
+                    await self.channel_layer.send(
+                        entry.channel_name,
+                        {
+                            "type": "social.event" if entry.user_id in party_uids else "queue.status",
+                            "payload": {
+                                "event": "error",
+                                "message": "Failed to launch game server; please try again.",
+                            },
+                        },
+                    )
+                return
+
+            for entry in matched_batch:
+                payload = assignments.get(entry.channel_name)
+                if not payload:
+                    continue
+                await self.channel_layer.send(
+                    entry.channel_name,
+                    {
+                        "type": "social.event" if entry.user_id in party_uids else "match.found",
+                        "payload": payload,
+                    },
+                )
+        else:
+            for item in queue_snapshot:
+                await self.channel_layer.send(
+                    item.channel_name,
+                    {
+                        "type": "social.event" if item.user_id in party_uids else "queue.status",
+                        "payload": {
+                            "event": "queued",
+                            "players_in_queue": len(queue_snapshot),
+                            "required_players": required,
+                        },
+                    },
+                )
+
+    async def _handle_cancel_party_matchmaking(self) -> None:
+        assert self.player is not None
+        members: List[PartyMember] = []
+        detail = None
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(self.player.user_id)
+            if not sess or not sess.party_id:
+                return
+            party = _ACTIVE_PARTIES.get(sess.party_id)
+            if not party:
+                return
+            party.is_queuing = False
+            members = list(party.members)
+            member_uids = {m.user_id for m in members}
+            for m in members:
+                ms = _ONLINE_USERS.get(m.user_id)
+                if ms:
+                    ms.status = "in_party"
+            detail = _serialize_party_state(party)
+
+        async with _QUEUE_LOCK:
+            _WAITING_QUEUE[:] = [
+                q for q in _WAITING_QUEUE if q.user_id not in member_uids
+            ]
+
+        for m in members:
+            if m.channel_name:
+                if detail:
+                    await self.channel_layer.send(
+                        m.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {"event": "party_state", "party": detail},
+                        },
+                    )
+                await self.channel_layer.send(
+                    m.channel_name,
+                    {
+                        "type": "social.event",
+                        "payload": {
+                            "event": "party_queue_canceled",
+                            "message": f"Matchmaking canceled by {self.player.username}.",
+                        },
+                    },
+                )
+
+    async def social_event(self, event: dict) -> None:
+        await self.send_json(event["payload"])
+
+    async def queue_status(self, event: dict) -> None:
+        await self.send_json(event["payload"])
+
+    async def match_found(self, event: dict) -> None:
         await self.send_json(event["payload"])

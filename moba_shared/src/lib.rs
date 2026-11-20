@@ -2424,6 +2424,14 @@ pub enum ShotAudioSource {
     Creep,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeroKillRewardEntry {
+    pub player_name: String,
+    pub is_killer: bool,
+    pub gold: u32,
+    pub xp: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum GameplayFxEvent {
     LightningStrike {
@@ -2473,6 +2481,13 @@ pub enum GameplayFxEvent {
     LastHitGold {
         pos: Vec3,
         gold: u32,
+    },
+    HeroKillFeed {
+        killer_name: String,
+        killer_team: TeamId,
+        victim_name: String,
+        victim_team: TeamId,
+        rewards: Vec<HeroKillRewardEntry>,
     },
     CreepDenied {
         pos: Vec3,
@@ -7510,6 +7525,18 @@ impl AuthoritativeWorldState {
             })
             .collect();
 
+        let pre_swap_dawn_kills: u32 = self
+            .players
+            .iter()
+            .filter(|p| p.hero_team == TeamId::Dawn)
+            .map(|p| p.kills)
+            .sum();
+        let pre_swap_dusk_kills: u32 = self
+            .players
+            .iter()
+            .filter(|p| p.hero_team == TeamId::Dusk)
+            .map(|p| p.kills)
+            .sum();
         self.swap_slot_in(slot_index);
         let mut snap = self.build_snapshot(config, items_cfg);
         snap.scoreboard_heroes = scoreboard_heroes;
@@ -7642,8 +7669,8 @@ impl AuthoritativeWorldState {
                 is_visible: true,
             });
         }
-        snap.dawn_total_kills = self.players.iter().filter(|p| p.hero_team == TeamId::Dawn).map(|p| p.kills).sum();
-        snap.dusk_total_kills = self.players.iter().filter(|p| p.hero_team == TeamId::Dusk).map(|p| p.kills).sum();
+        snap.dawn_total_kills = pre_swap_dawn_kills;
+        snap.dusk_total_kills = pre_swap_dusk_kills;
         snap.other_players = others;
         snap.top_bar_heroes = top_bar;
         let max_vis = config.chat.max_visible_messages;
@@ -8249,6 +8276,87 @@ pub fn grant_xp_to_player_slot(
             break;
         }
     }
+}
+
+fn award_hero_kill_rewards(
+    world: &mut AuthoritativeWorldState,
+    victim_idx: usize,
+    killer_slot_opt: Option<usize>,
+    config: &GameConfig,
+) {
+    let victim_name = world.players[victim_idx].hero_display_name.clone();
+    let victim_team = world.players[victim_idx].hero_team;
+    let victim_pos = world.players[victim_idx].soldier_pos;
+    let kill_gold: u32 = 225;
+    let kill_xp: u32 = 150;
+    let assist_gold: u32 = 75;
+    let assist_xp: u32 = 75;
+
+    let mut rewards: Vec<HeroKillRewardEntry> = Vec::new();
+    let mut killer_name = if victim_team == TeamId::Dawn {
+        "Dusk".to_string()
+    } else {
+        "Dawn".to_string()
+    };
+    let mut killer_team = if victim_team == TeamId::Dawn {
+        TeamId::Dusk
+    } else {
+        TeamId::Dawn
+    };
+
+    if let Some(k_slot) = killer_slot_opt {
+        if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == k_slot) {
+            attacker.kills += 1;
+            attacker.hero_gold += kill_gold;
+            killer_name = attacker.hero_display_name.clone();
+            killer_team = attacker.hero_team;
+            grant_xp_to_player_slot(attacker, kill_xp, config, &mut world.pending_fx);
+            rewards.push(HeroKillRewardEntry {
+                player_name: attacker.hero_display_name.clone(),
+                is_killer: true,
+                gold: kill_gold,
+                xp: kill_xp,
+            });
+        }
+        world.pending_fx.push(GameplayFxEvent::LastHitGold {
+            pos: victim_pos,
+            gold: kill_gold,
+        });
+
+        // اعطای Assist و سهم XP/Gold به هم‌تیمی‌های نزدیک قاتل
+        let assist_radius = config.active_hero(0).xp_gain_radius.max(18.0);
+        let mut assister_indices: Vec<usize> = Vec::new();
+        for (idx, p) in world.players.iter().enumerate() {
+            if p.slot_index != k_slot
+                && p.hero_team == killer_team
+                && !p.is_dead
+                && p.soldier_pos.distance(victim_pos) <= assist_radius
+            {
+                assister_indices.push(idx);
+            }
+        }
+        for idx in assister_indices {
+            let p = &mut world.players[idx];
+            p.assists += 1;
+            p.hero_gold += assist_gold;
+            let pname = p.hero_display_name.clone();
+            grant_xp_to_player_slot(p, assist_xp, config, &mut world.pending_fx);
+            rewards.push(HeroKillRewardEntry {
+                player_name: pname,
+                is_killer: false,
+                gold: assist_gold,
+                xp: assist_xp,
+            });
+        }
+    }
+
+    world.pending_fx.push(GameplayFxEvent::HeroKillFeed {
+        killer_name,
+        killer_team,
+        victim_name,
+        victim_team,
+        rewards,
+    });
 }
 
 fn trigger_random_death(world: &mut AuthoritativeWorldState, config: &GameConfig) {
@@ -10699,13 +10807,7 @@ fn apply_aoe_explosion(
                 trigger_random_death(world, config);
                 world.swap_slot_in(p_idx);
 
-                if let Some(o_slot) = owner_slot {
-                    if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == o_slot) {
-                        attacker.kills += 1;
-                        attacker.hero_gold += 225;
-                        grant_xp_to_player_slot(attacker, 150, config, &mut world.pending_fx);
-                    }
-                }
+                award_hero_kill_rewards(world, p_idx, owner_slot, config);
             }
         }
     }
@@ -11129,14 +11231,7 @@ fn shared_authoritative_react_system(
                 trigger_random_death(&mut world, &config);
                 world.swap_slot_in(enemy_idx);
 
-                if let Some(owner_slot) = bullet.owner_slot {
-                    let world_inner = &mut *world;
-                    if let Some(attacker) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
-                        attacker.kills += 1;
-                        attacker.hero_gold += 225;
-                        grant_xp_to_player_slot(attacker, 150, &config, &mut world_inner.pending_fx);
-                    }
-                }
+                award_hero_kill_rewards(&mut world, enemy_idx, bullet.owner_slot, &config);
             }
 
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
@@ -12010,12 +12105,7 @@ fn shared_authoritative_react_system(
                 world.swap_slot_in(enemy_idx);
                 trigger_random_death(&mut world, &config);
                 world.swap_slot_in(enemy_idx);
-                let w_inner = &mut *world;
-                if let Some(attacker) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
-                    attacker.kills += 1;
-                    attacker.hero_gold += 225;
-                    grant_xp_to_player_slot(attacker, 150, &config, &mut w_inner.pending_fx);
-                }
+                award_hero_kill_rewards(&mut world, enemy_idx, Some(owner_slot), &config);
             }
         } else if let Some(cour_idx) = hit_courier {
             hit_any_target = true;
@@ -12227,14 +12317,7 @@ fn shared_authoritative_react_system(
                     world.swap_slot_in(p_idx);
                     trigger_random_death(&mut world, &config);
                     world.swap_slot_in(p_idx);
-                    if let Some(o_slot) = pool.owner_slot {
-                        let w_inner = &mut *world;
-                        if let Some(attacker) = w_inner.players.iter_mut().find(|p| p.slot_index == o_slot) {
-                            attacker.kills += 1;
-                            attacker.hero_gold += 225;
-                            grant_xp_to_player_slot(attacker, 150, &config, &mut w_inner.pending_fx);
-                        }
-                    }
+                    award_hero_kill_rewards(&mut world, p_idx, pool.owner_slot, &config);
                 }
             }
         }

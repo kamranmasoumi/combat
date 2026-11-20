@@ -2298,7 +2298,7 @@ fn shop_scroll_system(
 fn clear_children(commands: &mut Commands, children_opt: Option<&Children>) {
     if let Some(children) = children_opt {
         for c in children.iter() {
-            commands.entity(c).despawn();
+            safe_despawn(&mut *commands, c);
         }
     }
 }
@@ -6101,4 +6101,13 @@ fn update_shop_notice_toast_system(
             n.display = Display::None;
         }
     }
+}
+
+#[inline]
+fn safe_despawn(commands: &mut Commands, entity: Entity) {
+    commands.queue(move |world: &mut World| {
+        if let Ok(em) = world.get_entity_mut(entity) {
+            em.despawn();
+        }
+    });
 }

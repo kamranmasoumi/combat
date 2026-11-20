@@ -37,7 +37,7 @@ use moba_shared::{
     RemotePlayerSnapshot, ServerLobbyPacket, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar,
     WeaponKind, CHANNEL_RELIABLE_LOBBY,
     BulletVfxSource, FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
-    GameplayFxEvent, ItemsConfig, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
+    GameplayFxEvent, HeroKillRewardEntry, ItemsConfig, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ScoreboardHeroInfo, ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
     CHANNEL_UNRELIABLE_STATE,
 };
@@ -218,6 +218,7 @@ fn main() {
     };
 
     App::new()
+        .set_error_handler(bevy::ecs::error::warn)
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: config.window.title.clone(),
@@ -268,6 +269,7 @@ fn main() {
         .insert_resource(InspectedUnit::default())
         .insert_resource(HeroClickMoveTarget::default())
         .insert_resource(LatestTopBarState::default())
+        .insert_resource(LatestHeroKillFeed::default())
         .insert_resource(WeatherLightningFlashState::default())
         .insert_resource(LatestScoreboard::default())
         .insert_resource(LatestTurrets::default())
@@ -413,6 +415,14 @@ fn main() {
                 sync_shop_context_and_network_system,
             )
                 .after(sync_remote_players_system)
+                .run_if(in_state(AppScreenState::InGame)),
+        )
+        .add_systems(
+            Update,
+            (
+                update_hero_kill_feed_system,
+                minimap_remote_heroes_system,
+            )
                 .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
@@ -2687,6 +2697,7 @@ fn setup_scene(
     spawn_minimap_ui(&mut commands, &config, minimap_handle, fog_handle);
     spawn_hero_hud_ui(&mut commands);
     spawn_top_match_hud_ui(&mut commands);
+    spawn_hero_kill_feed_ui(&mut commands);
     spawn_scoreboard_ui(&mut commands, &config);
     spawn_death_screen_overlay(&mut commands);
     spawn_end_of_match_overlay(&mut commands);
@@ -3024,7 +3035,7 @@ fn sync_toxic_pools_visual_system(
     for (ent, mut b, mut tf) in &mut bubble_q {
         b.timer.tick(time.delta());
         if b.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
             continue;
         }
         tf.translation += b.vel * dt;
@@ -3034,7 +3045,7 @@ fn sync_toxic_pools_visual_system(
 
     if !match_flow.is_in_game() {
         for (ent, _, _) in &pool_q {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
         return;
     }
@@ -3077,7 +3088,7 @@ fn sync_toxic_pools_visual_system(
                 ));
             }
         } else {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -3124,12 +3135,12 @@ fn sync_electric_beams_visual_system(
     if !match_flow.is_in_game() {
         for (ent, beam_vis, _) in &beam_q {
             if let Some(le) = beam_vis.muzzle_light {
-                commands.entity(le).despawn();
+                safe_despawn(&mut commands, le);
             }
             if let Some(ie) = beam_vis.impact_light {
-                commands.entity(ie).despawn();
+                safe_despawn(&mut commands, ie);
             }
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
         return;
     }
@@ -3264,12 +3275,12 @@ fn sync_electric_beams_visual_system(
             *vis = Visibility::Visible;
         } else {
             if let Some(le) = beam_vis.muzzle_light {
-                commands.entity(le).despawn();
+                safe_despawn(&mut commands, le);
             }
             if let Some(ie) = beam_vis.impact_light {
-                commands.entity(ie).despawn();
+                safe_despawn(&mut commands, ie);
             }
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -3432,7 +3443,7 @@ fn environment_vfx_and_water_animation_system(
         let s = ripple.start_scale.lerp(ripple.end_scale, frac);
         tf.scale = Vec3::new(s, (1.0 - frac).max(0.05), s);
         if ripple.timer.is_finished() {
-            commands.entity(entity).despawn();
+            safe_despawn(&mut commands, entity);
         }
     }
 
@@ -3585,10 +3596,10 @@ fn load_gltf_and_build_graph(
     }
 
     for ent in &old_soldier_q {
-        commands.entity(ent).despawn();
+        safe_despawn(&mut commands, ent);
     }
     for ent in &old_upper_q {
-        commands.entity(ent).despawn();
+        safe_despawn(&mut commands, ent);
     }
     weapon_status.attached = false;
     weapon_status.hand_entity = None;
@@ -3787,7 +3798,7 @@ fn attach_weapon_to_left_hand(
 
     for (w_ent, attached_kind) in &existing_weapon_q {
         if attached_kind.0 != hero_state.0.weapon_kind || status.attached_right_hand != want_right_hand {
-            commands.entity(w_ent).despawn();
+            safe_despawn(&mut commands, w_ent);
             status.attached = false;
         }
     }
@@ -4530,7 +4541,7 @@ fn client_receive_snapshot_and_sync_system(
                 *b_vis = Visibility::Visible;
                 seen_bullets.insert(vis.server_id);
             } else {
-                commands.entity(entity).despawn();
+                safe_despawn(&mut commands, entity);
             }
         }
 
@@ -4587,7 +4598,7 @@ fn client_receive_snapshot_and_sync_system(
                 vel.angular = g_snap.angular_velocity;
                 seen_grenades.insert(vis.server_id);
             } else {
-                commands.entity(entity).despawn();
+                safe_despawn(&mut commands, entity);
             }
         }
 
@@ -4643,6 +4654,27 @@ fn client_receive_snapshot_and_sync_system(
 
     let fx_live_muzzle = hud_sync.muzzle_query.single().ok().map(|gtf| gtf.translation());
     for fx in all_fx_events {
+        if let GameplayFxEvent::HeroKillFeed {
+            killer_name,
+            killer_team,
+            victim_name,
+            victim_team,
+            rewards,
+        } = fx
+        {
+            hud_sync.kill_feed.0.push(HeroKillFeedItem {
+                killer_name,
+                killer_team,
+                victim_name,
+                victim_team,
+                rewards,
+                timer: 8.5,
+            });
+            if hud_sync.kill_feed.0.len() > 4 {
+                hud_sync.kill_feed.0.remove(0);
+            }
+            continue;
+        }
         spawn_fx_from_server_event(
             &mut commands,
             &config,
@@ -4905,6 +4937,7 @@ fn spawn_fx_from_server_event(
                 ));
             }
         }
+        GameplayFxEvent::HeroKillFeed { .. } => {}
         GameplayFxEvent::LastHitGold { pos, gold } => {
             audio_q.0.push(ClientAudioEvent::LastHitGold);
             let coin_mat = shared_fx.coin_mat.clone();
@@ -5687,13 +5720,13 @@ fn gameplay_fx_system(
         let s = sp.start_scale.lerp(sp.end_scale, frac) * (1.0 - (frac - 0.70).max(0.0) * 3.0).max(0.05);
         tf.scale = Vec3::splat(s);
         if sp.timer.is_finished() {
-            commands.entity(entity).despawn();
+            safe_despawn(&mut commands, entity);
         }
     }
     for (entity, mut flash) in &mut flash_query {
         flash.timer.tick(time.delta());
         if flash.timer.is_finished() {
-            commands.entity(entity).despawn();
+            safe_despawn(&mut commands, entity);
         }
     }
 
@@ -6536,7 +6569,7 @@ fn minimap_overlay_update_system(
     let mut existing_dots = HashSet::new();
     for (ent, dot, mut node, mut bg) in &mut creep_dot_query {
         let Some(&cs) = alive_creeps.get(&dot.creep_id) else {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
             continue;
         };
         existing_dots.insert(cs.id);
@@ -6595,7 +6628,7 @@ fn minimap_overlay_update_system(
     let mut existing_cour_dots = HashSet::new();
     for (ent, cdot, mut node, mut bg) in &mut courier_dot_query {
         let Some(&cs) = alive_couriers.get(&cdot.owner_slot) else {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
             continue;
         };
         existing_cour_dots.insert(cdot.owner_slot);
@@ -6644,6 +6677,80 @@ fn minimap_overlay_update_system(
     }
 }
 
+
+fn minimap_remote_heroes_system(
+    mut commands: Commands,
+    config: Res<GameConfig>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    remote_players: Res<LatestRemotePlayers>,
+    match_flow: Res<ClientMatchFlow>,
+    minimap_root_q: Query<Entity, With<MinimapRoot>>,
+    mut hero_dot_query: Query<(Entity, &MinimapRemoteHeroDot, &mut Node, &mut BackgroundColor)>,
+) {
+    if !match_flow.is_in_game() {
+        for (ent, _, _, _) in &hero_dot_query {
+            safe_despawn(&mut commands, ent);
+        }
+        return;
+    }
+
+    let my_team = hero_hud.0.team;
+    let visible_remotes: HashMap<usize, &RemotePlayerSnapshot> = remote_players
+        .0
+        .iter()
+        .filter(|rp| !rp.is_dead && (rp.team == my_team || rp.is_visible))
+        .map(|rp| (rp.slot_index, rp))
+        .collect();
+
+    let mut existing = HashSet::new();
+    for (ent, dot, mut node, mut bg) in &mut hero_dot_query {
+        let Some(&rp) = visible_remotes.get(&dot.slot_index) else {
+            safe_despawn(&mut commands, ent);
+            continue;
+        };
+        existing.insert(rp.slot_index);
+        let uv = world_to_minimap_uv(&config, rp.pos.x, rp.pos.z);
+        node.left = px(uv.x * MINIMAP_WIDTH_PX - 4.5);
+        node.top = px(uv.y * MINIMAP_HEIGHT_PX - 4.5);
+        bg.0 = if rp.team == my_team {
+            Color::srgb(0.18, 0.96, 0.42)
+        } else {
+            Color::srgb(0.98, 0.22, 0.22)
+        };
+    }
+
+    if let Ok(root_ent) = minimap_root_q.single() {
+        for (&slot_index, &rp) in &visible_remotes {
+            if existing.contains(&slot_index) {
+                continue;
+            }
+            let uv = world_to_minimap_uv(&config, rp.pos.x, rp.pos.z);
+            let col = if rp.team == my_team {
+                Color::srgb(0.18, 0.96, 0.42)
+            } else {
+                Color::srgb(0.98, 0.22, 0.22)
+            };
+            commands.entity(root_ent).with_children(|p| {
+                p.spawn((
+                    MinimapRemoteHeroDot { slot_index },
+                    Pickable::IGNORE,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(uv.x * MINIMAP_WIDTH_PX - 4.5),
+                        top: px(uv.y * MINIMAP_HEIGHT_PX - 4.5),
+                        width: px(9.0),
+                        height: px(9.0),
+                        border: UiRect::all(px(1.5)),
+                        border_radius: BorderRadius::MAX,
+                        ..default()
+                    },
+                    BorderColor::all(Color::BLACK),
+                    BackgroundColor(col),
+                ));
+            });
+        }
+    }
+}
 
 fn bake_minimap_image(config: &GameConfig) -> Image {
     let w = MINIMAP_TEX_W as usize;
@@ -7654,7 +7761,7 @@ fn waterfall_mist_particle_system(
         tf.rotate_local_x(std::f32::consts::FRAC_PI_2);
         tf.scale = Vec3::splat(s);
         if p.timer.is_finished() {
-            commands.entity(entity).despawn();
+            safe_despawn(&mut commands, entity);
         }
     }
 }
@@ -8585,7 +8692,7 @@ fn level_up_vfx_system(
             tf.scale = Vec3::new(s, 1.0 + frac * 0.4, s);
         }
         if vfx.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 }
@@ -8945,6 +9052,7 @@ struct SnapshotHudSyncParams<'w, 's> {
     ancients: ResMut<'w, LatestAncients>,
     active_teleports: ResMut<'w, LatestActiveTeleports>,
     match_result: ResMut<'w, LatestMatchResult>,
+    kill_feed: ResMut<'w, LatestHeroKillFeed>,
     chat_state: ResMut<'w, ChatUiState>,
     ping_state: ResMut<'w, ClientPingState>,
     minimap_root_q: Query<'w, 's, Entity, With<MinimapRoot>>,
@@ -9483,14 +9591,14 @@ fn hero_preview_system(
 
     if phase != MatchPhase::HeroSelect {
         for (ent, _, _) in &preview_query {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
         match_flow.spawned_preview_hero_index = None;
     }
 
     if phase != MatchPhase::BattleLoading {
         for (ent, _) in &battle_query {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
         *spawned_battle_sig = None;
     }
@@ -9505,7 +9613,7 @@ fn hero_preview_system(
         let hero = config.active_hero(match_flow.preview_hero_index);
         if match_flow.spawned_preview_hero_index != Some(match_flow.preview_hero_index) {
             for (ent, _, _) in &preview_query {
-                commands.entity(ent).despawn();
+                safe_despawn(&mut commands, ent);
             }
             let gltf_scene = sc.asset_server.load(format!("{}#Scene0", hero.model_path));
             commands.spawn((
@@ -9589,7 +9697,7 @@ fn hero_preview_system(
 
         if spawned_battle_sig.as_deref() != Some(sig.as_str()) {
             for (ent, _) in &battle_query {
-                commands.entity(ent).despawn();
+                safe_despawn(&mut commands, ent);
             }
             let dawn_list: Vec<_> = snap.players.iter().filter(|p| p.team == TeamId::Dawn).collect();
             let dusk_list: Vec<_> = snap.players.iter().filter(|p| p.team == TeamId::Dusk).collect();
@@ -9791,7 +9899,7 @@ struct MatchOverlayUiQueries<'w, 's> {
 fn despawn_children_of(commands: &mut Commands, parent: Entity, children_q: &Query<&Children>) {
     if let Ok(children) = children_q.get(parent) {
         for child in children.iter() {
-            commands.entity(child).despawn();
+            safe_despawn(&mut *commands, child);
         }
     }
 }
@@ -10601,7 +10709,7 @@ fn sync_remote_players_system(
     // Server Authority: اگر مختصات بازیکن دشمن در Snapshot نباشد (در مه جنگ است)، مدل آن را حذف کن
     for (root_ent, vis_comp, _, _) in &existing_query {
         if !res.remote_players.0.iter().any(|rp| rp.slot_index == vis_comp.slot_index) {
-            commands.entity(root_ent).despawn();
+            safe_despawn(&mut commands, root_ent);
         }
     }
 
@@ -11117,7 +11225,7 @@ fn update_overhead_hero_bars_system(
                 continue;
             }
             Some((ent, cur_total, cur_gtotal)) if cur_total != tgt.ammo_total.max(1) || cur_gtotal != tgt.grenade_total.max(1) => {
-                commands.entity(ent).despawn();
+                safe_despawn(&mut commands, ent);
                 spawn_overhead_bar(&mut commands, tgt.key_id, tgt.ammo_total, tgt.grenade_total);
                 continue;
             }
@@ -11319,7 +11427,7 @@ fn sync_lane_creeps_system(
 
     for (root_ent, mut vis_comp, mut tf, mut vis) in &mut existing_query {
         let Some(&cs) = creep_map.get(&vis_comp.creep_id) else {
-            commands.entity(root_ent).despawn();
+            safe_despawn(&mut commands, root_ent);
             continue;
         };
         seen_ids.insert(cs.id);
@@ -11544,7 +11652,7 @@ fn update_overhead_creep_bars_system(
 
     for (ent, root, mut node) in &mut bar_root_q {
         let Some(&cs) = creep_map.get(&root.creep_id) else {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
             continue;
         };
         existing_bars.insert(root.creep_id, ent);
@@ -11673,6 +11781,22 @@ struct TopDawnPortraitsRow;
 
 #[derive(Component)]
 struct TopDuskPortraitsRow;
+
+#[derive(Clone)]
+struct HeroKillFeedItem {
+    killer_name: String,
+    killer_team: TeamId,
+    victim_name: String,
+    victim_team: TeamId,
+    rewards: Vec<HeroKillRewardEntry>,
+    timer: f32,
+}
+
+#[derive(Resource, Default)]
+struct LatestHeroKillFeed(Vec<HeroKillFeedItem>);
+
+#[derive(Component)]
+struct HeroKillFeedRoot;
 
 #[derive(Resource, Default)]
 struct TopBarPopulatedSignature(Vec<(usize, String, bool)>);
@@ -12328,7 +12452,7 @@ fn update_top_match_hud_system(
     if let Ok((dawn_ent, children_opt)) = dawn_row_q.single() {
         if let Some(children) = children_opt {
             for child in children.iter() {
-                commands.entity(child).despawn();
+                safe_despawn(&mut commands, child);
             }
         }
         commands.entity(dawn_ent).with_children(|parent| {
@@ -12341,7 +12465,7 @@ fn update_top_match_hud_system(
     if let Ok((dusk_ent, children_opt)) = dusk_row_q.single() {
         if let Some(children) = children_opt {
             for child in children.iter() {
-                commands.entity(child).despawn();
+                safe_despawn(&mut commands, child);
             }
         }
         commands.entity(dusk_ent).with_children(|parent| {
@@ -12356,6 +12480,155 @@ fn update_top_match_hud_system(
 // -----------------------------------------------------------------------------
 // سیستم پاپ‌آپ سکه گلد / علامت تعجب دیناید + افکت صفحه سیاه‌وسفید هنگام مرگ
 // -----------------------------------------------------------------------------
+
+fn spawn_hero_kill_feed_ui(commands: &mut Commands) {
+    commands.spawn((
+        HeroKillFeedRoot,
+        Pickable::IGNORE,
+        GlobalZIndex(185),
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(16.0),
+            bottom: px(275.0),
+            width: px(390.0),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::FlexStart,
+            row_gap: px(6.0),
+            display: Display::None,
+            ..default()
+        },
+    ));
+}
+
+fn kill_feed_team_color(team: TeamId) -> Color {
+    match team {
+        TeamId::Dawn => Color::srgb(0.24, 0.94, 0.66),
+        TeamId::Dusk => Color::srgb(0.98, 0.40, 0.38),
+        TeamId::Neutral => Color::srgb(0.86, 0.86, 0.90),
+    }
+}
+
+fn update_hero_kill_feed_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    match_flow: Res<ClientMatchFlow>,
+    mut feed: ResMut<LatestHeroKillFeed>,
+    mut root_q: Query<(Entity, &mut Node, Option<&Children>), With<HeroKillFeedRoot>>,
+    mut last_sig: Local<Vec<(String, String, usize)>>,
+) {
+    let Ok((root_ent, mut root_node, children_opt)) = root_q.single_mut() else {
+        return;
+    };
+    if !match_flow.is_in_game() {
+        if !feed.0.is_empty() {
+            feed.0.clear();
+        }
+        root_node.display = Display::None;
+        return;
+    }
+
+    let dt = time.delta_secs();
+    for item in &mut feed.0 {
+        item.timer = (item.timer - dt).max(0.0);
+    }
+    feed.0.retain(|item| item.timer > 0.0);
+
+    if feed.0.is_empty() {
+        if !last_sig.is_empty() {
+            last_sig.clear();
+            if let Some(ch) = children_opt {
+                for c in ch.iter() {
+                    safe_despawn(&mut commands, c);
+                }
+            }
+        }
+        root_node.display = Display::None;
+        return;
+    }
+    root_node.display = Display::Flex;
+
+    let new_sig: Vec<(String, String, usize)> = feed
+        .0
+        .iter()
+        .map(|it| (it.killer_name.clone(), it.victim_name.clone(), it.rewards.len()))
+        .collect();
+    if *last_sig == new_sig {
+        return;
+    }
+    *last_sig = new_sig;
+
+    if let Some(ch) = children_opt {
+        for c in ch.iter() {
+            safe_despawn(&mut commands, c);
+        }
+    }
+
+    commands.entity(root_ent).with_children(|parent| {
+        for item in &feed.0 {
+            let k_col = kill_feed_team_color(item.killer_team);
+            let v_col = kill_feed_team_color(item.victim_team);
+            parent
+                .spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: percent(100),
+                        padding: UiRect::axes(px(10.0), px(6.0)),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(3.0),
+                        border: UiRect::left(px(3.5)),
+                        border_radius: BorderRadius::all(px(5.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.03, 0.06, 0.09, 0.88)),
+                    BorderColor::all(k_col),
+                ))
+                .with_children(|card| {
+                    card.spawn((
+                        Pickable::IGNORE,
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: px(6.0),
+                            ..default()
+                        },
+                    ))
+                    .with_children(|row| {
+                        row.spawn((
+                            Text::new(item.killer_name.clone()),
+                            TextFont { font_size: FontSize::Px(12.5), ..default() },
+                            TextColor(k_col),
+                        ));
+                        row.spawn((
+                            Text::new("KILLED"),
+                            TextFont { font_size: FontSize::Px(10.5), ..default() },
+                            TextColor(Color::srgb(0.86, 0.88, 0.92)),
+                        ));
+                        row.spawn((
+                            Text::new(item.victim_name.clone()),
+                            TextFont { font_size: FontSize::Px(12.5), ..default() },
+                            TextColor(v_col),
+                        ));
+                    });
+
+                    if !item.rewards.is_empty() {
+                        let summary: Vec<String> = item
+                            .rewards
+                            .iter()
+                            .map(|r| {
+                                let role = if r.is_killer { "KILL" } else { "AST" };
+                                format!("{}: +{}G +{}XP ({})", r.player_name, r.gold, r.xp, role)
+                            })
+                            .collect();
+                        card.spawn((
+                            Text::new(summary.join("  |  ")),
+                            TextFont { font_size: FontSize::Px(10.5), ..default() },
+                            TextColor(Color::srgb(0.98, 0.84, 0.36)),
+                        ));
+                    }
+                });
+        }
+    });
+}
 
 #[derive(Component)]
 struct FloatingWorldPopup {
@@ -12430,7 +12703,7 @@ fn floating_world_popup_system(
     for (ent, mut popup, mut node, mut vis) in &mut popup_q {
         popup.timer.tick(time.delta());
         if popup.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
             continue;
         }
         let frac = popup.timer.fraction();
@@ -12636,7 +12909,7 @@ fn sync_turrets_system(
         // ۱. حذف کامل تاور نابودشده از صحنه بازی
         if ts.is_dead {
             root_comp.is_dead = true;
-            commands.entity(root_ent).despawn();
+            safe_despawn(&mut commands, root_ent);
             continue;
         }
 
@@ -12998,7 +13271,7 @@ fn sync_barracks_system(
         };
         if bs.is_dead {
             root_comp.is_dead = true;
-            commands.entity(root_ent).despawn();
+            safe_despawn(&mut commands, root_ent);
             continue;
         }
 
@@ -13272,7 +13545,7 @@ fn sync_ancients_system(
         };
         if asnap.is_dead {
             root_comp.is_dead = true;
-            commands.entity(root_ent).despawn();
+            safe_despawn(&mut commands, root_ent);
             continue;
         }
 
@@ -13807,7 +14080,7 @@ fn update_chat_ui_system(
     if let Ok((col_ent, children_opt)) = msg_col_q.single() {
         if let Some(children) = children_opt {
             for child in children.iter() {
-                commands.entity(child).despawn();
+                safe_despawn(&mut commands, child);
             }
         }
         commands.entity(col_ent).with_children(|col| {
@@ -14177,7 +14450,7 @@ fn update_ping_visuals_system(
         let s = ring.base_radius * (0.25 + pulse * 0.95);
         tf.scale = Vec3::new(s, (1.0 - frac).max(0.15), s);
         if ring.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -14187,7 +14460,7 @@ fn update_ping_visuals_system(
         tf.translation = beam.base_pos + Vec3::Y * (beam.beam_height * 0.5);
         tf.scale = Vec3::new(rem, 1.0, rem);
         if beam.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -14195,7 +14468,7 @@ fn update_ping_visuals_system(
     for (ent, mut badge, mut node, mut vis) in &mut badge_q {
         badge.timer.tick(dt);
         if badge.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
             continue;
         }
         if let Some((camera, cam_gtf)) = cam_opt {
@@ -14213,7 +14486,7 @@ fn update_ping_visuals_system(
     for (ent, mut dot, mut node) in &mut mini_q {
         dot.timer.tick(dt);
         if dot.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
             continue;
         }
         let pulse = (t * pulse_spd).sin() * 0.5 + 0.5;
@@ -15010,7 +15283,7 @@ fn sync_shop_context_and_network_system(
             true,
         ),
         InspectedUnit::Creep(_) | InspectedUnit::Turret(_) | InspectedUnit::Barracks(_) | InspectedUnit::Ancient(_) => {
-            (Some(Vec::new()), true)
+            (None, false)
         }
     };
     if ctx.in_game != in_game
@@ -15112,7 +15385,7 @@ fn sync_couriers_system(
         for (ent, vis_comp, mut tf, mut vis) in &mut existing_q {
             if vis_comp.owner_slot == c.owner_slot {
                 if vis_comp.model_path != c.model_path {
-                    commands.entity(ent).despawn();
+                    safe_despawn(&mut commands, ent);
                     continue;
                 }
                 found = true;
@@ -15163,7 +15436,7 @@ fn sync_couriers_system(
 
     for (ent, vis_comp, _, _) in &existing_q {
         if !seen.contains(&vis_comp.owner_slot) {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 }
@@ -15260,9 +15533,14 @@ fn update_overhead_courier_bars_system(
 
     for (ent, bar, _) in &bar_q {
         if !active_slots.contains(&bar.owner_slot) {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
+}
+
+#[derive(Component)]
+struct MinimapRemoteHeroDot {
+    slot_index: usize,
 }
 
 #[derive(Component)]
@@ -15356,7 +15634,7 @@ fn animate_move_click_arrows_system(
         arrow.elapsed += dt;
         let p = (arrow.elapsed / arrow.duration).clamp(0.0, 1.0);
         if p >= 1.0 {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
             continue;
         }
         let dist = 1.15 * (1.0 - p);
@@ -16461,7 +16739,7 @@ fn update_scoreboard_ui_system(
     if let Ok((cont_ent, ch_opt)) = p.container_q.single() {
         if let Some(ch) = ch_opt {
             for child in ch.iter() {
-                commands.entity(child).despawn();
+                safe_despawn(&mut commands, child);
             }
         }
         commands.entity(cont_ent).with_children(|parent| {
@@ -16800,10 +17078,10 @@ fn teleport_preview_and_input_system(
 ) {
     if !teleport_preview.active {
         for (ent, _, _) in &p.preview_ring_q {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
         for (ent, _, _) in &p.minimap_dot_q {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
         teleport_preview.valid_dest = None;
         teleport_preview.cursor_world_pos = None;
@@ -17019,10 +17297,10 @@ fn sync_active_teleports_visual_system(
 ) {
     if !v.match_flow.is_in_game() {
         for (ent, _, _) in &v.portal_q {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
         for (ent, _, _) in &v.illusion_q {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
         return;
     }
@@ -17042,12 +17320,12 @@ fn sync_active_teleports_visual_system(
 
     for (ent, pv, _) in &v.portal_q {
         if !v.latest_teleports.0.iter().any(|tp| tp.slot_index == pv.slot_index) {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
     for (ent, iv, _) in &v.illusion_q {
         if !v.latest_teleports.0.iter().any(|tp| tp.slot_index == iv.slot_index) {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -17309,4 +17587,13 @@ fn sync_invisibility_visual_system(
             .is_some_and(|rp| rp.is_invisible);
         apply_or_restore(&mut commands, rem_ent, is_invis);
     }
+}
+
+#[inline]
+fn safe_despawn(commands: &mut Commands, entity: Entity) {
+    commands.queue(move |world: &mut World| {
+        if let Ok(em) = world.get_entity_mut(entity) {
+            em.despawn();
+        }
+    });
 }

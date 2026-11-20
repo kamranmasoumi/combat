@@ -2286,7 +2286,7 @@ fn update_vfx_lifetimes_system(
     for (ent, mut os) in &mut q.one_shot_q {
         os.timer.tick(dt);
         if os.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -2295,7 +2295,7 @@ fn update_vfx_lifetimes_system(
         let rem = (1.0 - fade.timer.fraction()).clamp(0.0, 1.0);
         light.intensity = fade.initial_intensity * rem * rem;
         if fade.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -2310,7 +2310,7 @@ fn update_vfx_lifetimes_system(
             if pool.free_trail_mats.len() < MAX_POOLED_TRAIL_MATS {
                 pool.free_trail_mats.push(tr.mat_handle.clone());
             }
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -2324,7 +2324,7 @@ fn update_vfx_lifetimes_system(
             if pool.free_flash_mats.len() < MAX_POOLED_FLASH_MATS {
                 pool.free_flash_mats.push(fl.mat_handle.clone());
             }
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -2341,7 +2341,7 @@ fn update_vfx_lifetimes_system(
             if pool.free_ring_mats.len() < MAX_POOLED_RING_MATS {
                 pool.free_ring_mats.push(ring.mat_handle.clone());
             }
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -2355,7 +2355,7 @@ fn update_vfx_lifetimes_system(
             mat.uniforms.params.x = frac;
         }
         if fb.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -2370,7 +2370,7 @@ fn update_vfx_lifetimes_system(
             mat.uniforms.params.x = frac;
         }
         if we.timer.is_finished() {
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 
@@ -2384,7 +2384,7 @@ fn update_vfx_lifetimes_system(
             if pool.free_blood_mats.len() < MAX_POOLED_BLOOD_MATS {
                 pool.free_blood_mats.push(dec.mat_handle.clone());
             }
-            commands.entity(ent).despawn();
+            safe_despawn(&mut commands, ent);
         }
     }
 }
@@ -2837,9 +2837,9 @@ fn update_weather_vfx_system(
         } else {
             rm.fade = (rm.fade - fade_rate).max(0.0);
             if rm.fade <= 0.001 {
-                commands.entity(ent).despawn();
+                safe_despawn(&mut commands, ent);
                 for ge in &rain_ground_q {
-                    commands.entity(ge).despawn();
+                    safe_despawn(&mut commands, ge);
                 }
                 continue;
             }
@@ -2876,7 +2876,7 @@ fn update_weather_vfx_system(
         } else {
             sm.fade = (sm.fade - fade_rate).max(0.0);
             if sm.fade <= 0.001 {
-                commands.entity(ent).despawn();
+                safe_despawn(&mut commands, ent);
                 continue;
             }
         }
@@ -2885,4 +2885,13 @@ fn update_weather_vfx_system(
             mat.uniforms.shape.z = sm.fade;
         }
     }
+}
+
+#[inline]
+fn safe_despawn(commands: &mut Commands, entity: Entity) {
+    commands.queue(move |world: &mut World| {
+        if let Ok(em) = world.get_entity_mut(entity) {
+            em.despawn();
+        }
+    });
 }

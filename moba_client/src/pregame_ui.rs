@@ -42,6 +42,14 @@ pub enum PreGameTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFilter {
+    All,
+    Ranked,
+    Party,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     Login,
     Register,
@@ -133,6 +141,7 @@ pub struct PreGameSessionState {
     // Match History state
     pub history: Option<MatchHistoryResponse>,
     pub selected_history_idx: usize,
+    pub history_filter: HistoryFilter,
     pub confirm_modal: Option<ConfirmAction>,
     pub ui_dirty: bool,
 }
@@ -198,6 +207,7 @@ impl Default for PreGameSessionState {
             selected_lobby_id: None,
             history: None,
             selected_history_idx: 0,
+            history_filter: HistoryFilter::All,
             confirm_modal: None,
             ui_dirty: true,
         }
@@ -306,6 +316,7 @@ enum PreGameBtnAction {
     StartLobbyMatch,
     LeaveLobby,
     SelectHistoryMatch(usize),
+    SetHistoryFilter(HistoryFilter),
     RequestLogoutConfirm,
     RequestQuitConfirm,
     ConfirmModalAccept,
@@ -601,7 +612,7 @@ fn on_exit_pregame(
     showcase.idle_graph = None;
     showcase.idle_node = None;
     for ent in &query {
-        commands.entity(ent).despawn();
+        safe_despawn(&mut commands, ent);
     }
     for (ent, mut vis, saved) in &mut hidden_huds {
         *vis = saved.0;
@@ -656,7 +667,7 @@ fn sync_menu_party_soldiers_system(
     }
 
     for (ent, _, _) in &existing_q {
-        commands.entity(ent).despawn();
+        safe_despawn(&mut commands, ent);
     }
 
     if target_count > 0 {
@@ -2089,6 +2100,11 @@ fn handle_pregame_buttons_system(
             state.selected_history_idx = idx;
             state.ui_dirty = true;
         }
+        PreGameBtnAction::SetHistoryFilter(f) => {
+            state.history_filter = f;
+            state.selected_history_idx = 0;
+            state.ui_dirty = true;
+        }
         PreGameBtnAction::RequestLogoutConfirm => {
             state.confirm_modal = Some(ConfirmAction::Logout);
             state.ui_dirty = true;
@@ -2203,7 +2219,7 @@ fn rebuild_pregame_ui_system(
     };
     if let Some(ch_list) = children {
         for ch in ch_list.iter() {
-            commands.entity(ch).despawn();
+            safe_despawn(&mut commands, ch);
         }
     }
 
@@ -2237,7 +2253,7 @@ fn rebuild_pregame_ui_system(
             PreGameTab::FindingMatch => spawn_finding_match_screen(parent, &state, &config),
             PreGameTab::LobbyBrowser => spawn_lobby_browser_screen(parent, &state),
             PreGameTab::LobbyRoom => spawn_lobby_room_screen(parent, &state),
-            PreGameTab::MatchHistory => spawn_history_screen(parent, &state),
+            PreGameTab::MatchHistory => spawn_history_screen(parent, &state, &config),
         }
 
         if state.create_lobby_modal_open || state.edit_lobby_settings_open {
@@ -5637,151 +5653,572 @@ fn spawn_team_slots_panel(
         });
 }
 
-fn spawn_history_screen(parent: &mut ChildSpawnerCommands, state: &PreGameSessionState) {
-    let gold = Color::srgb(0.98, 0.80, 0.26);
-    let emerald = Color::srgb(0.16, 0.86, 0.58);
-    let crimson = Color::srgb(0.95, 0.28, 0.30);
-
-    if state.is_loading {
-        spawn_conceptual_loader(parent, &state.loading_label, gold);
-        return;
+fn resolve_hero_display_name(config: &GameConfig, hero_id: i32) -> String {
+    if hero_id > 0 {
+        if let Some(h) = config.heroes.get((hero_id - 1) as usize) {
+            return h.display_name.to_uppercase();
+        }
     }
+    if let Some(h) = config.heroes.first() {
+        return h.display_name.to_uppercase();
+    }
+    "SOLDIER".to_string()
+}
+
+fn spawn_history_screen(
+    parent: &mut ChildSpawnerCommands,
+    state: &PreGameSessionState,
+    config: &GameConfig,
+) {
+    let gold = Color::srgb(0.98, 0.82, 0.30);
+    let emerald = Color::srgb(0.28, 0.96, 0.60);
+    let crimson = Color::srgb(0.96, 0.38, 0.38);
 
     let Some(ref hist) = state.history else {
+        parent
+            .spawn(Node {
+                width: Val::Percent(100.0),
+                flex_grow: 1.0,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            })
+            .with_children(|c| {
+                spawn_conceptual_loader(c, "LOADING MATCH HISTORY", Color::srgb(0.32, 0.94, 0.84));
+            });
         return;
     };
 
+    let s = &hist.summary;
+    let filtered_matches: Vec<&crate::backend_client::MatchHistoryEntry> = hist
+        .matches
+        .iter()
+        .filter(|m| match state.history_filter {
+            HistoryFilter::All => true,
+            HistoryFilter::Ranked => !m.is_custom_lobby,
+            HistoryFilter::Party => m.is_party_match,
+            HistoryFilter::Custom => m.is_custom_lobby,
+        })
+        .collect();
+
+    let sel_idx = if filtered_matches.is_empty() {
+        0
+    } else {
+        state.selected_history_idx.min(filtered_matches.len() - 1)
+    };
+    let selected_match = filtered_matches.get(sel_idx).copied();
+
     parent
         .spawn(Node {
-            width: Val::Percent(94.0),
-            max_width: Val::Px(1140.0),
+            width: Val::Percent(100.0),
+            flex_grow: 1.0,
+            padding: UiRect::axes(Val::Px(22.0), Val::Px(14.0)),
             flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(14.0),
+            row_gap: Val::Px(12.0),
             ..default()
         })
         .with_children(|wrap| {
-            // نوار خلاصه آمار کلی
-            wrap.spawn(Node {
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(12.0),
-                ..default()
-            })
-            .with_children(|sum| {
-                spawn_mini_stat_chip(sum, "WIN RATE", &format!("{:.1}%", hist.summary.win_rate_percent), emerald);
-                spawn_mini_stat_chip(sum, "AVG KDA", &format!("{:.2}", hist.summary.avg_kda), gold);
-                spawn_mini_stat_chip(sum, "MATCHES", &hist.summary.total_matches.to_string(), Color::srgb(0.32, 0.72, 0.98));
-                spawn_mini_stat_chip(sum, "ABANDONS", &hist.summary.abandoned_count.to_string(), crimson);
-            });
+            // =================================================================
+            // ۱. نوار بالای CAREER SUMMARY (مشابه تصویر مرجع)
+            // =================================================================
+            wrap.spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    padding: UiRect::axes(Val::Px(18.0), Val::Px(10.0)),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(5.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.025, 0.088, 0.102, 0.92)),
+                BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.65)),
+            ))
+            .with_children(|hdr| {
+                hdr.spawn((
+                    Text::new("CAREER SUMMARY"),
+                    TextFont { font_size: FontSize::Px(20.0), ..default() },
+                    TextColor(Color::WHITE),
+                ));
 
-            // لیست نبردها + جدول جزئیات نبرد انتخابی
-            wrap.spawn(Node {
-                width: Val::Percent(100.0),
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(16.0),
-                ..default()
-            })
-            .with_children(|cols| {
-                cols.spawn(Node {
-                    width: Val::Px(460.0),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(8.0),
+                // شاخص‌های کلیدی
+                hdr.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(28.0),
+                    align_items: AlignItems::Center,
                     ..default()
                 })
-                .with_children(|list| {
-                    for (idx, m) in hist.matches.iter().take(8).enumerate() {
-                        let out_col = match m.outcome.as_str() {
-                            "win" => emerald,
-                            "loss" => crimson,
-                            "abandoned" => gold,
-                            _ => Color::srgb(0.55, 0.65, 0.78),
-                        };
-                        let selected = idx == state.selected_history_idx;
-                        list.spawn((
-                            UiButton,
-            Hovered::default(),
-                            Node {
-                                width: Val::Percent(100.0),
-                                padding: UiRect::axes(Val::Px(14.0), Val::Px(10.0)),
-                                justify_content: JustifyContent::SpaceBetween,
-                                align_items: AlignItems::Center,
-                                border: UiRect::all(Val::Px(if selected { 2.0 } else { 1.0 })),
-                                border_radius: BorderRadius::all(Val::Px(10.0)),
+                .with_children(|metrics| {
+                    let avg_kda_str = format!(
+                        "{:.1} KDA ({}/{}/{})",
+                        s.avg_kda, s.total_kills, s.total_deaths, s.total_assists
+                    );
+                    for (lbl, val, col) in [
+                        ("TOTAL MATCHES", format!("{}", s.total_matches), Color::WHITE),
+                        ("WIN RATE", format!("{:.1}%", s.win_rate_percent), emerald),
+                        ("AVG K/D/A", avg_kda_str, Color::srgb(0.86, 0.96, 0.95)),
+                        ("MMR / RANK", format!("{} ({})", s.mmr, s.rank_tier), gold),
+                    ] {
+                        metrics
+                            .spawn(Node {
+                                flex_direction: FlexDirection::Column,
                                 ..default()
-                            },
-                            BackgroundColor(Color::srgba(0.06, 0.09, 0.15, 0.95)),
-                            BorderColor::all(if selected { gold } else { out_col.with_alpha(0.55) }),
-                            PreGameBtnAction::SelectHistoryMatch(idx),
-                        ))
-                        .with_children(|row| {
-                            row.spawn((
-                                Text::new(format!("{}  -  {}/{}/{}", m.outcome.to_uppercase(), m.kills, m.deaths, m.assists)),
-                                TextFont { font_size: FontSize::Px(14.0), ..default() },
-                                TextColor(out_col),
-                            ));
-                            row.spawn((
-                                Text::new(format!("{:+} MMR", m.mmr_delta)),
-                                TextFont { font_size: FontSize::Px(13.0), ..default() },
-                                TextColor(Color::WHITE),
-                            ));
-                        });
+                            })
+                            .with_children(|mcol| {
+                                mcol.spawn((
+                                    Text::new(lbl),
+                                    TextFont { font_size: FontSize::Px(10.0), ..default() },
+                                    TextColor(Color::srgb(0.60, 0.78, 0.76)),
+                                ));
+                                mcol.spawn((
+                                    Text::new(val),
+                                    TextFont { font_size: FontSize::Px(15.0), ..default() },
+                                    TextColor(col),
+                                ));
+                            });
                     }
                 });
 
-                // جدول بازیکنان نبرد انتخابی
-                if let Some(sel) = hist.matches.get(state.selected_history_idx) {
-                    cols.spawn((
+                // فیلتر نوع بازی‌ها
+                hdr.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|filters| {
+                    for (fl, fl_lbl) in [
+                        (HistoryFilter::All, "ALL"),
+                        (HistoryFilter::Ranked, "RANKED"),
+                        (HistoryFilter::Party, "PARTY"),
+                        (HistoryFilter::Custom, "CUSTOM"),
+                    ] {
+                        let active = state.history_filter == fl;
+                        spawn_sized_button(
+                            filters,
+                            fl_lbl,
+                            PreGameBtnAction::SetHistoryFilter(fl),
+                            if active {
+                                Color::srgb(0.09, 0.40, 0.36)
+                            } else {
+                                Color::srgba(0.04, 0.12, 0.14, 0.90)
+                            },
+                            if active {
+                                Color::srgb(0.32, 0.96, 0.84)
+                            } else {
+                                Color::srgba(0.24, 0.50, 0.52, 0.60)
+                            },
+                            74.0,
+                            30.0,
+                        );
+                    }
+                });
+            });
+
+            // =================================================================
+            // ۲. بخش دو ستونه: چپ MATCH LOG | راست MATCH DETAILS + BACK TO MENU
+            // =================================================================
+            wrap.spawn(Node {
+                width: Val::Percent(100.0),
+                flex_grow: 1.0,
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(14.0),
+                ..default()
+            })
+            .with_children(|cols| {
+                // ستون چپ: جدول MATCH LOG
+                cols.spawn((
+                    Node {
+                        width: Val::Percent(62.0),
+                        height: Val::Percent(100.0),
+                        padding: UiRect::all(Val::Px(10.0)),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(6.0),
+                        border: UiRect::all(Val::Px(1.5)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.02, 0.070, 0.084, 0.88)),
+                    BorderColor::all(Color::srgba(0.24, 0.62, 0.60, 0.55)),
+                ))
+                .with_children(|log| {
+                    // هدر ستون‌ها
+                    log.spawn((
                         Node {
-                            flex_grow: 1.0,
-                            padding: UiRect::all(Val::Px(16.0)),
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(8.0),
-                            border: UiRect::all(Val::Px(1.5)),
-                            border_radius: BorderRadius::all(Val::Px(14.0)),
+                            width: Val::Percent(100.0),
+                            padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            border: UiRect::bottom(Val::Px(1.0)),
                             ..default()
                         },
-                        BackgroundColor(Color::srgba(0.035, 0.105, 0.115, 0.90)),
-                        BorderColor::all(gold.with_alpha(0.5)),
+                        BorderColor::all(Color::srgba(0.28, 0.68, 0.66, 0.45)),
                     ))
-                    .with_children(|sb| {
-                        sb.spawn((
-                            Text::new(format!("SCOREBOARD  -  {}  -  {}s", sel.played_at, sel.duration_sec)),
-                            TextFont { font_size: FontSize::Px(14.5), ..default() },
-                            TextColor(gold),
-                        ));
-                        for rp in &sel.players {
-                            let t_col = if rp.team_id == 1 { emerald } else { crimson };
-                            sb.spawn((
-                                Node {
-                                    width: Val::Percent(100.0),
-                                    padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-                                    justify_content: JustifyContent::SpaceBetween,
-                                    border_radius: BorderRadius::all(Val::Px(6.0)),
-                                    ..default()
-                                },
-                                BackgroundColor(if rp.is_me { t_col.with_alpha(0.18) } else { Color::srgba(0.08, 0.11, 0.17, 0.7) }),
-                            ))
-                            .with_children(|r| {
-                                r.spawn((
-                                    Text::new(format!("{} (Lv.{})", rp.username, rp.level)),
-                                    TextFont { font_size: FontSize::Px(13.5), ..default() },
-                                    TextColor(t_col),
-                                ));
-                                r.spawn((
-                                    Text::new(format!("{}/{}/{}  -  LH {}  -  {}g", rp.kills, rp.deaths, rp.assists, rp.last_hits, rp.gold_coins)),
-                                    TextFont { font_size: FontSize::Px(13.0), ..default() },
-                                    TextColor(Color::WHITE),
-                                ));
-                            });
+                    .with_children(|th| {
+                        for (lbl, pct) in [
+                            ("MATCH LOG", 18.0),
+                            ("HERO & MODE", 34.0),
+                            ("K / D / A", 16.0),
+                            ("DURATION", 14.0),
+                            ("PLAYED AT", 18.0),
+                        ] {
+                            th.spawn(Node { width: Val::Percent(pct), ..default() })
+                                .with_children(|c| {
+                                    c.spawn((
+                                        Text::new(lbl),
+                                        TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                        TextColor(Color::srgb(0.62, 0.82, 0.80)),
+                                    ));
+                                });
                         }
                     });
-                }
+
+                    if filtered_matches.is_empty() {
+                        log.spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_grow: 1.0,
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        })
+                        .with_children(|e| {
+                            e.spawn((
+                                Text::new("No matches recorded in this category yet."),
+                                TextFont { font_size: FontSize::Px(14.0), ..default() },
+                                TextColor(Color::srgb(0.66, 0.80, 0.80)),
+                            ));
+                        });
+                    } else {
+                        for (idx, m) in filtered_matches.iter().enumerate().take(8) {
+                            let is_sel = idx == sel_idx;
+                            let (outcome_lbl, accent) = match m.outcome.as_str() {
+                                "win" => ("VICTORY", emerald),
+                                "loss" => ("DEFEAT", crimson),
+                                "abandoned" => ("ABANDON", Color::srgb(0.98, 0.74, 0.24)),
+                                "running" => ("LIVE", Color::srgb(0.36, 0.88, 0.98)),
+                                _ => ("CANCELED", Color::srgb(0.60, 0.66, 0.68)),
+                            };
+                            let hero_name = resolve_hero_display_name(config, m.hero_id);
+                            let mode_sub = if m.is_custom_lobby {
+                                "CUSTOM LOBBY".to_string()
+                            } else if m.is_party_match {
+                                format!("PARTY RANKED ({:+} MMR)", m.mmr_delta)
+                            } else {
+                                format!("SOLO RANKED ({:+} MMR)", m.mmr_delta)
+                            };
+                            let dur_str = format!("{:02}:{:02}", m.duration_sec / 60, m.duration_sec % 60);
+
+                            log.spawn((
+                                UiButton,
+                                Hovered::default(),
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    height: Val::Px(54.0),
+                                    padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                                    flex_direction: FlexDirection::Row,
+                                    align_items: AlignItems::Center,
+                                    border: UiRect {
+                                        left: Val::Px(4.5),
+                                        right: Val::Px(if is_sel { 1.5 } else { 1.0 }),
+                                        top: Val::Px(if is_sel { 1.5 } else { 1.0 }),
+                                        bottom: Val::Px(if is_sel { 1.5 } else { 1.0 }),
+                                    },
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(if is_sel {
+                                    Color::srgba(0.16, 0.14, 0.05, 0.92)
+                                } else {
+                                    Color::srgba(0.035, 0.11, 0.13, 0.88)
+                                }),
+                                BorderColor::all(if is_sel { gold } else { accent.with_alpha(0.70) }),
+                                PreGameBtnAction::SelectHistoryMatch(idx),
+                            ))
+                            .with_children(|row| {
+                                // OUTCOME
+                                row.spawn(Node { width: Val::Percent(18.0), ..default() })
+                                    .with_children(|c| {
+                                        c.spawn((
+                                            Text::new(outcome_lbl),
+                                            TextFont { font_size: FontSize::Px(13.5), ..default() },
+                                            TextColor(accent),
+                                        ));
+                                    });
+                                // HERO & MODE
+                                row.spawn(Node {
+                                    width: Val::Percent(34.0),
+                                    flex_direction: FlexDirection::Column,
+                                    ..default()
+                                })
+                                .with_children(|c| {
+                                    c.spawn((
+                                        Text::new(hero_name),
+                                        TextFont { font_size: FontSize::Px(14.0), ..default() },
+                                        TextColor(Color::WHITE),
+                                    ));
+                                    c.spawn((
+                                        Text::new(mode_sub),
+                                        TextFont { font_size: FontSize::Px(10.0), ..default() },
+                                        TextColor(Color::srgb(0.68, 0.82, 0.80)),
+                                    ));
+                                });
+                                // K/D/A
+                                row.spawn(Node { width: Val::Percent(16.0), ..default() })
+                                    .with_children(|c| {
+                                        c.spawn((
+                                            Text::new(format!("{} / {} / {}", m.kills, m.deaths, m.assists)),
+                                            TextFont { font_size: FontSize::Px(13.5), ..default() },
+                                            TextColor(Color::srgb(0.95, 0.98, 0.97)),
+                                        ));
+                                    });
+                                // DURATION
+                                row.spawn(Node { width: Val::Percent(14.0), ..default() })
+                                    .with_children(|c| {
+                                        c.spawn((
+                                            Text::new(dur_str),
+                                            TextFont { font_size: FontSize::Px(13.0), ..default() },
+                                            TextColor(Color::srgb(0.84, 0.92, 0.92)),
+                                        ));
+                                    });
+                                // PLAYED AT
+                                row.spawn(Node { width: Val::Percent(18.0), ..default() })
+                                    .with_children(|c| {
+                                        c.spawn((
+                                            Text::new(m.played_at.clone()),
+                                            TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                            TextColor(if is_sel { gold } else { Color::srgb(0.72, 0.82, 0.82) }),
+                                        ));
+                                    });
+                            });
+                        }
+                    }
+                });
+
+                // ستون راست: MATCH DETAILS + BACK TO MENU
+                cols.spawn(Node {
+                    width: Val::Percent(38.0),
+                    height: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::SpaceBetween,
+                    row_gap: Val::Px(12.0),
+                    ..default()
+                })
+                .with_children(|right_col| {
+                    right_col
+                        .spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                flex_grow: 1.0,
+                                padding: UiRect::all(Val::Px(16.0)),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(12.0),
+                                border: UiRect::all(Val::Px(1.5)),
+                                border_radius: BorderRadius::all(Val::Px(6.0)),
+                                overflow: Overflow::clip(),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.025, 0.082, 0.098, 0.92)),
+                            BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.65)),
+                        ))
+                        .with_children(|det| {
+                            det.spawn((
+                                Text::new("MATCH DETAILS"),
+                                TextFont { font_size: FontSize::Px(17.0), ..default() },
+                                TextColor(Color::WHITE),
+                            ));
+
+                            if let Some(m) = selected_match {
+                                let (o_lbl, o_col) = match m.outcome.as_str() {
+                                    "win" => ("VICTORY", emerald),
+                                    "loss" => ("DEFEAT", crimson),
+                                    "abandoned" => ("ABANDONED", Color::srgb(0.98, 0.74, 0.24)),
+                                    _ => ("MATCH", Color::srgb(0.38, 0.88, 0.98)),
+                                };
+                                let dur_str = format!("{:02}:{:02}", m.duration_sec / 60, m.duration_sec % 60);
+                                let tag = if m.is_custom_lobby {
+                                    "CUSTOM"
+                                } else if m.is_party_match {
+                                    "PARTY"
+                                } else {
+                                    "SOLO"
+                                };
+                                det.spawn((
+                                    Text::new(format!("{}  |  ANCIENT RIVER TEMPLE  |  {}  [{}]", o_lbl, dur_str, tag)),
+                                    TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                    TextColor(o_col),
+                                ));
+
+                                // شبکه ۲×۲ آمار کلیدی نبرد انتخاب‌شده
+                                let mmr_str = if m.is_custom_lobby {
+                                    "0 (CUSTOM)".to_string()
+                                } else {
+                                    format!("{:+} MMR", m.mmr_delta)
+                                };
+                                let mmr_col = if m.mmr_delta > 0 {
+                                    emerald
+                                } else if m.mmr_delta < 0 {
+                                    crimson
+                                } else {
+                                    Color::srgb(0.75, 0.84, 0.84)
+                                };
+                                det.spawn(Node {
+                                    width: Val::Percent(100.0),
+                                    flex_direction: FlexDirection::Row,
+                                    flex_wrap: FlexWrap::Wrap,
+                                    row_gap: Val::Px(8.0),
+                                    column_gap: Val::Px(8.0),
+                                    ..default()
+                                })
+                                .with_children(|grid| {
+                                    for (k, v, c) in [
+                                        ("GOLD EARNED", format!("{}", m.gold_coins), gold),
+                                        ("LAST HITS / DENIES", format!("{} / {}", m.last_hits, m.denies), Color::WHITE),
+                                        ("HERO LEVEL", format!("LVL {}", m.level), Color::srgb(0.40, 0.90, 0.98)),
+                                        ("MMR CHANGE", mmr_str, mmr_col),
+                                    ] {
+                                        grid.spawn((
+                                            Node {
+                                                width: Val::Percent(47.5),
+                                                padding: UiRect::axes(Val::Px(10.0), Val::Px(7.0)),
+                                                flex_direction: FlexDirection::Column,
+                                                border: UiRect::all(Val::Px(1.0)),
+                                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                                ..default()
+                                            },
+                                            BackgroundColor(Color::srgba(0.04, 0.13, 0.15, 0.90)),
+                                            BorderColor::all(Color::srgba(0.24, 0.56, 0.56, 0.45)),
+                                        ))
+                                        .with_children(|cell| {
+                                            cell.spawn((
+                                                Text::new(k),
+                                                TextFont { font_size: FontSize::Px(9.5), ..default() },
+                                                TextColor(Color::srgb(0.62, 0.80, 0.78)),
+                                            ));
+                                            cell.spawn((
+                                                Text::new(v),
+                                                TextFont { font_size: FontSize::Px(16.0), ..default() },
+                                                TextColor(c),
+                                            ));
+                                        });
+                                    }
+                                });
+
+                                // خلاصه دو تیم (TEAM ALPHA vs TEAM OMEGA) و بازیکنان همراه با بج پارتی
+                                let t1_kills: i32 = m.players.iter().filter(|p| p.team_id == 1).map(|p| p.kills).sum();
+                                let t2_kills: i32 = m.players.iter().filter(|p| p.team_id == 2).map(|p| p.kills).sum();
+                                det.spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        border: UiRect::bottom(Val::Px(1.0)),
+                                        ..default()
+                                    },
+                                    BorderColor::all(Color::srgba(0.28, 0.68, 0.66, 0.45)),
+                                ))
+                                .with_children(|vs| {
+                                    vs.spawn((
+                                        Text::new(format!("TEAM ALPHA ({})", t1_kills)),
+                                        TextFont { font_size: FontSize::Px(12.0), ..default() },
+                                        TextColor(emerald),
+                                    ));
+                                    vs.spawn((
+                                        Text::new("VS"),
+                                        TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                        TextColor(gold),
+                                    ));
+                                    vs.spawn((
+                                        Text::new(format!("TEAM OMEGA ({})", t2_kills)),
+                                        TextFont { font_size: FontSize::Px(12.0), ..default() },
+                                        TextColor(Color::srgb(0.98, 0.64, 0.28)),
+                                    ));
+                                });
+
+                                // لیست بازیکنان حاضر در مسابقه و نمایش هم‌پارتی‌ها
+                                let mut party_tags: std::collections::HashMap<String, usize> =
+                                    std::collections::HashMap::new();
+                                for p in &m.players {
+                                    if !p.party_group_id.is_empty() && !party_tags.contains_key(&p.party_group_id) {
+                                        let next_id = party_tags.len() + 1;
+                                        party_tags.insert(p.party_group_id.clone(), next_id);
+                                    }
+                                }
+
+                                for p in m.players.iter().take(10) {
+                                    let t_col = if p.team_id == 1 {
+                                        emerald
+                                    } else {
+                                        Color::srgb(0.98, 0.64, 0.28)
+                                    };
+                                    let p_tag = if !p.party_group_id.is_empty() {
+                                        format!(" [P{}]", party_tags.get(&p.party_group_id).copied().unwrap_or(1))
+                                    } else {
+                                        String::new()
+                                    };
+                                    let h_lbl = resolve_hero_display_name(config, p.hero_id);
+                                    det.spawn((
+                                        Node {
+                                            width: Val::Percent(100.0),
+                                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                                            flex_direction: FlexDirection::Row,
+                                            justify_content: JustifyContent::SpaceBetween,
+                                            align_items: AlignItems::Center,
+                                            border_radius: BorderRadius::all(Val::Px(3.0)),
+                                            ..default()
+                                        },
+                                        BackgroundColor(if p.is_me {
+                                            Color::srgba(0.08, 0.24, 0.24, 0.92)
+                                        } else {
+                                            Color::srgba(0.035, 0.10, 0.12, 0.80)
+                                        }),
+                                    ))
+                                    .with_children(|prow| {
+                                        prow.spawn((
+                                            Text::new(format!("{}{} ({})", p.username, p_tag, h_lbl)),
+                                            TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                            TextColor(if p.is_me { gold } else { t_col }),
+                                        ));
+                                        prow.spawn((
+                                            Text::new(format!("{}/{}/{}  |  {}G", p.kills, p.deaths, p.assists, p.gold_coins)),
+                                            TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                            TextColor(Color::srgb(0.88, 0.94, 0.94)),
+                                        ));
+                                    });
+                                }
+                            } else {
+                                det.spawn((
+                                    Text::new("Select a match from the log to inspect details."),
+                                    TextFont { font_size: FontSize::Px(13.0), ..default() },
+                                    TextColor(Color::srgb(0.68, 0.80, 0.80)),
+                                ));
+                            }
+                        });
+
+                    // دکمه BACK TO MENU در پایین راست
+                    right_col
+                        .spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::FlexEnd,
+                            ..default()
+                        })
+                        .with_children(|b| {
+                            spawn_sized_button(
+                                b,
+                                "BACK TO MENU",
+                                PreGameBtnAction::SwitchTab(PreGameTab::Hub),
+                                Color::srgba(0.05, 0.16, 0.18, 0.94),
+                                Color::srgb(0.30, 0.86, 0.78),
+                                210.0,
+                                52.0,
+                            );
+                        });
+                });
             });
         });
 }
-
-// =============================================================================
-// ویجت‌های کمکی
-// =============================================================================
 
 fn spawn_conceptual_loader(parent: &mut ChildSpawnerCommands, label: &str, color: Color) {
     parent
@@ -5955,4 +6392,13 @@ fn rank_tier_color(tier: &str) -> Color {
     } else {
         Color::srgb(0.78, 0.52, 0.32)
     }
+}
+
+#[inline]
+fn safe_despawn(commands: &mut Commands, entity: Entity) {
+    commands.queue(move |world: &mut World| {
+        if let Ok(em) = world.get_entity_mut(entity) {
+            em.despawn();
+        }
+    });
 }

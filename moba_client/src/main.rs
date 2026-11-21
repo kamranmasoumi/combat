@@ -2629,6 +2629,25 @@ fn setup_scene(
         spawn_map_object_label(&mut commands, config.map.show_object_labels, target_ent, &t.id, size.y * 0.5 + 0.8);
     }
 
+    // ۱۴-ب. برچسب موقعیت کمپ‌های جنگل (برای طراحی دقیق مپ هنگام فعال بودن show_object_labels)
+    if config.map.show_object_labels {
+        for camp in &config.neutral_camps.camps {
+            let camp_ent = commands
+                .spawn((
+                    Transform::from_xyz(camp.center.0, camp.center.1, camp.center.2),
+                    GlobalTransform::default(),
+                ))
+                .id();
+            spawn_map_object_label(
+                &mut commands,
+                config.map.show_object_labels,
+                camp_ent,
+                &camp.id,
+                1.8,
+            );
+        }
+    }
+
     // ۱۵. ذرات معلق جادویی و شب‌تاب‌های درخشان بالای برکه‌ها و جنگل (Ambient VFX Motes)
     let firefly_mesh = meshes.add(Sphere::new(0.09));
     let cyan_mote_mat = materials.add(StandardMaterial {

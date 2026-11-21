@@ -1108,6 +1108,31 @@ impl GameConfig {
         }
         for item in &self.map.lanes {
             check_id(&item.id, "map.lanes");
+            assert!(
+                item.waypoints.len() >= 3,
+                "خطای بحرانی در config.ron: لاین '{}' باید حداقل ۳ waypoint داشته باشد تا ورودی پایگاه Dawn و Dusk متمایز باشند",
+                item.id
+            );
+            for (side_name, stair) in [
+                ("dawn_entrance_stair", &item.dawn_entrance_stair),
+                ("dusk_entrance_stair", &item.dusk_entrance_stair),
+            ] {
+                assert!(
+                    !stair.model_path.trim().is_empty(),
+                    "خطای بحرانی در config.ron: فیلد model_path برای {}.{} خالی است",
+                    item.id,
+                    side_name
+                );
+                let s = stair.model_transform.scale;
+                assert!(
+                    s.0.is_finite() && s.1.is_finite() && s.2.is_finite()
+                        && s.0 > 0.0 && s.1 > 0.0 && s.2 > 0.0,
+                    "خطای بحرانی در config.ron: مقدار scale برای {}.{} نامعتبر است: {:?}",
+                    item.id,
+                    side_name,
+                    s
+                );
+            }
         }
         for item in &self.obstacles {
             check_id(&item.id, "obstacles");
@@ -2287,6 +2312,13 @@ pub struct TreeDef {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LaneEntranceStairDef {
+    pub model_path: String,
+    pub model_transform: ModelTransformConfig,
+    pub occlusion_fade_enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LanePathDef {
     pub id: String,
     pub lane: LaneId,
@@ -2296,6 +2328,8 @@ pub struct LanePathDef {
     pub roughness: f32,
     pub waypoints: Vec<(f32, f32, f32)>,
     pub occlusion_fade_enabled: bool,
+    pub dawn_entrance_stair: LaneEntranceStairDef,
+    pub dusk_entrance_stair: LaneEntranceStairDef,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3824,6 +3858,12 @@ pub enum CustomCollider {
     Cylinder { half_height: f32, radius: f32 },
     Ball { radius: f32 },
     CapsuleY { half_segment: f32, radius: f32 },
+    /// منشور مثلثی توپر (گوه / پله توپر با سطح زیرین پر)
+    Wedge {
+        half_width: f32,
+        half_height: f32,
+        half_length: f32,
+    },
 }
 
 impl CustomCollider {
@@ -3856,6 +3896,15 @@ impl CustomCollider {
     }
 
     #[inline]
+    pub fn wedge(half_width: f32, half_height: f32, half_length: f32) -> Self {
+        Self::Wedge {
+            half_width,
+            half_height,
+            half_length,
+        }
+    }
+
+    #[inline]
     pub fn bounding_sphere_radius(&self) -> f32 {
         match *self {
             Self::Cuboid { half_extents } => half_extents.length(),
@@ -3868,6 +3917,11 @@ impl CustomCollider {
                 half_segment,
                 radius,
             } => half_segment + radius,
+            Self::Wedge {
+                half_width,
+                half_height,
+                half_length,
+            } => Vec3::new(half_width, half_height, half_length).length(),
         }
     }
 
@@ -3883,6 +3937,11 @@ impl CustomCollider {
                 half_extents.x.max(half_extents.y).max(half_extents.z)
             }
             Self::CapsuleY { radius, .. } => radius,
+            Self::Wedge {
+                half_width,
+                half_height,
+                half_length,
+            } => half_width.max(half_height).max(half_length),
         }
     }
 }
@@ -4527,6 +4586,86 @@ fn ray_intersect_single_entry(
             half_segment + radius,
             radius,
         ),
+        CustomCollider::Wedge {
+            half_width,
+            half_height,
+            half_length,
+        } => ray_intersect_wedge(
+            origin,
+            unit_dir,
+            max_toi,
+            entry.translation,
+            entry.rotation,
+            entry.inv_rotation,
+            half_width,
+            half_height,
+            half_length,
+        ),
+    }
+}
+
+fn ray_intersect_wedge(
+    origin: Vec3,
+    unit_dir: Vec3,
+    max_toi: f32,
+    pos: Vec3,
+    rot: Quat,
+    inv_rot: Quat,
+    half_width: f32,
+    half_height: f32,
+    half_length: f32,
+) -> Option<RayHit> {
+    let local_origin = inv_rot * (origin - pos);
+    let local_dir = inv_rot * unit_dir;
+    let slope_normal = Vec3::new(0.0, half_length, -half_height).normalize_or_zero();
+    let planes: [(Vec3, f32); 5] = [
+        (Vec3::NEG_X, half_width),
+        (Vec3::X, half_width),
+        (Vec3::NEG_Y, half_height),
+        (Vec3::Z, half_length),
+        (slope_normal, 0.0),
+    ];
+
+    let mut t_enter = 0.0_f32;
+    let mut t_exit = max_toi;
+    let mut enter_normal = Vec3::Y;
+    let mut hit_on_enter = false;
+
+    for (n, d) in planes {
+        let denom = n.dot(local_dir);
+        let num = d - n.dot(local_origin);
+        if denom.abs() < 1e-7 {
+            if num < 0.0 {
+                return None;
+            }
+        } else {
+            let t = num / denom;
+            if denom < 0.0 {
+                if t > t_enter {
+                    t_enter = t;
+                    enter_normal = n;
+                    hit_on_enter = true;
+                }
+            } else if t < t_exit {
+                t_exit = t;
+            }
+            if t_enter > t_exit {
+                return None;
+            }
+        }
+    }
+
+    if !hit_on_enter && t_enter == 0.0 {
+        return None;
+    }
+    if t_enter >= 0.0 && t_enter <= max_toi {
+        Some(RayHit {
+            toi: t_enter,
+            normal: (rot * enter_normal).normalize_or_zero(),
+            point: origin + unit_dir * t_enter,
+        })
+    } else {
+        None
     }
 }
 
@@ -4781,6 +4920,113 @@ pub fn sphere_vs_static_collider(
             half_segment + radius,
             radius,
         ),
+        CustomCollider::Wedge {
+            half_width,
+            half_height,
+            half_length,
+        } => sphere_vs_wedge(
+            sphere_center,
+            sphere_radius,
+            entry.translation,
+            entry.rotation,
+            entry.inv_rotation,
+            half_width,
+            half_height,
+            half_length,
+        ),
+    }
+}
+
+#[inline]
+fn closest_point_on_segment_2d(p: Vec2, a: Vec2, b: Vec2) -> Vec2 {
+    let ab = b - a;
+    let len_sq = ab.length_squared();
+    if len_sq <= 1e-8 {
+        return a;
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    a + ab * t
+}
+
+fn sphere_vs_wedge(
+    sphere_center: Vec3,
+    sphere_radius: f32,
+    pos: Vec3,
+    rot: Quat,
+    inv_rot: Quat,
+    half_width: f32,
+    half_height: f32,
+    half_length: f32,
+) -> Option<SphereContact> {
+    let local_p = inv_rot * (sphere_center - pos);
+    let slope_n_2d = Vec2::new(-half_height, half_length).normalize_or_zero();
+    let p2 = Vec2::new(local_p.z, local_p.y);
+
+    let d_left = -half_width - local_p.x;
+    let d_right = local_p.x - half_width;
+    let d_bottom = -half_height - local_p.y;
+    let d_back = local_p.z - half_length;
+    let d_slope = slope_n_2d.dot(p2);
+
+    if d_left <= 0.0 && d_right <= 0.0 && d_bottom <= 0.0 && d_back <= 0.0 && d_slope <= 0.0 {
+        let faces = [
+            (d_left, Vec3::NEG_X),
+            (d_right, Vec3::X),
+            (d_bottom, Vec3::NEG_Y),
+            (d_back, Vec3::Z),
+            (d_slope, Vec3::new(0.0, slope_n_2d.y, slope_n_2d.x)),
+        ];
+        let mut best_d = f32::NEG_INFINITY;
+        let mut best_n = Vec3::Y;
+        for (d, n) in faces {
+            if d > best_d {
+                best_d = d;
+                best_n = n;
+            }
+        }
+        let world_n = (rot * best_n).normalize_or_zero();
+        return Some(SphereContact {
+            normal: world_n,
+            penetration: sphere_radius - best_d,
+            contact_point: pos + rot * (local_p - best_n * best_d),
+        });
+    }
+
+    let qx = local_p.x.clamp(-half_width, half_width);
+    let q2 = if d_bottom <= 0.0 && d_back <= 0.0 && d_slope <= 0.0 {
+        p2
+    } else {
+        let a = Vec2::new(-half_length, -half_height);
+        let b = Vec2::new(half_length, -half_height);
+        let c = Vec2::new(half_length, half_height);
+        let c_ab = closest_point_on_segment_2d(p2, a, b);
+        let c_bc = closest_point_on_segment_2d(p2, b, c);
+        let c_ca = closest_point_on_segment_2d(p2, c, a);
+        let d_ab = p2.distance_squared(c_ab);
+        let d_bc = p2.distance_squared(c_bc);
+        let d_ca = p2.distance_squared(c_ca);
+        if d_ab <= d_bc && d_ab <= d_ca {
+            c_ab
+        } else if d_bc <= d_ca {
+            c_bc
+        } else {
+            c_ca
+        }
+    };
+
+    let closest = Vec3::new(qx, q2.y, q2.x);
+    let diff = local_p - closest;
+    let dist_sq = diff.length_squared();
+    if dist_sq < sphere_radius * sphere_radius {
+        let dist = dist_sq.sqrt();
+        let local_n = if dist > 1e-6 { diff / dist } else { Vec3::Y };
+        Some(SphereContact {
+            normal: (rot * local_n).normalize_or_zero(),
+            penetration: sphere_radius - dist,
+            contact_point: pos + rot * closest,
+        })
+    } else {
+        None
     }
 }
 
@@ -5351,6 +5597,54 @@ pub fn lane_segment_physics_bundle(
         world_collision_groups(),
         Transform {
             translation: mid,
+            rotation: rot,
+            scale: Vec3::ONE,
+        },
+    )
+}
+
+/// کلیدر منشور مثلثی توپر (مکعب مثلث) برای پله‌های ورودی دو پایگاه تا زیر پله کاملاً پر و غیرقابل نفوذ باشد
+pub fn entrance_stair_physics_bundle(
+    config: &GameConfig,
+    seg_id: String,
+    start: Vec3,
+    end: Vec3,
+    width: f32,
+) -> (
+    MapObjectId,
+    CustomRigidBody,
+    CustomCollider,
+    SurfaceMaterial,
+    CollisionGroups,
+    Transform,
+) {
+    let (low_pt, high_pt) = if start.y <= end.y {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let height = (high_pt.y - low_pt.y).max(0.05);
+    let horiz = Vec3::new(high_pt.x - low_pt.x, 0.0, high_pt.z - low_pt.z);
+    let len_xz = horiz.length().max(0.05);
+    let dir_xz = horiz / len_xz;
+    let right = Vec3::Y.cross(dir_xz).normalize_or_zero();
+    let rot = Quat::from_mat3(&Mat3::from_cols(right, Vec3::Y, dir_xz));
+    let center = Vec3::new(
+        (low_pt.x + high_pt.x) * 0.5,
+        (low_pt.y + high_pt.y) * 0.5,
+        (low_pt.z + high_pt.z) * 0.5,
+    );
+    (
+        MapObjectId(seg_id),
+        CustomRigidBody::Fixed,
+        CustomCollider::wedge(width * 0.5, height * 0.5, len_xz * 0.5),
+        SurfaceMaterial {
+            friction: config.physics.ground_friction,
+            restitution: config.physics.ground_restitution,
+        },
+        world_collision_groups(),
+        Transform {
+            translation: center,
             rotation: rot,
             scale: Vec3::ONE,
         },
@@ -8481,20 +8775,32 @@ fn spawn_server_environment_colliders_system(mut commands: Commands, config: Res
     }
 
     for lane in &config.map.lanes {
-        for seg_idx in 0..lane.waypoints.len().saturating_sub(1) {
+        let seg_count = lane.waypoints.len().saturating_sub(1);
+        let last_seg_idx = seg_count.saturating_sub(1);
+        for seg_idx in 0..seg_count {
             let a = lane.waypoints[seg_idx];
             let b = lane.waypoints[seg_idx + 1];
             let start = Vec3::new(a.0, a.1, a.2);
             let end = Vec3::new(b.0, b.1, b.2);
             if start.distance(end) > 0.1 {
-                commands.spawn(lane_segment_physics_bundle(
-                    &config,
-                    format!("{}_seg_{}", lane.id, seg_idx),
-                    start,
-                    end,
-                    lane.width,
-                    lane.thickness,
-                ));
+                if seg_idx == 0 || seg_idx == last_seg_idx {
+                    commands.spawn(entrance_stair_physics_bundle(
+                        &config,
+                        format!("{}_seg_{}", lane.id, seg_idx),
+                        start,
+                        end,
+                        lane.width,
+                    ));
+                } else {
+                    commands.spawn(lane_segment_physics_bundle(
+                        &config,
+                        format!("{}_seg_{}", lane.id, seg_idx),
+                        start,
+                        end,
+                        lane.width,
+                        lane.thickness,
+                    ));
+                }
             }
         }
     }
@@ -12839,6 +13145,46 @@ pub fn lane_creep_buffs(
     (hp_mult, scale_mult, armor_bonus, dmg_mult, fire_rate_mult)
 }
 
+#[inline]
+fn is_creep_walkable_xz(config: &GameConfig, x: f32, z: f32) -> bool {
+    if !config.map.canyon.enabled {
+        return true;
+    }
+    if canyon_sample_height(&config.map.canyon, x, z) >= -0.15 {
+        return true;
+    }
+    is_on_bridge_or_lane(config, x, z)
+}
+
+#[inline]
+fn move_creep_xz_with_river_barrier(
+    config: &GameConfig,
+    cur_x: f32,
+    cur_z: f32,
+    next_x: f32,
+    next_z: f32,
+) -> (f32, f32, bool) {
+    if is_creep_walkable_xz(config, next_x, next_z) {
+        return (next_x, next_z, true);
+    }
+    let can_x = is_creep_walkable_xz(config, next_x, cur_z);
+    let can_z = is_creep_walkable_xz(config, cur_x, next_z);
+    if can_x && !can_z {
+        return (next_x, cur_z, true);
+    }
+    if can_z && !can_x {
+        return (cur_x, next_z, true);
+    }
+    if can_x && can_z {
+        if (next_x - cur_x).abs() >= (next_z - cur_z).abs() {
+            return (next_x, cur_z, true);
+        } else {
+            return (cur_x, next_z, true);
+        }
+    }
+    (cur_x, cur_z, false)
+}
+
 fn step_lane_creeps_system(
     commands: &mut Commands,
     dt: f32,
@@ -13270,9 +13616,18 @@ fn step_lane_creeps_system(
                 }
             } else {
                 let step = world.creeps[idx].facing_dir * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt;
-                world.creeps[idx].pos.x += step.x;
-                world.creeps[idx].pos.z += step.z;
-                moved = true;
+                let cur_x = world.creeps[idx].pos.x;
+                let cur_z = world.creeps[idx].pos.z;
+                let (nx, nz, did_move) = move_creep_xz_with_river_barrier(
+                    config,
+                    cur_x,
+                    cur_z,
+                    cur_x + step.x,
+                    cur_z + step.z,
+                );
+                world.creeps[idx].pos.x = nx;
+                world.creeps[idx].pos.z = nz;
+                moved = did_move;
             }
         } else if is_neutral {
             // سرباز کمپ اگر دشمنی نباشد به جایگاه کمپ خودش برمی‌گردد و منتظر می‌ماند
@@ -13281,9 +13636,18 @@ fn step_lane_creeps_system(
                 let dir = to_home.normalize();
                 world.creeps[idx].facing_dir = dir;
                 let step = dir * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt;
-                world.creeps[idx].pos.x += step.x;
-                world.creeps[idx].pos.z += step.z;
-                moved = true;
+                let cur_x = world.creeps[idx].pos.x;
+                let cur_z = world.creeps[idx].pos.z;
+                let (nx, nz, did_move) = move_creep_xz_with_river_barrier(
+                    config,
+                    cur_x,
+                    cur_z,
+                    cur_x + step.x,
+                    cur_z + step.z,
+                );
+                world.creeps[idx].pos.x = nx;
+                world.creeps[idx].pos.z = nz;
+                moved = did_move;
             }
         } else {
             // ب) حرکت در امتداد Waypointهای لاین و پس از آن پیشروی مستقیم به سمت ساختمان اصلی (Ancient) دشمن
@@ -13362,9 +13726,18 @@ fn step_lane_creeps_system(
                     }
                     world.creeps[idx].facing_dir = dir;
                     let step = dir * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt;
-                    world.creeps[idx].pos.x += step.x;
-                    world.creeps[idx].pos.z += step.z;
-                    moved = true;
+                    let cur_x = world.creeps[idx].pos.x;
+                    let cur_z = world.creeps[idx].pos.z;
+                    let (nx, nz, did_move) = move_creep_xz_with_river_barrier(
+                        config,
+                        cur_x,
+                        cur_z,
+                        cur_x + step.x,
+                        cur_z + step.z,
+                    );
+                    world.creeps[idx].pos.x = nx;
+                    world.creeps[idx].pos.z = nz;
+                    moved = did_move;
                 }
             }
         }
@@ -13413,15 +13786,29 @@ fn step_lane_creeps_system(
             let dist = delta.length();
             if dist < min_d {
                 let push = if dist > 0.0001 { delta / dist } else { Vec2::new(0.0, 1.0) };
-                world.creeps[idx].pos.x = t_pos.x + push.x * min_d;
-                world.creeps[idx].pos.z = t_pos.z + push.y * min_d;
+                let (px, pz, _) = move_creep_xz_with_river_barrier(
+                    config,
+                    world.creeps[idx].pos.x,
+                    world.creeps[idx].pos.z,
+                    t_pos.x + push.x * min_d,
+                    t_pos.z + push.y * min_d,
+                );
+                world.creeps[idx].pos.x = px;
+                world.creeps[idx].pos.z = pz;
                 if moved {
                     let f = Vec2::new(world.creeps[idx].facing_dir.x, world.creeps[idx].facing_dir.z);
                     let t1 = Vec2::new(-push.y, push.x);
                     let tangent = if t1.dot(f) >= 0.0 { t1 } else { -t1 };
                     let slide = tangent * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt * 0.85;
-                    world.creeps[idx].pos.x += slide.x;
-                    world.creeps[idx].pos.z += slide.y;
+                    let (sx, sz, _) = move_creep_xz_with_river_barrier(
+                        config,
+                        world.creeps[idx].pos.x,
+                        world.creeps[idx].pos.z,
+                        world.creeps[idx].pos.x + slide.x,
+                        world.creeps[idx].pos.z + slide.y,
+                    );
+                    world.creeps[idx].pos.x = sx;
+                    world.creeps[idx].pos.z = sz;
                 }
             }
         }
@@ -13464,10 +13851,25 @@ fn step_lane_creeps_system(
                     Vec2::new(1.0, 0.0)
                 };
                 let half_push = (min_creep_dist - dist) * 0.5;
-                world.creeps[i].pos.x -= push_dir.x * half_push;
-                world.creeps[i].pos.z -= push_dir.y * half_push;
-                world.creeps[j].pos.x += push_dir.x * half_push;
-                world.creeps[j].pos.z += push_dir.y * half_push;
+                let (nix, niz, _) = move_creep_xz_with_river_barrier(
+                    config,
+                    world.creeps[i].pos.x,
+                    world.creeps[i].pos.z,
+                    world.creeps[i].pos.x - push_dir.x * half_push,
+                    world.creeps[i].pos.z - push_dir.y * half_push,
+                );
+                world.creeps[i].pos.x = nix;
+                world.creeps[i].pos.z = niz;
+
+                let (njx, njz, _) = move_creep_xz_with_river_barrier(
+                    config,
+                    world.creeps[j].pos.x,
+                    world.creeps[j].pos.z,
+                    world.creeps[j].pos.x + push_dir.x * half_push,
+                    world.creeps[j].pos.z + push_dir.y * half_push,
+                );
+                world.creeps[j].pos.x = njx;
+                world.creeps[j].pos.z = njz;
             }
         }
     }

@@ -24,7 +24,7 @@ use bevy::window::{CursorOptions, MonitorSelection, PresentMode, PrimaryWindow, 
 use moba_shared::{
     WeatherKind,
     ancient_physics_bundle, barracks_physics_bundle, center_bridge_physics_bundle, is_point_in_roshan_pit_circle, roshan_pit_physics_bundles, create_shared_renet_client,
-    grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
+    entrance_stair_physics_bundle, grenade_physics_bundle, ground_physics_bundle, lane_segment_physics_bundle,
     mountain_physics_bundle, obstacle_physics_bundle, orient_soldier_towards,
     particle_physics_bundle, ramp_physics_bundle, reconcile_soldier_physics_pos,
     shell_casing_physics_bundle, target_physics_bundle,
@@ -2000,7 +2000,7 @@ fn setup_scene(
         );
     }
 
-    // ۷. مسیرهای سنگ‌فرش ۳ لاین اصلی (Top, Mid, Bot)
+    // ۷. مسیرهای سنگ‌فرش ۳ لاین اصلی (Top, Mid, Bot) + مدل GLB اختصاصی فقط برای پله‌های ورودی دو پایگاه
     for lane in &config.map.lanes {
         let lc = lane.color_rgb;
         let lane_mat = materials.add(StandardMaterial {
@@ -2013,13 +2013,61 @@ fn setup_scene(
             perceptual_roughness: 0.9,
             ..default()
         });
-        for seg_idx in 0..lane.waypoints.len().saturating_sub(1) {
+        let seg_count = lane.waypoints.len().saturating_sub(1);
+        let last_seg_idx = seg_count.saturating_sub(1);
+
+        for seg_idx in 0..seg_count {
             let a = lane.waypoints[seg_idx];
             let b = lane.waypoints[seg_idx + 1];
             let start = Vec3::new(a.0, a.1, a.2);
             let end = Vec3::new(b.0, b.1, b.2);
             let len_3d = start.distance(end);
-            if len_3d > 0.1 {
+            if len_3d <= 0.1 {
+                continue;
+            }
+
+            let entrance_stair_opt = if seg_idx == 0 {
+                Some(&lane.dawn_entrance_stair)
+            } else if seg_idx == last_seg_idx {
+                Some(&lane.dusk_entrance_stair)
+            } else {
+                None
+            };
+
+            if let Some(stair) = entrance_stair_opt {
+                // کلیدر منشور مثلثی توپر اسپاون می‌شود تا زیر پله خالی نباشد (بدون مش Bevy و بدون جدول کناری)
+                commands.spawn(entrance_stair_physics_bundle(
+                    &config,
+                    format!("{}_seg_{}", lane.id, seg_idx),
+                    start,
+                    end,
+                    lane.width,
+                ));
+
+                assert!(
+                    custom_glb_exists(&stair.model_path),
+                    "خطای بحرانی: فایل مدل پله '{}' در مسیر assets/ یافت نشد!",
+                    stair.model_path
+                );
+
+                let scene_handle = asset_server.load(format!("{}#Scene0", stair.model_path));
+                let mut stair_cmds = commands.spawn((
+                    WorldAssetRoot(scene_handle),
+                    model_transform_to_bevy(&stair.model_transform),
+                    Visibility::Visible,
+                ));
+                if stair.occlusion_fade_enabled {
+                    stair_cmds.insert(VisionOccludable {
+                        is_faded: false,
+                        half_extents: Vec3::new(
+                            lane.width * 0.5,
+                            (start.y - end.y).abs() * 0.5 + lane.thickness * 0.5,
+                            len_3d * 0.5,
+                        ),
+                    });
+                }
+            } else {
+                // سایر سگمنت‌های لاین (از جمله پل میانی) همچنان با طراحی فعلی Bevy رندر می‌شوند
                 let mut seg_cmds = commands.spawn((
                     Mesh3d(meshes.add(Cuboid::new(lane.width, lane.thickness, len_3d))),
                     MeshMaterial3d(lane_mat.clone()),
@@ -2039,21 +2087,20 @@ fn setup_scene(
                         half_extents: Vec3::new(lane.width * 0.5, lane.thickness * 0.5, len_3d * 0.5),
                     });
                 }
-                seg_cmds
-                    .with_children(|parent| {
-                        // لبه‌های سنگی دو طرف جاده (Curbs)
-                        for &side in &[-1.0_f32, 1.0_f32] {
-                            parent.spawn((
-                                Mesh3d(meshes.add(Cuboid::new(
-                                    0.45,
-                                    lane.thickness * 1.18,
-                                    len_3d,
-                                ))),
-                                MeshMaterial3d(curb_mat.clone()),
-                                Transform::from_xyz(side * (lane.width * 0.5), 0.02, 0.0),
-                            ));
-                        }
-                    });
+                seg_cmds.with_children(|parent| {
+                    // لبه‌های سنگی دو طرف جاده (Curbs)
+                    for &side in &[-1.0_f32, 1.0_f32] {
+                        parent.spawn((
+                            Mesh3d(meshes.add(Cuboid::new(
+                                0.45,
+                                lane.thickness * 1.18,
+                                len_3d,
+                            ))),
+                            MeshMaterial3d(curb_mat.clone()),
+                            Transform::from_xyz(side * (lane.width * 0.5), 0.02, 0.0),
+                        ));
+                    }
+                });
             }
         }
     }

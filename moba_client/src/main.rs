@@ -13726,8 +13726,7 @@ fn update_overhead_ancients_bars_system(
             continue;
         }
         let a_def = &config.map.ancients[asnap.index];
-        let scaled_h = (a_def.base_size.1 + a_def.core_height * 0.30) * a_def.model_transform.scale_vec().y;
-        let world_head = a_def.model_transform.location_vec() + Vec3::Y * scaled_h;
+        let world_head = a_def.model_transform.location_vec() + Vec3::Y * a_def.hp_bar_height_offset;
         if let Ok(sp) = camera.world_to_viewport(cam_gtf, world_head) {
             node.display = Display::Flex;
             node.left = px(sp.x - 68.0);

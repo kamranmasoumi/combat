@@ -1125,6 +1125,11 @@ impl GameConfig {
         }
         for item in &self.map.ancients {
             check_id(&item.id, "map.ancients");
+            assert!(
+                item.hp_bar_height_offset > 0.0 && item.hp_bar_height_offset.is_finite(),
+                "خطای بحرانی در config.ron: مقدار hp_bar_height_offset برای {} باید بزرگ‌تر از صفر باشد",
+                item.id
+            );
         }
         for item in &self.map.turrets {
             check_id(&item.id, "map.turrets");
@@ -2255,6 +2260,7 @@ pub struct AncientDef {
     pub base_size: (f32, f32, f32),
     pub core_radius: f32,
     pub core_height: f32,
+    pub hp_bar_height_offset: f32,
     pub max_hp: f32,
     pub armor: f32,
     pub backdoor_protection_requires_creeps: bool,
@@ -6170,6 +6176,23 @@ pub fn particle_physics_bundle(
 }
 
 /// قانون برتری دید ارتفاعی و خط دید موانع (Dota 2 High-Ground + Line-of-Sight) با برد دلخواه
+/// محاسبه ارتفاع واقعی سطح زمین/فلات (مانند High Ground پایگاه) در مختصات افقی (x, z)
+#[inline]
+pub fn sample_terrain_top_y(config: &GameConfig, x: f32, z: f32) -> f32 {
+    let mut best_y = 0.0_f32;
+    for plat in &config.map.terrains {
+        let loc = plat.model_transform.location;
+        let scl = plat.model_transform.scale;
+        let hx = plat.size.0 * 0.5 * scl.0.abs();
+        let hz = plat.size.2 * 0.5 * scl.2.abs();
+        if (x - loc.0).abs() <= hx && (z - loc.2).abs() <= hz {
+            let top_y = loc.1 + plat.size.1 * 0.5 * scl.1.abs();
+            best_y = best_y.max(top_y);
+        }
+    }
+    best_y
+}
+
 pub fn can_observer_see_point_with_range(
     physics_world: &CustomPhysicsWorld,
     config: &GameConfig,
@@ -13704,7 +13727,8 @@ fn step_lane_creeps_system(
                         && best_target.map_or(true, |(_, bd)| edge_dist < bd)
                     {
                         let to_tur = Vec3::new(my_pos.x - t_pos.x, 0.0, my_pos.z - t_pos.z).normalize_or_zero();
-                        let tur_edge_pos = Vec3::new(t_pos.x, my_pos.y, t_pos.z) + to_tur * (t_rad + 0.45);
+                        let tur_ground_y = sample_terrain_top_y(config, t_pos.x, t_pos.z).max(t_pos.y);
+                        let tur_edge_pos = Vec3::new(t_pos.x, tur_ground_y, t_pos.z) + to_tur * (t_rad + 0.45);
                         if can_observer_see_point_with_range(
                             physics_world,
                             config,
@@ -13730,7 +13754,8 @@ fn step_lane_creeps_system(
                         && best_target.map_or(true, |(_, bd)| edge_dist < bd)
                     {
                         let to_bar = Vec3::new(my_pos.x - b_pos.x, 0.0, my_pos.z - b_pos.z).normalize_or_zero();
-                        let bar_edge_pos = Vec3::new(b_pos.x, my_pos.y, b_pos.z) + to_bar * (b_rad * 1.45 + 0.6);
+                        let bar_ground_y = sample_terrain_top_y(config, b_pos.x, b_pos.z).max(b_pos.y);
+                        let bar_edge_pos = Vec3::new(b_pos.x, bar_ground_y, b_pos.z) + to_bar * (b_rad * 1.45 + 0.6);
                         if can_observer_see_point_with_range(
                             physics_world,
                             config,
@@ -13751,7 +13776,18 @@ fn step_lane_creeps_system(
                         continue;
                     }
                     let d_xz = Vec2::new(my_pos.x, my_pos.z).distance(Vec2::new(cour_pos.x, cour_pos.z));
-                    if d_xz <= eff_creep_vision && best_target.map_or(true, |(_, bd)| d_xz < bd) {
+                    if d_xz <= eff_creep_vision
+                        && best_target.map_or(true, |(_, bd)| d_xz < bd)
+                        && can_observer_see_point_with_range(
+                            physics_world,
+                            config,
+                            my_pos,
+                            cour_pos,
+                            c_stats.aim_chest_height,
+                            eff_creep_vision,
+                            0.0,
+                        )
+                    {
                         best_target = Some((cour_pos, d_xz));
                     }
                 }
@@ -13766,7 +13802,8 @@ fn step_lane_creeps_system(
                         && best_target.map_or(true, |(_, bd)| edge_dist < bd)
                     {
                         let to_anc = Vec3::new(my_pos.x - a_pos.x, 0.0, my_pos.z - a_pos.z).normalize_or_zero();
-                        let anc_edge_pos = Vec3::new(a_pos.x, my_pos.y, a_pos.z) + to_anc * (a_rad * 1.45 + 0.6);
+                        let anc_ground_y = sample_terrain_top_y(config, a_pos.x, a_pos.z).max(a_pos.y);
+                        let anc_edge_pos = Vec3::new(a_pos.x, anc_ground_y, a_pos.z) + to_anc * (a_rad * 1.45 + 0.6);
                         if can_observer_see_point_with_range(
                             physics_world,
                             config,
@@ -14409,7 +14446,8 @@ fn step_turrets_system(
             }
             let d = my_pos.distance(c_pos);
             let to_c = Vec3::new(c_pos.x - my_pos.x, 0.0, c_pos.z - my_pos.z).normalize_or_zero();
-            let ray_start = Vec3::new(my_pos.x, c_pos.y, my_pos.z) + to_c * (t_world_radius + 0.45);
+            let turret_ground_y = sample_terrain_top_y(config, my_pos.x, my_pos.z).max(my_pos.y);
+            let ray_start = Vec3::new(my_pos.x, turret_ground_y, my_pos.z) + to_c * (t_world_radius + 0.45);
             if d <= t_def.attack_range
                 && best_creep.map_or(true, |(_, bd)| d < bd)
                 && can_observer_see_point_with_range(
@@ -14417,7 +14455,7 @@ fn step_turrets_system(
                     config,
                     ray_start,
                     c_pos,
-                    1.15,
+                    1.65,
                     t_def.vision_range
                         * config.effective_vision_multiplier(
                             world.match_elapsed_secs,
@@ -14438,7 +14476,8 @@ fn step_turrets_system(
                 }
                 let d = my_pos.distance(h_pos);
                 let to_h = Vec3::new(h_pos.x - my_pos.x, 0.0, h_pos.z - my_pos.z).normalize_or_zero();
-                let ray_start = Vec3::new(my_pos.x, h_pos.y, my_pos.z) + to_h * (t_world_radius + 0.45);
+                let turret_ground_y = sample_terrain_top_y(config, my_pos.x, my_pos.z).max(my_pos.y);
+                let ray_start = Vec3::new(my_pos.x, turret_ground_y, my_pos.z) + to_h * (t_world_radius + 0.45);
                 if d <= t_def.attack_range
                     && best_hero.map_or(true, |(_, bd)| d < bd)
                     && can_observer_see_point_with_range(
@@ -14446,7 +14485,7 @@ fn step_turrets_system(
                         config,
                         ray_start,
                         h_pos,
-                        1.15,
+                        1.65,
                         t_def.vision_range
                             * config.effective_vision_multiplier(
                                 world.match_elapsed_secs,

@@ -419,6 +419,7 @@ impl GameConfig {
         cfg.validate_fx();
         cfg.validate_creeps();
         cfg.validate_neutral_camps();
+        cfg.validate_obstacles();
         cfg
     }
 
@@ -485,6 +486,82 @@ impl GameConfig {
         assert!(ge.water_geyser_duration_secs > 0.0, "grenade_explosion_vfx.water_geyser_duration_secs باید بزرگ‌تر از صفر باشد");
         assert!(ge.shockwave_duration_secs > 0.0, "grenade_explosion_vfx.shockwave_duration_secs باید بزرگ‌تر از صفر باشد");
     }
+
+    pub fn validate_obstacles(&self) {
+        let s = &self.soldier;
+        assert!(
+            s.vault_check_distance.is_finite() && s.vault_check_distance > 0.0,
+            "soldier.vault_check_distance باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            s.vault_travel_distance.is_finite() && s.vault_travel_distance > 0.0,
+            "soldier.vault_travel_distance باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            s.vault_ray_height.is_finite() && s.vault_ray_height >= 0.0,
+            "soldier.vault_ray_height نمی‌تواند منفی باشد"
+        );
+        assert!(
+            s.vault_anim_reference_height.is_finite() && s.vault_anim_reference_height >= 0.0,
+            "soldier.vault_anim_reference_height نمی‌تواند منفی باشد"
+        );
+        assert!(
+            s.vault_top_clearance.is_finite() && s.vault_top_clearance >= 0.0,
+            "soldier.vault_top_clearance نمی‌تواند منفی باشد"
+        );
+        assert!(
+            s.vault_min_lift_height.is_finite() && s.vault_min_lift_height >= 0.0,
+            "soldier.vault_min_lift_height نمی‌تواند منفی باشد"
+        );
+        assert!(
+            s.vault_max_lift_height.is_finite()
+                && s.vault_max_lift_height >= s.vault_min_lift_height,
+            "soldier.vault_max_lift_height باید بزرگ‌تر یا مساوی vault_min_lift_height باشد"
+        );
+        assert!(
+            s.vault_apex_fraction.is_finite()
+                && s.vault_apex_fraction > 0.05
+                && s.vault_apex_fraction < 0.95,
+            "soldier.vault_apex_fraction باید در بازه (0.05, 0.95) باشد"
+        );
+        assert!(
+            s.vault_arc_exponent.is_finite()
+                && s.vault_arc_exponent > 0.0
+                && s.vault_arc_exponent <= 4.0,
+            "soldier.vault_arc_exponent باید در بازه (0.0, 4.0] باشد"
+        );
+        assert!(
+            s.vault_approach_max_angle_deg.is_finite()
+                && s.vault_approach_max_angle_deg > 0.0
+                && s.vault_approach_max_angle_deg < 90.0,
+            "soldier.vault_approach_max_angle_deg باید در بازه (0.0, 90.0) باشد"
+        );
+
+        for obs in &self.obstacles {
+            assert!(
+                obs.vault_height_offset.is_finite(),
+                "vault_height_offset در آبجکت '{}' نامعتبر است",
+                obs.id
+            );
+            let mut seen_sides = HashSet::new();
+            for &side in &obs.vault_sides {
+                assert!(
+                    seen_sides.insert(side),
+                    "ضلع تکراری {:?} در vault_sides آبجکت '{}' تعریف شده است",
+                    side,
+                    obs.id
+                );
+            }
+            if obs.can_vault {
+                assert!(
+                    !obs.vault_sides.is_empty(),
+                    "خطای بحرانی کانفیگ: آبجکت '{}' دارای can_vault: true است اما vault_sides آن خالی است!",
+                    obs.id
+                );
+            }
+        }
+    }
+
 
     pub fn resolve_bullet_vfx(&self, source: &BulletVfxSource) -> &WeaponVfxProfile {
         match source {
@@ -1750,6 +1827,13 @@ pub struct SoldierConfig {
     pub vault_check_distance: f32,
     pub vault_travel_distance: f32,
     pub vault_ray_height: f32,
+    pub vault_anim_reference_height: f32,
+    pub vault_top_clearance: f32,
+    pub vault_min_lift_height: f32,
+    pub vault_max_lift_height: f32,
+    pub vault_apex_fraction: f32,
+    pub vault_arc_exponent: f32,
+    pub vault_approach_max_angle_deg: f32,
     pub free_traversal_wall_padding: f32,
     pub death_extra_respawn_delay_secs: f32,
     pub death_animations: Vec<String>,
@@ -2378,6 +2462,15 @@ pub struct LanePathDef {
     pub dusk_entrance_stair: LaneEntranceStairDef,
 }
 
+/// اضلاع جانبی مجاز مکعب مستطیل برای اجرای حرکت Vault در فضای محلی (Local Space) آبجکت
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum VaultSide {
+    PosX,
+    NegX,
+    PosZ,
+    NegZ,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ObstacleDef {
     pub id: String,
@@ -2386,6 +2479,8 @@ pub struct ObstacleDef {
     pub kind: CoverKind,
     pub size: (f32, f32, f32),
     pub can_vault: bool,
+    pub vault_sides: Vec<VaultSide>,
+    pub vault_height_offset: f32,
     pub color_rgb: (f32, f32, f32),
     pub roughness: f32,
     pub occlusion_fade_enabled: bool,
@@ -5290,10 +5385,13 @@ pub struct ElevationSurface {
 #[derive(Component)]
 pub struct PhysicsGround;
 
-#[derive(Component)]
+#[derive(Component, Clone, Debug)]
 pub struct PhysicsObstacle {
     pub id: String,
     pub can_vault: bool,
+    pub vault_sides: Vec<VaultSide>,
+    pub vault_height_offset: f32,
+    pub top_y: f32,
 }
 
 #[derive(Component)]
@@ -5902,11 +6000,18 @@ pub fn obstacle_physics_bundle(
         obs.size.1 * 0.5 * s.y,
         obs.size.2 * 0.5 * s.z,
     );
+    let world_half_y = (tf.rotation * Vec3::X).y.abs() * half.x
+        + (tf.rotation * Vec3::Y).y.abs() * half.y
+        + (tf.rotation * Vec3::Z).y.abs() * half.z;
+    let top_y = tf.translation.y + world_half_y;
     (
         MapObjectId(obs.id.clone()),
         PhysicsObstacle {
             id: obs.id.clone(),
             can_vault: obs.can_vault,
+            vault_sides: obs.vault_sides.clone(),
+            vault_height_offset: obs.vault_height_offset,
+            top_y,
         },
         CustomRigidBody::Fixed,
         CustomCollider::cuboid(half.x, half.y, half.z),
@@ -6669,6 +6774,7 @@ pub struct SharedTraversalState {
     pub start_pos: Vec3,
     pub target_pos: Vec3,
     pub travel_dir: Vec3,
+    pub vault_peak_lift: f32,
     pub chain_dive_after: bool,
     pub swing_arc_sag: f32,
     pub swing_total_duration: f32,
@@ -7097,6 +7203,7 @@ impl AuthoritativeWorldState {
                 start_pos: spawn_pos,
                 target_pos: spawn_pos,
                 travel_dir: initial_aim_dir,
+                vault_peak_lift: 0.0,
                 chain_dive_after: false,
                 swing_arc_sag: 0.0,
                 swing_total_duration: 0.0,
@@ -7781,6 +7888,7 @@ impl AuthoritativeWorldState {
                     start_pos: spawn_pos,
                     target_pos: spawn_pos,
                     travel_dir: facing_dir,
+                    vault_peak_lift: 0.0,
                     chain_dive_after: false,
                     swing_arc_sag: 0.0,
                     swing_total_duration: 0.0,
@@ -9098,7 +9206,7 @@ fn shared_authoritative_drive_system(
     physics_world: Res<CustomPhysicsWorld>,
     mut world: ResMut<AuthoritativeWorldState>,
     mut soldier_query: Query<(&PhysicsSoldier, &mut Transform, &mut CustomCharacterController)>,
-    obstacle_query: Query<&PhysicsObstacle>,
+    obstacle_query: Query<(&PhysicsObstacle, &Transform), Without<PhysicsSoldier>>,
     target_query: Query<&PhysicsTarget>,
     turret_query: Query<&PhysicsTurret>,
     barracks_query: Query<&PhysicsBarracks>,
@@ -9312,7 +9420,7 @@ fn shared_drive_single_player(
     input: &ClientInputCommand,
     soldier_tf: &mut Transform,
     controller: &mut CustomCharacterController,
-    obstacle_query: &Query<&PhysicsObstacle>,
+    obstacle_query: &Query<(&PhysicsObstacle, &Transform), Without<PhysicsSoldier>>,
     target_query: &Query<&PhysicsTarget>,
     turret_query: &Query<&PhysicsTurret>,
     barracks_query: &Query<&PhysicsBarracks>,
@@ -10055,6 +10163,7 @@ fn step_wall_climb_custom(
                 start_pos,
                 target_pos,
                 travel_dir: into_plateau,
+                vault_peak_lift: 0.0,
                 chain_dive_after: false,
                 swing_arc_sag: 0.0,
                 swing_total_duration: 0.0,
@@ -10186,13 +10295,152 @@ fn sample_ground_and_deep_water_at(
     (bridge_or_ground_hit, effective_landing_y, is_deep_water)
 }
 
+struct VaultCandidate {
+    vault_dir: Vec3,
+    target_pos: Vec3,
+    peak_lift: f32,
+}
+
+fn try_find_vault_candidate(
+    world: &AuthoritativeWorldState,
+    config: &GameConfig,
+    physics_world: &CustomPhysicsWorld,
+    obstacle_query: &Query<(&PhysicsObstacle, &Transform), Without<PhysicsSoldier>>,
+    target_query: &Query<&PhysicsTarget>,
+    travel_dir: Vec3,
+) -> Option<VaultCandidate> {
+    let ray_origin = world.soldier_pos + Vec3::Y * config.soldier.vault_ray_height;
+    let query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
+
+    let (hit_ent, hit) = physics_world.cast_ray(
+        ray_origin,
+        travel_dir,
+        config.soldier.vault_check_distance,
+        query_groups,
+        |entity| {
+            obstacle_query
+                .get(entity)
+                .map(|(obs, _)| obs.can_vault)
+                .unwrap_or(false)
+        },
+    )?;
+
+    let (obs, obs_tf) = obstacle_query.get(hit_ent).ok()?;
+    let local_normal = (obs_tf.rotation.inverse() * hit.normal).normalize_or_zero();
+
+    // فقط اضلاع جانبی مکعب مستطیل مجاز هستند (سطح بالا و پایین نادیده گرفته می‌شود)
+    if local_normal.y.abs() >= 0.5 {
+        return None;
+    }
+
+    let hit_side = if local_normal.x.abs() >= local_normal.z.abs() {
+        if local_normal.x >= 0.0 {
+            VaultSide::PosX
+        } else {
+            VaultSide::NegX
+        }
+    } else if local_normal.z >= 0.0 {
+        VaultSide::PosZ
+    } else {
+        VaultSide::NegZ
+    };
+
+    if !obs.vault_sides.contains(&hit_side) {
+        return None;
+    }
+
+    let world_face_normal = Vec3::new(hit.normal.x, 0.0, hit.normal.z).normalize_or_zero();
+    if world_face_normal == Vec3::ZERO {
+        return None;
+    }
+    let inward_dir = -world_face_normal;
+    let min_approach_dot = config
+        .soldier
+        .vault_approach_max_angle_deg
+        .to_radians()
+        .cos();
+    if travel_dir.dot(inward_dir) < min_approach_dot {
+        return None;
+    }
+
+    let vault_dir = inward_dir;
+    let target_x = world.soldier_pos.x + vault_dir.x * config.soldier.vault_travel_distance;
+    let target_z = world.soldier_pos.z + vault_dir.z * config.soldier.vault_travel_distance;
+    let landing_ray_origin = Vec3::new(
+        target_x,
+        obs.top_y.max(world.soldier_pos.y) + 4.0,
+        target_z,
+    );
+    let landing_y = physics_world
+        .cast_ray(
+            landing_ray_origin,
+            Vec3::NEG_Y,
+            20.0,
+            query_groups,
+            |ent| !obstacle_query.contains(ent) && !target_query.contains(ent),
+        )
+        .map(|(_, h)| h.point.y)
+        .unwrap_or(world.soldier_pos.y);
+
+    let base_mid_y = world
+        .soldier_pos
+        .y
+        .lerp(landing_y, config.soldier.vault_apex_fraction);
+    let obstacle_rel_height = (obs.top_y - base_mid_y).max(0.0);
+    let required_lift = obstacle_rel_height
+        - config.soldier.vault_anim_reference_height
+        + config.soldier.vault_top_clearance
+        + obs.vault_height_offset;
+    let peak_lift = required_lift.clamp(
+        config.soldier.vault_min_lift_height,
+        config.soldier.vault_max_lift_height,
+    );
+
+    Some(VaultCandidate {
+        vault_dir,
+        target_pos: Vec3::new(target_x, landing_y, target_z),
+        peak_lift,
+    })
+}
+
+fn start_obstacle_vault(
+    world: &mut AuthoritativeWorldState,
+    config: &GameConfig,
+    candidate: VaultCandidate,
+) -> bool {
+    if world.hero_stamina < world.hero_slide_stamina_cost {
+        return false;
+    }
+    world.hero_stamina -= world.hero_slide_stamina_cost;
+    let count = config.soldier.vault_animations.len();
+    assert!(count > 0, "لیست vault_animations در کانفیگ خالی است!");
+    let idx = ((world.next_rand() * count as f32) as usize).min(count - 1);
+    let chosen_anim = config.soldier.vault_animations[idx].clone();
+    let exact_duration = config.exact_anim_duration(&chosen_anim);
+
+    world.traversal.is_active = true;
+    world.traversal.kind = TraversalKind::ObstacleVault;
+    world.traversal.anim_name = chosen_anim;
+    world.traversal.elapsed = 0.0;
+    world.traversal.duration = exact_duration;
+    world.traversal.start_pos = world.soldier_pos;
+    world.traversal.target_pos = candidate.target_pos;
+    world.traversal.travel_dir = candidate.vault_dir;
+    world.traversal.vault_peak_lift = candidate.peak_lift;
+    world.traversal.chain_dive_after = false;
+    world.soldier_facing_dir = candidate.vault_dir;
+    world.firing_anim_remaining = None;
+    world.reload_remaining = None;
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn step_traversal_custom(
     world: &mut AuthoritativeWorldState,
     input: &ClientInputCommand,
     config: &GameConfig,
     physics_world: &CustomPhysicsWorld,
-    obstacle_query: &Query<&PhysicsObstacle>,
+    obstacle_query: &Query<(&PhysicsObstacle, &Transform), Without<PhysicsSoldier>>,
     target_query: &Query<&PhysicsTarget>,
     mountain_query: &Query<&PhysicsMountain>,
     elev_query: &Query<&ElevationSurface>,
@@ -10404,25 +10652,38 @@ fn step_traversal_custom(
                 smooth_z,
             );
             world.soldier_pos = Vec3::new(smooth_x, smooth_y, smooth_z);
-        } else if world.traversal.kind == TraversalKind::ObstacleVault
-            || world.traversal.kind == TraversalKind::JumpOver
-        {
+        } else if world.traversal.kind == TraversalKind::ObstacleVault {
             controller.translation = None;
-            let ground_y = if world.traversal.kind == TraversalKind::JumpOver {
-                let ray_orig = Vec3::new(current_pos.x, current_pos.y + 4.0, current_pos.z);
-                physics_world
-                    .cast_ray(
-                        ray_orig,
-                        Vec3::NEG_Y,
-                        10.0,
-                        soldier_collision_groups(),
-                        |ent| !obstacle_query.contains(ent) && !target_query.contains(ent),
-                    )
-                    .map(|(_, hit)| hit.point.y)
-                    .unwrap_or(current_pos.y)
+            let apex = config.soldier.vault_apex_fraction;
+            let arc_u = if frac <= apex {
+                0.5 * (frac / apex)
             } else {
-                current_pos.y
+                0.5 + 0.5 * ((frac - apex) / (1.0 - apex))
             };
+            let arc_factor = (arc_u * std::f32::consts::PI)
+                .sin()
+                .max(0.0)
+                .powf(config.soldier.vault_arc_exponent);
+            let vault_y = current_pos.y + world.traversal.vault_peak_lift * arc_factor;
+            soldier_tf.translation = Vec3::new(
+                current_pos.x,
+                vault_y + config.physics.soldier_capsule_center_y * world.hero_scale,
+                current_pos.z,
+            );
+            world.soldier_pos = Vec3::new(current_pos.x, vault_y, current_pos.z);
+        } else if world.traversal.kind == TraversalKind::JumpOver {
+            controller.translation = None;
+            let ray_orig = Vec3::new(current_pos.x, current_pos.y + 4.0, current_pos.z);
+            let ground_y = physics_world
+                .cast_ray(
+                    ray_orig,
+                    Vec3::NEG_Y,
+                    10.0,
+                    soldier_collision_groups(),
+                    |ent| !obstacle_query.contains(ent) && !target_query.contains(ent),
+                )
+                .map(|(_, hit)| hit.point.y)
+                .unwrap_or(current_pos.y);
             soldier_tf.translation = Vec3::new(
                 current_pos.x,
                 ground_y + config.physics.soldier_capsule_center_y * world.hero_scale,
@@ -10513,6 +10774,7 @@ fn step_traversal_custom(
             }
 
             world.traversal.is_active = false;
+            world.traversal.vault_peak_lift = 0.0;
             world.traversal.chain_dive_after = false;
             controller.translation = None;
             if was_quick_roll {
@@ -10631,53 +10893,19 @@ fn step_traversal_custom(
         world.aim_world_dir
     };
 
-    let ray_origin = world.soldier_pos + Vec3::Y * config.soldier.vault_ray_height;
     let query_groups = CollisionGroups::new(GROUP_SOLDIER, GROUP_WORLD);
-
-    let check_vault = || {
-        physics_world
-            .cast_ray(
-                ray_origin,
-                travel_dir,
-                config.soldier.vault_check_distance,
-                query_groups,
-                |entity| {
-                    obstacle_query
-                        .get(entity)
-                        .map(|obs| obs.can_vault)
-                        .unwrap_or(false)
-                },
-            )
-            .is_some()
-    };
 
     let (kind, anim_name, speed, stamina_cost) = if world.effective_stance == Stance::Run {
         if input.space_just_pressed && world.space_hold_secs.is_none() {
-            if check_vault() {
-                if world.hero_stamina < world.hero_slide_stamina_cost {
-                    return;
-                }
-                world.hero_stamina -= world.hero_slide_stamina_cost;
-                let count = config.soldier.vault_animations.len();
-                assert!(count > 0, "لیست vault_animations در کانفیگ خالی است!");
-                let idx = ((world.next_rand() * count as f32) as usize).min(count - 1);
-                let chosen_anim = config.soldier.vault_animations[idx].clone();
-                let exact_duration = config.exact_anim_duration(&chosen_anim);
-
-                world.traversal.is_active = true;
-                world.traversal.kind = TraversalKind::ObstacleVault;
-                world.traversal.anim_name = chosen_anim;
-                world.traversal.elapsed = 0.0;
-                world.traversal.duration = exact_duration;
-                world.traversal.start_pos = world.soldier_pos;
-                world.traversal.target_pos = Vec3::new(
-                    world.soldier_pos.x + travel_dir.x * config.soldier.vault_travel_distance,
-                    world.soldier_pos.y,
-                    world.soldier_pos.z + travel_dir.z * config.soldier.vault_travel_distance,
-                );
-                world.traversal.travel_dir = travel_dir;
-                world.traversal.chain_dive_after = false;
-                world.soldier_facing_dir = travel_dir;
+            if let Some(candidate) = try_find_vault_candidate(
+                world,
+                config,
+                physics_world,
+                obstacle_query,
+                target_query,
+                travel_dir,
+            ) {
+                start_obstacle_vault(world, config, candidate);
                 return;
             }
             world.space_hold_secs = Some(0.0);
@@ -10715,31 +10943,15 @@ fn step_traversal_custom(
         if !input.space_just_pressed {
             return;
         }
-        if check_vault() {
-            if world.hero_stamina < world.hero_slide_stamina_cost {
-                return;
-            }
-            world.hero_stamina -= world.hero_slide_stamina_cost;
-            let count = config.soldier.vault_animations.len();
-            assert!(count > 0, "لیست vault_animations در کانفیگ خالی است!");
-            let idx = ((world.next_rand() * count as f32) as usize).min(count - 1);
-            let chosen_anim = config.soldier.vault_animations[idx].clone();
-            let exact_duration = config.exact_anim_duration(&chosen_anim);
-
-            world.traversal.is_active = true;
-            world.traversal.kind = TraversalKind::ObstacleVault;
-            world.traversal.anim_name = chosen_anim;
-            world.traversal.elapsed = 0.0;
-            world.traversal.duration = exact_duration;
-            world.traversal.start_pos = world.soldier_pos;
-            world.traversal.target_pos = Vec3::new(
-                world.soldier_pos.x + travel_dir.x * config.soldier.vault_travel_distance,
-                world.soldier_pos.y,
-                world.soldier_pos.z + travel_dir.z * config.soldier.vault_travel_distance,
-            );
-            world.traversal.travel_dir = travel_dir;
-            world.traversal.chain_dive_after = false;
-            world.soldier_facing_dir = travel_dir;
+        if let Some(candidate) = try_find_vault_candidate(
+            world,
+            config,
+            physics_world,
+            obstacle_query,
+            target_query,
+            travel_dir,
+        ) {
+            start_obstacle_vault(world, config, candidate);
             return;
         }
         match world.effective_stance {

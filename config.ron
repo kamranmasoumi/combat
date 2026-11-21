@@ -1,11 +1,11 @@
 GameConfig(
     network: NetworkConfig(
         server_bind_addr: "0.0.0.0:5000",
-        server_public_addr: "172.21.13.50:5000",
+        server_public_addr: "46.245.72.142:5000",
         client_bind_addr: "0.0.0.0:0",
-        backend_http_url: "http://127.0.0.1:8000",
-        backend_ws_url: "ws://127.0.0.1:8000",
-        redis_addr: "172.21.13.50:6379",
+        backend_http_url: "http://46.245.72.142:8000",
+        backend_ws_url: "ws://46.245.72.142:8000",
+        redis_addr: "127.0.0.1:6379",
         server_tick_rate_hz: 60.0,
         protocol_id: 7001,
         max_clients: 10,
@@ -564,6 +564,7 @@ GameConfig(
         orient_min_dir_sq: 0.0001,
         water_move_speed_multiplier: 0.80,
         water_splash_interval_secs: 0.16,
+        deep_water_swim_depth: 0.85,
     ),
     heroes: [
         HeroDef(
@@ -3575,7 +3576,7 @@ GameConfig(
     ),
     map: MapConfig(
             map_dimensions: (340.0, 240.0),
-            show_object_labels: true,
+            show_object_labels: false,
             base_vision_range: 38.0,
             high_ground_vision_bonus: 14.0,
             high_ground_occlusion_min_diff: 1.2,

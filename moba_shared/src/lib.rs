@@ -471,6 +471,7 @@ impl GameConfig {
         assert!(self.soldier.cliff_chain_min_slide_dist >= 0.0, "soldier.cliff_chain_min_slide_dist must be >= 0");
         assert!(self.soldier.cliff_edge_min_anim_duration_secs > 0.0, "soldier.cliff_edge_min_anim_duration_secs must be > 0");
         assert!(!self.soldier.vertical_aim_key.trim().is_empty(), "soldier.vertical_aim_key cannot be empty");
+        assert!(self.physics.deep_water_swim_depth.is_finite() && self.physics.deep_water_swim_depth > 0.0, "physics.deep_water_swim_depth باید بزرگ‌تر از صفر باشد");
         Self::validate_weapon_vfx_profile(&self.fx.creep_bullet_vfx, "fx.creep_bullet_vfx");
         Self::validate_weapon_vfx_profile(&self.fx.turret_bullet_vfx, "fx.turret_bullet_vfx");
         let bs = &self.fx.blood_splatter_vfx;
@@ -1584,6 +1585,7 @@ pub struct PhysicsConfig {
     pub orient_min_dir_sq: f32,
     pub water_move_speed_multiplier: f32,
     pub water_splash_interval_secs: f32,
+    pub deep_water_swim_depth: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -3911,6 +3913,54 @@ pub fn sample_water_surface_at(config: &GameConfig, world_pos: Vec3) -> Option<(
     }
     None
 }
+
+/// بررسی اینکه آیا نقطه (پای هیرو) در عمق شنای آب قرار دارد یا خیر
+#[inline]
+pub fn is_pos_in_deep_water(config: &GameConfig, pos: Vec3) -> bool {
+    if let Some((water_y, _)) = sample_water_surface_at(config, pos) {
+        (water_y - pos.y) >= config.physics.deep_water_swim_depth
+    } else {
+        false
+    }
+}
+
+/// قانون مخفی‌شدن هیرو هنگام شنا در آب عمیق (Server-Authoritative):
+/// هیرویی که داخل آب شنا می‌کند برای تیم دشمن غیرقابل‌مشاهده است و مختصاتش ارسال نمی‌شود،
+/// مگر اینکه حداقل یک هیروی زنده از تیم دشمن هم داخل آب شنا کند و هر دو در رنج میدان دید همدیگر باشند.
+pub fn is_swimming_hero_revealed_to_team(
+    players: &[PlayerSlotState],
+    target_slot: usize,
+    viewer_team: TeamId,
+    config: &GameConfig,
+    match_elapsed_secs: f32,
+    current_weather: WeatherKind,
+) -> bool {
+    let Some(target) = players.iter().find(|p| p.slot_index == target_slot) else {
+        return false;
+    };
+    if target.hero_team == viewer_team {
+        return true;
+    }
+    if !is_pos_in_deep_water(config, target.soldier_pos) {
+        return true;
+    }
+    let target_hero = config.active_hero(target.hero_index);
+    let target_vis = config.hero_effective_vision(target_hero, match_elapsed_secs, current_weather);
+
+    players.iter().any(|obs| {
+        obs.hero_team == viewer_team
+            && !obs.is_dead
+            && is_pos_in_deep_water(config, obs.soldier_pos)
+            && {
+                let obs_hero = config.active_hero(obs.hero_index);
+                let obs_vis =
+                    config.hero_effective_vision(obs_hero, match_elapsed_secs, current_weather);
+                let mutual_range = obs_vis.min(target_vis);
+                obs.soldier_pos.distance(target.soldier_pos) <= mutual_range
+            }
+    })
+}
+
 
 /// تقاطع اشعه دوربین با سطح آب برکه‌ها و رودخانه دره (برای دقت هدف‌گیری سه‌بعدی روی سطح آب)
 pub fn raycast_water_surface(
@@ -7981,13 +8031,30 @@ impl AuthoritativeWorldState {
             })
             .collect();
 
+        let water_hidden_slots: HashSet<usize> = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.hero_team != viewer_team
+                    && !is_swimming_hero_revealed_to_team(
+                        &self.players,
+                        p.slot_index,
+                        viewer_team,
+                        config,
+                        self.match_elapsed_secs,
+                        self.current_weather,
+                    )
+            })
+            .map(|p| p.slot_index)
+            .collect();
+
         let active_teleports: Vec<ActiveTeleportSnapshot> = self
             .players
             .iter()
             .filter_map(|p| {
                 if p.hero_team != viewer_team
-                    && p.invisibility_remaining > 0.0
-                    && !p.is_revealed_by_turret
+                    && ((p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret)
+                        || water_hidden_slots.contains(&p.slot_index))
                 {
                     return None;
                 }
@@ -8067,7 +8134,9 @@ impl AuthoritativeWorldState {
             let hidden_by_invis = p.hero_team != self.hero_team
                 && p.invisibility_remaining > 0.0
                 && !p.is_revealed_by_turret;
+            let hidden_by_water = water_hidden_slots.contains(&p.slot_index);
             let is_vis = !hidden_by_invis
+                && !hidden_by_water
                 && (p.hero_team == self.hero_team
                     || self.fog_of_war.is_world_point_visible(config, p.soldier_pos.x, p.soldier_pos.z));
             // Server Authority: اگر دشمن در مه جنگ باشد، مختصات و اطلاعات او اصلاً به کلاینت ارسال نمی‌شود!
@@ -9229,11 +9298,27 @@ fn shared_authoritative_drive_system(
         }
         return;
     }
-    let hero_aim_targets: Vec<(usize, TeamId, Vec3, f32, Stance, bool)> = world
+    let hero_aim_targets: Vec<(usize, TeamId, Vec3, f32, Stance, bool, bool, bool)> = world
         .players
         .iter()
         .map(|p| {
             let hidden_invis = p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret;
+            let water_vis_dawn = is_swimming_hero_revealed_to_team(
+                &world.players,
+                p.slot_index,
+                TeamId::Dawn,
+                &config,
+                world.match_elapsed_secs,
+                world.current_weather,
+            );
+            let water_vis_dusk = is_swimming_hero_revealed_to_team(
+                &world.players,
+                p.slot_index,
+                TeamId::Dusk,
+                &config,
+                world.match_elapsed_secs,
+                world.current_weather,
+            );
             (
                 p.slot_index,
                 p.hero_team,
@@ -9241,6 +9326,8 @@ fn shared_authoritative_drive_system(
                 p.hero_scale,
                 p.effective_stance,
                 p.is_dead || hidden_invis,
+                water_vis_dawn,
+                water_vis_dusk,
             )
         })
         .collect();
@@ -9428,7 +9515,7 @@ fn shared_drive_single_player(
     mountain_query: &Query<&PhysicsMountain>,
     map_obj_query: &Query<&MapObjectId>,
     elev_query: &Query<&ElevationSurface>,
-    hero_aim_targets: &[(usize, TeamId, Vec3, f32, Stance, bool)],
+    hero_aim_targets: &[(usize, TeamId, Vec3, f32, Stance, bool, bool, bool)],
 ) {
 
     // تایمر زنده شدن مجدد در چشمه پایگاه
@@ -9674,8 +9761,13 @@ fn shared_drive_single_player(
 
             // ب) بررسی برخورد تحلیلی اشعه ماوس با کپسول هیروهای دشمن قابل مشاهده (مستقل از موانع بین دوربین و هدف)
             let mut best_enemy_hit: Option<(f32, Vec3)> = None;
-            for &(e_slot, e_team, e_pos, e_scale, e_stance, e_dead) in hero_aim_targets {
-                if e_slot == world.active_slot || e_team == world.hero_team || e_dead {
+            for &(e_slot, e_team, e_pos, e_scale, e_stance, e_dead, e_water_vis_dawn, e_water_vis_dusk) in hero_aim_targets {
+                let water_visible = match world.hero_team {
+                    TeamId::Dawn => e_water_vis_dawn,
+                    TeamId::Dusk => e_water_vis_dusk,
+                    TeamId::Neutral => false,
+                };
+                if e_slot == world.active_slot || e_team == world.hero_team || e_dead || !water_visible {
                     continue;
                 }
                 if !world.fog_of_war.is_world_point_visible(config, e_pos.x, e_pos.z) {
@@ -9958,7 +10050,7 @@ fn shared_drive_single_player(
 
         if let Some((water_y, flow_dir)) = water_sample {
             let water_depth = (water_y - world.soldier_pos.y).max(0.0);
-            let is_deep_water = water_depth >= 0.85;
+            let is_deep_water = water_depth >= config.physics.deep_water_swim_depth;
 
             let hero_cfg = config.active_hero(world.hero_index);
             let hero_move_mult = world.hero_move_speed_multiplier * world.toxic_slow_multiplier * if world.invisibility_remaining > 0.0 { 1.0 + world.invis_move_speed_bonus_pct } else { 1.0 };
@@ -9985,7 +10077,7 @@ fn shared_drive_single_player(
                     intensity: 1.35,
                 });
                 world.water_splash_cooldown = config.physics.water_splash_interval_secs;
-            } else if world.is_moving && world.water_splash_cooldown <= 0.0 {
+            } else if !is_deep_water && world.is_moving && world.water_splash_cooldown <= 0.0 {
                 world.pending_fx.push(GameplayFxEvent::WaterSplash {
                     pos: splash_pos,
                     intensity: 0.85,
@@ -10287,7 +10379,7 @@ fn sample_ground_and_deep_water_at(
         } else {
             (effective_landing_y - extra_depth).max(-1.6)
         };
-        (water_y - effective_bed_y) >= 0.85
+        (water_y - effective_bed_y) >= config.physics.deep_water_swim_depth
     } else {
         false
     };
@@ -10830,7 +10922,7 @@ fn step_traversal_custom(
     }
 
     if let Some((water_y, _)) = sample_water_surface_at(config, world.soldier_pos) {
-        if (water_y - world.soldier_pos.y) >= 0.85 {
+        if (water_y - world.soldier_pos.y) >= config.physics.deep_water_swim_depth {
             world.space_hold_secs = None;
             return;
         }
@@ -13032,17 +13124,36 @@ fn shared_authoritative_react_system(
     }
 
     let dead_flags: Vec<bool> = world.targets.iter().map(|t| t.is_dead).collect();
-    let laser_hero_targets: Vec<(usize, TeamId, Vec3, f32, Stance, bool)> = world
+    let laser_hero_targets: Vec<(usize, TeamId, Vec3, f32, Stance, bool, bool, bool)> = world
         .players
         .iter()
         .map(|p| {
+            let hidden_invis = p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret;
+            let water_vis_dawn = is_swimming_hero_revealed_to_team(
+                &world.players,
+                p.slot_index,
+                TeamId::Dawn,
+                &config,
+                world.match_elapsed_secs,
+                world.current_weather,
+            );
+            let water_vis_dusk = is_swimming_hero_revealed_to_team(
+                &world.players,
+                p.slot_index,
+                TeamId::Dusk,
+                &config,
+                world.match_elapsed_secs,
+                world.current_weather,
+            );
             (
                 p.slot_index,
                 p.hero_team,
                 p.soldier_pos,
                 p.hero_scale,
                 p.effective_stance,
-                p.is_dead,
+                p.is_dead || hidden_invis,
+                water_vis_dawn,
+                water_vis_dusk,
             )
         })
         .collect();
@@ -13084,8 +13195,13 @@ fn shared_authoritative_react_system(
             if max_laser_dist > f32::EPSILON {
                 let laser_dir = to_laser / max_laser_dist;
                 let mut best_toi = max_laser_dist;
-                for &(e_slot, e_team, e_pos, e_scale, e_stance, e_dead) in &laser_hero_targets {
-                    if e_slot == world.active_slot || e_team == world.hero_team || e_dead {
+                for &(e_slot, e_team, e_pos, e_scale, e_stance, e_dead, e_water_vis_dawn, e_water_vis_dusk) in &laser_hero_targets {
+                    let water_visible = match world.hero_team {
+                        TeamId::Dawn => e_water_vis_dawn,
+                        TeamId::Dusk => e_water_vis_dusk,
+                        TeamId::Neutral => false,
+                    };
+                    if e_slot == world.active_slot || e_team == world.hero_team || e_dead || !water_visible {
                         continue;
                     }
                     let h_rad = config.soldier.player_radius
@@ -13233,7 +13349,7 @@ pub fn shared_client_drive_system(
     let deep_mult = hero_cfg.deep_water_speed_multiplier;
     let speed_mult = if let Some((water_y, _)) = water_sample {
         let depth = (water_y - feet_pos.y).max(0.0);
-        if depth >= 0.85 {
+        if depth >= config.physics.deep_water_swim_depth {
             hero_move_mult * deep_mult
         } else {
             hero_move_mult * shallow_mult
@@ -13789,12 +13905,34 @@ fn step_lane_creeps_system(
         .iter()
         .map(|c| (c.id, c.team, c.pos, c.is_dead, c.is_aggroed))
         .collect();
-    let hero_snap: Vec<(TeamId, Vec3, bool)> = world
+    let hero_snap: Vec<(TeamId, Vec3, bool, bool, bool)> = world
         .players
         .iter()
         .map(|p| {
             let hidden_invis = p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret;
-            (p.hero_team, p.soldier_pos, p.is_dead || hidden_invis)
+            let water_vis_dawn = is_swimming_hero_revealed_to_team(
+                &world.players,
+                p.slot_index,
+                TeamId::Dawn,
+                config,
+                world.match_elapsed_secs,
+                world.current_weather,
+            );
+            let water_vis_dusk = is_swimming_hero_revealed_to_team(
+                &world.players,
+                p.slot_index,
+                TeamId::Dusk,
+                config,
+                world.match_elapsed_secs,
+                world.current_weather,
+            );
+            (
+                p.hero_team,
+                p.soldier_pos,
+                p.is_dead || hidden_invis,
+                water_vis_dawn,
+                water_vis_dusk,
+            )
         })
         .collect();
     let hero_body_snap: Vec<(TeamId, Vec3, f32)> = world
@@ -13909,8 +14047,13 @@ fn step_lane_creeps_system(
                     best_target = Some((other_pos + Vec3::Y * c_stats.aim_chest_height, d));
                 }
             }
-            for &(h_team, h_pos, h_dead) in &hero_snap {
-                if h_team == my_team || h_dead {
+            for &(h_team, h_pos, h_dead, h_water_vis_dawn, h_water_vis_dusk) in &hero_snap {
+                let water_visible = match my_team {
+                    TeamId::Dawn => h_water_vis_dawn,
+                    TeamId::Dusk => h_water_vis_dusk,
+                    TeamId::Neutral => !is_pos_in_deep_water(config, h_pos),
+                };
+                if h_team == my_team || h_dead || !water_visible {
                     continue;
                 }
                 let d = my_pos.distance(h_pos);
@@ -14593,12 +14736,34 @@ fn step_turrets_system(
         .map(|c| (c.team, c.pos, c.is_dead, c.camp_index.is_none()))
         .collect();
 
-    let hero_snap: Vec<(TeamId, Vec3, bool)> = world
+    let hero_snap: Vec<(TeamId, Vec3, bool, bool, bool)> = world
         .players
         .iter()
         .map(|p| {
             let hidden_invis = p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret;
-            (p.hero_team, p.soldier_pos, p.is_dead || hidden_invis)
+            let water_vis_dawn = is_swimming_hero_revealed_to_team(
+                &world.players,
+                p.slot_index,
+                TeamId::Dawn,
+                config,
+                world.match_elapsed_secs,
+                world.current_weather,
+            );
+            let water_vis_dusk = is_swimming_hero_revealed_to_team(
+                &world.players,
+                p.slot_index,
+                TeamId::Dusk,
+                config,
+                world.match_elapsed_secs,
+                world.current_weather,
+            );
+            (
+                p.hero_team,
+                p.soldier_pos,
+                p.is_dead || hidden_invis,
+                water_vis_dawn,
+                water_vis_dusk,
+            )
         })
         .collect();
 
@@ -14682,8 +14847,13 @@ fn step_turrets_system(
 
         let mut best_hero: Option<(Vec3, f32)> = None;
         if best_creep.is_none() {
-            for &(h_team, h_pos, h_dead) in &hero_snap {
-                if h_team == my_team || h_dead {
+            for &(h_team, h_pos, h_dead, h_water_vis_dawn, h_water_vis_dusk) in &hero_snap {
+                let water_visible = match my_team {
+                    TeamId::Dawn => h_water_vis_dawn,
+                    TeamId::Dusk => h_water_vis_dusk,
+                    TeamId::Neutral => false,
+                };
+                if h_team == my_team || h_dead || !water_visible {
                     continue;
                 }
                 let d = my_pos.distance(h_pos);

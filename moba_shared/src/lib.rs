@@ -680,6 +680,38 @@ impl GameConfig {
             (0.0..=1.0).contains(&c.deny_hp_threshold_ratio),
             "deny_hp_threshold_ratio باید بین 0 و 1 باشد"
         );
+        assert!(
+            c.river_barrier_margin >= 0.0 && c.river_barrier_margin.is_finite(),
+            "river_barrier_margin باید عددی نامنفی و معتبر باشد"
+        );
+        assert!(
+            c.cliff_lookahead_dist > 0.0 && c.cliff_lookahead_dist.is_finite(),
+            "cliff_lookahead_dist باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            c.lane_rejoin_max_deviation > 0.0 && c.lane_rejoin_max_deviation.is_finite(),
+            "lane_rejoin_max_deviation باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            c.hero_block_detect_dist > 0.0 && c.hero_block_detect_dist.is_finite(),
+            "hero_block_detect_dist باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            (0.0..=1.0).contains(&c.hero_block_front_cone_dot),
+            "hero_block_front_cone_dot باید در بازه [0.0, 1.0] باشد"
+        );
+        assert!(
+            c.hero_block_hesitation_secs >= 0.0 && c.hero_block_hesitation_secs.is_finite(),
+            "hero_block_hesitation_secs باید نامنفی و معتبر باشد"
+        );
+        assert!(
+            c.hero_block_hesitation_cooldown_secs >= 0.0 && c.hero_block_hesitation_cooldown_secs.is_finite(),
+            "hero_block_hesitation_cooldown_secs باید نامنفی و معتبر باشد"
+        );
+        assert!(
+            c.hero_block_steer_strength > 0.0 && c.hero_block_steer_strength.is_finite(),
+            "hero_block_steer_strength باید بزرگ‌تر از صفر باشد"
+        );
     }
 
     pub fn validate_camera(&self) {
@@ -1838,6 +1870,14 @@ pub struct CreepConfig {
     pub anim_die: String,
     pub die_despawn_delay_secs: f32,
     pub waypoint_reach_dist: f32,
+    pub river_barrier_margin: f32,
+    pub cliff_lookahead_dist: f32,
+    pub lane_rejoin_max_deviation: f32,
+    pub hero_block_detect_dist: f32,
+    pub hero_block_front_cone_dot: f32,
+    pub hero_block_hesitation_secs: f32,
+    pub hero_block_hesitation_cooldown_secs: f32,
+    pub hero_block_steer_strength: f32,
     pub hovered_tint_emissive_rgb: (f32, f32, f32),
 }
 
@@ -6532,6 +6572,9 @@ pub struct LaneCreepState {
     pub anim_state: CreepAnimState,
     pub is_dead: bool,
     pub despawn_timer: f32,
+    pub hero_block_hesitation_timer: f32,
+    pub hero_block_cooldown_timer: f32,
+    pub hero_block_steer_side: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -9127,6 +9170,41 @@ fn shared_authoritative_drive_system(
         }
     }
 
+    // ۱. حل برخورد حرکت هیرو با سربازان پیش از حرکت سربازان:
+    // هیرو هرگز نمی‌تواند سربازها را هل بدهد یا کنار بزند؛ سرباز برای هیرو یک مانع کاملاً صلب است.
+    if !world.creeps.is_empty() && !world.players.is_empty() {
+        let base_r = config.soldier.player_radius;
+        let world_inner = &mut *world;
+        for p in &mut world_inner.players {
+            if p.is_dead {
+                continue;
+            }
+            for c in &world_inner.creeps {
+                let c_stats = resolve_creep_stats(&config, c.creep_type_id.as_deref());
+                let min_dist = base_r * p.hero_scale + c_stats.collider_radius;
+                if c.is_dead || (p.soldier_pos.y - c.pos.y).abs() > 1.8 {
+                    continue;
+                }
+                let delta = Vec2::new(p.soldier_pos.x - c.pos.x, p.soldier_pos.z - c.pos.z);
+                let dist = delta.length();
+                if dist < min_dist {
+                    let push_dir = if dist > 0.0001 {
+                        delta / dist
+                    } else {
+                        Vec2::new(1.0, 0.0)
+                    };
+                    p.soldier_pos.x = c.pos.x + push_dir.x * min_dist;
+                    p.soldier_pos.z = c.pos.z + push_dir.y * min_dist;
+                }
+            }
+        }
+        for (soldier_marker, mut soldier_tf, _) in &mut soldier_query {
+            let p = &world.players[soldier_marker.slot_index];
+            soldier_tf.translation.x = p.soldier_pos.x;
+            soldier_tf.translation.z = p.soldier_pos.z;
+        }
+    }
+
     // تولید موج سربازان هر لاین (دقیقاً پس از دقیقه‌ی اول، هر ۳۰ ثانیه) و هوش مصنوعی حرکت/شلیک
     step_lane_creeps_system(
         &mut commands,
@@ -9199,39 +9277,7 @@ fn shared_authoritative_drive_system(
         }
     }
 
-    // حل برخورد فیزیکی هیروها با سربازان لاین (مانع فیزیکی کامل، عدم عبور از داخل سربازها)
-    if !world.creeps.is_empty() && !world.players.is_empty() {
-        let base_r = config.soldier.player_radius;
-        let world_inner = &mut *world;
-        for p in &mut world_inner.players {
-            if p.is_dead {
-                continue;
-            }
-            for c in &world_inner.creeps {
-                let c_stats = resolve_creep_stats(&config, c.creep_type_id.as_deref());
-                let min_dist = base_r * p.hero_scale + c_stats.collider_radius;
-                if c.is_dead || (p.soldier_pos.y - c.pos.y).abs() > 1.8 {
-                    continue;
-                }
-                let delta = Vec2::new(p.soldier_pos.x - c.pos.x, p.soldier_pos.z - c.pos.z);
-                let dist = delta.length();
-                if dist < min_dist {
-                    let push_dir = if dist > 0.0001 {
-                        delta / dist
-                    } else {
-                        Vec2::new(1.0, 0.0)
-                    };
-                    p.soldier_pos.x = c.pos.x + push_dir.x * min_dist;
-                    p.soldier_pos.z = c.pos.z + push_dir.y * min_dist;
-                }
-            }
-        }
-        for (soldier_marker, mut soldier_tf, _) in &mut soldier_query {
-            let p = &world.players[soldier_marker.slot_index];
-            soldier_tf.translation.x = p.soldier_pos.x;
-            soldier_tf.translation.z = p.soldier_pos.z;
-        }
-    }
+
 }
 
 fn shared_drive_single_player(
@@ -13145,17 +13191,190 @@ pub fn lane_creep_buffs(
     (hp_mult, scale_mult, armor_bonus, dmg_mult, fire_rate_mult)
 }
 
+/// بررسی دقیق قرارگیری سرباز روی سطح ایمن (فلات بیرون از حاشیه دره، یا داخل مستطیل دقیق پل/لاین با حاشیه امن)
+/// بدون تخصیص حافظه (O(1)) تا هیچ سربازی از لبه پل یا پرتگاه به رودخانه سقوط نکند.
 #[inline]
-fn is_creep_walkable_xz(config: &GameConfig, x: f32, z: f32) -> bool {
+fn is_creep_safe_ground_xz(config: &GameConfig, x: f32, z: f32, margin: f32) -> bool {
     if !config.map.canyon.enabled {
         return true;
     }
-    if canyon_sample_height(&config.map.canyon, x, z) >= -0.15 {
+    // ۱. اگر با حاشیه امن بیرون از لبه پرتگاه دره باشد، روی فلات امن است
+    if canyon_edge_distance(&config.map.canyon, x, z) <= -margin {
         return true;
     }
-    is_on_bridge_or_lane(config, x, z)
+    // ۲. بررسی قرارگیری ایمن روی پل مرکزی
+    let cb = &config.map.center_bridge;
+    let cb_tf = cb.model_transform.to_transform();
+    let cb_rad = (cb.outer_radius * cb_tf.scale.x.max(cb_tf.scale.z) - margin).max(0.5);
+    let dx = x - cb_tf.translation.x;
+    let dz = z - cb_tf.translation.z;
+    if dx * dx + dz * dz <= cb_rad * cb_rad {
+        return true;
+    }
+    // ۳. بررسی قرارگیری ایمن داخل مستطیل دقیق (OBB) هر سگمنت لاین + مفاصل داخلی بین سگمنت‌ها
+    let p_xz = Vec2::new(x, z);
+    for lane in &config.map.lanes {
+        let half_w = (lane.width * 0.5 - margin).max(0.5);
+        let half_w_sq = half_w * half_w;
+        let wp_count = lane.waypoints.len();
+        for seg_idx in 0..wp_count.saturating_sub(1) {
+            let a_xz = Vec2::new(lane.waypoints[seg_idx].0, lane.waypoints[seg_idx].2);
+            let b_xz = Vec2::new(lane.waypoints[seg_idx + 1].0, lane.waypoints[seg_idx + 1].2);
+            let ab = b_xz - a_xz;
+            let len = ab.length();
+            if len > 1e-4 {
+                let u = ab / len;
+                let rel = p_xz - a_xz;
+                let proj = rel.dot(u);
+                if proj >= 0.0 && proj <= len {
+                    let perp_sq = (rel - u * proj).length_squared();
+                    if perp_sq <= half_w_sq {
+                        return true;
+                    }
+                }
+            }
+        }
+        // پوشش نرم مفاصل داخلی تغییر زاویه لاین
+        for wp_idx in 1..wp_count.saturating_sub(1) {
+            let w_xz = Vec2::new(lane.waypoints[wp_idx].0, lane.waypoints[wp_idx].2);
+            if p_xz.distance_squared(w_xz) <= half_w_sq {
+                return true;
+            }
+        }
+    }
+    false
 }
 
+/// بررسی سریع (۶ نمونه بدون تخصیص حافظه) برای تشخیص عبور خط مستقیم بین دو نقطه از روی رودخانه/پرتگاه
+#[inline]
+fn segment_crosses_river_barrier(
+    config: &GameConfig,
+    from_xz: Vec2,
+    to_xz: Vec2,
+    margin: f32,
+) -> bool {
+    if !config.map.canyon.enabled {
+        return false;
+    }
+    const SAMPLES: usize = 6;
+    for i in 1..SAMPLES {
+        let t = (i as f32) / (SAMPLES as f32);
+        let p = from_xz.lerp(to_xz, t);
+        if !is_creep_safe_ground_xz(config, p.x, p.y, margin) {
+            return true;
+        }
+    }
+    false
+}
+
+/// یافتن نزدیک‌ترین نقطه و سگمنت روی لاین برای بازیابی هوشمند مسیر (مشابه Dota 2)
+#[inline]
+fn nearest_point_on_lane_xz(lane: &LanePathDef, p_xz: Vec2) -> (Vec2, usize, f32) {
+    let mut best_pt = p_xz;
+    let mut best_seg = 0usize;
+    let mut best_dist_sq = f32::MAX;
+    for seg_idx in 0..lane.waypoints.len().saturating_sub(1) {
+        let a_xz = Vec2::new(lane.waypoints[seg_idx].0, lane.waypoints[seg_idx].2);
+        let b_xz = Vec2::new(lane.waypoints[seg_idx + 1].0, lane.waypoints[seg_idx + 1].2);
+        let ab = b_xz - a_xz;
+        let len_sq = ab.length_squared();
+        let t = if len_sq > 1e-5 {
+            ((p_xz - a_xz).dot(ab) / len_sq).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let closest = a_xz + ab * t;
+        let dsq = p_xz.distance_squared(closest);
+        if dsq < best_dist_sq {
+            best_dist_sq = dsq;
+            best_pt = closest;
+            best_seg = seg_idx;
+        }
+    }
+    (best_pt, best_seg, best_dist_sq.sqrt())
+}
+
+/// هدایت هوشمند و سبک (Zero-Allocation) برای لغزش روان روی لبه‌های مورب و منحنی پرتگاه و جلوگیری از گیر کردن
+#[inline]
+fn steer_creep_step_avoiding_river(
+    config: &GameConfig,
+    cur_x: f32,
+    cur_z: f32,
+    desired_dir: Vec3,
+    step_dist: f32,
+    margin: f32,
+) -> (f32, f32, Vec3, bool) {
+    let dir2 = Vec2::new(desired_dir.x, desired_dir.z).normalize_or_zero();
+    if dir2.length_squared() < 1e-6 || step_dist <= 1e-6 {
+        return (cur_x, cur_z, desired_dir, false);
+    }
+
+    let lookahead = config.creeps.cliff_lookahead_dist.max(step_dist * 2.0);
+    let direct_x = cur_x + dir2.x * step_dist;
+    let direct_z = cur_z + dir2.y * step_dist;
+    let direct_step_ok = is_creep_safe_ground_xz(config, direct_x, direct_z, margin);
+    let direct_look_ok = is_creep_safe_ground_xz(
+        config,
+        cur_x + dir2.x * lookahead,
+        cur_z + dir2.y * lookahead,
+        margin,
+    );
+
+    // مسیر سریع: ۹۵٪ تیک‌ها که مانعی جلو نیست تنها با ۲ چک ساده برمی‌گردد
+    if direct_step_ok && direct_look_ok {
+        return (direct_x, direct_z, Vec3::new(dir2.x, 0.0, dir2.y), true);
+    }
+
+    // جستجوی زاویه‌ای سبک برای لغزش نرم در امتداد لبه پرتگاه یا پل (تا ±۱۳۵ درجه)
+    const ANGLES_DEG: [f32; 14] = [
+        18.0, -18.0, 36.0, -36.0, 55.0, -55.0, 75.0, -75.0, 95.0, -95.0, 115.0, -115.0, 135.0,
+        -135.0,
+    ];
+
+    let mut best_score = if direct_step_ok { 0.35 } else { f32::NEG_INFINITY };
+    let mut best_dir = dir2;
+    let mut found = direct_step_ok;
+
+    for &deg in &ANGLES_DEG {
+        let rad = deg.to_radians();
+        let (s, c) = rad.sin_cos();
+        let cand = Vec2::new(dir2.x * c - dir2.y * s, dir2.x * s + dir2.y * c);
+        let nx = cur_x + cand.x * step_dist;
+        let nz = cur_z + cand.y * step_dist;
+        if !is_creep_safe_ground_xz(config, nx, nz, margin) {
+            continue;
+        }
+        let look_ok = is_creep_safe_ground_xz(
+            config,
+            cur_x + cand.x * lookahead,
+            cur_z + cand.y * lookahead,
+            margin,
+        );
+        let half_look_ok = is_creep_safe_ground_xz(
+            config,
+            cur_x + cand.x * (lookahead * 0.5),
+            cur_z + cand.y * (lookahead * 0.5),
+            margin,
+        );
+        let align = cand.dot(dir2);
+        let score = align + if look_ok { 0.65 } else if half_look_ok { 0.25 } else { -0.25 };
+        if score > best_score {
+            best_score = score;
+            best_dir = cand;
+            found = true;
+        }
+    }
+
+    if found {
+        let nx = cur_x + best_dir.x * step_dist;
+        let nz = cur_z + best_dir.y * step_dist;
+        (nx, nz, Vec3::new(best_dir.x, 0.0, best_dir.y), true)
+    } else {
+        (cur_x, cur_z, desired_dir, false)
+    }
+}
+
+/// محافظ ساده برای هل‌دادن‌های فیزیکی (تاور و جداسازی سربازان) تا هیچ‌گاه سربازی به داخل دره پرتاب نشود
 #[inline]
 fn move_creep_xz_with_river_barrier(
     config: &GameConfig,
@@ -13163,26 +13382,25 @@ fn move_creep_xz_with_river_barrier(
     cur_z: f32,
     next_x: f32,
     next_z: f32,
+    margin: f32,
 ) -> (f32, f32, bool) {
-    if is_creep_walkable_xz(config, next_x, next_z) {
+    if is_creep_safe_ground_xz(config, next_x, next_z, margin) {
         return (next_x, next_z, true);
     }
-    let can_x = is_creep_walkable_xz(config, next_x, cur_z);
-    let can_z = is_creep_walkable_xz(config, cur_x, next_z);
-    if can_x && !can_z {
-        return (next_x, cur_z, true);
+    let delta = Vec2::new(next_x - cur_x, next_z - cur_z);
+    let dist = delta.length();
+    if dist <= 1e-5 {
+        return (cur_x, cur_z, false);
     }
-    if can_z && !can_x {
-        return (cur_x, next_z, true);
-    }
-    if can_x && can_z {
-        if (next_x - cur_x).abs() >= (next_z - cur_z).abs() {
-            return (next_x, cur_z, true);
-        } else {
-            return (cur_x, next_z, true);
-        }
-    }
-    (cur_x, cur_z, false)
+    let (sx, sz, _, ok) = steer_creep_step_avoiding_river(
+        config,
+        cur_x,
+        cur_z,
+        Vec3::new(delta.x / dist, 0.0, delta.y / dist),
+        dist,
+        margin,
+    );
+    (sx, sz, ok)
 }
 
 fn step_lane_creeps_system(
@@ -13253,6 +13471,9 @@ fn step_lane_creeps_system(
                         anim_state: CreepAnimState::Run,
                         is_dead: false,
                         despawn_timer: 0.0,
+                        hero_block_hesitation_timer: 0.0,
+                        hero_block_cooldown_timer: 0.0,
+                        hero_block_steer_side: 0.0,
                     });
                 }
             }
@@ -13311,6 +13532,9 @@ fn step_lane_creeps_system(
                     anim_state: CreepAnimState::Idle,
                     is_dead: false,
                     despawn_timer: 0.0,
+                    hero_block_hesitation_timer: 0.0,
+                    hero_block_cooldown_timer: 0.0,
+                    hero_block_steer_side: 0.0,
                 });
             }
         }
@@ -13337,6 +13561,12 @@ fn step_lane_creeps_system(
             let hidden_invis = p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret;
             (p.hero_team, p.soldier_pos, p.is_dead || hidden_invis)
         })
+        .collect();
+    let hero_body_snap: Vec<(TeamId, Vec3, f32)> = world
+        .players
+        .iter()
+        .filter(|p| !p.is_dead)
+        .map(|p| (p.hero_team, p.soldier_pos, config.soldier.player_radius * p.hero_scale))
         .collect();
     let courier_snap: Vec<(TeamId, Vec3, bool)> = world
         .players
@@ -13388,13 +13618,19 @@ fn step_lane_creeps_system(
 
         world.creeps[idx].fire_cooldown = (world.creeps[idx].fire_cooldown - dt).max(0.0);
         world.creeps[idx].fire_anim_timer = (world.creeps[idx].fire_anim_timer - dt).max(0.0);
+        world.creeps[idx].hero_block_hesitation_timer =
+            (world.creeps[idx].hero_block_hesitation_timer - dt).max(0.0);
+        world.creeps[idx].hero_block_cooldown_timer =
+            (world.creeps[idx].hero_block_cooldown_timer - dt).max(0.0);
 
         let my_id = world.creeps[idx].id;
         let my_team = world.creeps[idx].team;
         let my_pos = world.creeps[idx].pos;
+        let prev_safe_pos = my_pos;
         let my_home = world.creeps[idx].home_pos;
         let my_lane = world.creeps[idx].lane;
         let c_stats = resolve_creep_stats(config, world.creeps[idx].creep_type_id.as_deref());
+        let safety_margin = c_stats.collider_radius + config.creeps.river_barrier_margin;
         let is_neutral = my_team == TeamId::Neutral;
         let leashed_back = is_neutral && my_pos.distance(my_home) > config.neutral_camps.aggro_leash_radius;
         if leashed_back {
@@ -13615,18 +13851,24 @@ fn step_lane_creeps_system(
                     });
                 }
             } else {
-                let step = world.creeps[idx].facing_dir * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt;
+                let step_dist = c_stats.move_speed
+                    * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team)
+                    * dt;
                 let cur_x = world.creeps[idx].pos.x;
                 let cur_z = world.creeps[idx].pos.z;
-                let (nx, nz, did_move) = move_creep_xz_with_river_barrier(
+                let (nx, nz, steered_dir, did_move) = steer_creep_step_avoiding_river(
                     config,
                     cur_x,
                     cur_z,
-                    cur_x + step.x,
-                    cur_z + step.z,
+                    world.creeps[idx].facing_dir,
+                    step_dist,
+                    safety_margin,
                 );
                 world.creeps[idx].pos.x = nx;
                 world.creeps[idx].pos.z = nz;
+                if did_move {
+                    world.creeps[idx].facing_dir = steered_dir;
+                }
                 moved = did_move;
             }
         } else if is_neutral {
@@ -13634,19 +13876,22 @@ fn step_lane_creeps_system(
             let to_home = Vec3::new(my_home.x - my_pos.x, 0.0, my_home.z - my_pos.z);
             if to_home.length() > 0.35 {
                 let dir = to_home.normalize();
-                world.creeps[idx].facing_dir = dir;
-                let step = dir * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt;
+                let step_dist = c_stats.move_speed
+                    * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team)
+                    * dt;
                 let cur_x = world.creeps[idx].pos.x;
                 let cur_z = world.creeps[idx].pos.z;
-                let (nx, nz, did_move) = move_creep_xz_with_river_barrier(
+                let (nx, nz, steered_dir, did_move) = steer_creep_step_avoiding_river(
                     config,
                     cur_x,
                     cur_z,
-                    cur_x + step.x,
-                    cur_z + step.z,
+                    dir,
+                    step_dist,
+                    safety_margin,
                 );
                 world.creeps[idx].pos.x = nx;
                 world.creeps[idx].pos.z = nz;
+                world.creeps[idx].facing_dir = steered_dir;
                 moved = did_move;
             }
         } else {
@@ -13664,42 +13909,90 @@ fn step_lane_creeps_system(
                     }
                 }
             } else if let Some(lane_def) = config.map.lanes.iter().find(|l| l.lane == my_lane) {
-                let wp_idx = world.creeps[idx]
+                let wp_len = lane_def.waypoints.len();
+                let mut wp_idx = world.creeps[idx]
                     .waypoint_index
-                    .min(lane_def.waypoints.len().saturating_sub(1));
+                    .min(wp_len.saturating_sub(1));
                 let wp = lane_def.waypoints[wp_idx];
-                let wp_pos = Vec3::new(wp.0, wp.1, wp.2);
-                let to_wp = Vec3::new(wp_pos.x - my_pos.x, 0.0, wp_pos.z - my_pos.z);
-                let dist_wp = to_wp.length();
+                let my_xz = Vec2::new(my_pos.x, my_pos.z);
+                let wp_xz = Vec2::new(wp.0, wp.2);
 
-                // اگر Waypoint دقیقاً روی مرکز یک تاور باشد، شعاع رسیدن به Waypoint از شعاع تاور بزرگ‌تر می‌شود تا سرباز پشت تاور گیر نکند
-                let mut reach_dist = config.creeps.waypoint_reach_dist;
-                for &(_t_team, t_pos, t_rad, _t_h, t_dead) in &turret_snap {
-                    if !t_dead && Vec2::new(wp_pos.x - t_pos.x, wp_pos.z - t_pos.z).length() <= t_rad + 2.0 {
-                        reach_dist = reach_dist.max(t_rad + c_stats.collider_radius + 1.5);
+                // بازیابی هوشمند مسیر لاین (مشابه Dota 2): اگر سرباز به خارج از لاین کشیده شده یا خط مستقیم به Waypoint از رودخانه عبور کند،
+                // ابتدا به نزدیک‌ترین نقطه قابل‌دسترس لاین در سمت خودش برمی‌گردد و سپس روی پل لاین پیشروی می‌کند.
+                let (nearest_pt, nearest_seg, dist_from_lane) =
+                    nearest_point_on_lane_xz(lane_def, my_xz);
+                let direct_blocked =
+                    segment_crosses_river_barrier(config, my_xz, wp_xz, safety_margin);
+
+                if direct_blocked || dist_from_lane > config.creeps.lane_rejoin_max_deviation {
+                    if !segment_crosses_river_barrier(config, my_xz, nearest_pt, safety_margin)
+                        && dist_from_lane > lane_def.width * 0.40
+                    {
+                        let rejoined_wp = match my_team {
+                            TeamId::Dawn => (nearest_seg + 1).min(wp_len.saturating_sub(1)),
+                            TeamId::Dusk => nearest_seg,
+                            TeamId::Neutral => wp_idx,
+                        };
+                        world.creeps[idx].waypoint_index = rejoined_wp;
+                        let to_rejoin = Vec3::new(nearest_pt.x - my_pos.x, 0.0, nearest_pt.y - my_pos.z);
+                        let d_rejoin = to_rejoin.length();
+                        if d_rejoin > 0.1 {
+                            move_target_opt = Some((to_rejoin, d_rejoin));
+                        }
+                    } else if direct_blocked {
+                        // یافتن نزدیک‌ترین Waypoint قابل‌دسترس بدون عبور از رودخانه تا سرباز از روی پل عبور کند
+                        let mut best_reach_wp: Option<(usize, f32)> = None;
+                        for (wi, &(wx, _wy, wz)) in lane_def.waypoints.iter().enumerate() {
+                            let cand_xz = Vec2::new(wx, wz);
+                            if !segment_crosses_river_barrier(config, my_xz, cand_xz, safety_margin) {
+                                let d = my_xz.distance(cand_xz);
+                                if best_reach_wp.map_or(true, |(_, bd)| d < bd) {
+                                    best_reach_wp = Some((wi, d));
+                                }
+                            }
+                        }
+                        if let Some((best_wi, _)) = best_reach_wp {
+                            wp_idx = best_wi;
+                            world.creeps[idx].waypoint_index = best_wi;
+                        }
                     }
                 }
 
-                if dist_wp <= reach_dist {
-                    match my_team {
-                        TeamId::Dawn => {
-                            if wp_idx + 1 < lane_def.waypoints.len() {
-                                world.creeps[idx].waypoint_index = wp_idx + 1;
-                            } else {
-                                world.creeps[idx].waypoint_index = usize::MAX;
-                            }
+                if move_target_opt.is_none() {
+                    let wp = lane_def.waypoints[wp_idx];
+                    let wp_pos = Vec3::new(wp.0, wp.1, wp.2);
+                    let to_wp = Vec3::new(wp_pos.x - my_pos.x, 0.0, wp_pos.z - my_pos.z);
+                    let dist_wp = to_wp.length();
+
+                    // اگر Waypoint دقیقاً روی مرکز یک تاور باشد، شعاع رسیدن به Waypoint از شعاع تاور بزرگ‌تر می‌شود تا سرباز پشت تاور گیر نکند
+                    let mut reach_dist = config.creeps.waypoint_reach_dist;
+                    for &(_t_team, t_pos, t_rad, _t_h, t_dead) in &turret_snap {
+                        if !t_dead && Vec2::new(wp_pos.x - t_pos.x, wp_pos.z - t_pos.z).length() <= t_rad + 2.0 {
+                            reach_dist = reach_dist.max(t_rad + c_stats.collider_radius + 1.5);
                         }
-                        TeamId::Dusk => {
-                            if wp_idx > 0 {
-                                world.creeps[idx].waypoint_index = wp_idx - 1;
-                            } else {
-                                world.creeps[idx].waypoint_index = usize::MAX;
-                            }
-                        }
-                        TeamId::Neutral => {}
                     }
-                } else {
-                    move_target_opt = Some((to_wp, dist_wp));
+
+                    if dist_wp <= reach_dist {
+                        match my_team {
+                            TeamId::Dawn => {
+                                if wp_idx + 1 < wp_len {
+                                    world.creeps[idx].waypoint_index = wp_idx + 1;
+                                } else {
+                                    world.creeps[idx].waypoint_index = usize::MAX;
+                                }
+                            }
+                            TeamId::Dusk => {
+                                if wp_idx > 0 {
+                                    world.creeps[idx].waypoint_index = wp_idx - 1;
+                                } else {
+                                    world.creeps[idx].waypoint_index = usize::MAX;
+                                }
+                            }
+                            TeamId::Neutral => {}
+                        }
+                    } else {
+                        move_target_opt = Some((to_wp, dist_wp));
+                    }
                 }
             }
 
@@ -13724,20 +14017,105 @@ fn step_lane_creeps_system(
                             }
                         }
                     }
-                    world.creeps[idx].facing_dir = dir;
-                    let step = dir * c_stats.move_speed * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team) * dt;
-                    let cur_x = world.creeps[idx].pos.x;
-                    let cur_z = world.creeps[idx].pos.z;
-                    let (nx, nz, did_move) = move_creep_xz_with_river_barrier(
-                        config,
-                        cur_x,
-                        cur_z,
-                        cur_x + step.x,
-                        cur_z + step.z,
-                    );
-                    world.creeps[idx].pos.x = nx;
-                    world.creeps[idx].pos.z = nz;
-                    moved = did_move;
+                    // مکانیک مهارتی Creep Blocking (مشابه Dota 2):
+                    // اگر هیرو (به‌ویژه هیروی خودی) دقیقاً جلوی مسیر سرباز قرار گیرد، سرباز مکث بسیار کوتاهی کرده
+                    // و سپس هوشمندانه از سمت بازتر دور هیرو می‌چرخد و عبور می‌کند.
+                    let mut blocked_hesitating = false;
+                    let mut saw_blocking_hero = false;
+                    let fwd2 = Vec2::new(dir.x, dir.z).normalize_or_zero();
+                    let mut best_steer_vec = Vec2::ZERO;
+
+                    for &(h_team, h_pos, h_rad) in &hero_body_snap {
+                        if (my_pos.y - h_pos.y).abs() > 1.8 {
+                            continue;
+                        }
+                        let to_hero = Vec2::new(h_pos.x - my_pos.x, h_pos.z - my_pos.z);
+                        let dist_h = to_hero.length();
+                        let min_d = h_rad + c_stats.collider_radius;
+                        let detect_r = min_d + config.creeps.hero_block_detect_dist;
+                        if dist_h < detect_r && dist_h > 0.001 {
+                            let to_hero_dir = to_hero / dist_h;
+                            let front_dot = to_hero_dir.dot(fwd2);
+                            if front_dot > 0.15 {
+                                saw_blocking_hero = true;
+                                // فقط اگر هیروی خودی دقیقاً در مخروط جلویی سرباز ایستاده باشد، مکث کوتاه واکنش فعال می‌شود
+                                let head_on_dist = min_d + config.creeps.hero_block_detect_dist * 0.65;
+                                if h_team == my_team
+                                    && front_dot >= config.creeps.hero_block_front_cone_dot
+                                    && dist_h <= head_on_dist
+                                {
+                                    if world.creeps[idx].hero_block_hesitation_timer <= 0.0
+                                        && world.creeps[idx].hero_block_cooldown_timer <= 0.0
+                                    {
+                                        world.creeps[idx].hero_block_hesitation_timer =
+                                            config.creeps.hero_block_hesitation_secs;
+                                        world.creeps[idx].hero_block_cooldown_timer =
+                                            config.creeps.hero_block_hesitation_secs
+                                                + config.creeps.hero_block_hesitation_cooldown_secs;
+                                    }
+                                    if world.creeps[idx].hero_block_hesitation_timer > 0.0 {
+                                        blocked_hesitating = true;
+                                    }
+                                }
+
+                                // انتخاب هوشمند سمت دور زدن هیرو (بدون پرش چپ و راست و بدون رفتن سمت پرتگاه)
+                                let perp = Vec2::new(-to_hero_dir.y, to_hero_dir.x);
+                                let cross = fwd2.x * to_hero_dir.y - fwd2.y * to_hero_dir.x;
+                                let mut side_sign = if world.creeps[idx].hero_block_steer_side != 0.0 {
+                                    world.creeps[idx].hero_block_steer_side
+                                } else if cross.abs() > 0.06 {
+                                    if cross > 0.0 { -1.0 } else { 1.0 }
+                                } else if (my_id & 1) == 0 {
+                                    1.0
+                                } else {
+                                    -1.0
+                                };
+                                // اگر سمت انتخاب‌شده به پرتگاه رودخانه می‌رسد، از سمت دیگر دور می‌زند
+                                let probe_side = Vec2::new(my_pos.x, my_pos.z) + perp * (side_sign * (min_d + 0.6));
+                                if !is_creep_safe_ground_xz(config, probe_side.x, probe_side.y, safety_margin) {
+                                    side_sign = -side_sign;
+                                }
+                                world.creeps[idx].hero_block_steer_side = side_sign;
+
+                                let prox = ((detect_r - dist_h) / config.creeps.hero_block_detect_dist.max(0.05))
+                                    .clamp(0.0, 1.0);
+                                best_steer_vec += perp * (side_sign * prox * config.creeps.hero_block_steer_strength);
+                            }
+                        }
+                    }
+
+                    if !saw_blocking_hero {
+                        world.creeps[idx].hero_block_steer_side = 0.0;
+                    }
+
+                    if blocked_hesitating {
+                        world.creeps[idx].facing_dir = dir;
+                        moved = false;
+                    } else {
+                        if best_steer_vec.length_squared() > 0.0001 {
+                            let steered2 = (fwd2 + best_steer_vec).normalize_or_zero();
+                            if steered2.length_squared() > 0.0001 {
+                                dir = Vec3::new(steered2.x, 0.0, steered2.y);
+                            }
+                        }
+                        let step_dist = c_stats.move_speed
+                            * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team)
+                            * dt;
+                        let cur_x = world.creeps[idx].pos.x;
+                        let cur_z = world.creeps[idx].pos.z;
+                        let (nx, nz, steered_dir, did_move) = steer_creep_step_avoiding_river(
+                            config,
+                            cur_x,
+                            cur_z,
+                            dir,
+                            step_dist,
+                            safety_margin,
+                        );
+                        world.creeps[idx].pos.x = nx;
+                        world.creeps[idx].pos.z = nz;
+                        world.creeps[idx].facing_dir = steered_dir;
+                        moved = did_move;
+                    }
                 }
             }
         }
@@ -13767,13 +14145,21 @@ fn step_lane_creeps_system(
                 true
             },
         );
+        let min_safe_ground_y = if config.map.canyon.enabled {
+            config.map.canyon.water_y + 0.5
+        } else {
+            f32::NEG_INFINITY
+        };
         if let Some((_ent, hit)) = hit_opt {
-            if hit.normal.y > 0.5 {
+            if hit.normal.y > 0.5 && hit.point.y >= min_safe_ground_y {
                 world.creeps[idx].pos.y = hit.point.y;
+            } else if inside_canyon {
+                // جلوگیری قطعی از سقوط به بستر رودخانه یا پرواز در هوا
+                world.creeps[idx].pos = prev_safe_pos;
             }
         } else if inside_canyon {
-            let swim_floor = config.map.canyon.water_y - 1.15;
-            world.creeps[idx].pos.y = canyon_h.max(swim_floor);
+            // هرگز سرباز را به داخل آب نمی‌اندازیم؛ به آخرین موقعیت امن روی لبه یا پل برمی‌گردانیم
+            world.creeps[idx].pos = prev_safe_pos;
         }
 
         // جلوگیری از ورود و گیر افتادن سربازان پشت پایه تاورها (به همراه لغزش مماسی دور تاور)
@@ -13792,6 +14178,7 @@ fn step_lane_creeps_system(
                     world.creeps[idx].pos.z,
                     t_pos.x + push.x * min_d,
                     t_pos.z + push.y * min_d,
+                    safety_margin,
                 );
                 world.creeps[idx].pos.x = px;
                 world.creeps[idx].pos.z = pz;
@@ -13806,10 +14193,39 @@ fn step_lane_creeps_system(
                         world.creeps[idx].pos.z,
                         world.creeps[idx].pos.x + slide.x,
                         world.creeps[idx].pos.z + slide.y,
+                        safety_margin,
                     );
                     world.creeps[idx].pos.x = sx;
                     world.creeps[idx].pos.z = sz;
                 }
+            }
+        }
+
+        // جلوگیری از نفوذ سرباز به داخل بدن هیرو (در صورت تماس، سرباز روی محیط هیرو می‌لغزد و هیرو را هل نمی‌دهد)
+        for &(_h_team, h_pos, h_rad) in &hero_body_snap {
+            if (world.creeps[idx].pos.y - h_pos.y).abs() > 1.8 {
+                continue;
+            }
+            let min_d = h_rad + c_stats.collider_radius;
+            let delta = Vec2::new(world.creeps[idx].pos.x - h_pos.x, world.creeps[idx].pos.z - h_pos.z);
+            let dist = delta.length();
+            if dist < min_d {
+                let push = if dist > 0.0001 {
+                    delta / dist
+                } else {
+                    let f = Vec2::new(world.creeps[idx].facing_dir.x, world.creeps[idx].facing_dir.z).normalize_or_zero();
+                    if f.length_squared() > 0.01 { -f } else { Vec2::new(1.0, 0.0) }
+                };
+                let (cx, cz, _) = move_creep_xz_with_river_barrier(
+                    config,
+                    world.creeps[idx].pos.x,
+                    world.creeps[idx].pos.z,
+                    h_pos.x + push.x * min_d,
+                    h_pos.z + push.y * min_d,
+                    safety_margin,
+                );
+                world.creeps[idx].pos.x = cx;
+                world.creeps[idx].pos.z = cz;
             }
         }
 
@@ -13850,6 +14266,7 @@ fn step_lane_creeps_system(
                 } else {
                     Vec2::new(1.0, 0.0)
                 };
+                let sep_margin = config.creeps.collider_radius + config.creeps.river_barrier_margin;
                 let half_push = (min_creep_dist - dist) * 0.5;
                 let (nix, niz, _) = move_creep_xz_with_river_barrier(
                     config,
@@ -13857,6 +14274,7 @@ fn step_lane_creeps_system(
                     world.creeps[i].pos.z,
                     world.creeps[i].pos.x - push_dir.x * half_push,
                     world.creeps[i].pos.z - push_dir.y * half_push,
+                    sep_margin,
                 );
                 world.creeps[i].pos.x = nix;
                 world.creeps[i].pos.z = niz;
@@ -13867,9 +14285,40 @@ fn step_lane_creeps_system(
                     world.creeps[j].pos.z,
                     world.creeps[j].pos.x + push_dir.x * half_push,
                     world.creeps[j].pos.z + push_dir.y * half_push,
+                    sep_margin,
                 );
                 world.creeps[j].pos.x = njx;
                 world.creeps[j].pos.z = njz;
+            }
+        }
+    }
+
+    // ۵. تضمین عدم نفوذ سرباز به داخل هیرو پس از جداسازی سربازان از یکدیگر
+    for i in 0..c_len {
+        if world.creeps[i].is_dead {
+            continue;
+        }
+        let c_stats = resolve_creep_stats(config, world.creeps[i].creep_type_id.as_deref());
+        let safety_margin = c_stats.collider_radius + config.creeps.river_barrier_margin;
+        for &(_h_team, h_pos, h_rad) in &hero_body_snap {
+            if (world.creeps[i].pos.y - h_pos.y).abs() > 1.8 {
+                continue;
+            }
+            let min_d = h_rad + c_stats.collider_radius;
+            let delta = Vec2::new(world.creeps[i].pos.x - h_pos.x, world.creeps[i].pos.z - h_pos.z);
+            let dist = delta.length();
+            if dist < min_d {
+                let push = if dist > 0.0001 { delta / dist } else { Vec2::new(1.0, 0.0) };
+                let (cx, cz, _) = move_creep_xz_with_river_barrier(
+                    config,
+                    world.creeps[i].pos.x,
+                    world.creeps[i].pos.z,
+                    h_pos.x + push.x * min_d,
+                    h_pos.z + push.y * min_d,
+                    safety_margin,
+                );
+                world.creeps[i].pos.x = cx;
+                world.creeps[i].pos.z = cz;
             }
         }
     }
@@ -13927,10 +14376,18 @@ fn step_turrets_system(
         let t_world_radius = t_def.base_radius * t_scale.x.max(t_scale.z);
         let t_world_height = world.turrets[idx].height;
 
-        // ۱. اولویت تاورها (Tier 1 -> Tier 2 -> Tier 3): اگر تاور جلویی هنوز زنده است، این تاور ضدضربه است
-        let prev_tier_alive = turret_status.iter().any(|&(tm, ln, tr, dead)| {
-            tm == my_team && ln == my_lane && tr < my_tier && !dead
-        });
+        // ۱. اولویت تاورها مطابق قوانین دقیق Dota 2:
+        // - برای Tier 1, 2, 3: تا زمانی که تاور رده پایین‌تر همان لاین زنده است، ضدضربه باقی می‌ماند.
+        // - برای Tier 4 (دوقلوهای جلوی Ancient): به محض نابودی حداقل یک تاور Tier 3 در هر لاینی (Top/Mid/Bot) آسیب‌پذیر می‌شوند.
+        let prev_tier_alive = if my_tier >= 4 {
+            !turret_status
+                .iter()
+                .any(|&(tm, _ln, tr, dead)| tm == my_team && tr == 3 && dead)
+        } else {
+            turret_status.iter().any(|&(tm, ln, tr, dead)| {
+                tm == my_team && ln == my_lane && tr < my_tier && !dead
+            })
+        };
 
         // ۲. محافظت Backdoor: دشمن برای ضربه زدن به تاور حتماً باید سرباز لاین زنده در محدوده تاور داشته باشد
         let has_enemy_lane_creeps = if t_def.backdoor_protection_requires_creeps {
@@ -14124,6 +14581,13 @@ fn step_ancients_system(
         .map(|t| (t.team, t.is_dead))
         .collect();
 
+    let turret_t4_status: Vec<(TeamId, bool)> = world
+        .turrets
+        .iter()
+        .filter(|t| t.tier == 4)
+        .map(|t| (t.team, t.is_dead))
+        .collect();
+
     let creep_snap: Vec<(TeamId, Vec3, bool, bool)> = world
         .creeps
         .iter()
@@ -14145,6 +14609,11 @@ fn step_ancients_system(
             .iter()
             .any(|&(tm, dead)| tm == my_team && dead);
 
+        // مطابق Dota 2: تا زمانی که هر یک از ۲ تاور Tier 4 زنده باشد، ساختمان Ancient ضدضربه است
+        let any_t4_alive = turret_t4_status
+            .iter()
+            .any(|&(tm, dead)| tm == my_team && !dead);
+
         let has_enemy_lane_creeps = if a_def.backdoor_protection_requires_creeps {
             creep_snap.iter().any(|&(c_team, c_pos, c_dead, is_lane_creep)| {
                 !c_dead
@@ -14157,7 +14626,7 @@ fn step_ancients_system(
             true
         };
 
-        world.ancients[idx].is_invulnerable = !any_t3_dead || !has_enemy_lane_creeps;
+        world.ancients[idx].is_invulnerable = !any_t3_dead || any_t4_alive || !has_enemy_lane_creeps;
     }
 }
 

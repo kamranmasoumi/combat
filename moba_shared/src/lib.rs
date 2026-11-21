@@ -520,6 +520,15 @@ impl GameConfig {
             self.combat.min_reload_duration_secs > 0.0,
             "min_reload_duration_secs باید بزرگ‌تر از صفر باشد"
         );
+        assert!(
+            self.combat.passive_gold_interval_secs.is_finite()
+                && self.combat.passive_gold_interval_secs > 0.0,
+            "passive_gold_interval_secs باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            self.combat.passive_gold_amount > 0,
+            "passive_gold_amount باید بزرگ‌تر از صفر باشد"
+        );
         assert!(self.soldier.jump_over_speed > 0.0, "soldier.jump_over_speed باید بزرگ‌تر از صفر باشد");
         assert!(self.soldier.jump_over_clearance_height > 0.0, "soldier.jump_over_clearance_height باید بزرگ‌تر از صفر باشد");
         assert!(self.soldier.space_hold_threshold_secs > 0.0, "soldier.space_hold_threshold_secs باید بزرگ‌تر از صفر باشد");
@@ -1722,6 +1731,8 @@ pub struct CombatConfig {
     pub min_reload_duration_secs: f32,
     pub turret_backdoor_creep_radius: f32,
     pub turret_bullet_spread_rad: f32,
+    pub passive_gold_interval_secs: f32,
+    pub passive_gold_amount: u32,
     pub respawn_times_per_level: Vec<f32>,
     pub xp_thresholds_per_level: Vec<u32>,
 }
@@ -6562,6 +6573,7 @@ pub struct AuthoritativeWorldState {
     pub dusk_time_bank_secs: f32,
     pub winning_team: Option<TeamId>,
     pub match_elapsed_secs: f32,
+    pub passive_gold_accumulator_secs: f32,
     pub current_weather: WeatherKind,
     pub weather_remaining_secs: f32,
     pub lightning_cooldown_secs: f32,
@@ -6812,6 +6824,7 @@ impl AuthoritativeWorldState {
             dusk_time_bank_secs: config.pause.team_time_bank_secs,
             winning_team: None,
             match_elapsed_secs: 0.0,
+            passive_gold_accumulator_secs: 0.0,
             current_weather: config.weather.initial_weather,
             weather_remaining_secs: config.weather_duration_bounds(config.weather.initial_weather).0,
             lightning_cooldown_secs: config.weather.lightning_min_interval_secs,
@@ -8829,6 +8842,18 @@ fn shared_authoritative_drive_system(
 
     step_barracks_system(&config, &mut world);
     step_ancients_system(&config, &mut world);
+
+    world.passive_gold_accumulator_secs += dt;
+    while world.passive_gold_accumulator_secs >= config.combat.passive_gold_interval_secs {
+        world.passive_gold_accumulator_secs -= config.combat.passive_gold_interval_secs;
+        if world.players.is_empty() {
+            world.hero_gold = world.hero_gold.saturating_add(config.combat.passive_gold_amount);
+        } else {
+            for p in &mut world.players {
+                p.hero_gold = p.hero_gold.saturating_add(config.combat.passive_gold_amount);
+            }
+        }
+    }
 
     // حل برخورد فیزیکی هیروها با یکدیگر (هیچ دو هیرویی نمی‌توانند از داخل هم عبور کنند)
     if world.players.len() > 1 {

@@ -43,3 +43,39 @@ set MOBA_SERVER_ADDR=<IP_عمومی_سرور>:4433 && cargo build --release -p m
 
 
 هر فایلی که احساس میکنم نیازه برات فرستادم. این هم محتویات فایل server/main.rs
+
+
+
+
+
+
+
+
+
+
+بررسی دقیق کدهای فعلی (main.rs، config.ron و consumers.py) نشان می‌دهد رفتار فعلی برنامه در محیط عملیاتی به این شکل است:
+
+۱. وضعیت config.ron و items.ron در نسخه Release
+در حالت Debug (cargo run)، تابع load_client_config() در main.rs الزاماً دنبال config.ron و items.ron روی دیسک می‌گردد و اگر نباشد panic می‌کند.
+
+در حالت Release (cargo build --release)، اگر config.ron و items.ron کنار فایل .exe نباشند، کلاینت از نسخه‌ای استفاده می‌کند که موقع کامپایل داخل خود .exe امبد شده است (include_str!("../../config.ron") و include_str!("../../items.ron")).
+
+بعد از ورود به نبرد (InGame)، چون has_local_config و has_local_items برابر false هستند، moba_server جدیدترین GameConfig و ItemsConfig را از طریق شبکه برای کلاینت می‌فرستد و جایگزین می‌کند تا قوانین و آیتم‌ها کاملاً با سرور یکی باشد.
+
+۲. آدرس لاگین، ثبت‌نام و وب‌سوکت در محیط عملیاتی
+کلاینت هنگام استارت (main.rs خط ۱۳۰)، backend_http_url و backend_ws_url را از همان config.ron امبدشده می‌خواند.
+
+نکته مهم: در config.ron فعلی شما این دو مقدار هنوز روی 127.0.0.1:8000 هستند. یعنی اگر با همین config.ron خروجی Release بگیرید و فایل config.ron را کنار .exe نگذارید، کلاینت همچنان به 127.0.0.1:8000 وصل می‌شود، نه 46.245.72.142:8000.
+
+برای نسخه عملیاتی، یا باید قبل از cargo build --release این دو خط را در config.ron به [http://46.245.72.142:8000](http://46.245.72.142:8000) و ws://46.245.72.142:8000 تغییر دهید، یا اگر بخواهید بدون تغییر config.ron انجام شود می‌توانیم پشتیبانی از متغیر زمان کامپایل (option_env!("MOBA_BACKEND_HTTP_URL") و MOBA_BACKEND_WS_URL) را در main.rs اضافه کنیم.
+
+۳. آدرس و پورت سرور لوپ بازی (UDP) هنگام Find Match و Lobby
+بله، این بخش کاملاً داینامیک از سمت جنگو به کلاینت می‌رسد.
+
+وقتی مچ یا لابی استارت می‌شود، consumers.py از طریق resolve_game_server_host و find_available_udp_port آدرس و پورت سرور بازی را تعیین می‌کند و در پیام match_found (و هنگام Reconnect در /api/v1/match/active/) فیلد server_addr (مثلاً "46.245.72.142:4435") را به کلاینت می‌دهد.
+
+در کلاینت (on_enter_ingame_connect_system در main.rs)، config.network.server_public_addr و server_bind_addr با همین info.server_addr جایگزین می‌شوند و سوکت UDP مستقیم به همان سرور وصل می‌شود؛ بنابراین لوپ بازی هیچ وابستگی به IP داخل config.ron ندارد.
+
+اگر لوپ بازی (moba_server) قرار است روی ماشین دیگری با IP متفاوت اجرا شود، سمت سرور جنگو کافی است در consumers.py متغیر محیطی GAME_SERVER_HOST (یا آدرس سرور مقصد) را برابر IP آن ماشین قرار دهید تا کلاینت‌ها خودکار به همان ماشین وصل شوند (و بین جنگو، Redis و آن ماشین شبکه/پورت برقرار باشد).
+
+اگر می‌خواهید، می‌توانم پشتیبانی از MOBA_BACKEND_HTTP_URL و MOBA_BACKEND_WS_URL (برای تزریق آدرس سرور هنگام بیلد Release بدون تغییر config.ron لوکال) را به main.rs اضافه کنم.

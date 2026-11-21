@@ -820,7 +820,9 @@ pub fn auto_combine_items(
         for idx in consumed_indices {
             inventory.remove(idx);
         }
-        let free_slot = if !inventory.iter().any(|it| it.slot == preferred_slot) {
+        let free_slot = if preferred_slot < max_slots
+            && !inventory.iter().any(|it| it.slot == preferred_slot)
+        {
             preferred_slot
         } else {
             (0..max_slots)
@@ -1833,11 +1835,10 @@ pub fn try_transfer_courier_item_to_hero(
     .length();
     if dist_xz <= h_cfg.courier.deliver_radius {
         let transferred = execute_courier_slot_to_hero_transfer(p, courier_slot, config, items_cfg);
-        p.courier_order = if transferred {
-            CourierOrder::Idle
-        } else {
-            CourierOrder::Idle
-        };
+        if !transferred {
+            set_shop_notice(p, "HERO INVENTORY FULL", true);
+        }
+        p.courier_order = CourierOrder::Idle;
         return transferred;
     }
 
@@ -2121,59 +2122,70 @@ pub fn step_couriers_system(
             match p.courier_order {
                 CourierOrder::DeliverToHero if !p.is_dead && new_dist <= h_cfg.courier.deliver_radius => {
                     let mut transferred_any = false;
-                    let mut remaining = Vec::new();
-                    for mut c_item in p.courier_inventory.drain(..) {
-                        let def_opt = items_cfg.get_item(&c_item.item_id);
-                        let is_tp = def_opt.is_some_and(|d| d.dedicated_tp_slot);
-                        let is_stack = def_opt.is_some_and(|d| d.stackable);
-                        if is_tp {
-                            if let Some(ref mut tp_item) = p.tp_slot {
-                                if tp_item.item_id == c_item.item_id && is_stack {
-                                    tp_item.count = tp_item.count.saturating_add(c_item.count);
-                                    transferred_any = true;
+                    loop {
+                        let mut pass_transferred = false;
+                        let mut remaining = Vec::new();
+                        for mut c_item in p.courier_inventory.drain(..) {
+                            let def_opt = items_cfg.get_item(&c_item.item_id);
+                            let is_tp = def_opt.is_some_and(|d| d.dedicated_tp_slot);
+                            let is_stack = def_opt.is_some_and(|d| d.stackable);
+                            if is_tp {
+                                if let Some(ref mut tp_item) = p.tp_slot {
+                                    if tp_item.item_id == c_item.item_id && is_stack {
+                                        tp_item.count = tp_item.count.saturating_add(c_item.count);
+                                        pass_transferred = true;
+                                    } else {
+                                        remaining.push(c_item);
+                                    }
+                                } else {
+                                    c_item.slot = 0;
+                                    p.tp_slot = Some(c_item);
+                                    pass_transferred = true;
+                                }
+                            } else if is_stack {
+                                if let Some(existing) = p.inventory.iter_mut().find(|it| it.item_id == c_item.item_id) {
+                                    existing.count = existing.count.saturating_add(c_item.count);
+                                    pass_transferred = true;
+                                } else if let Some(free_slot) = (0..items_cfg.max_inventory_slots)
+                                    .find(|s| !p.inventory.iter().any(|it| it.slot == *s))
+                                {
+                                    c_item.slot = free_slot;
+                                    p.inventory.push(c_item);
+                                    pass_transferred = true;
                                 } else {
                                     remaining.push(c_item);
                                 }
-                            } else {
-                                c_item.slot = 0;
-                                p.tp_slot = Some(c_item);
-                                transferred_any = true;
-                            }
-                        } else if is_stack {
-                            if let Some(existing) = p.inventory.iter_mut().find(|it| it.item_id == c_item.item_id) {
-                                existing.count = existing.count.saturating_add(c_item.count);
-                                transferred_any = true;
                             } else if let Some(free_slot) = (0..items_cfg.max_inventory_slots)
                                 .find(|s| !p.inventory.iter().any(|it| it.slot == *s))
                             {
                                 c_item.slot = free_slot;
                                 p.inventory.push(c_item);
-                                transferred_any = true;
+                                pass_transferred = true;
                             } else {
-                                remaining.push(c_item);
-                            }
-                        } else if let Some(free_slot) = (0..items_cfg.max_inventory_slots)
-                            .find(|s| !p.inventory.iter().any(|it| it.slot == *s))
-                        {
-                            c_item.slot = free_slot;
-                            p.inventory.push(c_item);
-                            transferred_any = true;
-                        } else {
-                            // اگر اینونتوری ۶/۶ پر است اما این آیتم با اجزای داخل اینونتوری ترکیب می‌شود
-                            let mut test_inv = p.inventory.clone();
-                            c_item.slot = items_cfg.max_inventory_slots;
-                            test_inv.push(c_item.clone());
-                            if auto_combine_items(&mut test_inv, items_cfg.max_inventory_slots, &items_cfg)
-                                && test_inv.len() <= items_cfg.max_inventory_slots
-                            {
-                                p.inventory = test_inv;
-                                transferred_any = true;
-                            } else {
-                                remaining.push(c_item);
+                                // اگر اینونتوری ۶/۶ پر است اما این آیتم با اجزای داخل اینونتوری ترکیب می‌شود
+                                // نکته حیاتی: هرگز c_item.slot را تغییر ندهیم تا در صورت عدم ترکیب، آیتم در اسلات کوریر مخفی نشود
+                                let mut test_inv = p.inventory.clone();
+                                let mut test_item = c_item.clone();
+                                test_item.slot = items_cfg.max_inventory_slots;
+                                test_inv.push(test_item);
+                                if auto_combine_items(&mut test_inv, items_cfg.max_inventory_slots, &items_cfg)
+                                    && test_inv.len() <= items_cfg.max_inventory_slots
+                                {
+                                    p.inventory = test_inv;
+                                    pass_transferred = true;
+                                } else {
+                                    remaining.push(c_item);
+                                }
                             }
                         }
+                        p.courier_inventory = remaining;
+                        if pass_transferred {
+                            transferred_any = true;
+                        }
+                        if !pass_transferred || p.courier_inventory.is_empty() {
+                            break;
+                        }
                     }
-                    p.courier_inventory = remaining;
                     let crafted_any = auto_combine_items(
                         &mut p.inventory,
                         items_cfg.max_inventory_slots,
@@ -2181,6 +2193,9 @@ pub fn step_couriers_system(
                     );
                     if transferred_any || crafted_any {
                         recompute_player_slot_stats(p, &config, &items_cfg);
+                    }
+                    if !p.courier_inventory.is_empty() {
+                        set_shop_notice(p, "HERO INVENTORY FULL - COURIER RETURNING", true);
                     }
                     p.courier_order = CourierOrder::ReturnToFountain;
                 }
@@ -2196,8 +2211,9 @@ pub fn step_couriers_system(
                     if transferred {
                         p.courier_order = CourierOrder::ReturnToFountain;
                     } else {
-                        // اینونتوری هیرو ۶/۶ پر است و قابل ترکیب نیست: کوریر نزدیک هیرو متوقف می‌شود و آیتم حفظ می‌گردد
-                        p.courier_order = CourierOrder::Idle;
+                        // اینونتوری هیرو ۶/۶ پر است و قابل ترکیب نیست: کوریر با آیتم به پایگاه برمی‌گردد تا آیتم محفوظ بماند
+                        set_shop_notice(p, "HERO INVENTORY FULL - COURIER RETURNING", true);
+                        p.courier_order = CourierOrder::ReturnToFountain;
                     }
                 }
                 CourierOrder::PickupStashThenDeliver

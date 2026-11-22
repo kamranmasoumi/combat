@@ -278,9 +278,11 @@ pub struct SettingsUiState {
 struct InventoryDragState {
     pressed_slot: Option<usize>,
     pressed_is_courier: bool,
+    pressed_is_stash: bool,
     press_cursor: Vec2,
     dragging_slot: Option<usize>,
     dragging_is_courier: bool,
+    dragging_is_stash: bool,
 }
 
 #[derive(Resource)]
@@ -299,6 +301,7 @@ pub struct ShopUiState {
     pub prev_inventory: Vec<InventoryItemState>,
     pub prev_courier_inventory: Vec<InventoryItemState>,
     pub prev_stash: Vec<InventoryItemState>,
+    pub prev_tp_slot: Option<InventoryItemState>,
     pub last_notice_seq: u64,
     pub notice_text: String,
     pub notice_is_error: bool,
@@ -326,6 +329,7 @@ impl Default for ShopUiState {
             prev_inventory: Vec::new(),
             prev_courier_inventory: Vec::new(),
             prev_stash: Vec::new(),
+            prev_tp_slot: None,
             last_notice_seq: 0,
             notice_text: String::new(),
             notice_is_error: false,
@@ -735,6 +739,9 @@ fn effective_cost_for_display(items_cfg: &ItemsConfig, item_id: &str, ctx: &Shop
     if hero_in_shop {
         combined.extend(ctx.inventory.iter().cloned());
         combined.extend(ctx.stash.iter().cloned());
+        if courier_in_shop {
+            combined.extend(ctx.courier_inventory.iter().cloned());
+        }
     } else if courier_in_shop {
         combined.extend(ctx.courier_inventory.iter().cloned());
         combined.extend(ctx.stash.iter().cloned());
@@ -1851,43 +1858,85 @@ fn add_item_expanded_to_cart(
     cart.extend(expanded);
 }
 
+fn prune_crafted_item_from_cart(
+    items_cfg: &ItemsConfig,
+    item_id: &str,
+    lost_counts: &mut std::collections::HashMap<String, usize>,
+    cart: &mut Vec<String>,
+) {
+    if let Some(pos) = cart.iter().position(|c| c == item_id) {
+        cart.remove(pos);
+        return;
+    }
+    let Some(def) = items_cfg.get_item(item_id) else {
+        return;
+    };
+    if def.recipe.is_empty() {
+        return;
+    }
+    for comp_id in &def.recipe {
+        // اگر این کامپوننت از قبل در اینونتوری بوده و الان در ترکیب مصرف شده، قبلاً از سبد پاک شده است؛
+        // پس نباید نسخه دیگری از همان کامپوننت (متعلق به شاخه دیگر درخت ساخت) از سبد حذف شود!
+        if let Some(rem) = lost_counts.get_mut(comp_id) {
+            if *rem > 0 {
+                *rem -= 1;
+                continue;
+            }
+        }
+        prune_crafted_item_from_cart(items_cfg, comp_id, lost_counts, cart);
+    }
+    if items_cfg.recipe_fee(item_id) > 0 {
+        let rec_id = recipe_item_id(item_id);
+        if let Some(rem) = lost_counts.get_mut(&rec_id) {
+            if *rem > 0 {
+                *rem -= 1;
+                return;
+            }
+        }
+        if let Some(rpos) = cart.iter().position(|c| c == &rec_id) {
+            cart.remove(rpos);
+        }
+    }
+}
+
 fn prune_newly_bought_from_cart(
     items_cfg: &ItemsConfig,
     prev_inv: &[InventoryItemState],
     curr_inv: &[InventoryItemState],
     cart: &mut Vec<String>,
 ) {
-    let mut prev_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut prev_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for it in prev_inv {
-        *prev_counts.entry(it.item_id.as_str()).or_insert(0) += 1;
+        *prev_counts.entry(it.item_id.clone()).or_insert(0) += it.count as usize;
     }
-    let mut curr_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut curr_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for it in curr_inv {
-        *curr_counts.entry(it.item_id.as_str()).or_insert(0) += 1;
+        *curr_counts.entry(it.item_id.clone()).or_insert(0) += it.count as usize;
     }
-    for (id, &cnt) in &curr_counts {
+
+    // آیتم‌هایی که در همین فریم از اینونتوری مصرف (ترکیب) شده‌اند
+    let mut lost_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (id, &old_cnt) in &prev_counts {
+        let new_cnt = curr_counts.get(id).copied().unwrap_or(0);
+        if old_cnt > new_cnt {
+            lost_counts.insert(id.clone(), old_cnt - new_cnt);
+        }
+    }
+
+    // آیتم‌هایی که در همین فریم به دست آمده‌اند (مرتب‌شده از بالاترین Tier برای رفتار قطعی)
+    let mut gained_items: Vec<(String, usize, u8)> = Vec::new();
+    for (id, &new_cnt) in &curr_counts {
         let old_cnt = prev_counts.get(id).copied().unwrap_or(0);
-        if cnt > old_cnt {
-            let gained = cnt - old_cnt;
-            for _ in 0..gained {
-                if let Some(pos) = cart.iter().position(|c| c.as_str() == *id) {
-                    cart.remove(pos);
-                }
-                // حتی اگر خود آیتم ترکیبی در سبد نبود (بلکه recipe:<id> و کامپوننت‌ها در سبد بودند)، آن‌ها را پاک کن
-                if let Some(def) = items_cfg.get_item(id) {
-                    if !def.recipe.is_empty() {
-                        let rec_id = recipe_item_id(id);
-                        if let Some(rpos) = cart.iter().position(|c| c == &rec_id) {
-                            cart.remove(rpos);
-                        }
-                        for comp_id in &def.recipe {
-                            if let Some(cpos) = cart.iter().position(|c| c == comp_id) {
-                                cart.remove(cpos);
-                            }
-                        }
-                    }
-                }
-            }
+        if new_cnt > old_cnt {
+            let tier = items_cfg.get_item(id).map_or(0, |d| d.tier);
+            gained_items.push((id.clone(), new_cnt - old_cnt, tier));
+        }
+    }
+    gained_items.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    for (id, gained, _) in gained_items {
+        for _ in 0..gained {
+            prune_crafted_item_from_cart(items_cfg, &id, &mut lost_counts, cart);
         }
     }
 }
@@ -1895,18 +1944,17 @@ fn prune_newly_bought_from_cart(
 fn try_send_buy_item(
     item_id: &str,
     items_cfg: &ItemsConfig,
-    ctx: &ShopContextSnapshot,
+    _ctx: &ShopContextSnapshot,
     outgoing: &mut ShopOutgoingQueue,
-    audio_q: &mut AudioEventQueue,
+    _audio_q: &mut AudioEventQueue,
 ) -> bool {
     if let Some(target_id) = parse_recipe_target(item_id) {
-        return try_send_buy_recipe(target_id, items_cfg, ctx, outgoing, audio_q);
+        return try_send_buy_recipe(target_id, items_cfg, _ctx, outgoing, _audio_q);
     }
-    let (eff_cost, _) = effective_cost_for_display(items_cfg, item_id, ctx);
-    if ctx.gold < eff_cost {
-        audio_q.0.push(ClientAudioEvent::NotEnoughGold);
+    if items_cfg.get_item(item_id).is_none() {
         return false;
     }
+    // اصل Server Authority: کلاینت درخواست خرید را مسدود نمی‌کند؛ سرور مرجع نهایی طلا و موجودی است
     outgoing.0.push(ClientLobbyMessage::BuyItem {
         item_id: item_id.to_string(),
     });
@@ -1916,13 +1964,11 @@ fn try_send_buy_item(
 fn try_send_buy_recipe(
     target_item_id: &str,
     items_cfg: &ItemsConfig,
-    ctx: &ShopContextSnapshot,
+    _ctx: &ShopContextSnapshot,
     outgoing: &mut ShopOutgoingQueue,
-    audio_q: &mut AudioEventQueue,
+    _audio_q: &mut AudioEventQueue,
 ) -> bool {
-    let fee = items_cfg.recipe_fee(target_item_id);
-    if fee == 0 || ctx.gold < fee {
-        audio_q.0.push(ClientAudioEvent::NotEnoughGold);
+    if items_cfg.recipe_fee(target_item_id) == 0 {
         return false;
     }
     outgoing.0.push(ClientLobbyMessage::BuyRecipe {
@@ -1969,13 +2015,20 @@ fn shop_hotkey_and_button_system(
     if ui_state.prev_inventory != ctx.inventory
         || ui_state.prev_courier_inventory != ctx.courier_inventory
         || ui_state.prev_stash != ctx.stash
+        || ui_state.prev_tp_slot != ctx.tp_slot
     {
         let mut prev_all = ui_state.prev_inventory.clone();
         prev_all.extend(ui_state.prev_courier_inventory.iter().cloned());
         prev_all.extend(ui_state.prev_stash.iter().cloned());
+        if let Some(ref tp) = ui_state.prev_tp_slot {
+            prev_all.push(tp.clone());
+        }
         let mut curr_all = ctx.inventory.clone();
         curr_all.extend(ctx.courier_inventory.iter().cloned());
         curr_all.extend(ctx.stash.iter().cloned());
+        if let Some(ref tp) = ctx.tp_slot {
+            curr_all.push(tp.clone());
+        }
 
         prune_newly_bought_from_cart(&items_cfg, &prev_all, &curr_all, &mut ui_state.cart);
 
@@ -2015,6 +2068,7 @@ fn shop_hotkey_and_button_system(
         ui_state.prev_inventory = ctx.inventory.clone();
         ui_state.prev_courier_inventory = ctx.courier_inventory.clone();
         ui_state.prev_stash = ctx.stash.clone();
+        ui_state.prev_tp_slot = ctx.tp_slot.clone();
         ui_state.dirty = true;
     } else if ctx.in_game {
         *prev_inv_ready = true;
@@ -4075,6 +4129,8 @@ fn sell_confirm_modal_system(
             ctx.stash.iter().any(|it| it.slot == slot)
         } else if ui_state.pending_sell_is_courier {
             ctx.courier_inventory.iter().any(|it| it.slot == slot)
+        } else if slot == usize::MAX {
+            ctx.tp_slot.as_ref().is_some_and(|it| it.count > 0)
         } else {
             ctx.inventory.iter().any(|it| it.slot == slot)
         };
@@ -4101,8 +4157,18 @@ fn sell_confirm_modal_system(
             m_node.display = desired_display;
         }
         if let Some(slot) = ui_state.pending_sell_slot {
-            m_node.left = px(items_cfg.shop_ui.hud_inventory_left_px + (slot as f32) * 52.0);
-            m_node.bottom = px(if ui_state.pending_sell_is_stash { 196.0 } else { 76.0 });
+            let sui = &items_cfg.shop_ui;
+            let x_offset = if slot == usize::MAX {
+                sui.sell_menu_tp_offset_px
+            } else {
+                (slot as f32) * sui.sell_menu_slot_stride_px
+            };
+            m_node.left = px(sui.hud_inventory_left_px + x_offset);
+            m_node.bottom = px(if ui_state.pending_sell_is_stash {
+                sui.sell_menu_stash_bottom_px
+            } else {
+                sui.sell_menu_hero_bottom_px
+            });
         }
     }
 
@@ -4130,6 +4196,8 @@ fn sell_confirm_modal_system(
         ctx.stash.iter().find(|it| it.slot == slot)
     } else if is_courier {
         ctx.courier_inventory.iter().find(|it| it.slot == slot)
+    } else if slot == usize::MAX {
+        ctx.tp_slot.as_ref()
     } else {
         ctx.inventory.iter().find(|it| it.slot == slot)
     };
@@ -5229,6 +5297,7 @@ fn hud_inventory_drag_and_drop_system(
             if ctx.tp_slot.as_ref().is_some_and(|it| it.count > 0) {
                 drag_state.pressed_slot = Some(usize::MAX);
                 drag_state.pressed_is_courier = false;
+                drag_state.pressed_is_stash = false;
                 drag_state.press_cursor = cpos;
                 drag_state.dragging_slot = None;
                 ui_state.suppress_world_click_this_frame = true;
@@ -5244,8 +5313,18 @@ fn hud_inventory_drag_and_drop_system(
         None
     };
 
-    // کلیک راست روی اسلات‌های اینونتوری هیرو، کوریر یا Stash -> منوی فروش / انتقال به Stash
+    // کلیک راست روی اسلات‌های اینونتوری هیرو، اسلات TP، کوریر یا Stash -> منوی فروش / انتقال به Stash
     if mouse.just_pressed(MouseButton::Right) {
+        if hovered_tp {
+            if ctx.tp_slot.as_ref().is_some_and(|it| it.count > 0) {
+                ui_state.pending_sell_slot = Some(usize::MAX);
+                ui_state.pending_sell_is_courier = false;
+                ui_state.pending_sell_is_stash = false;
+                ui_state.suppress_world_click_this_frame = true;
+                ui_state.dirty = true;
+            }
+            return;
+        }
         if let Some(st_idx) = hovered_stash_slot {
             if ctx.stash.iter().any(|it| it.slot == st_idx) {
                 ui_state.pending_sell_slot = Some(st_idx);
@@ -5274,27 +5353,22 @@ fn hud_inventory_drag_and_drop_system(
         }
     }
 
-    // کلیک چپ روی اسلات Stash -> انتقال سریع به هیرو (یا کوریر در صورت انتخاب)
+    // شروع فشردن کلیک چپ روی اسلات Stash (کلیک ساده = انتقال سریع؛ درگ = Swap اسلات Stash یا انتقال به هیرو/کوریر)
     if mouse.just_pressed(MouseButton::Left) {
-        if let Some(st_idx) = hovered_stash_slot {
+        if let (Some(st_idx), Some(cpos)) = (hovered_stash_slot, cursor_pos) {
             if ctx.stash.iter().any(|it| it.slot == st_idx) {
-                if courier_ctrl.selected {
-                    outgoing
-                        .0
-                        .push(ClientLobbyMessage::MoveStashItemToCourier { stash_slot: st_idx });
-                } else {
-                    outgoing
-                        .0
-                        .push(ClientLobbyMessage::MoveStashItemToHero { stash_slot: st_idx });
-                }
+                drag_state.pressed_slot = Some(st_idx);
+                drag_state.pressed_is_courier = false;
+                drag_state.pressed_is_stash = true;
+                drag_state.press_cursor = cpos;
+                drag_state.dragging_slot = None;
                 ui_state.suppress_world_click_this_frame = true;
-                return;
             }
         }
     }
 
     // شروع فشردن کلیک چپ روی اسلات اینونتوری (هم هیرو و هم کوریر)
-    if mouse.just_pressed(MouseButton::Left) && !hovered_tp {
+    if mouse.just_pressed(MouseButton::Left) && !hovered_tp && hovered_stash_slot.is_none() {
         if let (Some(slot_idx), Some(cpos)) = (hovered_slot, cursor_pos) {
             let is_cour = courier_ctrl.selected;
             let has_item = if is_cour {
@@ -5305,6 +5379,7 @@ fn hud_inventory_drag_and_drop_system(
             if has_item {
                 drag_state.pressed_slot = Some(slot_idx);
                 drag_state.pressed_is_courier = is_cour;
+                drag_state.pressed_is_stash = false;
                 drag_state.press_cursor = cpos;
                 drag_state.dragging_slot = None;
                 ui_state.suppress_world_click_this_frame = true;
@@ -5318,7 +5393,13 @@ fn hud_inventory_drag_and_drop_system(
             if drag_state.dragging_slot.is_none() && cpos.distance(drag_state.press_cursor) > threshold {
                 drag_state.dragging_slot = Some(from_slot);
                 drag_state.dragging_is_courier = drag_state.pressed_is_courier;
-                let item_id_opt = if from_slot == usize::MAX {
+                drag_state.dragging_is_stash = drag_state.pressed_is_stash;
+                let item_id_opt = if drag_state.dragging_is_stash {
+                    ctx.stash
+                        .iter()
+                        .find(|it| it.slot == from_slot)
+                        .map(|it| it.item_id.as_str())
+                } else if from_slot == usize::MAX {
                     ctx.tp_slot.as_ref().map(|it| it.item_id.as_str())
                 } else if drag_state.dragging_is_courier {
                     ctx.courier_inventory
@@ -5392,9 +5473,33 @@ fn hud_inventory_drag_and_drop_system(
     if mouse.just_released(MouseButton::Left) {
         if let Some(from_slot) = drag_state.dragging_slot.take() {
             let from_courier = drag_state.dragging_is_courier;
+            let from_stash = drag_state.dragging_is_stash;
             ui_state.suppress_world_click_this_frame = true;
 
-            if over_stash_bar && from_slot != usize::MAX {
+            if from_stash {
+                if let Some(to_st) = hovered_stash_slot {
+                    if to_st != from_slot {
+                        outgoing.0.push(ClientLobbyMessage::SwapStashSlots {
+                            from_slot,
+                            to_slot: to_st,
+                        });
+                    }
+                } else if drag_bridge.hovered_world_target == Some(WorldDropTarget::Courier)
+                    || hovered_drone_btn
+                    || (hovered_slot.is_some() && courier_ctrl.selected)
+                {
+                    outgoing
+                        .0
+                        .push(ClientLobbyMessage::MoveStashItemToCourier { stash_slot: from_slot });
+                } else if drag_bridge.hovered_world_target == Some(WorldDropTarget::Hero)
+                    || (hovered_slot.is_some() && !courier_ctrl.selected)
+                    || hovered_tp
+                {
+                    outgoing
+                        .0
+                        .push(ClientLobbyMessage::MoveStashItemToHero { stash_slot: from_slot });
+                }
+            } else if over_stash_bar {
                 if from_courier {
                     outgoing
                         .0
@@ -5418,7 +5523,16 @@ fn hud_inventory_drag_and_drop_system(
                 outgoing.0.push(ClientLobbyMessage::TransferCourierItemToHero {
                     courier_slot: from_slot,
                 });
-            } else if !from_courier && from_slot != usize::MAX {
+            } else if from_courier && courier_ctrl.selected {
+                if let Some(to_slot) = hovered_slot {
+                    if to_slot != from_slot {
+                        outgoing.0.push(ClientLobbyMessage::SwapCourierSlots {
+                            from_slot,
+                            to_slot,
+                        });
+                    }
+                }
+            } else if !from_courier && !courier_ctrl.selected && from_slot != usize::MAX {
                 if let Some(to_slot) = hovered_slot {
                     if to_slot != from_slot {
                         outgoing.0.push(ClientLobbyMessage::SwapInventorySlots {
@@ -5430,7 +5544,17 @@ fn hud_inventory_drag_and_drop_system(
             }
         } else if let Some(clicked_slot) = drag_state.pressed_slot {
             ui_state.suppress_world_click_this_frame = true;
-            if clicked_slot == usize::MAX && hovered_tp {
+            if drag_state.pressed_is_stash && hovered_stash_slot == Some(clicked_slot) {
+                if courier_ctrl.selected {
+                    outgoing
+                        .0
+                        .push(ClientLobbyMessage::MoveStashItemToCourier { stash_slot: clicked_slot });
+                } else {
+                    outgoing
+                        .0
+                        .push(ClientLobbyMessage::MoveStashItemToHero { stash_slot: clicked_slot });
+                }
+            } else if clicked_slot == usize::MAX && hovered_tp {
                 if ctx.tp_slot.as_ref().is_some_and(|it| it.count > 0)
                     && !ctx.is_dead
                     && !ctx.is_teleporting
@@ -5514,6 +5638,7 @@ fn courier_hud_and_hotkey_system(
         outgoing.0.push(ClientLobbyMessage::CourierReturnToFountain);
         ui_state.suppress_world_click_this_frame = true;
     }
+    let prev_selected = courier_ctrl.selected;
     for _ in &p.select_btn_q {
         courier_ctrl.selected = !courier_ctrl.selected;
         ui_state.suppress_world_click_this_frame = true;
@@ -5532,6 +5657,9 @@ fn courier_hud_and_hotkey_system(
         if keys.just_pressed(KeyCode::F1) {
             courier_ctrl.selected = false;
         }
+    }
+    if courier_ctrl.selected != prev_selected && !ui_state.pending_sell_is_stash {
+        ui_state.pending_sell_slot = None;
     }
 
     if let Ok(mut st) = p.select_txt_q.single_mut() {

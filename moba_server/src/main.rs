@@ -5,7 +5,8 @@ use moba_shared::{
     step_shadow_blade_system, step_teleports_system, step_weather_and_environment_system,
     try_activate_shadow_blade, try_buy_cart, try_buy_item, try_cancel_teleport,
     try_courier_deliver, try_courier_move_to, try_courier_return_to_fountain, try_cycle_item_mode,
-    try_sell_courier_item, try_sell_item, try_start_teleport, try_swap_inventory_slots,
+    try_sell_courier_item, try_sell_item, try_start_teleport, try_swap_courier_slots,
+    try_swap_inventory_slots, try_swap_stash_slots,
     try_buy_recipe, try_move_courier_item_to_stash, try_move_hero_item_to_stash,
     try_move_stash_item_to_courier, try_move_stash_item_to_hero, try_sell_stash_item,
     try_take_all_stash_to_hero, try_transfer_courier_item_to_hero,
@@ -564,6 +565,32 @@ fn server_network_receive_system(
                         if match_state.phase == MatchPhase::InGame {
                             if let Some(slot_idx) = match_state.slot_for_client(client_id) {
                                 try_swap_inventory_slots(
+                                    &mut world,
+                                    slot_idx,
+                                    from_slot,
+                                    to_slot,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::SwapCourierSlots { from_slot, to_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_swap_courier_slots(
+                                    &mut world,
+                                    slot_idx,
+                                    from_slot,
+                                    to_slot,
+                                    &config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::SwapStashSlots { from_slot, to_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_swap_stash_slots(
                                     &mut world,
                                     slot_idx,
                                     from_slot,

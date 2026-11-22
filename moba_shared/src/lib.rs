@@ -462,6 +462,7 @@ impl GameConfig {
         assert!(!self.network.backend_http_url.trim().is_empty(), "network.backend_http_url cannot be empty");
         assert!(!self.network.backend_ws_url.trim().is_empty(), "network.backend_ws_url cannot be empty");
         assert!(!self.network.redis_addr.trim().is_empty(), "network.redis_addr cannot be empty");
+        assert!(self.soldier.team_spawn_slot_spacing > 0.0, "soldier.team_spawn_slot_spacing باید بزرگ‌تر از صفر باشد");
         assert!(self.soldier.cliff_dive_speed > 0.0, "soldier.cliff_dive_speed must be > 0");
         assert!(self.soldier.cliff_dive_arc_boost > 0.0, "soldier.cliff_dive_arc_boost must be > 0");
         assert!(self.soldier.fall_dive_arc_boost > 0.0, "soldier.fall_dive_arc_boost must be > 0");
@@ -631,6 +632,8 @@ impl GameConfig {
             assert!(hero.courier.respawn_secs > 0.0, "courier.respawn_secs هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.courier.deliver_radius > 0.0, "courier.deliver_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.courier.fountain_radius > 0.0, "courier.fountain_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.move_to_arrival_radius > 0.0, "courier.move_to_arrival_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.courier.move_stop_epsilon > 0.0, "courier.move_stop_epsilon هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.courier.hit_radius > 0.0, "courier.hit_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.vision_range > 0.0, "vision_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.night_vision_range > 0.0, "night_vision_range هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -1658,6 +1661,8 @@ pub struct CourierConfig {
     pub respawn_secs: f32,
     pub deliver_radius: f32,
     pub fountain_radius: f32,
+    pub move_to_arrival_radius: f32,
+    pub move_stop_epsilon: f32,
     pub hit_radius: f32,
     pub bounty_gold: u32,
     pub vision_range: f32,
@@ -1804,6 +1809,7 @@ pub struct WallClimbConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SoldierConfig {
     pub spawn_pos: (f32, f32, f32),
+    pub team_spawn_slot_spacing: f32,
     pub initial_aim_dir: (f32, f32, f32),
     pub initial_aim_hit_pos: (f32, f32, f32),
     pub aim_plane_height_offset: f32,
@@ -2914,6 +2920,8 @@ pub enum ClientLobbyMessage {
     SellItem { inv_index: usize },
     CycleItemMode { inv_index: usize },
     SwapInventorySlots { from_slot: usize, to_slot: usize },
+    SwapCourierSlots { from_slot: usize, to_slot: usize },
+    SwapStashSlots { from_slot: usize, to_slot: usize },
     SellCourierItem { inv_index: usize },
     CourierDeliver,
     CourierReturnToFountain,
@@ -6112,7 +6120,14 @@ pub fn target_physics_bundle(
 }
 
 pub fn team_spawn_pos(config: &GameConfig, team: TeamId, team_slot_offset: usize) -> Vec3 {
-    let z_off = (team_slot_offset as f32) * 2.6;
+    // چیدمان متقارن (0, +1, -1, +2, -2, ...) حول محور فاونتن تا هر ۵ بازیکن تیم کاملاً داخل شعاع فاونتن/شاپ اسپاون شوند
+    let signed_step: i32 = if team_slot_offset == 0 {
+        0
+    } else {
+        let rank = ((team_slot_offset + 1) / 2) as i32;
+        if team_slot_offset % 2 == 1 { rank } else { -rank }
+    };
+    let z_off = (signed_step as f32) * config.soldier.team_spawn_slot_spacing;
     match team {
         TeamId::Dawn => Vec3::new(
             config.soldier.spawn_pos.0,
@@ -8758,7 +8773,21 @@ pub fn reconcile_soldier_physics_pos(
 }
 
 
+/// مرکز فاونتن پایگاه تیم خودی بر اساس config.ron (برای هدف بازگشت کوریر)
+pub fn team_fountain_pos(config: &GameConfig, team: TeamId) -> Option<Vec3> {
+    if team == TeamId::Neutral {
+        return None;
+    }
+    config
+        .map
+        .fountains
+        .iter()
+        .find(|ftn| ftn.team == team)
+        .map(|ftn| ftn.model_transform.location_vec())
+}
+
 /// محاسبه بونوس بازسازی سلامتی در چشمه پایگاه تیم خودی بر اساس config.ron
+/// فاصله روی صفحه افقی (XZ) سنجیده می‌شود تا ارتفاع پرواز Courier باعث خروج کاذب از محدوده شاپ نشود.
 pub fn fountain_regen_bonus_for_pos(config: &GameConfig, team: TeamId, pos: Vec3) -> f32 {
     if team == TeamId::Neutral {
         return 0.0;
@@ -8769,7 +8798,8 @@ pub fn fountain_regen_bonus_for_pos(config: &GameConfig, team: TeamId, pos: Vec3
             continue;
         }
         let ftn_pos = ftn.model_transform.location_vec();
-        if pos.distance(ftn_pos) <= ftn.heal_radius {
+        let dist_xz = Vec2::new(pos.x - ftn_pos.x, pos.z - ftn_pos.z).length();
+        if dist_xz <= ftn.heal_radius {
             best_bonus = best_bonus.max(ftn.heal_per_sec);
         }
     }

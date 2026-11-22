@@ -1,6 +1,7 @@
 ItemsConfig(
     max_inventory_slots: 6,
     max_stash_slots: 6,
+    max_cart_buy_items: 16,
     sell_refund_ratio: 0.50,
     shop_ui: (
         shop_panel_width_px: 920.0,
@@ -16,6 +17,10 @@ ItemsConfig(
         pyramid_connector_thickness_px: 2.0,
         shop_error_toast_secs: 3.0,
         hud_inventory_left_px: 592.0,
+        sell_menu_slot_stride_px: 52.0,
+        sell_menu_hero_bottom_px: 76.0,
+        sell_menu_stash_bottom_px: 196.0,
+        sell_menu_tp_offset_px: 312.0,
     ),
     teleport: (
         item_id: "town_portal_scroll",
@@ -24,6 +29,7 @@ ItemsConfig(
         channel_duration_secs: 3.0,
         building_teleport_radius: 12.0,
         min_building_clearance: 3.2,
+        building_clearance_margin: 0.35,
         max_click_snap_distance: 32.0,
         cancel_on_left_click: true,
         cancel_on_move: false,

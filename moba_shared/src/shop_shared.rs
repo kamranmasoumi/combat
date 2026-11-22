@@ -6,10 +6,16 @@ use std::fs;
 
 use crate::{
     fountain_regen_bonus_for_pos, sample_camera_focus_y, soldier_collision_groups,
-    ActiveTeleportState, ActiveWeaponSlot, AncientSnapshot, AncientState, AuthoritativeWorldState,
-    BarracksSnapshot, BarracksState, CourierOrder, CustomPhysicsWorld, GameConfig, GameplayFxEvent,
-    PhysicsSoldier, PlayerSlotState, TeamId, TurretSnapshot, TurretState,
+    team_fountain_pos, ActiveTeleportState, ActiveWeaponSlot, AncientSnapshot, AncientState,
+    AuthoritativeWorldState, BarracksSnapshot, BarracksState, CourierOrder, CustomPhysicsWorld,
+    GameConfig, GameplayFxEvent, PausePhase, PhysicsSoldier, PlayerSlotState, TeamId,
+    TurretSnapshot, TurretState,
 };
+
+#[inline]
+fn is_match_action_allowed(world: &AuthoritativeWorldState) -> bool {
+    world.pause_phase == PausePhase::Running && world.winning_team.is_none()
+}
 
 pub const RECIPE_ID_PREFIX: &str = "recipe:";
 
@@ -345,6 +351,7 @@ pub struct TeleportConfig {
     pub channel_duration_secs: f32,
     pub building_teleport_radius: f32,
     pub min_building_clearance: f32,
+    pub building_clearance_margin: f32,
     pub max_click_snap_distance: f32,
     pub cancel_on_left_click: bool,
     pub cancel_on_move: bool,
@@ -399,12 +406,17 @@ pub struct ShopUiConfig {
     pub pyramid_connector_thickness_px: f32,
     pub shop_error_toast_secs: f32,
     pub hud_inventory_left_px: f32,
+    pub sell_menu_slot_stride_px: f32,
+    pub sell_menu_hero_bottom_px: f32,
+    pub sell_menu_stash_bottom_px: f32,
+    pub sell_menu_tp_offset_px: f32,
 }
 
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct ItemsConfig {
     pub max_inventory_slots: usize,
     pub max_stash_slots: usize,
+    pub max_cart_buy_items: usize,
     pub sell_refund_ratio: f32,
     pub shop_ui: ShopUiConfig,
     pub teleport: TeleportConfig,
@@ -442,6 +454,7 @@ impl ItemsConfig {
     pub fn validate(&self) {
         assert!(self.max_inventory_slots > 0, "max_inventory_slots باید بزرگ‌تر از صفر باشد");
         assert!(self.max_stash_slots > 0, "max_stash_slots باید بزرگ‌تر از صفر باشد");
+        assert!(self.max_cart_buy_items > 0, "max_cart_buy_items باید بزرگ‌تر از صفر باشد");
         assert!(
             (0.0..=1.0).contains(&self.sell_refund_ratio),
             "sell_refund_ratio باید بین 0.0 و 1.0 باشد"
@@ -460,6 +473,10 @@ impl ItemsConfig {
         assert!(sui.pyramid_connector_thickness_px > 0.0, "shop_ui.pyramid_connector_thickness_px باید مثبت باشد");
         assert!(sui.shop_error_toast_secs > 0.0, "shop_ui.shop_error_toast_secs باید مثبت باشد");
         assert!(sui.hud_inventory_left_px >= 0.0, "shop_ui.hud_inventory_left_px نامعتبر است");
+        assert!(sui.sell_menu_slot_stride_px > 0.0, "shop_ui.sell_menu_slot_stride_px باید مثبت باشد");
+        assert!(sui.sell_menu_hero_bottom_px >= 0.0, "shop_ui.sell_menu_hero_bottom_px نامعتبر است");
+        assert!(sui.sell_menu_stash_bottom_px >= 0.0, "shop_ui.sell_menu_stash_bottom_px نامعتبر است");
+        assert!(sui.sell_menu_tp_offset_px >= 0.0, "shop_ui.sell_menu_tp_offset_px نامعتبر است");
         assert!(!self.items.is_empty(), "لیست items در items.ron نمی‌تواند خالی باشد");
         let tp = &self.teleport;
         assert!(!tp.item_id.trim().is_empty(), "teleport.item_id در items.ron خالی است");
@@ -468,6 +485,7 @@ impl ItemsConfig {
         assert!(tp.channel_duration_secs > 0.0, "teleport.channel_duration_secs باید مثبت باشد");
         assert!(tp.building_teleport_radius > 0.0, "teleport.building_teleport_radius باید مثبت باشد");
         assert!(tp.min_building_clearance >= 0.0, "teleport.min_building_clearance نامعتبر است");
+        assert!(tp.building_clearance_margin >= 0.0, "teleport.building_clearance_margin نامعتبر است");
         assert!(tp.max_click_snap_distance > 0.0, "teleport.max_click_snap_distance باید مثبت باشد");
         assert!(tp.portal_radius > 0.0, "teleport.portal_radius باید مثبت باشد");
         assert!(tp.portal_height > 0.0, "teleport.portal_height باید مثبت باشد");
@@ -550,8 +568,8 @@ impl ItemsConfig {
             .unwrap_or(0)
     }
 
-    /// محاسبه هزینه باقی‌مانده خرید یک آیتم با کسر قیمت کامپوننت‌ها و اسکرول Recipe موجود در اینونتوری
-    pub fn effective_purchase_cost(
+    /// محاسبه تک‌سطحی هزینه باقی‌مانده (مخصوص ترکیب خودکار از پایین به بالا در auto_combine_items)
+    pub fn effective_purchase_cost_direct(
         &self,
         item_id: &str,
         inventory: &[InventoryItemState],
@@ -591,6 +609,85 @@ impl ItemsConfig {
                 consumed_indices.push(idx);
                 owned_value = owned_value.saturating_add(rec_fee);
             }
+        }
+
+        let remaining_cost = item.cost.saturating_sub(owned_value);
+        Some((remaining_cost, consumed_indices))
+    }
+
+    fn collect_owned_components_recursive(
+        &self,
+        item_id: &str,
+        inventory: &[InventoryItemState],
+        used: &mut [bool],
+        consumed_indices: &mut Vec<usize>,
+        owned_value: &mut u32,
+    ) {
+        let Some(item) = self.get_item(item_id) else {
+            return;
+        };
+        for comp_id in &item.recipe {
+            if let Some((idx, _)) = inventory
+                .iter()
+                .enumerate()
+                .find(|(idx, inv)| !used[*idx] && &inv.item_id == comp_id)
+            {
+                used[idx] = true;
+                consumed_indices.push(idx);
+                if let Some(comp) = self.get_item(comp_id) {
+                    *owned_value = owned_value.saturating_add(comp.cost);
+                }
+            } else if let Some(comp_def) = self.get_item(comp_id) {
+                if !comp_def.recipe.is_empty() {
+                    self.collect_owned_components_recursive(
+                        comp_id,
+                        inventory,
+                        used,
+                        consumed_indices,
+                        owned_value,
+                    );
+                }
+            }
+        }
+
+        let rec_fee = self.recipe_fee(item_id);
+        if rec_fee > 0 {
+            let rec_id = recipe_item_id(item_id);
+            if let Some((idx, _)) = inventory
+                .iter()
+                .enumerate()
+                .find(|(idx, inv)| !used[*idx] && inv.item_id == rec_id)
+            {
+                used[idx] = true;
+                consumed_indices.push(idx);
+                *owned_value = owned_value.saturating_add(rec_fee);
+            }
+        }
+    }
+
+    /// محاسبه بازگشتی (چندسطحی) هزینه باقی‌مانده خرید یک آیتم با کسر قیمت کامپوننت‌ها، زیرکامپوننت‌ها و اسکرول‌های Recipe موجود
+    pub fn effective_purchase_cost(
+        &self,
+        item_id: &str,
+        inventory: &[InventoryItemState],
+    ) -> Option<(u32, Vec<usize>)> {
+        if let Some(target_id) = parse_recipe_target(item_id) {
+            let fee = self.recipe_fee(target_id);
+            return (fee > 0).then_some((fee, Vec::new()));
+        }
+        let item = self.get_item(item_id)?;
+        let mut consumed_indices = Vec::new();
+        let mut used = vec![false; inventory.len()];
+        let mut owned_value = 0_u32;
+
+        if !item.recipe.is_empty() {
+            self.collect_owned_components_recursive(
+                item_id,
+                inventory,
+                &mut used,
+                &mut consumed_indices,
+                &mut owned_value,
+            );
         }
 
         let remaining_cost = item.cost.saturating_sub(owned_value);
@@ -800,7 +897,7 @@ pub fn auto_combine_items(
             let expected_consumed =
                 item_def.recipe.len() + usize::from(items_cfg.recipe_fee(&item_def.id) > 0);
             if let Some((remaining_cost, consumed_indices)) =
-                items_cfg.effective_purchase_cost(&item_def.id, inventory)
+                items_cfg.effective_purchase_cost_direct(&item_def.id, inventory)
             {
                 if remaining_cost == 0 && consumed_indices.len() == expected_consumed {
                     found_craft = Some((item_def.id.clone(), consumed_indices));
@@ -847,12 +944,131 @@ pub fn set_shop_notice(p: &mut PlayerSlotState, text: impl Into<String>, is_erro
     p.shop_notice_is_error = is_error;
 }
 
-/// تلاش برای قرار دادن یک آیتم (یا اسکرول Recipe) در یک اینونتوری مشخص (با پشتیبانی استک و ترکیب خودکار حتی در حالت پر)
+/// تضمین معتبر بودن شماره اسلات تمام آیتم‌ها در بازه 0..max_slots (جلوگیری از نامرئی شدن آیتم پس از ترکیب در حالت ۶/۶ پر)
+fn normalize_overflow_slots(inv: &mut [InventoryItemState], max_slots: usize) {
+    for i in 0..inv.len() {
+        if inv[i].slot >= max_slots {
+            if let Some(free_slot) = (0..max_slots)
+                .find(|s| !inv.iter().enumerate().any(|(j, it)| j != i && it.slot == *s))
+            {
+                inv[i].slot = free_slot;
+            }
+        }
+    }
+}
+
+/// ترکیب خودکار بین‌اینونتوری (مثلاً Hero + Stash + Courier در چشمه) پس از خرید اسکرول Recipe یا ورود آیتم
+fn auto_combine_across_inventories(
+    primary: &mut Vec<InventoryItemState>,
+    primary_max_slots: usize,
+    mut aux1_opt: Option<&mut Vec<InventoryItemState>>,
+    mut aux2_opt: Option<&mut Vec<InventoryItemState>>,
+    items_cfg: &ItemsConfig,
+) -> (bool, bool, bool) {
+    let mut crafted_any = false;
+    let mut aux1_touched = false;
+    let mut aux2_touched = false;
+
+    loop {
+        let p_len = primary.len();
+        let a1_len = aux1_opt.as_deref().map_or(0, |v| v.len());
+        let mut combined = Vec::with_capacity(p_len + a1_len + aux2_opt.as_deref().map_or(0, |v| v.len()));
+        combined.extend(primary.iter().cloned());
+        if let Some(ref a1) = aux1_opt {
+            combined.extend(a1.iter().cloned());
+        }
+        if let Some(ref a2) = aux2_opt {
+            combined.extend(a2.iter().cloned());
+        }
+
+        let mut found: Option<(String, Vec<usize>)> = None;
+        for item_def in &items_cfg.items {
+            if item_def.recipe.is_empty() || item_def.dedicated_tp_slot {
+                continue;
+            }
+            let expected_consumed =
+                item_def.recipe.len() + usize::from(items_cfg.recipe_fee(&item_def.id) > 0);
+            if let Some((rem, indices)) =
+                items_cfg.effective_purchase_cost_direct(&item_def.id, &combined)
+            {
+                if rem == 0 && indices.len() == expected_consumed {
+                    let p_consumed = indices.iter().filter(|&&idx| idx < p_len).count();
+                    if primary.len() - p_consumed + 1 <= primary_max_slots {
+                        found = Some((item_def.id.clone(), indices));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let Some((crafted_id, indices)) = found else {
+            break;
+        };
+
+        let mut p_idx = Vec::new();
+        let mut a1_idx = Vec::new();
+        let mut a2_idx = Vec::new();
+        for idx in indices {
+            if idx < p_len {
+                p_idx.push(idx);
+            } else if idx < p_len + a1_len {
+                a1_idx.push(idx - p_len);
+            } else {
+                a2_idx.push(idx - p_len - a1_len);
+            }
+        }
+
+        let preferred_slot = p_idx
+            .iter()
+            .filter_map(|&idx| primary.get(idx).map(|it| it.slot))
+            .min();
+
+        p_idx.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in p_idx {
+            primary.remove(idx);
+        }
+        if !a1_idx.is_empty() {
+            if let Some(a1) = aux1_opt.as_deref_mut() {
+                a1_idx.sort_unstable_by(|a, b| b.cmp(a));
+                for idx in a1_idx {
+                    a1.remove(idx);
+                }
+                aux1_touched = true;
+            }
+        }
+        if !a2_idx.is_empty() {
+            if let Some(a2) = aux2_opt.as_deref_mut() {
+                a2_idx.sort_unstable_by(|a, b| b.cmp(a));
+                for idx in a2_idx {
+                    a2.remove(idx);
+                }
+                aux2_touched = true;
+            }
+        }
+
+        let free_slot = preferred_slot
+            .filter(|s| *s < primary_max_slots && !primary.iter().any(|it| it.slot == *s))
+            .or_else(|| (0..primary_max_slots).find(|s| !primary.iter().any(|it| it.slot == *s)))
+            .unwrap_or(0);
+        primary.push(InventoryItemState {
+            item_id: crafted_id,
+            active_mode: 0,
+            slot: free_slot,
+            count: 1,
+        });
+        crafted_any = true;
+    }
+
+    (crafted_any, aux1_touched, aux2_touched)
+}
+
+/// تلاش برای قرار دادن یک آیتم (یا اسکرول Recipe) در یک اینونتوری مشخص با حفظ active_mode، پشتیبانی استک و ترکیب خودکار
 fn try_insert_into_inventory(
     inv: &mut Vec<InventoryItemState>,
     max_slots: usize,
     item_id: &str,
     count: u32,
+    active_mode: usize,
     items_cfg: &ItemsConfig,
 ) -> bool {
     let is_stack = items_cfg
@@ -867,7 +1083,7 @@ fn try_insert_into_inventory(
     if let Some(free_slot) = (0..max_slots).find(|s| !inv.iter().any(|it| it.slot == *s)) {
         inv.push(InventoryItemState {
             item_id: item_id.to_string(),
-            active_mode: 0,
+            active_mode,
             slot: free_slot,
             count,
         });
@@ -878,26 +1094,29 @@ fn try_insert_into_inventory(
     let mut test_inv = inv.clone();
     test_inv.push(InventoryItemState {
         item_id: item_id.to_string(),
-        active_mode: 0,
+        active_mode,
         slot: max_slots,
         count,
     });
     if auto_combine_items(&mut test_inv, max_slots, items_cfg) && test_inv.len() <= max_slots {
+        normalize_overflow_slots(&mut test_inv, max_slots);
         *inv = test_inv;
         return true;
     }
     false
 }
 
-/// محاسبه خرید ترکیبی از یک اینونتوری اصلی + اختیاری Stash (در صورت حضور واحد در چشمه)
+/// محاسبه خرید ترکیبی چندسطحی از اینونتوری هدف + تا ۲ اینونتوری کمکی در دسترس (مثلاً Stash و Courier/Hero در چشمه)
+/// خروجی: Ok((bought, aux1_touched, aux2_touched))
 fn try_craft_buy_into_target(
     hero_gold: &mut u32,
     target_inv: &mut Vec<InventoryItemState>,
     target_max_slots: usize,
-    mut stash_opt: Option<&mut Vec<InventoryItemState>>,
+    mut aux1_opt: Option<&mut Vec<InventoryItemState>>,
+    mut aux2_opt: Option<&mut Vec<InventoryItemState>>,
     item_id: &str,
     items_cfg: &ItemsConfig,
-) -> Result<bool, &'static str> {
+) -> Result<(bool, bool, bool), &'static str> {
     let Some(item_def) = items_cfg.get_item(item_id) else {
         return Err("INVALID ITEM");
     };
@@ -909,73 +1128,41 @@ fn try_craft_buy_into_target(
             }
             *hero_gold -= item_def.cost;
             existing.count = existing.count.saturating_add(1);
-            return Ok(true);
+            return Ok((true, false, false));
         }
     }
 
-    let mut target_used = vec![false; target_inv.len()];
-    let mut stash_used = stash_opt
-        .as_deref()
-        .map(|s| vec![false; s.len()])
-        .unwrap_or_default();
-    let mut target_consumed = Vec::new();
-    let mut stash_consumed = Vec::new();
-    let mut owned_val = 0_u32;
-
-    if !item_def.recipe.is_empty() {
-        for comp_id in &item_def.recipe {
-            if let Some((idx, _)) = target_inv
-                .iter()
-                .enumerate()
-                .find(|(idx, inv)| !target_used[*idx] && &inv.item_id == comp_id)
-            {
-                target_used[idx] = true;
-                target_consumed.push(idx);
-                if let Some(c) = items_cfg.get_item(comp_id) {
-                    owned_val = owned_val.saturating_add(c.cost);
-                }
-            } else if let Some(ref stash) = stash_opt {
-                if let Some((idx, _)) = stash
-                    .iter()
-                    .enumerate()
-                    .find(|(idx, inv)| !stash_used[*idx] && &inv.item_id == comp_id)
-                {
-                    stash_used[idx] = true;
-                    stash_consumed.push(idx);
-                    if let Some(c) = items_cfg.get_item(comp_id) {
-                        owned_val = owned_val.saturating_add(c.cost);
-                    }
-                }
-            }
-        }
-        let rec_fee = items_cfg.recipe_fee(item_id);
-        if rec_fee > 0 {
-            let rec_id = recipe_item_id(item_id);
-            if let Some((idx, _)) = target_inv
-                .iter()
-                .enumerate()
-                .find(|(idx, inv)| !target_used[*idx] && inv.item_id == rec_id)
-            {
-                target_used[idx] = true;
-                target_consumed.push(idx);
-                owned_val = owned_val.saturating_add(rec_fee);
-            } else if let Some(ref stash) = stash_opt {
-                if let Some((idx, _)) = stash
-                    .iter()
-                    .enumerate()
-                    .find(|(idx, inv)| !stash_used[*idx] && inv.item_id == rec_id)
-                {
-                    stash_used[idx] = true;
-                    stash_consumed.push(idx);
-                    owned_val = owned_val.saturating_add(rec_fee);
-                }
-            }
-        }
+    // ساخت نمای یکپارچه برای جستجوی بازگشتی چندسطحی (اولویت: target -> aux1 -> aux2)
+    let t_len = target_inv.len();
+    let a1_len = aux1_opt.as_deref().map_or(0, |v| v.len());
+    let mut combined = Vec::with_capacity(t_len + a1_len + aux2_opt.as_deref().map_or(0, |v| v.len()));
+    combined.extend(target_inv.iter().cloned());
+    if let Some(ref a1) = aux1_opt {
+        combined.extend(a1.iter().cloned());
+    }
+    if let Some(ref a2) = aux2_opt {
+        combined.extend(a2.iter().cloned());
     }
 
-    let cost_to_pay = item_def.cost.saturating_sub(owned_val);
+    let (cost_to_pay, consumed_combined) = items_cfg
+        .effective_purchase_cost(item_id, &combined)
+        .ok_or("INVALID ITEM")?;
+
     if *hero_gold < cost_to_pay {
         return Err("NOT ENOUGH GOLD");
+    }
+
+    let mut target_consumed = Vec::new();
+    let mut aux1_consumed = Vec::new();
+    let mut aux2_consumed = Vec::new();
+    for idx in consumed_combined {
+        if idx < t_len {
+            target_consumed.push(idx);
+        } else if idx < t_len + a1_len {
+            aux1_consumed.push(idx - t_len);
+        } else {
+            aux2_consumed.push(idx - t_len - a1_len);
+        }
     }
 
     let final_slots = target_inv.len() - target_consumed.len() + 1;
@@ -996,17 +1183,32 @@ fn try_craft_buy_into_target(
         if auto_combine_items(&mut test_inv, target_max_slots, items_cfg)
             && test_inv.len() <= target_max_slots
         {
+            normalize_overflow_slots(&mut test_inv, target_max_slots);
             *hero_gold -= cost_to_pay;
             *target_inv = test_inv;
-            if let Some(stash) = stash_opt.as_deref_mut() {
-                stash_consumed.sort_unstable_by(|a, b| b.cmp(a));
-                for idx in stash_consumed {
-                    stash.remove(idx);
+            let mut a1_touched = false;
+            let mut a2_touched = false;
+            if !aux1_consumed.is_empty() {
+                if let Some(a1) = aux1_opt.as_deref_mut() {
+                    aux1_consumed.sort_unstable_by(|a, b| b.cmp(a));
+                    for idx in aux1_consumed {
+                        a1.remove(idx);
+                    }
+                    a1_touched = true;
                 }
             }
-            return Ok(true);
+            if !aux2_consumed.is_empty() {
+                if let Some(a2) = aux2_opt.as_deref_mut() {
+                    aux2_consumed.sort_unstable_by(|a, b| b.cmp(a));
+                    for idx in aux2_consumed {
+                        a2.remove(idx);
+                    }
+                    a2_touched = true;
+                }
+            }
+            return Ok((true, a1_touched, a2_touched));
         }
-        return Ok(false); // اینونتوری هدف پر است -> اجازه fallback به Stash
+        return Ok((false, false, false)); // اینونتوری هدف پر است -> اجازه fallback به Stash
     }
 
     let preferred_slot = target_consumed
@@ -1018,14 +1220,29 @@ fn try_craft_buy_into_target(
     for idx in target_consumed {
         target_inv.remove(idx);
     }
-    if let Some(stash) = stash_opt.as_deref_mut() {
-        stash_consumed.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in stash_consumed {
-            stash.remove(idx);
+    let mut a1_touched = false;
+    let mut a2_touched = false;
+    if !aux1_consumed.is_empty() {
+        if let Some(a1) = aux1_opt.as_deref_mut() {
+            aux1_consumed.sort_unstable_by(|a, b| b.cmp(a));
+            for idx in aux1_consumed {
+                a1.remove(idx);
+            }
+            a1_touched = true;
         }
     }
+    if !aux2_consumed.is_empty() {
+        if let Some(a2) = aux2_opt.as_deref_mut() {
+            aux2_consumed.sort_unstable_by(|a, b| b.cmp(a));
+            for idx in aux2_consumed {
+                a2.remove(idx);
+            }
+            a2_touched = true;
+        }
+    }
+
     let free_slot = preferred_slot
-        .filter(|s| !target_inv.iter().any(|it| it.slot == *s))
+        .filter(|s| *s < target_max_slots && !target_inv.iter().any(|it| it.slot == *s))
         .or_else(|| (0..target_max_slots).find(|s| !target_inv.iter().any(|it| it.slot == *s)))
         .unwrap_or(0);
     target_inv.push(InventoryItemState {
@@ -1035,7 +1252,7 @@ fn try_craft_buy_into_target(
         count: 1,
     });
     auto_combine_items(target_inv, target_max_slots, items_cfg);
-    Ok(true)
+    Ok((true, a1_touched, a2_touched))
 }
 
 /// خرید فقط اسکرول Recipe یک آیتم ترکیبی (به‌عنوان یک آیتم جدا با هزینه صرفاً recipe_fee)
@@ -1046,6 +1263,9 @@ pub fn try_buy_recipe(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1066,53 +1286,158 @@ pub fn try_buy_recipe(
         && fountain_regen_bonus_for_pos(config, p.hero_team, p.courier_pos) > 0.0;
     let rec_id = recipe_item_id(target_item_id);
 
-    // قانون ۱: هیرو در محدوده شاپ -> اول هیرو، اگر پر بود Stash
+    // قانون ۱: هیرو در محدوده شاپ -> اول هیرو (با ترکیب بین‌اینونتوری با Stash و Courier)، اگر پر بود Stash
     if hero_in_shop {
+        // ابتدا بررسی ترکیب مستقیم بین‌اینونتوری اگر هیرو پر است ولی این Recipe ترکیب را کامل می‌کند
         if try_insert_into_inventory(
             &mut p.inventory,
             items_cfg.max_inventory_slots,
             &rec_id,
             1,
+            0,
             items_cfg,
         ) {
             p.hero_gold -= fee;
+            let aux2 = if courier_in_shop {
+                Some(&mut p.courier_inventory)
+            } else {
+                None
+            };
+            auto_combine_across_inventories(
+                &mut p.inventory,
+                items_cfg.max_inventory_slots,
+                Some(&mut p.stash),
+                aux2,
+                items_cfg,
+            );
             recompute_player_slot_stats(p, config, items_cfg);
             return true;
+        }
+        // اگر هیرو ۶/۶ پر بود، تست کن آیا افزودن Recipe به مجموعه Hero+Stash(+Courier) باعث ترکیب و آزاد شدن جا در هیرو می‌شود
+        {
+            let mut test_hero = p.inventory.clone();
+            let mut test_stash = p.stash.clone();
+            let mut test_cour = p.courier_inventory.clone();
+            test_hero.push(InventoryItemState {
+                item_id: rec_id.clone(),
+                active_mode: 0,
+                slot: items_cfg.max_inventory_slots,
+                count: 1,
+            });
+            let aux2 = if courier_in_shop {
+                Some(&mut test_cour)
+            } else {
+                None
+            };
+            let (crafted, _, _) = auto_combine_across_inventories(
+                &mut test_hero,
+                items_cfg.max_inventory_slots,
+                Some(&mut test_stash),
+                aux2,
+                items_cfg,
+            );
+            if crafted && test_hero.len() <= items_cfg.max_inventory_slots {
+                normalize_overflow_slots(&mut test_hero, items_cfg.max_inventory_slots);
+                p.hero_gold -= fee;
+                p.inventory = test_hero;
+                p.stash = test_stash;
+                if courier_in_shop {
+                    p.courier_inventory = test_cour;
+                }
+                recompute_player_slot_stats(p, config, items_cfg);
+                return true;
+            }
         }
         if try_insert_into_inventory(
             &mut p.stash,
             items_cfg.max_stash_slots,
             &rec_id,
             1,
+            0,
             items_cfg,
         ) {
             p.hero_gold -= fee;
+            let aux2 = if courier_in_shop {
+                Some(&mut p.courier_inventory)
+            } else {
+                None
+            };
+            let (_, hero_touched, _) = auto_combine_across_inventories(
+                &mut p.stash,
+                items_cfg.max_stash_slots,
+                Some(&mut p.inventory),
+                aux2,
+                items_cfg,
+            );
+            if hero_touched {
+                recompute_player_slot_stats(p, config, items_cfg);
+            }
             return true;
         }
         set_shop_notice(p, "HERO & STASH FULL - CANNOT BUY", true);
         return false;
     }
 
-    // قانون ۲: هیرو خارج از شاپ، کوریر در محدوده شاپ -> اول کوریر، اگر پر بود Stash
+    // قانون ۲: هیرو خارج از شاپ، کوریر در محدوده شاپ -> اول کوریر (با ترکیب بین‌اینونتوری با Stash)، اگر پر بود Stash
     if courier_in_shop {
         if try_insert_into_inventory(
             &mut p.courier_inventory,
             courier_max_slots,
             &rec_id,
             1,
+            0,
             items_cfg,
         ) {
             p.hero_gold -= fee;
+            auto_combine_across_inventories(
+                &mut p.courier_inventory,
+                courier_max_slots,
+                Some(&mut p.stash),
+                None,
+                items_cfg,
+            );
             return true;
+        }
+        {
+            let mut test_cour = p.courier_inventory.clone();
+            let mut test_stash = p.stash.clone();
+            test_cour.push(InventoryItemState {
+                item_id: rec_id.clone(),
+                active_mode: 0,
+                slot: courier_max_slots,
+                count: 1,
+            });
+            let (crafted, _, _) = auto_combine_across_inventories(
+                &mut test_cour,
+                courier_max_slots,
+                Some(&mut test_stash),
+                None,
+                items_cfg,
+            );
+            if crafted && test_cour.len() <= courier_max_slots {
+                normalize_overflow_slots(&mut test_cour, courier_max_slots);
+                p.hero_gold -= fee;
+                p.courier_inventory = test_cour;
+                p.stash = test_stash;
+                return true;
+            }
         }
         if try_insert_into_inventory(
             &mut p.stash,
             items_cfg.max_stash_slots,
             &rec_id,
             1,
+            0,
             items_cfg,
         ) {
             p.hero_gold -= fee;
+            auto_combine_across_inventories(
+                &mut p.stash,
+                items_cfg.max_stash_slots,
+                Some(&mut p.courier_inventory),
+                None,
+                items_cfg,
+            );
             return true;
         }
         set_shop_notice(p, "COURIER & STASH FULL - CANNOT BUY", true);
@@ -1125,6 +1450,7 @@ pub fn try_buy_recipe(
         items_cfg.max_stash_slots,
         &rec_id,
         1,
+        0,
         items_cfg,
     ) {
         p.hero_gold -= fee;
@@ -1142,6 +1468,9 @@ pub fn try_buy_item(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     if let Some(target_id) = parse_recipe_target(item_id) {
         return try_buy_recipe(world, slot_index, target_id, config, items_cfg);
     }
@@ -1159,7 +1488,7 @@ pub fn try_buy_item(
     let courier_in_shop = !p.courier_is_dead
         && fountain_regen_bonus_for_pos(config, p.hero_team, p.courier_pos) > 0.0;
 
-    // قانون ۱: هیرو در محدوده شاپ -> اول هیرو، اگر پر بود Stash
+    // قانون ۱: هیرو در محدوده شاپ -> اول هیرو (با دیدن Stash و Courier در شاپ)، اگر پر بود Stash (با دیدن Hero و Courier)
     if hero_in_shop {
         if item_def.dedicated_tp_slot {
             if p.hero_gold < item_def.cost {
@@ -1183,15 +1512,21 @@ pub fn try_buy_item(
                 return true;
             }
         } else {
+            let aux2 = if courier_in_shop {
+                Some(&mut p.courier_inventory)
+            } else {
+                None
+            };
             match try_craft_buy_into_target(
                 &mut p.hero_gold,
                 &mut p.inventory,
                 items_cfg.max_inventory_slots,
                 Some(&mut p.stash),
+                aux2,
                 item_id,
                 items_cfg,
             ) {
-                Ok(true) => {
+                Ok((true, _, _)) => {
                     recompute_player_slot_stats(p, config, items_cfg);
                     return true;
                 }
@@ -1199,63 +1534,76 @@ pub fn try_buy_item(
                     set_shop_notice(p, msg, true);
                     return false;
                 }
-                Ok(false) => {} // اینونتوری هیرو پر است -> ورود به Stash
+                Ok((false, _, _)) => {} // اینونتوری هیرو پر است -> ورود به Stash
             }
         }
 
-        // هیرو پر بود -> تلاش برای قرار دادن در Stash
+        // هیرو پر بود -> تلاش برای قرار دادن در Stash (با دیدن کامپوننت‌های داخل Hero و Courier در شاپ)
+        let aux2 = if courier_in_shop {
+            Some(&mut p.courier_inventory)
+        } else {
+            None
+        };
         match try_craft_buy_into_target(
             &mut p.hero_gold,
             &mut p.stash,
             items_cfg.max_stash_slots,
-            None,
+            Some(&mut p.inventory),
+            aux2,
             item_id,
             items_cfg,
         ) {
-            Ok(true) => return true,
+            Ok((true, hero_touched, _)) => {
+                if hero_touched {
+                    recompute_player_slot_stats(p, config, items_cfg);
+                }
+                return true;
+            }
             Err(msg) => {
                 set_shop_notice(p, msg, true);
                 return false;
             }
-            Ok(false) => {
+            Ok((false, _, _)) => {
                 set_shop_notice(p, "HERO & STASH FULL - CANNOT BUY", true);
                 return false;
             }
         }
     }
 
-    // قانون ۲: هیرو خارج از شاپ، کوریر داخل شاپ -> اول کوریر، اگر پر بود Stash
+    // قانون ۲: هیرو خارج از شاپ، کوریر داخل شاپ -> اول کوریر (با دیدن Stash)، اگر پر بود Stash (با دیدن Courier)
     if courier_in_shop {
         match try_craft_buy_into_target(
             &mut p.hero_gold,
             &mut p.courier_inventory,
             courier_max_slots,
             Some(&mut p.stash),
+            None,
             item_id,
             items_cfg,
         ) {
-            Ok(true) => return true,
+            Ok((true, _, _)) => return true,
             Err(msg) => {
                 set_shop_notice(p, msg, true);
                 return false;
             }
-            Ok(false) => {} // کوریر پر است -> ورود به Stash
+            Ok((false, _, _)) => {} // کوریر پر است -> ورود به Stash
         }
 
         match try_craft_buy_into_target(
             &mut p.hero_gold,
             &mut p.stash,
             items_cfg.max_stash_slots,
+            Some(&mut p.courier_inventory),
             None,
             item_id,
             items_cfg,
         ) {
-            Ok(true) => return true,
+            Ok((true, _, _)) => return true,
             Err(msg) => {
                 set_shop_notice(p, msg, true);
                 return false;
             }
-            Ok(false) => {
+            Ok((false, _, _)) => {
                 set_shop_notice(p, "COURIER & STASH FULL - CANNOT BUY", true);
                 return false;
             }
@@ -1268,22 +1616,23 @@ pub fn try_buy_item(
         &mut p.stash,
         items_cfg.max_stash_slots,
         None,
+        None,
         item_id,
         items_cfg,
     ) {
-        Ok(true) => true,
+        Ok((true, _, _)) => true,
         Err(msg) => {
             set_shop_notice(p, msg, true);
             false
         }
-        Ok(false) => {
+        Ok((false, _, _)) => {
             set_shop_notice(p, "STASH FULL - CANNOT BUY", true);
             false
         }
     }
 }
 
-/// بارگیری خودکار آیتم‌های داخل Stash به ترتیب اسلات در اینونتوری کوریر (تا سقف ظرفیت کوریر)
+/// بارگیری خودکار آیتم‌های داخل Stash به ترتیب اسلات در اینونتوری کوریر (تا سقف ظرفیت کوریر با حفظ active_mode)
 pub fn pull_stash_into_courier(
     p: &mut PlayerSlotState,
     config: &GameConfig,
@@ -1303,6 +1652,7 @@ pub fn pull_stash_into_courier(
             courier_max_slots,
             &st_item.item_id,
             st_item.count,
+            st_item.active_mode,
             items_cfg,
         ) {
             moved_any = true;
@@ -1314,7 +1664,7 @@ pub fn pull_stash_into_courier(
     moved_any
 }
 
-/// انتقال دستی آیتم از اینونتوری هیرو به Stash (فقط وقتی هیرو زنده و داخل چشمه است)
+/// انتقال دستی آیتم از اینونتوری هیرو (یا اسلات TP با usize::MAX) به Stash (فقط وقتی هیرو زنده و داخل چشمه است)
 pub fn try_move_hero_item_to_stash(
     world: &mut AuthoritativeWorldState,
     slot_index: usize,
@@ -1322,11 +1672,36 @@ pub fn try_move_hero_item_to_stash(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
     if p.is_dead || fountain_regen_bonus_for_pos(config, p.hero_team, p.soldier_pos) <= 0.0 {
         set_shop_notice(p, "MUST BE IN SHOP TO MOVE TO STASH", true);
+        return false;
+    }
+    if hero_slot == usize::MAX {
+        if p.active_teleport.is_some() {
+            set_shop_notice(p, "CANNOT MOVE TP WHILE TELEPORTING", true);
+            return false;
+        }
+        let Some(tp_item) = p.tp_slot.clone() else {
+            return false;
+        };
+        if try_insert_into_inventory(
+            &mut p.stash,
+            items_cfg.max_stash_slots,
+            &tp_item.item_id,
+            tp_item.count,
+            tp_item.active_mode,
+            items_cfg,
+        ) {
+            p.tp_slot = None;
+            return true;
+        }
+        set_shop_notice(p, "STASH IS FULL", true);
         return false;
     }
     let Some(pos) = p.inventory.iter().position(|it| it.slot == hero_slot) else {
@@ -1338,6 +1713,7 @@ pub fn try_move_hero_item_to_stash(
         items_cfg.max_stash_slots,
         &item.item_id,
         item.count,
+        item.active_mode,
         items_cfg,
     ) {
         p.inventory.remove(pos);
@@ -1356,6 +1732,9 @@ pub fn try_move_stash_item_to_hero(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1380,7 +1759,7 @@ pub fn try_move_stash_item_to_hero(
         } else {
             p.tp_slot = Some(InventoryItemState {
                 item_id: item.item_id,
-                active_mode: 0,
+                active_mode: item.active_mode,
                 slot: 0,
                 count: item.count,
             });
@@ -1393,6 +1772,7 @@ pub fn try_move_stash_item_to_hero(
         items_cfg.max_inventory_slots,
         &item.item_id,
         item.count,
+        item.active_mode,
         items_cfg,
     ) {
         p.stash.remove(pos);
@@ -1410,6 +1790,9 @@ pub fn try_take_all_stash_to_hero(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1436,7 +1819,7 @@ pub fn try_take_all_stash_to_hero(
             } else {
                 p.tp_slot = Some(InventoryItemState {
                     item_id: st_item.item_id.clone(),
-                    active_mode: 0,
+                    active_mode: st_item.active_mode,
                     slot: 0,
                     count: st_item.count,
                 });
@@ -1449,6 +1832,7 @@ pub fn try_take_all_stash_to_hero(
                 items_cfg.max_inventory_slots,
                 &st_item.item_id,
                 st_item.count,
+                st_item.active_mode,
                 items_cfg,
             );
         }
@@ -1475,6 +1859,9 @@ pub fn try_move_courier_item_to_stash(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1497,6 +1884,7 @@ pub fn try_move_courier_item_to_stash(
         items_cfg.max_stash_slots,
         &item.item_id,
         item.count,
+        item.active_mode,
         items_cfg,
     ) {
         p.courier_inventory.remove(pos);
@@ -1514,6 +1902,9 @@ pub fn try_move_stash_item_to_courier(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1533,6 +1924,7 @@ pub fn try_move_stash_item_to_courier(
         courier_max_slots,
         &item.item_id,
         item.count,
+        item.active_mode,
         items_cfg,
     ) {
         p.stash.remove(pos);
@@ -1549,6 +1941,9 @@ pub fn try_sell_stash_item(
     stash_slot: usize,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1565,7 +1960,7 @@ pub fn try_sell_stash_item(
     true
 }
 
-/// خرید یکجای سبد خرید به صورت Server-Authoritative
+/// خرید یکجا و اتمی (All-or-Nothing) سبد خرید به صورت Server-Authoritative با سقف مجاز کانفیگ
 pub fn try_buy_cart(
     world: &mut AuthoritativeWorldState,
     slot_index: usize,
@@ -1573,19 +1968,35 @@ pub fn try_buy_cart(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
-    if item_ids.is_empty() {
+    if !is_match_action_allowed(world)
+        || item_ids.is_empty()
+        || item_ids.len() > items_cfg.max_cart_buy_items
+    {
         return false;
     }
-    let mut bought_any = false;
+    let Some(backup_player) = world.players.get(slot_index).cloned() else {
+        return false;
+    };
+
     for item_id in item_ids {
-        if try_buy_item(world, slot_index, item_id, config, items_cfg) {
-            bought_any = true;
+        if !try_buy_item(world, slot_index, item_id, config, items_cfg) {
+            // برگشت کامل (Rollback) در صورت شکست هر آیتم در سبد، با حفظ پیام خطای ثبت‌شده
+            if let Some(p) = world.players.get_mut(slot_index) {
+                let err_seq = p.shop_notice_seq;
+                let err_text = p.shop_notice_text.clone();
+                let err_flag = p.shop_notice_is_error;
+                *p = backup_player;
+                p.shop_notice_seq = err_seq;
+                p.shop_notice_text = err_text;
+                p.shop_notice_is_error = err_flag;
+            }
+            return false;
         }
     }
-    bought_any
+    true
 }
 
-/// فروش آیتم از اینونتوری (فقط در محدوده چشمه تیم خودی)
+/// فروش آیتم از اینونتوری (فقط در محدوده چشمه تیم خودی؛ محافظت‌شده در برابر اکسپلویت تلپورت رایگان)
 pub fn try_sell_item(
     world: &mut AuthoritativeWorldState,
     slot_index: usize,
@@ -1593,6 +2004,9 @@ pub fn try_sell_item(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1603,6 +2017,10 @@ pub fn try_sell_item(
         let Some(ref mut tp_item) = p.tp_slot else {
             return false;
         };
+        if p.active_teleport.is_some() && tp_item.count <= 1 {
+            set_shop_notice(p, "CANNOT SELL TP WHILE TELEPORTING", true);
+            return false;
+        }
         let refund = items_cfg.sell_price(&tp_item.item_id);
         if tp_item.count > 1 {
             tp_item.count -= 1;
@@ -1634,6 +2052,9 @@ pub fn try_cycle_item_mode(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1654,7 +2075,7 @@ pub fn try_cycle_item_mode(
     true
 }
 
-/// جابجایی یا تعویض جای آیتم‌ها در خانه‌های اینونتوری (Drag & Drop)
+/// جابجایی یا تعویض جای آیتم‌ها در خانه‌های اینونتوری هیرو (Drag & Drop)
 pub fn try_swap_inventory_slots(
     world: &mut AuthoritativeWorldState,
     slot_index: usize,
@@ -1662,6 +2083,9 @@ pub fn try_swap_inventory_slots(
     to_slot: usize,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     if from_slot >= items_cfg.max_inventory_slots
         || to_slot >= items_cfg.max_inventory_slots
         || from_slot == to_slot
@@ -1688,8 +2112,79 @@ pub fn try_swap_inventory_slots(
     true
 }
 
+/// جابجایی یا تعویض جای آیتم‌ها در خانه‌های اینونتوری کوریر (Drag & Drop)
+pub fn try_swap_courier_slots(
+    world: &mut AuthoritativeWorldState,
+    slot_index: usize,
+    from_slot: usize,
+    to_slot: usize,
+    config: &GameConfig,
+) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
+    let Some(p) = world.players.get_mut(slot_index) else {
+        return false;
+    };
+    let max_slots = config.active_hero(p.hero_index).courier.inventory_slots;
+    if from_slot >= max_slots || to_slot >= max_slots || from_slot == to_slot {
+        return false;
+    }
+    let has_any = p
+        .courier_inventory
+        .iter()
+        .any(|it| it.slot == from_slot || it.slot == to_slot);
+    if !has_any {
+        return false;
+    }
+    for it in &mut p.courier_inventory {
+        if it.slot == from_slot {
+            it.slot = to_slot;
+        } else if it.slot == to_slot {
+            it.slot = from_slot;
+        }
+    }
+    true
+}
 
-/// فروش آیتم از اینونتوری Courier (وقتی Courier زنده و داخل چشمه است)
+/// جابجایی یا تعویض جای آیتم‌ها در خانه‌های Stash (Drag & Drop)
+pub fn try_swap_stash_slots(
+    world: &mut AuthoritativeWorldState,
+    slot_index: usize,
+    from_slot: usize,
+    to_slot: usize,
+    items_cfg: &ItemsConfig,
+) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
+    if from_slot >= items_cfg.max_stash_slots
+        || to_slot >= items_cfg.max_stash_slots
+        || from_slot == to_slot
+    {
+        return false;
+    }
+    let Some(p) = world.players.get_mut(slot_index) else {
+        return false;
+    };
+    let has_any = p
+        .stash
+        .iter()
+        .any(|it| it.slot == from_slot || it.slot == to_slot);
+    if !has_any {
+        return false;
+    }
+    for it in &mut p.stash {
+        if it.slot == from_slot {
+            it.slot = to_slot;
+        } else if it.slot == to_slot {
+            it.slot = from_slot;
+        }
+    }
+    true
+}
+
+/// فروش ۱ عدد از آیتم اینونتوری Courier (وقتی Courier زنده و داخل چشمه است — با پشتیبانی صحیح استک)
 pub fn try_sell_courier_item(
     world: &mut AuthoritativeWorldState,
     slot_index: usize,
@@ -1697,6 +2192,9 @@ pub fn try_sell_courier_item(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1708,8 +2206,12 @@ pub fn try_sell_courier_item(
     let Some(pos) = p.courier_inventory.iter().position(|it| it.slot == inv_index) else {
         return false;
     };
-    let removed = p.courier_inventory.remove(pos);
-    let refund = items_cfg.sell_price(&removed.item_id);
+    let refund = items_cfg.sell_price(&p.courier_inventory[pos].item_id);
+    if p.courier_inventory[pos].count > 1 {
+        p.courier_inventory[pos].count -= 1;
+    } else {
+        p.courier_inventory.remove(pos);
+    }
     p.hero_gold = p.hero_gold.saturating_add(refund);
     true
 }
@@ -1720,19 +2222,36 @@ pub fn try_courier_deliver(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
     if p.courier_is_dead {
         return false;
     }
+    let courier_max_slots = config.active_hero(p.hero_index).courier.inventory_slots;
     let courier_in_shop =
         fountain_regen_bonus_for_pos(config, p.hero_team, p.courier_pos) > 0.0;
     if courier_in_shop {
         pull_stash_into_courier(p, config, items_cfg);
         p.courier_order = CourierOrder::DeliverToHero;
-    } else if p.courier_inventory.is_empty() && !p.stash.is_empty() {
-        p.courier_order = CourierOrder::PickupStashThenDeliver;
+    } else if !p.stash.is_empty() {
+        let can_carry_more = p.courier_inventory.len() < courier_max_slots
+            || p.stash.iter().any(|st| {
+                items_cfg
+                    .get_item(&st.item_id)
+                    .is_some_and(|d| d.stackable)
+                    && p.courier_inventory
+                        .iter()
+                        .any(|ci| ci.item_id == st.item_id)
+            });
+        if can_carry_more {
+            p.courier_order = CourierOrder::PickupStashThenDeliver;
+        } else {
+            p.courier_order = CourierOrder::DeliverToHero;
+        }
     } else {
         p.courier_order = CourierOrder::DeliverToHero;
     }
@@ -1740,6 +2259,9 @@ pub fn try_courier_deliver(
 }
 
 pub fn try_courier_return_to_fountain(world: &mut AuthoritativeWorldState, slot_index: usize) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1756,6 +2278,9 @@ pub fn try_courier_move_to(
     world_pos: Vec3,
     config: &GameConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1780,6 +2305,9 @@ pub fn try_transfer_hero_item_to_courier(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1817,6 +2345,9 @@ pub fn try_transfer_courier_item_to_hero(
     config: &GameConfig,
     items_cfg: &ItemsConfig,
 ) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -1918,6 +2449,7 @@ pub fn execute_hero_slot_to_courier_transfer(
     if auto_combine_items(&mut test_cour, courier_max_slots, items_cfg)
         && test_cour.len() <= courier_max_slots
     {
+        normalize_overflow_slots(&mut test_cour, courier_max_slots);
         p.courier_inventory = test_cour;
         if hero_slot == usize::MAX {
             p.tp_slot = None;
@@ -2023,6 +2555,7 @@ pub fn execute_courier_slot_to_hero_transfer(
     if auto_combine_items(&mut test_inv, items_cfg.max_inventory_slots, items_cfg)
         && test_inv.len() <= items_cfg.max_inventory_slots
     {
+        normalize_overflow_slots(&mut test_inv, items_cfg.max_inventory_slots);
         p.inventory = test_inv;
         p.courier_inventory.remove(cour_pos);
         recompute_player_slot_stats(p, config, items_cfg);
@@ -2041,7 +2574,7 @@ pub fn step_couriers_system(
     mut world: ResMut<AuthoritativeWorldState>,
 ) {
     let dt = time.delta_secs();
-    if dt <= 0.0 {
+    if dt <= 0.0 || !is_match_action_allowed(&world) {
         return;
     }
 
@@ -2084,16 +2617,17 @@ pub fn step_couriers_system(
             continue;
         }
 
+        let fountain_home = team_fountain_pos(&config, p.hero_team).unwrap_or(p.spawn_pos);
         let target_xz = match p.courier_order {
             CourierOrder::Idle => None,
             CourierOrder::ReturnToFountain | CourierOrder::PickupStashThenDeliver => {
-                Some(Vec3::new(p.spawn_pos.x, fly_y, p.spawn_pos.z))
+                Some(Vec3::new(fountain_home.x, fly_y, fountain_home.z))
             }
             CourierOrder::MoveTo => Some(Vec3::new(p.courier_target_pos.x, fly_y, p.courier_target_pos.z)),
             CourierOrder::DeliverToHero | CourierOrder::DeliverSlotToHero { .. } => {
                 if p.is_dead {
                     p.courier_order = CourierOrder::ReturnToFountain;
-                    Some(Vec3::new(p.spawn_pos.x, fly_y, p.spawn_pos.z))
+                    Some(Vec3::new(fountain_home.x, fly_y, fountain_home.z))
                 } else {
                     Some(Vec3::new(p.soldier_pos.x, fly_y, p.soldier_pos.z))
                 }
@@ -2105,7 +2639,7 @@ pub fn step_couriers_system(
             let dist = delta.length();
             let step = h_cfg.courier.move_speed * dt;
 
-            if dist > 0.05 {
+            if dist > h_cfg.courier.move_stop_epsilon {
                 let dir = delta / dist;
                 p.courier_facing_dir = dir;
                 if dist <= step {
@@ -2171,6 +2705,7 @@ pub fn step_couriers_system(
                                 if auto_combine_items(&mut test_inv, items_cfg.max_inventory_slots, &items_cfg)
                                     && test_inv.len() <= items_cfg.max_inventory_slots
                                 {
+                                    normalize_overflow_slots(&mut test_inv, items_cfg.max_inventory_slots);
                                     p.inventory = test_inv;
                                     pass_transferred = true;
                                 } else {
@@ -2184,6 +2719,38 @@ pub fn step_couriers_system(
                         }
                         if !pass_transferred || p.courier_inventory.is_empty() {
                             break;
+                        }
+                    }
+                    // اگر هیرو ۶/۶ پر است و کوریر چند قطعه دارد که با هم ترکیب می‌شوند (تحویل دسته‌ای)
+                    if !p.courier_inventory.is_empty() {
+                        let non_tp_indices: Vec<usize> = p
+                            .courier_inventory
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, it)| {
+                                items_cfg
+                                    .get_item(&it.item_id)
+                                    .is_none_or(|d| !d.dedicated_tp_slot)
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        if non_tp_indices.len() >= 2 {
+                            let mut batch_inv = p.inventory.clone();
+                            for (offset, &ci) in non_tp_indices.iter().enumerate() {
+                                let mut item_copy = p.courier_inventory[ci].clone();
+                                item_copy.slot = items_cfg.max_inventory_slots + offset;
+                                batch_inv.push(item_copy);
+                            }
+                            if auto_combine_items(&mut batch_inv, items_cfg.max_inventory_slots, &items_cfg)
+                                && batch_inv.len() <= items_cfg.max_inventory_slots
+                            {
+                                normalize_overflow_slots(&mut batch_inv, items_cfg.max_inventory_slots);
+                                p.inventory = batch_inv;
+                                for &ci in non_tp_indices.iter().rev() {
+                                    p.courier_inventory.remove(ci);
+                                }
+                                transferred_any = true;
+                            }
                         }
                     }
                     let crafted_any = auto_combine_items(
@@ -2229,7 +2796,7 @@ pub fn step_couriers_system(
                 CourierOrder::ReturnToFountain if new_dist <= h_cfg.courier.fountain_radius => {
                     p.courier_order = CourierOrder::Idle;
                 }
-                CourierOrder::MoveTo if new_dist <= 0.6 => {
+                CourierOrder::MoveTo if new_dist <= h_cfg.courier.move_to_arrival_radius => {
                     p.courier_order = CourierOrder::Idle;
                 }
                 _ => {}
@@ -2330,7 +2897,7 @@ pub fn resolve_teleport_destination(
         items_cfg
             .teleport
             .min_building_clearance
-            .max(b_rad + config.soldier.player_radius + 0.35)
+            .max(b_rad + config.soldier.player_radius + items_cfg.teleport.building_clearance_margin)
     };
     let max_r = items_cfg.teleport.building_teleport_radius.max(min_clear);
     let clamped_r = dist_xz.clamp(min_clear, max_r);
@@ -2441,7 +3008,7 @@ pub fn resolve_teleport_destination_from_snapshots(
         items_cfg
             .teleport
             .min_building_clearance
-            .max(b_rad + config.soldier.player_radius + 0.35)
+            .max(b_rad + config.soldier.player_radius + items_cfg.teleport.building_clearance_margin)
     };
     let max_r = items_cfg.teleport.building_teleport_radius.max(min_clear);
     let clamped_r = dist_xz.clamp(min_clear, max_r);
@@ -2463,7 +3030,7 @@ pub fn try_start_teleport(
     items_cfg: &ItemsConfig,
     physics_world: &CustomPhysicsWorld,
 ) -> bool {
-    if world.winning_team.is_some() {
+    if !is_match_action_allowed(world) {
         return false;
     }
     let Some(p) = world.players.get(slot_index) else {
@@ -2550,6 +3117,9 @@ pub fn try_start_teleport(
 
 /// لغو تلپورت فعال (مثلاً با کلیک چپ یا تیراندازی)
 pub fn try_cancel_teleport(world: &mut AuthoritativeWorldState, slot_index: usize) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
@@ -2572,11 +3142,12 @@ pub fn step_teleports_system(
     mut soldier_q: Query<(&PhysicsSoldier, &mut Transform)>,
 ) {
     let dt = time.delta_secs();
-    if dt <= 0.0 {
+    if dt <= 0.0 || !is_match_action_allowed(&world) {
         return;
     }
 
     let mut completed_slots: Vec<(usize, Vec3, Vec3, usize)> = Vec::new();
+    let mut canceled_slots: Vec<(usize, Vec3)> = Vec::new();
 
     for p in &mut world.players {
         if p.teleport_cooldown_remaining > 0.0 {
@@ -2591,29 +3162,52 @@ pub fn step_teleports_system(
                 let facing_dir = tp.facing_dir;
                 let inv_idx = tp.inv_index;
                 p.active_teleport = None;
-                p.teleport_cooldown_remaining = items_cfg.teleport.cooldown_secs;
-                p.soldier_pos = dest_pos;
-                p.soldier_facing_dir = facing_dir;
 
+                // محافظت ضد اکسپلویت تلپورت رایگان: پیش از انتقال، وجود و مصرف اسکرول تلپورت تأیید می‌شود
                 if items_cfg.teleport.consume_on_use {
+                    let mut consumed = false;
                     if let Some(ref mut tp_item) = p.tp_slot {
                         if tp_item.count > 1 {
                             tp_item.count -= 1;
-                        } else {
+                            consumed = true;
+                        } else if tp_item.count == 1 {
                             p.tp_slot = None;
+                            consumed = true;
                         }
-                    } else if let Some(pos) = p.inventory.iter().position(|it| it.slot == inv_idx) {
+                    } else if let Some(pos) = p.inventory.iter().position(|it| {
+                        it.slot == inv_idx
+                            && it.count > 0
+                            && items_cfg
+                                .get_item(&it.item_id)
+                                .is_some_and(|d| d.active_ability == ItemActiveAbility::Teleport)
+                    }) {
                         if p.inventory[pos].count > 1 {
                             p.inventory[pos].count -= 1;
                         } else {
                             p.inventory.remove(pos);
                             recompute_player_slot_stats(p, &config, &items_cfg);
                         }
+                        consumed = true;
+                    }
+                    if !consumed {
+                        canceled_slots.push((p.slot_index, origin_pos));
+                        continue;
                     }
                 }
+
+                p.teleport_cooldown_remaining = items_cfg.teleport.cooldown_secs;
+                p.soldier_pos = dest_pos;
+                p.soldier_facing_dir = facing_dir;
                 completed_slots.push((p.slot_index, origin_pos, dest_pos, inv_idx));
             }
         }
+    }
+
+    for (slot_idx, origin_pos) in canceled_slots {
+        world.pending_fx.push(GameplayFxEvent::TeleportCanceled {
+            slot_index: slot_idx,
+            origin_pos,
+        });
     }
 
     for (slot_idx, origin_pos, dest_pos, _) in completed_slots {
@@ -2641,7 +3235,7 @@ pub fn try_activate_shadow_blade(
     inv_index: usize,
     items_cfg: &ItemsConfig,
 ) -> bool {
-    if world.winning_team.is_some() {
+    if !is_match_action_allowed(world) {
         return false;
     }
     let Some(p) = world.players.get_mut(slot_index) else {
@@ -2676,7 +3270,7 @@ pub fn step_shadow_blade_system(
     mut world: ResMut<AuthoritativeWorldState>,
 ) {
     let dt = time.delta_secs();
-    if dt <= 0.0 || world.winning_team.is_some() {
+    if dt <= 0.0 || !is_match_action_allowed(&world) {
         return;
     }
     let true_sight_r = items_cfg.shadow_blade.turret_true_sight_radius;

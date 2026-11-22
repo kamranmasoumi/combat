@@ -53,6 +53,12 @@ pub struct VerifyOtpResponse {
     pub email: String,
     pub mmr: i32,
     pub rank_tier: String,
+    #[serde(default)]
+    pub wins: i32,
+    #[serde(default)]
+    pub losses: i32,
+    #[serde(default)]
+    pub abandoned_count: i32,
     pub is_new_player: bool,
     pub active_match: Option<ActiveMatchInfo>,
 }
@@ -348,7 +354,7 @@ pub enum BackendAsyncEvent {
         message: String,
         active_match: Option<ActiveMatchInfo>,
     },
-    MatchmakingClosed,
+    MatchmakingClosed(u64),
     // WebSocket Custom Lobby Events
     LobbyList {
         lobbies: Vec<LobbySummary>,
@@ -374,7 +380,7 @@ pub enum BackendAsyncEvent {
         message: String,
     },
     LobbyError(String),
-    LobbyWsClosed,
+    LobbyWsClosed(u64),
     // Friends HTTP & Social/Party WebSocket Events
     FriendsLoaded(FriendsSnapshot),
     FriendSearchResults(Vec<PlayerSearchResult>),
@@ -417,7 +423,7 @@ pub enum BackendAsyncEvent {
         message: String,
     },
     PartyQueueCanceled(String),
-    SocialWsClosed,
+    SocialWsClosed(u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +482,12 @@ pub struct BackendClient {
     mm_ws_tx: Option<Sender<String>>,
     lobby_ws_tx: Option<Sender<String>>,
     social_ws_tx: Option<Sender<String>>,
+    mm_conn_id: u64,
+    lobby_conn_id: u64,
+    social_conn_id: u64,
+    http_timeout_secs: u64,
+    ws_ping_interval_secs: u64,
+    ws_poll_sleep_ms: u64,
 }
 
 impl BackendClient {
@@ -489,7 +501,63 @@ impl BackendClient {
             mm_ws_tx: None,
             lobby_ws_tx: None,
             social_ws_tx: None,
+            mm_conn_id: 0,
+            lobby_conn_id: 0,
+            social_conn_id: 0,
+            http_timeout_secs: 0,
+            ws_ping_interval_secs: 0,
+            ws_poll_sleep_ms: 0,
         }
+    }
+
+    pub fn configure_network(
+        &mut self,
+        http_timeout_secs: u64,
+        ws_ping_interval_secs: u64,
+        ws_poll_sleep_ms: u64,
+    ) {
+        assert!(http_timeout_secs > 0, "main_menu.http_timeout_secs must be > 0");
+        assert!(ws_ping_interval_secs > 0, "main_menu.ws_ping_interval_secs must be > 0");
+        assert!(ws_poll_sleep_ms > 0, "main_menu.ws_poll_sleep_ms must be > 0");
+        self.http_timeout_secs = http_timeout_secs;
+        self.ws_ping_interval_secs = ws_ping_interval_secs;
+        self.ws_poll_sleep_ms = ws_poll_sleep_ms;
+    }
+
+    fn http_timeout(&self) -> Duration {
+        assert!(
+            self.http_timeout_secs > 0,
+            "BackendClient::configure_network must be called from GameConfig.main_menu before HTTP requests"
+        );
+        Duration::from_secs(self.http_timeout_secs)
+    }
+
+    fn ws_ping_interval(&self) -> Duration {
+        assert!(
+            self.ws_ping_interval_secs > 0,
+            "BackendClient::configure_network must be called from GameConfig.main_menu before WebSocket connections"
+        );
+        Duration::from_secs(self.ws_ping_interval_secs)
+    }
+
+    fn ws_poll_sleep(&self) -> Duration {
+        assert!(
+            self.ws_poll_sleep_ms > 0,
+            "BackendClient::configure_network must be called from GameConfig.main_menu before WebSocket connections"
+        );
+        Duration::from_millis(self.ws_poll_sleep_ms)
+    }
+
+    pub fn active_mm_conn_id(&self) -> u64 {
+        self.mm_conn_id
+    }
+
+    pub fn active_lobby_conn_id(&self) -> u64 {
+        self.lobby_conn_id
+    }
+
+    pub fn active_social_conn_id(&self) -> u64 {
+        self.social_conn_id
     }
 
     pub fn poll_events(&self) -> Vec<BackendAsyncEvent> {
@@ -509,6 +577,7 @@ impl BackendClient {
     pub fn request_otp(&self, email: String, mode: String, username: String) {
         let url = format!("{}/api/v1/auth/request-otp/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             let body = serde_json::json!({
                 "email": email,
@@ -516,7 +585,7 @@ impl BackendClient {
                 "username": username
             });
             match ureq::post(&url)
-                .timeout(Duration::from_secs(8))
+                .timeout(timeout)
                 .send_json(body)
             {
                 Ok(_) => {
@@ -532,10 +601,11 @@ impl BackendClient {
     pub fn verify_otp(&self, email: String, otp_code: String) {
         let url = format!("{}/api/v1/auth/verify-otp/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             let body = serde_json::json!({ "email": email, "otp_code": otp_code });
             match ureq::post(&url)
-                .timeout(Duration::from_secs(10))
+                .timeout(timeout)
                 .send_json(body)
             {
                 Ok(resp) => match resp.into_json::<VerifyOtpResponse>() {
@@ -547,9 +617,9 @@ impl BackendClient {
                             email: v.email,
                             mmr: v.mmr,
                             rank_tier: v.rank_tier,
-                            wins: 0,
-                            losses: 0,
-                            abandoned_count: 0,
+                            wins: v.wins,
+                            losses: v.losses,
+                            abandoned_count: v.abandoned_count,
                         };
                         let _ = tx.send(BackendAsyncEvent::OtpVerified {
                             access_token: v.access_token,
@@ -576,10 +646,11 @@ impl BackendClient {
     pub fn restore_session(&self, access_token: String) {
         let url = format!("{}/api/v1/auth/me/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             match ureq::get(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
-                .timeout(Duration::from_secs(6))
+                .timeout(timeout)
                 .call()
             {
                 Ok(resp) => match resp.into_json::<ProfileMeResponse>() {
@@ -600,13 +671,20 @@ impl BackendClient {
                             active_match: me.active_match,
                         });
                     }
-                    Err(_) => {
-                        let _ = tx.send(BackendAsyncEvent::SessionInvalid);
+                    Err(e) => {
+                        let _ = tx.send(BackendAsyncEvent::HttpError(format!(
+                            "Failed to parse profile response: {}",
+                            e
+                        )));
                     }
                 },
-                Err(_) => {
+                Err(ureq::Error::Status(401 | 403, _)) => {
                     clear_persisted_session();
                     let _ = tx.send(BackendAsyncEvent::SessionInvalid);
+                }
+                Err(e) => {
+                    // Network/server outage: keep session.json intact so player is not logged out permanently.
+                    let _ = tx.send(BackendAsyncEvent::HttpError(extract_ureq_error(e)));
                 }
             }
         });
@@ -615,10 +693,11 @@ impl BackendClient {
     pub fn fetch_active_match(&self, access_token: String) {
         let url = format!("{}/api/v1/match/active/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             if let Ok(resp) = ureq::get(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
-                .timeout(Duration::from_secs(6))
+                .timeout(timeout)
                 .call()
             {
                 if let Ok(v) = resp.into_json::<serde_json::Value>() {
@@ -635,10 +714,11 @@ impl BackendClient {
     pub fn disconnect_match(&self, access_token: String) {
         let url = format!("{}/api/v1/match/disconnect/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             match ureq::post(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
-                .timeout(Duration::from_secs(6))
+                .timeout(timeout)
                 .send_string("{}")
             {
                 Ok(resp) => {
@@ -662,10 +742,11 @@ impl BackendClient {
     pub fn reconnect_match(&self, access_token: String) {
         let url = format!("{}/api/v1/match/reconnect/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             match ureq::post(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
-                .timeout(Duration::from_secs(6))
+                .timeout(timeout)
                 .send_string("{}")
             {
                 Ok(resp) => {
@@ -689,14 +770,15 @@ impl BackendClient {
     pub fn abandon_match(&self, access_token: String) {
         let url = format!("{}/api/v1/match/abandon/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             match ureq::post(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
-                .timeout(Duration::from_secs(8))
+                .timeout(timeout)
                 .send_string("{}")
             {
-                Ok(resp) => {
-                    if let Ok(v) = resp.into_json::<serde_json::Value>() {
+                Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                    Ok(v) => {
                         let mmr = v.get("mmr").and_then(|x| x.as_i64()).unwrap_or(1000) as i32;
                         let rank_tier = v
                             .get("rank_tier")
@@ -715,7 +797,13 @@ impl BackendClient {
                             abandoned_count,
                         });
                     }
-                }
+                    Err(e) => {
+                        let _ = tx.send(BackendAsyncEvent::HttpError(format!(
+                            "Invalid abandon response: {}",
+                            e
+                        )));
+                    }
+                },
                 Err(e) => {
                     let _ = tx.send(BackendAsyncEvent::HttpError(extract_ureq_error(e)));
                 }
@@ -726,10 +814,11 @@ impl BackendClient {
     pub fn fetch_match_history(&self, access_token: String) {
         let url = format!("{}/api/v1/match/history/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             match ureq::get(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
-                .timeout(Duration::from_secs(8))
+                .timeout(timeout)
                 .call()
             {
                 Ok(resp) => match resp.into_json::<MatchHistoryResponse>() {
@@ -756,6 +845,9 @@ impl BackendClient {
 
     pub fn start_matchmaking(&mut self, access_token: String) {
         self.stop_matchmaking();
+        self.mm_conn_id = self.mm_conn_id.wrapping_add(1);
+        let conn_id = self.mm_conn_id;
+        let poll_sleep = self.ws_poll_sleep();
         let ws_url = format!("{}/ws/matchmaking/?token={}", self.ws_base, access_token);
         let tx = self.tx.clone();
         let (out_tx, out_rx) = mpsc::channel::<String>();
@@ -828,15 +920,15 @@ impl BackendClient {
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        let _ = tx.send(BackendAsyncEvent::MatchmakingClosed);
+                        let _ = tx.send(BackendAsyncEvent::MatchmakingClosed(conn_id));
                         return;
                     }
                     Ok(_) => {}
                     Err(tungstenite::Error::Io(ref e)) if e.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(25));
+                        thread::sleep(poll_sleep);
                     }
                     Err(_) => {
-                        let _ = tx.send(BackendAsyncEvent::MatchmakingClosed);
+                        let _ = tx.send(BackendAsyncEvent::MatchmakingClosed(conn_id));
                         return;
                     }
                 }
@@ -845,6 +937,7 @@ impl BackendClient {
     }
 
     pub fn stop_matchmaking(&mut self) {
+        self.mm_conn_id = self.mm_conn_id.wrapping_add(1);
         if let Some(tx) = self.mm_ws_tx.take() {
             let _ = tx.send(serde_json::json!({"action": "cancel"}).to_string());
             let _ = tx.send("__CLOSE__".to_string());
@@ -857,6 +950,9 @@ impl BackendClient {
 
     pub fn connect_lobby_ws(&mut self, access_token: String) {
         self.disconnect_lobby_ws();
+        self.lobby_conn_id = self.lobby_conn_id.wrapping_add(1);
+        let conn_id = self.lobby_conn_id;
+        let poll_sleep = self.ws_poll_sleep();
         let ws_url = format!("{}/ws/lobby/?token={}", self.ws_base, access_token);
         let tx = self.tx.clone();
         let (out_tx, out_rx) = mpsc::channel::<String>();
@@ -956,15 +1052,15 @@ impl BackendClient {
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        let _ = tx.send(BackendAsyncEvent::LobbyWsClosed);
+                        let _ = tx.send(BackendAsyncEvent::LobbyWsClosed(conn_id));
                         return;
                     }
                     Ok(_) => {}
                     Err(tungstenite::Error::Io(ref e)) if e.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(25));
+                        thread::sleep(poll_sleep);
                     }
                     Err(_) => {
-                        let _ = tx.send(BackendAsyncEvent::LobbyWsClosed);
+                        let _ = tx.send(BackendAsyncEvent::LobbyWsClosed(conn_id));
                         return;
                     }
                 }
@@ -973,6 +1069,7 @@ impl BackendClient {
     }
 
     pub fn disconnect_lobby_ws(&mut self) {
+        self.lobby_conn_id = self.lobby_conn_id.wrapping_add(1);
         if let Some(tx) = self.lobby_ws_tx.take() {
             let _ = tx.send("__CLOSE__".to_string());
         }
@@ -991,9 +1088,11 @@ impl BackendClient {
     pub fn fetch_friends(&self, access_token: String) {
         let url = format!("{}/api/v1/friends/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             let resp = ureq::get(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
+                .timeout(timeout)
                 .call();
             match resp {
                 Ok(r) => match r.into_json::<FriendsSnapshot>() {
@@ -1020,23 +1119,35 @@ impl BackendClient {
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
             .collect();
+        if encoded.len() < 2 {
+            let _ = self.tx.send(BackendAsyncEvent::FriendSearchResults(Vec::new()));
+            return;
+        }
         let url = format!("{}/api/v1/friends/search/?q={}", self.http_base, encoded);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             let resp = ureq::get(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
+                .timeout(timeout)
                 .call();
             match resp {
                 Ok(r) => match r.into_string() {
-                    Ok(body) => {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                        Ok(v) => {
                             let results: Vec<PlayerSearchResult> = v
                                 .get("results")
                                 .and_then(|x| serde_json::from_value(x.clone()).ok())
                                 .unwrap_or_default();
                             let _ = tx.send(BackendAsyncEvent::FriendSearchResults(results));
                         }
-                    }
+                        Err(e) => {
+                            let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
+                                "Invalid search response: {}",
+                                e
+                            )));
+                        }
+                    },
                     Err(e) => {
                         let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
                             "Search error: {}",
@@ -1054,21 +1165,23 @@ impl BackendClient {
     pub fn send_friend_request(&self, access_token: String, target_user_id: String) {
         let url = format!("{}/api/v1/friends/request/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             let body = serde_json::json!({ "target_user_id": target_user_id }).to_string();
             let resp = ureq::post(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
                 .set("Content-Type", "application/json")
+                .timeout(timeout)
                 .send_string(&body);
             match resp {
-                Ok(r) => {
-                    if let Ok(text) = r.into_string() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(r) => match r.into_string() {
+                    Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(v) => {
                             let msg = v
                                 .get("message")
                                 .and_then(|x| x.as_str())
-                                .unwrap_or("Friend request sent.")
-                                .to_string();
+                                .map(|s| sanitize_ascii_msg(s, "Friend request sent."))
+                                .unwrap_or_else(|| "Friend request sent.".to_string());
                             let snap: FriendsSnapshot =
                                 serde_json::from_value(v).unwrap_or_default();
                             let _ = tx.send(BackendAsyncEvent::FriendActionDone {
@@ -1076,8 +1189,20 @@ impl BackendClient {
                                 snapshot: snap,
                             });
                         }
+                        Err(e) => {
+                            let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
+                                "Invalid friend request response: {}",
+                                e
+                            )));
+                        }
+                    },
+                    Err(e) => {
+                        let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
+                            "Friend request read error: {}",
+                            e
+                        )));
                     }
-                }
+                },
                 Err(e) => {
                     let _ = tx.send(BackendAsyncEvent::FriendActionError(extract_ureq_error(e)));
                 }
@@ -1088,6 +1213,7 @@ impl BackendClient {
     pub fn respond_friend_request(&self, access_token: String, request_id: i64, accept: bool) {
         let url = format!("{}/api/v1/friends/respond/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             let body = serde_json::json!({
                 "request_id": request_id,
@@ -1097,16 +1223,17 @@ impl BackendClient {
             let resp = ureq::post(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
                 .set("Content-Type", "application/json")
+                .timeout(timeout)
                 .send_string(&body);
             match resp {
-                Ok(r) => {
-                    if let Ok(text) = r.into_string() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(r) => match r.into_string() {
+                    Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(v) => {
                             let msg = v
                                 .get("message")
                                 .and_then(|x| x.as_str())
-                                .unwrap_or("Friend request updated.")
-                                .to_string();
+                                .map(|s| sanitize_ascii_msg(s, "Friend request updated."))
+                                .unwrap_or_else(|| "Friend request updated.".to_string());
                             let snap: FriendsSnapshot =
                                 serde_json::from_value(v).unwrap_or_default();
                             let _ = tx.send(BackendAsyncEvent::FriendActionDone {
@@ -1114,8 +1241,20 @@ impl BackendClient {
                                 snapshot: snap,
                             });
                         }
+                        Err(e) => {
+                            let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
+                                "Invalid friend response payload: {}",
+                                e
+                            )));
+                        }
+                    },
+                    Err(e) => {
+                        let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
+                            "Friend response read error: {}",
+                            e
+                        )));
                     }
-                }
+                },
                 Err(e) => {
                     let _ = tx.send(BackendAsyncEvent::FriendActionError(extract_ureq_error(e)));
                 }
@@ -1126,16 +1265,18 @@ impl BackendClient {
     pub fn remove_friend(&self, access_token: String, friend_user_id: String) {
         let url = format!("{}/api/v1/friends/remove/", self.http_base);
         let tx = self.tx.clone();
+        let timeout = self.http_timeout();
         thread::spawn(move || {
             let body = serde_json::json!({ "friend_user_id": friend_user_id }).to_string();
             let resp = ureq::post(&url)
                 .set("Authorization", &format!("Bearer {}", access_token))
                 .set("Content-Type", "application/json")
+                .timeout(timeout)
                 .send_string(&body);
             match resp {
-                Ok(r) => {
-                    if let Ok(text) = r.into_string() {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(r) => match r.into_string() {
+                    Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(v) => {
                             let snap: FriendsSnapshot =
                                 serde_json::from_value(v).unwrap_or_default();
                             let _ = tx.send(BackendAsyncEvent::FriendActionDone {
@@ -1143,8 +1284,20 @@ impl BackendClient {
                                 snapshot: snap,
                             });
                         }
+                        Err(e) => {
+                            let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
+                                "Invalid remove friend response: {}",
+                                e
+                            )));
+                        }
+                    },
+                    Err(e) => {
+                        let _ = tx.send(BackendAsyncEvent::FriendActionError(format!(
+                            "Remove friend read error: {}",
+                            e
+                        )));
                     }
-                }
+                },
                 Err(e) => {
                     let _ = tx.send(BackendAsyncEvent::FriendActionError(extract_ureq_error(e)));
                 }
@@ -1164,6 +1317,10 @@ impl BackendClient {
         if self.social_ws_tx.is_some() {
             return;
         }
+        self.social_conn_id = self.social_conn_id.wrapping_add(1);
+        let conn_id = self.social_conn_id;
+        let ping_interval = self.ws_ping_interval();
+        let poll_sleep = self.ws_poll_sleep();
         let ws_url = format!("{}/ws/social/?token={}", self.ws_base, access_token);
         let tx = self.tx.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
@@ -1171,24 +1328,23 @@ impl BackendClient {
 
         thread::spawn(move || {
             let Ok((mut socket, _)) = tungstenite::connect(ws_url.as_str()) else {
-                let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
+                let _ = tx.send(BackendAsyncEvent::SocialWsClosed(conn_id));
                 return;
             };
             set_ws_nonblocking(&mut socket);
             let mut last_ping = std::time::Instant::now();
 
             loop {
-                if last_ping.elapsed() >= Duration::from_secs(15) {
+                if last_ping.elapsed() >= ping_interval {
                     last_ping = std::time::Instant::now();
                     if socket.send(Message::Ping(Vec::new().into())).is_err() {
-                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
+                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed(conn_id));
                         break;
                     }
                 }
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     if cmd == "__CLOSE__" {
                         let _ = socket.close(None);
-                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
                         return;
                     }
                     let _ = socket.send(Message::Text(cmd.into()));
@@ -1427,17 +1583,17 @@ impl BackendClient {
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
+                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed(conn_id));
                         break;
                     }
                     Ok(_) => {}
                     Err(tungstenite::Error::Io(ref e))
                         if e.kind() == std::io::ErrorKind::WouldBlock =>
                     {
-                        thread::sleep(Duration::from_millis(25));
+                        thread::sleep(poll_sleep);
                     }
                     Err(_) => {
-                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed);
+                        let _ = tx.send(BackendAsyncEvent::SocialWsClosed(conn_id));
                         break;
                     }
                 }
@@ -1446,6 +1602,7 @@ impl BackendClient {
     }
 
     pub fn disconnect_social_ws(&mut self) {
+        self.social_conn_id = self.social_conn_id.wrapping_add(1);
         if let Some(tx) = self.social_ws_tx.take() {
             let _ = tx.send("__CLOSE__".to_string());
         }
@@ -1464,6 +1621,8 @@ fn parse_match_found_payload(v: &serde_json::Value) -> Option<ActiveMatchInfo> {
     let server_addr = v.get("server_addr")?.as_str()?.to_string();
     let ticket_id = v.get("ticket_id")?.as_str()?.to_string();
     let player_count = v.get("player_count").and_then(|x| x.as_u64()).unwrap_or(2) as usize;
+    let team_id = v.get("team_id").and_then(|x| x.as_i64()).unwrap_or(1) as i32;
+    let slot_index = v.get("slot_index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
     let game_link = v
         .get("game_link")
         .and_then(|x| x.as_str())
@@ -1475,8 +1634,8 @@ fn parse_match_found_payload(v: &serde_json::Value) -> Option<ActiveMatchInfo> {
         server_addr,
         ticket_id,
         player_count,
-        team_id: 1,
-        slot_index: 0,
+        team_id,
+        slot_index,
         participant_status: "connected".to_string(),
         game_link,
     })

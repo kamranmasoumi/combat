@@ -5763,6 +5763,22 @@ fn update_hud_buffs_bar_system(
                 .with_children(|circle| {
                     if let Some(def) = items_cfg.get_item(&buff.item_id) {
                         spawn_item_icon_badge(circle, &asset_server, &mut icon_cache, def, 24.0, 9.0);
+                    } else {
+                        let tag = match buff.id.as_str() {
+                            "flame_armor_debuff" => "ARM",
+                            "electric_fire_rate_slow" => "ZAP",
+                            "toxic_slow" => "TOX",
+                            _ => "!",
+                        };
+                        circle.spawn((
+                            Pickable::IGNORE,
+                            Text::new(tag),
+                            TextFont {
+                                font_size: FontSize::Px(8.5),
+                                ..default()
+                            },
+                            TextColor(bar_col),
+                        ));
                     }
                 });
 

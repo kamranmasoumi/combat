@@ -9,7 +9,7 @@ use crate::{
     team_fountain_pos, ActiveTeleportState, ActiveWeaponSlot, AncientSnapshot, AncientState,
     AuthoritativeWorldState, BarracksSnapshot, BarracksState, CourierOrder, CustomPhysicsWorld,
     GameConfig, GameplayFxEvent, PausePhase, PhysicsSoldier, PlayerSlotState, TeamId,
-    TurretSnapshot, TurretState,
+    TurretSnapshot, TurretState, WeaponKind,
 };
 
 #[inline]
@@ -412,12 +412,48 @@ pub struct ShopUiConfig {
     pub sell_menu_tp_offset_px: f32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct StatLimitsConfig {
+    pub min_move_speed_multiplier: f32,
+    pub max_move_speed_multiplier: f32,
+    pub min_max_hp: f32,
+    pub min_max_stamina: f32,
+    pub min_stamina_regen_per_sec: f32,
+    pub min_fire_rate_multiplier: f32,
+    pub max_fire_rate_multiplier: f32,
+    pub min_reload_speed_multiplier: f32,
+    pub max_reload_speed_multiplier: f32,
+    pub min_weapon_damage: f32,
+    pub min_weapon_range: f32,
+    pub min_grenade_aoe: f32,
+    pub min_grenade_recharge_mult: f32,
+    pub min_grenade_recharge_secs: f32,
+    pub beam_dps_per_primary_damage: f32,
+    pub beam_charge_per_magazine_bonus: f32,
+    pub toxic_dps_per_primary_damage: f32,
+    pub shotgun_damage_bonus_multiplier: f32,
+    pub min_pellet_effective_damage: f32,
+    pub max_toxic_slow_ratio: f32,
+    pub max_beam_attack_speed_slow: f32,
+    pub min_electric_slow_divisor: f32,
+    pub min_toxic_slow_multiplier: f32,
+    pub toxic_pool_vertical_tolerance: f32,
+    pub aoe_building_damage_ratio: f32,
+    pub ancient_destroy_explosion_radius: f32,
+    pub mode_cycle_cooldown_secs: f32,
+    pub non_stacking_boot_item_ids: Vec<String>,
+    pub flame_debuff_bar_color_rgb: (f32, f32, f32),
+    pub electric_debuff_bar_color_rgb: (f32, f32, f32),
+    pub toxic_debuff_bar_color_rgb: (f32, f32, f32),
+}
+
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct ItemsConfig {
     pub max_inventory_slots: usize,
     pub max_stash_slots: usize,
     pub max_cart_buy_items: usize,
     pub sell_refund_ratio: f32,
+    pub stat_limits: StatLimitsConfig,
     pub shop_ui: ShopUiConfig,
     pub teleport: TeleportConfig,
     pub shadow_blade: ShadowBladeConfig,
@@ -459,6 +495,31 @@ impl ItemsConfig {
             (0.0..=1.0).contains(&self.sell_refund_ratio),
             "sell_refund_ratio باید بین 0.0 و 1.0 باشد"
         );
+        let lim = &self.stat_limits;
+        assert!(lim.min_move_speed_multiplier > 0.0 && lim.max_move_speed_multiplier >= lim.min_move_speed_multiplier, "stat_limits move_speed_multiplier نامعتبر است");
+        assert!(lim.min_max_hp > 0.0, "stat_limits.min_max_hp باید مثبت باشد");
+        assert!(lim.min_max_stamina > 0.0, "stat_limits.min_max_stamina باید مثبت باشد");
+        assert!(lim.min_stamina_regen_per_sec >= 0.0, "stat_limits.min_stamina_regen_per_sec نامعتبر است");
+        assert!(lim.min_fire_rate_multiplier > 0.0 && lim.max_fire_rate_multiplier >= lim.min_fire_rate_multiplier, "stat_limits fire_rate_multiplier نامعتبر است");
+        assert!(lim.min_reload_speed_multiplier > 0.0 && lim.max_reload_speed_multiplier >= lim.min_reload_speed_multiplier, "stat_limits reload_speed_multiplier نامعتبر است");
+        assert!(lim.min_weapon_damage > 0.0, "stat_limits.min_weapon_damage باید مثبت باشد");
+        assert!(lim.min_weapon_range > 0.0, "stat_limits.min_weapon_range باید مثبت باشد");
+        assert!(lim.min_grenade_aoe > 0.0, "stat_limits.min_grenade_aoe باید مثبت باشد");
+        assert!(lim.min_grenade_recharge_mult > 0.0, "stat_limits.min_grenade_recharge_mult باید مثبت باشد");
+        assert!(lim.min_grenade_recharge_secs > 0.0, "stat_limits.min_grenade_recharge_secs باید مثبت باشد");
+        assert!(lim.beam_dps_per_primary_damage > 0.0, "stat_limits.beam_dps_per_primary_damage باید مثبت باشد");
+        assert!(lim.beam_charge_per_magazine_bonus > 0.0, "stat_limits.beam_charge_per_magazine_bonus باید مثبت باشد");
+        assert!(lim.toxic_dps_per_primary_damage >= 0.0, "stat_limits.toxic_dps_per_primary_damage نامعتبر است");
+        assert!(lim.shotgun_damage_bonus_multiplier > 0.0, "stat_limits.shotgun_damage_bonus_multiplier باید مثبت باشد");
+        assert!(lim.min_pellet_effective_damage > 0.0, "stat_limits.min_pellet_effective_damage باید مثبت باشد");
+        assert!((0.0..1.0).contains(&lim.max_toxic_slow_ratio), "stat_limits.max_toxic_slow_ratio نامعتبر است");
+        assert!((0.0..1.0).contains(&lim.max_beam_attack_speed_slow), "stat_limits.max_beam_attack_speed_slow نامعتبر است");
+        assert!((0.05..=1.0).contains(&lim.min_electric_slow_divisor), "stat_limits.min_electric_slow_divisor نامعتبر است");
+        assert!((0.05..=1.0).contains(&lim.min_toxic_slow_multiplier), "stat_limits.min_toxic_slow_multiplier نامعتبر است");
+        assert!(lim.toxic_pool_vertical_tolerance > 0.0, "stat_limits.toxic_pool_vertical_tolerance باید مثبت باشد");
+        assert!((0.0..=2.0).contains(&lim.aoe_building_damage_ratio), "stat_limits.aoe_building_damage_ratio نامعتبر است");
+        assert!(lim.ancient_destroy_explosion_radius > 0.0, "stat_limits.ancient_destroy_explosion_radius باید مثبت باشد");
+        assert!(lim.mode_cycle_cooldown_secs >= 0.0, "stat_limits.mode_cycle_cooldown_secs نامعتبر است");
         let sui = &self.shop_ui;
         assert!(sui.shop_panel_width_px > 400.0, "shop_ui.shop_panel_width_px نامعتبر است");
         assert!(sui.shop_panel_height_px > 300.0, "shop_ui.shop_panel_height_px نامعتبر است");
@@ -769,7 +830,34 @@ impl ItemsConfig {
     }
 }
 
-/// بازمحاسبه کامل تمام ۱۶ ویژگی هیرو و سلاح‌ها بر اساس هیروی پایه + سطح + آیتم‌های اینونتوری
+/// پایان فوری نامرئی بودن Shadow Blade اگر بازیکن دیگر آیتم Shadow Blade در اینونتوری نداشته باشد
+pub fn clear_shadow_blade_invis_if_unowned(
+    p: &mut PlayerSlotState,
+    items_cfg: &ItemsConfig,
+    pending_fx: &mut Vec<GameplayFxEvent>,
+) {
+    if p.invisibility_remaining <= 0.0 {
+        return;
+    }
+    let still_owns_sb = p.inventory.iter().any(|it| {
+        items_cfg
+            .get_item(&it.item_id)
+            .is_some_and(|d| d.active_ability == ItemActiveAbility::ShadowBlade)
+    });
+    if !still_owns_sb {
+        p.invisibility_remaining = 0.0;
+        p.invisibility_total_secs = 0.0;
+        p.invis_move_speed_bonus_pct = 0.0;
+        p.is_revealed_by_turret = false;
+        pending_fx.push(GameplayFxEvent::ShadowBladeEnded {
+            slot_index: p.slot_index,
+            pos: p.soldier_pos,
+        });
+    }
+}
+
+/// بازمحاسبه کامل تمام ویژگی‌های هیرو و تمام سلاح‌های منحصر‌به‌فرد (Rifle/Sniper/Shotgun/Throwable/Toxic/Beam/Pistol/Grenade)
+/// به‌صورت تک‌منبع حقیقت (Single Source of Truth) بر اساس هیروی پایه + سطح + محیط + آیتم‌های اینونتوری + سقف‌های items.ron
 pub fn recompute_player_slot_stats(
     p: &mut PlayerSlotState,
     config: &GameConfig,
@@ -778,20 +866,31 @@ pub fn recompute_player_slot_stats(
     let base = config.active_hero(p.hero_index);
     let levels_gained = p.hero_level.saturating_sub(1) as f32;
     let growth = &base.level_growth;
+    let lim = &items_cfg.stat_limits;
 
     let mut total_mod = base
         .environment
         .combined(p.active_is_night, p.active_weather)
         .to_item_stats_modifier();
+
+    // قانون دوتا ۲ برای عدم استک شدن سرعت حرکت بوت‌ها: فقط بیشترین move_speed_pct بین آیتم‌های بوت اعمال می‌شود
+    let mut best_boot_ms_pct: f32 = 0.0;
     for inv in &p.inventory {
         if let Some(item) = items_cfg.get_item(&inv.item_id) {
-            total_mod.add(&item.stats);
+            let is_boot = lim.non_stacking_boot_item_ids.iter().any(|b| b == &item.id);
+            let mut item_mod = item.stats;
             if !item.modes.is_empty() {
                 let m_idx = inv.active_mode.min(item.modes.len() - 1);
-                total_mod.add(&item.modes[m_idx].stats);
+                item_mod.add(&item.modes[m_idx].stats);
             }
+            if is_boot && item_mod.move_speed_pct > 0.0 {
+                best_boot_ms_pct = best_boot_ms_pct.max(item_mod.move_speed_pct);
+                item_mod.move_speed_pct = 0.0;
+            }
+            total_mod.add(&item_mod);
         }
     }
+    total_mod.move_speed_pct += best_boot_ms_pct;
 
     let prev_max_hp = p.hero_max_hp.max(1.0);
     let prev_max_stamina = p.hero_max_stamina.max(1.0);
@@ -799,82 +898,155 @@ pub fn recompute_player_slot_stats(
     let stamina_ratio = (p.hero_stamina / prev_max_stamina).clamp(0.0, 1.0);
 
     // ویژگی‌های هیرو
-    p.hero_move_speed_multiplier = (base.move_speed_multiplier + total_mod.move_speed_pct).max(0.25);
-    p.hero_max_hp =
-        (base.max_hp + growth.max_hp_per_level * levels_gained + total_mod.max_hp_bonus).max(50.0);
+    p.hero_move_speed_multiplier = (base.move_speed_multiplier + total_mod.move_speed_pct)
+        .clamp(lim.min_move_speed_multiplier, lim.max_move_speed_multiplier);
+    p.hero_max_hp = (base.max_hp + growth.max_hp_per_level * levels_gained + total_mod.max_hp_bonus)
+        .max(lim.min_max_hp);
     p.hero_hp = if p.is_dead {
         0.0
     } else {
-        (hp_ratio * p.hero_max_hp).clamp(1.0, p.hero_max_hp)
+        // جلوگیری از اکسپلویت افزایش HP هنگام اسپم تغییر مود وقتی HP کمتر از ۱ است
+        let min_alive_hp = p.hero_hp.min(1.0).max(0.01);
+        (hp_ratio * p.hero_max_hp).clamp(min_alive_hp, p.hero_max_hp)
     };
     p.hero_hp_regen_per_sec =
         (base.hp_regen_per_sec + growth.hp_regen_per_level * levels_gained + total_mod.hp_regen_bonus)
             .max(0.0);
 
-    p.hero_max_stamina = (base.max_stamina + total_mod.max_stamina_bonus).max(10.0);
+    p.hero_max_stamina = (base.max_stamina + total_mod.max_stamina_bonus).max(lim.min_max_stamina);
     p.hero_stamina = (stamina_ratio * p.hero_max_stamina).clamp(0.0, p.hero_max_stamina);
     p.hero_stamina_regen_per_sec = (base.stamina_regen_per_sec
         + growth.stamina_regen_per_level * levels_gained
         + total_mod.stamina_regen_bonus)
-        .max(1.0);
+        .max(lim.min_stamina_regen_per_sec);
     p.hero_armor = base.armor + growth.armor_per_level * levels_gained + total_mod.armor_bonus;
 
-    // اسلحه اصلی (Primary)
+    // به‌روزرسانی آنی سرعت نمایشی (حتی وقتی هیرو ایستاده است)
+    let invis_mult = if p.invisibility_remaining > 0.0 {
+        1.0 + p.invis_move_speed_bonus_pct
+    } else {
+        1.0
+    };
+    p.current_move_speed =
+        config.soldier.run_speed * p.hero_move_speed_multiplier * p.toxic_slow_multiplier * invis_mult;
+
+    // اسلحه اصلی (Primary) با پشتیبانی کامل از تمام WeaponKindها
     let base_p_rate =
-        (base.weapon.fire_rate_secs - growth.fire_rate_reduction_per_level * levels_gained).max(0.01);
+        (base.weapon.fire_rate_secs - growth.fire_rate_reduction_per_level * levels_gained)
+            .max(config.combat.min_fire_rate_secs);
     let base_p_reload =
         (base.weapon.reload_duration_secs - growth.reload_time_reduction_per_level * levels_gained)
-            .max(0.05);
-    let p_rate_mult = (1.0 + total_mod.primary_fire_rate_pct).max(0.20);
-    let p_reload_mult = (1.0 + total_mod.primary_reload_speed_pct).max(0.20);
+            .max(config.combat.min_reload_duration_secs);
+    let p_rate_mult = (1.0 + total_mod.primary_fire_rate_pct)
+        .clamp(lim.min_fire_rate_multiplier, lim.max_fire_rate_multiplier);
+    let p_reload_mult = (1.0 + total_mod.primary_reload_speed_pct)
+        .clamp(lim.min_reload_speed_multiplier, lim.max_reload_speed_multiplier);
 
     p.hero_weapon.fire_rate_secs =
         (base_p_rate / p_rate_mult).max(config.combat.min_fire_rate_secs);
     p.hero_weapon.reload_duration_secs =
         (base_p_reload / p_reload_mult).max(config.combat.min_reload_duration_secs);
+
+    let effective_primary_dmg_bonus = if base.weapon.pellets_per_shot > 1 {
+        total_mod.primary_damage_bonus * lim.shotgun_damage_bonus_multiplier
+    } else {
+        total_mod.primary_damage_bonus
+    };
     p.hero_weapon.damage = (base.weapon.damage
         + growth.damage_per_level * levels_gained
-        + total_mod.primary_damage_bonus)
-        .max(1.0);
-    p.hero_weapon.magazine_size =
-        ((base.weapon.magazine_size as i32) + total_mod.primary_magazine_bonus).max(1) as u32;
+        + effective_primary_dmg_bonus)
+        .max(lim.min_weapon_damage);
     p.hero_weapon.max_range = (base.weapon.max_range
         + growth.max_range_per_level * levels_gained
         + total_mod.primary_range_bonus)
-        .max(2.0);
+        .max(lim.min_weapon_range);
+
+    // سلاح‌های Beam (ElectricBeam و FlameBeam): اعمال کامل دمیج، سرعت شلیک، خشاب و رشد سطح
+    if base.weapon.weapon_kind == WeaponKind::ElectricBeam
+        || base.weapon.weapon_kind == WeaponKind::FlameBeam
+    {
+        let base_beam_dps = base.weapon.beam_dps
+            + growth.beam_dps_per_level * levels_gained
+            + total_mod.primary_damage_bonus * lim.beam_dps_per_primary_damage;
+        p.hero_weapon.beam_dps = (base_beam_dps * p_rate_mult).max(lim.min_weapon_damage);
+        p.hero_weapon.beam_max_charge = (base.weapon.beam_max_charge
+            + (total_mod.primary_magazine_bonus as f32) * lim.beam_charge_per_magazine_bonus)
+            .max(1.0);
+        p.hero_weapon.magazine_size = p.hero_weapon.beam_max_charge.ceil() as u32;
+        p.hero_weapon.beam_attack_speed_slow = (base.weapon.beam_attack_speed_slow
+            + growth.beam_attack_speed_slow_per_level * levels_gained)
+            .clamp(0.0, lim.max_beam_attack_speed_slow);
+        p.hero_weapon.beam_armor_reduction = (base.weapon.beam_armor_reduction
+            + growth.beam_armor_reduction_per_level * levels_gained)
+            .max(0.0);
+        p.beam_charge = p.beam_charge.clamp(0.0, p.hero_weapon.beam_max_charge);
+    } else {
+        p.hero_weapon.magazine_size =
+            ((base.weapon.magazine_size as i32) + total_mod.primary_magazine_bonus).max(1) as u32;
+    }
+
+    // سلاح‌های استخر سم (Venom Alchemist): اعمال کامل دمیج آیتم‌ها و رشد سطح روی toxic_pool_dps
+    if base.weapon.toxic_pool_duration_secs > 0.0 {
+        p.hero_weapon.toxic_pool_dps = (base.weapon.toxic_pool_dps
+            + growth.toxic_dps_per_level * levels_gained
+            + total_mod.primary_damage_bonus * lim.toxic_dps_per_primary_damage)
+            .max(0.0);
+        p.hero_weapon.toxic_slow_ratio = (base.weapon.toxic_slow_ratio
+            + growth.toxic_slow_per_level * levels_gained)
+            .clamp(0.0, lim.max_toxic_slow_ratio);
+        p.hero_weapon.toxic_pool_duration_secs = (base.weapon.toxic_pool_duration_secs
+            + growth.toxic_duration_per_level * levels_gained)
+            .max(0.0);
+    }
 
     // اسلحه دوم (Pistol)
-    let pis_rate_mult = (1.0 + total_mod.pistol_fire_rate_pct).max(0.20);
-    let pis_reload_mult = (1.0 + total_mod.pistol_reload_speed_pct).max(0.20);
+    let pis_rate_mult = (1.0 + total_mod.pistol_fire_rate_pct)
+        .clamp(lim.min_fire_rate_multiplier, lim.max_fire_rate_multiplier);
+    let pis_reload_mult = (1.0 + total_mod.pistol_reload_speed_pct)
+        .clamp(lim.min_reload_speed_multiplier, lim.max_reload_speed_multiplier);
 
     p.hero_pistol.fire_rate_secs =
         (base.pistol.fire_rate_secs / pis_rate_mult).max(config.combat.min_fire_rate_secs);
     p.hero_pistol.reload_duration_secs =
         (base.pistol.reload_duration_secs / pis_reload_mult).max(config.combat.min_reload_duration_secs);
-    p.hero_pistol.damage = (base.pistol.damage + total_mod.pistol_damage_bonus).max(1.0);
+    p.hero_pistol.damage =
+        (base.pistol.damage + total_mod.pistol_damage_bonus).max(lim.min_weapon_damage);
     p.hero_pistol.magazine_size =
         ((base.pistol.magazine_size as i32) + total_mod.pistol_magazine_bonus).max(1) as u32;
-    p.hero_pistol.max_range = (base.pistol.max_range + total_mod.pistol_range_bonus).max(2.0);
+    p.hero_pistol.max_range =
+        (base.pistol.max_range + total_mod.pistol_range_bonus).max(lim.min_weapon_range);
 
+    let is_beam_primary = base.weapon.weapon_kind == WeaponKind::ElectricBeam
+        || base.weapon.weapon_kind == WeaponKind::FlameBeam;
     match p.active_weapon {
         ActiveWeaponSlot::Primary => {
-            p.ammo_in_mag = p.ammo_in_mag.min(p.hero_weapon.magazine_size);
+            if is_beam_primary {
+                p.ammo_in_mag = p.beam_charge.ceil() as u32;
+            } else {
+                p.ammo_in_mag = p.ammo_in_mag.min(p.hero_weapon.magazine_size);
+            }
             p.other_weapon_ammo_in_mag = p.other_weapon_ammo_in_mag.min(p.hero_pistol.magazine_size);
         }
         ActiveWeaponSlot::Pistol => {
             p.ammo_in_mag = p.ammo_in_mag.min(p.hero_pistol.magazine_size);
-            p.other_weapon_ammo_in_mag = p.other_weapon_ammo_in_mag.min(p.hero_weapon.magazine_size);
+            if is_beam_primary {
+                p.other_weapon_ammo_in_mag = p.beam_charge.ceil() as u32;
+            } else {
+                p.other_weapon_ammo_in_mag =
+                    p.other_weapon_ammo_in_mag.min(p.hero_weapon.magazine_size);
+            }
         }
     }
 
     // تقویت نارنجک‌ها با آیتم‌ها
     let base_g = base.grenade;
-    p.hero_grenade.damage = (base_g.damage + total_mod.grenade_damage_bonus).max(1.0);
-    p.hero_grenade.aoe_radius = (base_g.aoe_radius + total_mod.grenade_aoe_bonus).max(0.5);
+    p.hero_grenade.damage = (base_g.damage + total_mod.grenade_damage_bonus).max(lim.min_weapon_damage);
+    p.hero_grenade.aoe_radius = (base_g.aoe_radius + total_mod.grenade_aoe_bonus).max(lim.min_grenade_aoe);
     p.hero_grenade.max_charges =
         ((base_g.max_charges as i32) + total_mod.grenade_max_charges_bonus).max(1) as u32;
-    let g_recharge_mult = (1.0 + total_mod.grenade_recharge_speed_pct).max(0.25);
-    p.hero_grenade.recharge_secs = (base_g.recharge_secs / g_recharge_mult).max(1.0);
+    let g_recharge_mult = (1.0 + total_mod.grenade_recharge_speed_pct).max(lim.min_grenade_recharge_mult);
+    p.hero_grenade.recharge_secs =
+        (base_g.recharge_secs / g_recharge_mult).max(lim.min_grenade_recharge_secs);
     p.grenade_charges = p.grenade_charges.min(p.hero_grenade.max_charges);
     if p.grenade_charges < p.hero_grenade.max_charges && p.grenade_recharge_remaining <= 0.0 {
         p.grenade_recharge_remaining = p.hero_grenade.recharge_secs;
@@ -1675,7 +1847,8 @@ pub fn try_move_hero_item_to_stash(
     if !is_match_action_allowed(world) {
         return false;
     }
-    let Some(p) = world.players.get_mut(slot_index) else {
+    let (players, pending_fx) = (&mut world.players, &mut world.pending_fx);
+    let Some(p) = players.get_mut(slot_index) else {
         return false;
     };
     if p.is_dead || fountain_regen_bonus_for_pos(config, p.hero_team, p.soldier_pos) <= 0.0 {
@@ -1717,6 +1890,7 @@ pub fn try_move_hero_item_to_stash(
         items_cfg,
     ) {
         p.inventory.remove(pos);
+        clear_shadow_blade_invis_if_unowned(p, items_cfg, pending_fx);
         recompute_player_slot_stats(p, config, items_cfg);
         return true;
     }
@@ -2007,7 +2181,8 @@ pub fn try_sell_item(
     if !is_match_action_allowed(world) {
         return false;
     }
-    let Some(p) = world.players.get_mut(slot_index) else {
+    let (players, pending_fx) = (&mut world.players, &mut world.pending_fx);
+    let Some(p) = players.get_mut(slot_index) else {
         return false;
     };
     if p.is_dead || fountain_regen_bonus_for_pos(config, p.hero_team, p.soldier_pos) <= 0.0 {
@@ -2040,6 +2215,7 @@ pub fn try_sell_item(
         p.inventory.remove(pos);
     }
     p.hero_gold = p.hero_gold.saturating_add(refund);
+    clear_shadow_blade_invis_if_unowned(p, items_cfg, pending_fx);
     recompute_player_slot_stats(p, config, items_cfg);
     true
 }
@@ -2058,7 +2234,7 @@ pub fn try_cycle_item_mode(
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
-    if p.is_dead {
+    if p.is_dead || p.mode_cycle_cooldown_remaining > 0.0 {
         return false;
     }
     let Some(inv_item) = p.inventory.iter_mut().find(|it| it.slot == inv_index) else {
@@ -2071,6 +2247,7 @@ pub fn try_cycle_item_mode(
         return false;
     }
     inv_item.active_mode = (inv_item.active_mode + 1) % item_def.modes.len();
+    p.mode_cycle_cooldown_remaining = items_cfg.stat_limits.mode_cycle_cooldown_secs;
     recompute_player_slot_stats(p, config, items_cfg);
     true
 }
@@ -2438,6 +2615,8 @@ pub fn execute_hero_slot_to_courier_transfer(
             recompute_player_slot_stats(p, config, items_cfg);
         }
         auto_combine_items(&mut p.courier_inventory, courier_max_slots, items_cfg);
+        let mut _dummy_fx = Vec::new();
+        clear_shadow_blade_invis_if_unowned(p, items_cfg, &mut _dummy_fx);
         return true;
     }
 
@@ -3258,6 +3437,7 @@ pub fn try_activate_shadow_blade(
     p.invisibility_total_secs = sb.duration_secs;
     p.invis_move_speed_bonus_pct = sb.invis_move_speed_bonus_pct;
     p.shadow_blade_cooldown_remaining = sb.cooldown_secs;
+    p.current_move_speed *= 1.0 + sb.invis_move_speed_bonus_pct;
     let pos = p.soldier_pos;
     world.pending_fx.push(GameplayFxEvent::ShadowBladeActivated { slot_index, pos });
     true
@@ -3282,6 +3462,9 @@ pub fn step_shadow_blade_system(
         .collect();
 
     for p in &mut world.players {
+        if p.mode_cycle_cooldown_remaining > 0.0 {
+            p.mode_cycle_cooldown_remaining = (p.mode_cycle_cooldown_remaining - dt).max(0.0);
+        }
         if p.shadow_blade_cooldown_remaining > 0.0 {
             p.shadow_blade_cooldown_remaining = (p.shadow_blade_cooldown_remaining - dt).max(0.0);
         }

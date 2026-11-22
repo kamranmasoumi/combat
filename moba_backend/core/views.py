@@ -1,9 +1,12 @@
+import hmac
 import json
 import re
-import random
+import secrets
 from datetime import timedelta
 from typing import Optional
 
+from django.conf import settings
+from django.db import transaction
 from django.db.models import Q
 from django.http import HttpRequest, JsonResponse
 from django.utils import timezone
@@ -29,6 +32,15 @@ from .models import (
     Player,
     PlayerSessionToken,
 )
+
+
+def _is_internal_webhook_authorized(request: HttpRequest) -> bool:
+    configured_secret = str(getattr(settings, "INTERNAL_WEBHOOK_SECRET", "") or "").strip()
+    if configured_secret:
+        provided = str(request.headers.get("X-Internal-Secret", "") or "").strip()
+        return bool(provided) and hmac.compare_digest(provided, configured_secret)
+    remote_addr = str(request.META.get("REMOTE_ADDR", "") or "").strip()
+    return remote_addr in ("127.0.0.1", "::1", "localhost")
 
 
 def _parse_json_body(request: HttpRequest) -> dict:
@@ -116,11 +128,19 @@ def request_otp_view(request: HttpRequest) -> JsonResponse:
             )
         username = ""
 
+    cooldown_secs = int(getattr(settings, "OTP_COOLDOWN_SECS", 15))
+    recent_cutoff = timezone.now() - timedelta(seconds=cooldown_secs)
+    if OtpVerification.objects.filter(email=email, created_at__gt=recent_cutoff).exists():
+        return JsonResponse(
+            {"error": f"Please wait {cooldown_secs} seconds before requesting another OTP."},
+            status=429,
+        )
+
     # باطل کردن کدهای قبلی استفاده‌نشده این ایمیل
     OtpVerification.objects.filter(email=email, is_used=False).update(is_used=True)
 
-    otp_code = f"{random.randint(100000, 999999)}"
-    expires_at = timezone.now() + timedelta(minutes=5)
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
+    expires_at = timezone.now() + timedelta(minutes=int(getattr(settings, "OTP_TTL_MINUTES", 5)))
 
     OtpVerification.objects.create(
         email=email,
@@ -164,56 +184,56 @@ def verify_otp_view(request: HttpRequest) -> JsonResponse:
             {"error": "Invalid email or 6-digit OTP code."}, status=400
         )
 
-    otp_record = (
-        OtpVerification.objects.filter(
-            email=email, otp_code=otp_code, is_used=False
-        )
-        .order_by("-created_at")
-        .first()
-    )
-
-    if not otp_record or not otp_record.is_valid():
-        return JsonResponse(
-            {"error": "Invalid or expired OTP code."}, status=400
+    with transaction.atomic():
+        otp_record = (
+            OtpVerification.objects.select_for_update()
+            .filter(email=email, otp_code=otp_code, is_used=False)
+            .order_by("-created_at")
+            .first()
         )
 
-    chosen_username = (otp_record.username or "").strip()
-    existing_player = Player.objects.filter(email=email).first()
-    if chosen_username:
-        if existing_player:
+        if not otp_record or not otp_record.is_valid():
             return JsonResponse(
-                {"error": "Account already exists. Please log in."}, status=400
+                {"error": "Invalid or expired OTP code."}, status=400
             )
-        err = _validate_username(chosen_username)
-        if err:
-            return JsonResponse({"error": err}, status=400)
-        player = Player.objects.create(
-            email=email,
-            username=chosen_username,
-            mmr=1000,
-            rank_tier="Simorgh Initiate",
-        )
-        created = True
-    else:
-        if not existing_player:
+
+        chosen_username = (otp_record.username or "").strip()
+        existing_player = Player.objects.select_for_update().filter(email=email).first()
+        if chosen_username:
+            if existing_player:
+                return JsonResponse(
+                    {"error": "Account already exists. Please log in."}, status=400
+                )
+            err = _validate_username(chosen_username)
+            if err:
+                return JsonResponse({"error": err}, status=400)
+            player = Player.objects.create(
+                email=email,
+                username=chosen_username,
+                mmr=1000,
+                rank_tier="Simorgh Initiate",
+            )
+            created = True
+        else:
+            if not existing_player:
+                return JsonResponse(
+                    {"error": "Account not found. Please register first."}, status=404
+                )
+            player = existing_player
+            created = False
+
+        otp_record.is_used = True
+        otp_record.save(update_fields=["is_used"])
+
+        if player.is_banned:
             return JsonResponse(
-                {"error": "Account not found. Please register first."}, status=404
+                {"error": "Your account has been suspended."}, status=403
             )
-        player = existing_player
-        created = False
 
-    otp_record.is_used = True
-    otp_record.save(update_fields=["is_used"])
+        player.last_login_at = timezone.now()
+        player.save(update_fields=["last_login_at"])
 
-    if player.is_banned:
-        return JsonResponse(
-            {"error": "حساب کاربری شما مسدود شده است"}, status=403
-        )
-
-    player.last_login_at = timezone.now()
-    player.save(update_fields=["last_login_at"])
-
-    session_token = PlayerSessionToken.create_for_player(player)
+        session_token = PlayerSessionToken.create_for_player(player)
     client_ip = request.META.get("REMOTE_ADDR", "")
     active_match = get_active_match_for_player(player, client_ip=client_ip)
 
@@ -232,6 +252,9 @@ def verify_otp_view(request: HttpRequest) -> JsonResponse:
             "email": player.email,
             "mmr": player.mmr,
             "rank_tier": player.rank_tier,
+            "wins": player.wins,
+            "losses": player.losses,
+            "abandoned_count": player.abandoned_count,
             "is_new_player": created,
             "active_match": active_match,
         },
@@ -247,7 +270,7 @@ def profile_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     client_ip = request.META.get("REMOTE_ADDR", "")
     active_match = get_active_match_for_player(player, client_ip=client_ip)
@@ -275,7 +298,7 @@ def active_match_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     client_ip = request.META.get("REMOTE_ADDR", "")
     active_match = get_active_match_for_player(player, client_ip=client_ip)
@@ -298,7 +321,7 @@ def disconnect_match_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     disconnected_count = disconnect_active_match_for_player(player)
     client_ip = request.META.get("REMOTE_ADDR", "")
@@ -323,7 +346,7 @@ def reconnect_match_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     reconnected_count = reconnect_active_match_for_player(player)
     client_ip = request.META.get("REMOTE_ADDR", "")
@@ -346,9 +369,11 @@ def update_player_connection_state_view(request: HttpRequest) -> JsonResponse:
     وب‌هوک داخلی فراخوانی‌شده توسط `moba_server` هر زمان که ارتباط UDP بازیکن در لوپ بازی
     برقرار/ریکانکت (`connected`) یا قطع (`disconnected`) می‌شود.
     """
+    if not _is_internal_webhook_authorized(request):
+        return JsonResponse({"error": "Forbidden internal webhook."}, status=403)
     data = _parse_json_body(request)
     if not data.get("room_id") and not data.get("port"):
-        return JsonResponse({"error": "فیلد room_id یا port الزامی است"}, status=400)
+        return JsonResponse({"error": "room_id or port is required."}, status=400)
 
     result = update_player_connection_state_from_server(data)
     status_code = 200 if result.get("status") in ("ok", "ignored") else 404
@@ -366,7 +391,7 @@ def abandon_match_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     result = abandon_active_matches_for_player(player)
     return JsonResponse(
@@ -387,9 +412,11 @@ def report_match_result_view(request: HttpRequest) -> JsonResponse:
     وب‌هوک داخلی فراخوانی‌شده توسط `moba_server` در پایان نبرد برای ذخیره نتیجه بازی،
     آمار بازیکنان (K/D/A, Hero, Level, Gold)، بروزرسانی MMR/Rank و بستن اتاق بازی.
     """
+    if not _is_internal_webhook_authorized(request):
+        return JsonResponse({"error": "Forbidden internal webhook."}, status=403)
     data = _parse_json_body(request)
     if not data.get("room_id"):
-        return JsonResponse({"error": "فیلد room_id الزامی است"}, status=400)
+        return JsonResponse({"error": "room_id is required."}, status=400)
 
     result = record_match_result_from_server(data)
     status_code = 200 if result.get("status") == "ok" else 404
@@ -404,7 +431,7 @@ def match_history_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     participations = list(
         MatchParticipant.objects.select_related("match_room")
@@ -532,7 +559,7 @@ def friends_list_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     payload = build_friends_payload_for_player(player)
     return JsonResponse(payload, status=200)
@@ -546,7 +573,7 @@ def friends_search_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     q = str(request.GET.get("q", "")).strip()
     if len(q) < 2:
@@ -604,7 +631,7 @@ def send_friend_request_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     data = _parse_json_body(request)
     target_uid = str(data.get("target_user_id", "")).strip()
@@ -627,6 +654,8 @@ def send_friend_request_view(request: HttpRequest) -> JsonResponse:
     ).first()
 
     if existing:
+        if existing.status == Friendship.STATUS_BLOCKED:
+            return JsonResponse({"error": "Unable to send friend request."}, status=403)
         if existing.status == Friendship.STATUS_ACCEPTED:
             return JsonResponse({"error": "Already friends"}, status=400)
         if existing.status == Friendship.STATUS_PENDING:
@@ -703,7 +732,7 @@ def respond_friend_request_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     data = _parse_json_body(request)
     try:
@@ -761,7 +790,7 @@ def remove_friend_view(request: HttpRequest) -> JsonResponse:
     """
     player = _resolve_authenticated_player(request)
     if not player:
-        return JsonResponse({"error": "توکن نامعتبر یا منقضی است"}, status=401)
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
 
     data = _parse_json_body(request)
     friend_uid = str(data.get("friend_user_id", "")).strip()

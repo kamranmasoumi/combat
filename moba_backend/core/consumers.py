@@ -166,6 +166,9 @@ def find_available_udp_port() -> int:
     raise RuntimeError("No free UDP port available in configured range!")
 
 
+_find_available_udp_port_async = database_sync_to_async(find_available_udp_port)
+
+
 def resolve_game_server_host(client_ip: Optional[str] = None) -> str:
     """
     تعیین آدرس IP سرور بازی برای اتصال UDP کلاینت‌ها.
@@ -307,7 +310,7 @@ async def wait_for_udp_server_ready(port: int, timeout_sec: float = 30.0) -> boo
 
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
-        if is_systemd_unit_failed(unit_name):
+        if await asyncio.to_thread(is_systemd_unit_failed, unit_name):
             print(
                 f"[MATCHMAKING ERROR] Systemd service {unit_name} entered failed state!",
                 flush=True,
@@ -315,7 +318,7 @@ async def wait_for_udp_server_ready(port: int, timeout_sec: float = 30.0) -> boo
             _ACTIVE_SERVICE_UNITS.pop(port, None)
             return False
 
-        if is_udp_port_bound(port):
+        if await asyncio.to_thread(is_udp_port_bound, port):
             print(
                 f"[MATCHMAKING READY] Systemd service {unit_name} bound UDP port {port} and is ready!",
                 flush=True,
@@ -980,6 +983,8 @@ def _create_match_records_and_spawn(
             "server_addr": server_addr,
             "ticket_id": ticket_id,
             "player_count": player_count,
+            "team_id": team_id,
+            "slot_index": idx,
             "game_link": game_link,
         }
 
@@ -989,6 +994,72 @@ def _create_match_records_and_spawn(
         match_room.save(update_fields=["process_pid"])
 
     return assignments
+
+
+def _pop_matched_batch_preserving_parties(
+    queue: List[QueuedPlayerEntry], required: int
+) -> Optional[List[QueuedPlayerEntry]]:
+    """
+    انتخاب دقیقاً `required` بازیکن از صف بدون نصف‌کردن هیچ گروه پارتی (party_group_id).
+    """
+    if len(queue) < required:
+        return None
+
+    groups_order: List[str] = []
+    groups_map: Dict[str, List[QueuedPlayerEntry]] = {}
+    for entry in queue:
+        key = entry.party_group_id if entry.party_group_id else f"solo:{entry.user_id}"
+        if key not in groups_map:
+            groups_order.append(key)
+            groups_map[key] = []
+        groups_map[key].append(entry)
+
+    chosen_keys: List[str] = []
+
+    def dfs(start_idx: int, remaining: int) -> bool:
+        if remaining == 0:
+            return True
+        for i in range(start_idx, len(groups_order)):
+            gkey = groups_order[i]
+            gsize = len(groups_map[gkey])
+            if gsize <= remaining:
+                chosen_keys.append(gkey)
+                if dfs(i + 1, remaining - gsize):
+                    return True
+                chosen_keys.pop()
+        return False
+
+    if not dfs(0, required):
+        return None
+
+    chosen_set = set(chosen_keys)
+    matched: List[QueuedPlayerEntry] = []
+    remaining_queue: List[QueuedPlayerEntry] = []
+    for entry in queue:
+        key = entry.party_group_id if entry.party_group_id else f"solo:{entry.user_id}"
+        if key in chosen_set:
+            matched.append(entry)
+        else:
+            remaining_queue.append(entry)
+    queue[:] = remaining_queue
+    return matched
+
+
+@database_sync_to_async
+def _find_party_member_in_active_match(player_pks: List[int]) -> Optional[str]:
+    part = (
+        MatchParticipant.objects.select_related("player", "match_room")
+        .filter(
+            player_id__in=player_pks,
+            match_room__status=GameMatchRoom.STATUS_RUNNING,
+            status__in=[
+                MatchParticipant.STATUS_CONNECTED,
+                MatchParticipant.STATUS_DISCONNECTED,
+            ],
+        )
+        .first()
+    )
+    return part.player.username if part else None
 
 
 class MatchmakingConsumer(AsyncWebsocketConsumer):
@@ -1111,14 +1182,26 @@ class MatchmakingConsumer(AsyncWebsocketConsumer):
                 flush=True,
             )
 
-            if len(_WAITING_QUEUE) >= required:
-                matched_batch = _WAITING_QUEUE[:required]
-                del _WAITING_QUEUE[:required]
-            else:
+            matched_batch = _pop_matched_batch_preserving_parties(_WAITING_QUEUE, required)
+            if matched_batch is None:
                 queue_snapshot = list(_WAITING_QUEUE)
 
         if matched_batch is not None:
-            port = find_available_udp_port()
+            try:
+                port = await _find_available_udp_port_async()
+            except Exception:
+                for entry in matched_batch:
+                    await self.channel_layer.send(
+                        entry.channel_name,
+                        {
+                            "type": "queue.status",
+                            "payload": {
+                                "event": "error",
+                                "message": "No free game server port available; please try again.",
+                            },
+                        },
+                    )
+                return
             room_id = f"room-{secrets.randbelow(900) + 100}-{secrets.token_hex(2)}"
             first_client_ip = matched_batch[0].client_ip if matched_batch else client_ip
             server_host = resolve_game_server_host(first_client_ip)
@@ -1436,6 +1519,18 @@ class LobbyConsumer(AsyncWebsocketConsumer):
         client_info = self.scope.get("client")
         client_ip = client_info[0] if client_info and len(client_info) > 0 else ""
 
+        async with _SOCIAL_LOCK:
+            usess = _ONLINE_USERS.get(self.player.user_id)
+            in_party_now = bool(usess and usess.party_id)
+        if in_party_now:
+            await self.send_json(
+                {
+                    "event": "error",
+                    "message": "Leave your active party before creating a custom lobby.",
+                }
+            )
+            return
+
         # چک مجدد عدم حضور در بازی فعال
         active_match = await _get_active_match_for_player_async(
             self.player, client_ip=client_ip
@@ -1531,6 +1626,18 @@ class LobbyConsumer(AsyncWebsocketConsumer):
 
         client_info = self.scope.get("client")
         client_ip = client_info[0] if client_info and len(client_info) > 0 else ""
+
+        async with _SOCIAL_LOCK:
+            usess = _ONLINE_USERS.get(self.player.user_id)
+            in_party_now = bool(usess and usess.party_id)
+        if in_party_now:
+            await self.send_json(
+                {
+                    "event": "error",
+                    "message": "Leave your active party before joining a custom lobby.",
+                }
+            )
+            return
 
         active_match = await _get_active_match_for_player_async(
             self.player, client_ip=client_ip
@@ -1938,8 +2045,12 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             new_title = str(msg.get("title", "")).strip()[:36]
             if new_title:
                 lobby.title = new_title
-            if "password" in msg:
-                lobby.password = str(msg.get("password", "")).strip()[:24]
+            if msg.get("clear_password"):
+                lobby.password = ""
+            elif "password" in msg:
+                new_pw = str(msg.get("password", "")).strip()[:24]
+                if new_pw:
+                    lobby.password = new_pw
             try:
                 new_cap = int(msg.get("max_players", lobby.max_players))
             except Exception:
@@ -1947,12 +2058,14 @@ class LobbyConsumer(AsyncWebsocketConsumer):
             if new_cap in ALLOWED_LOBBY_CAPACITIES and new_cap >= len(lobby.members):
                 lobby.max_players = new_cap
                 half = new_cap // 2
-                # اطمینان از معتبر بودن شماره اسلات اعضا پس از تغییر ظرفیت
-                for m in lobby.members:
-                    if m.slot_index >= half:
-                        free = _find_first_free_slot(lobby)
-                        if free:
-                            m.team_id, m.slot_index = free
+                # ابتدا اسلات اعضای خارج از محدوده جدید را خالی کن تا هنگام جابه‌جایی برخورد رخ ندهد
+                displaced = [m for m in lobby.members if m.slot_index >= half]
+                for m in displaced:
+                    m.slot_index = -1
+                for m in displaced:
+                    free = _find_first_free_slot(lobby)
+                    if free:
+                        m.team_id, m.slot_index = free
             lobby.chat_history.append(
                 {
                     "sender": "SYSTEM",
@@ -2043,7 +2156,7 @@ class LobbyConsumer(AsyncWebsocketConsumer):
         await self._broadcast_lobby_list_to_browsers()
 
         try:
-            port = find_available_udp_port()
+            port = await _find_available_udp_port_async()
         except Exception:
             async with _LOBBY_LOCK:
                 if lobby_id_copy in _ACTIVE_LOBBIES:
@@ -2132,8 +2245,8 @@ class LobbyConsumer(AsyncWebsocketConsumer):
 # سیستم جامع دوستان، وضعیت آنلاین (Presence)، پارتی (Party) و نوتیفیکیشن زنده
 # ============================================================================
 
-PARTY_DEFAULT_MAX_SIZE = 5
-PARTY_INVITE_TTL_SECS = 60.0
+PARTY_DEFAULT_MAX_SIZE = int(getattr(settings, "PARTY_DEFAULT_MAX_SIZE", 5))
+PARTY_INVITE_TTL_SECS = float(getattr(settings, "PARTY_INVITE_TTL_SECS", 60.0))
 
 
 @dataclass
@@ -3295,6 +3408,27 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 )
                 return
 
+            member_pks = [m.player_pk for m in party.members]
+
+        busy_member_name = await _find_party_member_in_active_match(member_pks)
+        if busy_member_name:
+            await self.send_json(
+                {
+                    "event": "notification",
+                    "kind": "error",
+                    "title": "ACTIVE MATCH",
+                    "message": f"{busy_member_name} already has an active match in progress.",
+                }
+            )
+            return
+
+        async with _SOCIAL_LOCK:
+            sess = _ONLINE_USERS.get(self.player.user_id)
+            if not sess or not sess.party_id:
+                return
+            party = _ACTIVE_PARTIES.get(sess.party_id)
+            if not party or party.leader_user_id != self.player.user_id or party.is_queuing:
+                return
             party.is_queuing = True
             party_id_copy = party.party_id
             party_members_copy = list(party.members)
@@ -3342,14 +3476,48 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                     )
                 )
 
-            if len(_WAITING_QUEUE) >= required:
-                matched_batch = _WAITING_QUEUE[:required]
-                del _WAITING_QUEUE[:required]
-            else:
+            matched_batch = _pop_matched_batch_preserving_parties(_WAITING_QUEUE, required)
+            if matched_batch is None:
                 queue_snapshot = list(_WAITING_QUEUE)
 
         if matched_batch is not None:
-            port = find_available_udp_port()
+            try:
+                port = await _find_available_udp_port_async()
+            except Exception:
+                p_groups = {e.party_group_id for e in matched_batch if e.party_group_id}
+                async with _SOCIAL_LOCK:
+                    for pid_g in p_groups:
+                        p_obj = _ACTIVE_PARTIES.get(pid_g)
+                        if p_obj:
+                            p_obj.is_queuing = False
+                            for pm in p_obj.members:
+                                ps = _ONLINE_USERS.get(pm.user_id)
+                                if ps:
+                                    ps.status = "in_party"
+                            p_state = _serialize_party_state(p_obj)
+                            for pm in p_obj.members:
+                                if pm.channel_name:
+                                    await self.channel_layer.send(
+                                        pm.channel_name,
+                                        {
+                                            "type": "social.event",
+                                            "payload": {"event": "party_state", "party": p_state},
+                                        },
+                                    )
+                for entry in matched_batch:
+                    await self.channel_layer.send(
+                        entry.channel_name,
+                        {
+                            "type": "social.event",
+                            "payload": {
+                                "event": "notification",
+                                "kind": "error",
+                                "title": "SERVER BUSY",
+                                "message": "No free game server port available; please try again.",
+                            },
+                        },
+                    )
+                return
             room_id = f"room-{secrets.randbelow(900) + 100}-{secrets.token_hex(2)}"
             first_ip = matched_batch[0].client_ip if matched_batch else ""
             server_host = resolve_game_server_host(first_ip)
@@ -3508,7 +3676,28 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
             return
         async with _LOBBY_LOCK:
             lb_obj = _ACTIVE_LOBBIES.get(lobby_id)
-            has_password = bool(lb_obj.password) if lb_obj else False
+            if not lb_obj or lb_obj.is_starting:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "LOBBY UNAVAILABLE",
+                        "message": "This lobby is no longer open for invites.",
+                    }
+                )
+                return
+            if not any(m.user_id == self.player.user_id for m in lb_obj.members):
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "NOT IN LOBBY",
+                        "message": "You must be inside the lobby to invite players.",
+                    }
+                )
+                return
+            has_password = bool(lb_obj.password)
+            auth_title = lb_obj.title
         async with _SOCIAL_LOCK:
             target_sess = _ONLINE_USERS.get(target_uid)
         if not target_sess or not target_sess.channel_name:
@@ -3528,7 +3717,7 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 "payload": {
                     "event": "lobby_invite_received",
                     "lobby_id": lobby_id,
-                    "lobby_title": lobby_title or f"{self.player.username}'s Room",
+                    "lobby_title": auth_title,
                     "has_password": has_password,
                     "from_user_id": self.player.user_id,
                     "from_username": self.player.username,

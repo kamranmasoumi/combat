@@ -8,15 +8,16 @@ use bevy::animation::RepeatAnimation;
 use bevy::app::AppExit;
 use bevy::gltf::Gltf;
 use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input::ButtonState;
 use bevy::light::AmbientLight;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::Pressed;
+use bevy::ui::{Pressed, RelativeCursorPosition};
 use bevy::ui_widgets::Button as UiButton;
 use bevy::window::{CursorOptions, PrimaryWindow};
 use moba_shared::GameConfig;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::f32::consts::TAU;
 
 // =============================================================================
@@ -114,7 +115,7 @@ pub struct PreGameSessionState {
     pub friend_searching: bool,
     pub social_syncing: bool,
     pub social_reconnect_timer: f32,
-    pub pending_sent_invites: HashSet<String>,
+    pub pending_sent_invites: HashMap<String, f32>,
     pub party: Option<PartyState>,
     pub pending_party_invites: Vec<PartyInviteInfo>,
     pub party_chat_open: bool,
@@ -182,7 +183,7 @@ impl Default for PreGameSessionState {
             friend_searching: false,
             social_syncing: false,
             social_reconnect_timer: 0.0,
-            pending_sent_invites: HashSet::new(),
+            pending_sent_invites: HashMap::new(),
             party: None,
             pending_party_invites: Vec::new(),
             party_chat_open: false,
@@ -228,6 +229,15 @@ struct PreGameEntity;
 
 #[derive(Component)]
 struct PreGameHiddenHud(Visibility);
+
+#[derive(Component)]
+struct PreGameDeactivatedCamera;
+
+#[derive(Component, Clone, Copy)]
+struct PreGameBtnBaseBorder(BorderColor);
+
+#[derive(Component)]
+struct PreGameScrollableList;
 
 #[derive(Component)]
 struct MenuBackdropPlane;
@@ -343,6 +353,7 @@ impl Plugin for PreGamePlugin {
                     poll_backend_events_system,
                     handle_pregame_keyboard_system,
                     handle_pregame_buttons_system,
+                    handle_pregame_scroll_system,
                     update_menu_backdrop_system,
                     sync_menu_party_soldiers_system,
                     attach_menu_soldier_anim_system,
@@ -433,21 +444,33 @@ fn on_enter_pregame(
     mut state: ResMut<PreGameSessionState>,
     mut showcase: ResMut<MenuShowcaseAssets>,
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
-    mut old_cams_q: Query<&mut Camera, (With<Camera3d>, Without<PreGameEntity>)>,
+    mut old_cams_q: Query<(Entity, &mut Camera), (With<Camera3d>, Without<PreGameEntity>)>,
     mut hud_roots: Query<(Entity, &mut Visibility), (With<Node>, Without<ChildOf>, Without<PreGameEntity>)>,
 ) {
+    let mm = &config.main_menu;
+    backend.configure_network(
+        mm.http_timeout_secs,
+        mm.ws_ping_interval_secs,
+        mm.ws_poll_sleep_ms,
+    );
+    state.queue_required = mm.default_queue_required_players;
+    if !mm.lobby_capacities.contains(&state.create_capacity) {
+        state.create_capacity = mm.lobby_capacities[0];
+    }
+
     for mut copt in &mut cursor_q {
         copt.visible = true;
     }
-    for mut cam in &mut old_cams_q {
-        cam.is_active = false;
+    for (cam_ent, mut cam) in &mut old_cams_q {
+        if cam.is_active {
+            commands.entity(cam_ent).insert(PreGameDeactivatedCamera);
+            cam.is_active = false;
+        }
     }
     for (ent, mut vis) in &mut hud_roots {
         commands.entity(ent).insert(PreGameHiddenHud(*vis));
         *vis = Visibility::Hidden;
     }
-
-    let mm = &config.main_menu;
     showcase.gltf_handle = Some(asset_server.load(mm.soldier_model_path.clone()));
     showcase.idle_graph = None;
     showcase.idle_node = None;
@@ -606,6 +629,7 @@ fn on_exit_pregame(
     mut showcase: ResMut<MenuShowcaseAssets>,
     query: Query<Entity, With<PreGameEntity>>,
     mut hidden_huds: Query<(Entity, &mut Visibility, &PreGameHiddenHud)>,
+    mut deactivated_cams: Query<(Entity, &mut Camera), With<PreGameDeactivatedCamera>>,
 ) {
     backend.disconnect_social_ws();
     showcase.spawned_squad_count = 0;
@@ -617,6 +641,10 @@ fn on_exit_pregame(
     for (ent, mut vis, saved) in &mut hidden_huds {
         *vis = saved.0;
         commands.entity(ent).remove::<PreGameHiddenHud>();
+    }
+    for (cam_ent, mut cam) in &mut deactivated_cams {
+        cam.is_active = true;
+        commands.entity(cam_ent).remove::<PreGameDeactivatedCamera>();
     }
 }
 
@@ -777,12 +805,24 @@ fn poll_backend_events_system(
         }
     }
 
+    // شمارش معکوس و پاک‌سازی خودکار دعوت‌های ارسالی منقضی‌شده
+    if !state.pending_sent_invites.is_empty() {
+        let before_inv = state.pending_sent_invites.len();
+        state.pending_sent_invites.retain(|_, rem| {
+            *rem -= dt;
+            *rem > 0.0
+        });
+        if state.pending_sent_invites.len() != before_inv {
+            state.ui_dirty = true;
+        }
+    }
+
     // اتصال مجدد خودکار وب‌سوکت Social/Party در صورت قطع شدن
     if let Some(tok) = state.access_token.clone() {
         if !backend.is_social_ws_connected() {
             state.social_reconnect_timer -= dt;
             if state.social_reconnect_timer <= 0.0 {
-                state.social_reconnect_timer = 2.0;
+                state.social_reconnect_timer = config.main_menu.social_reconnect_interval_secs;
                 backend.connect_social_ws(tok.clone());
                 backend.fetch_friends(tok);
             }
@@ -799,6 +839,7 @@ fn poll_backend_events_system(
     }
 
     let notif_dur = config.main_menu.notification_duration_secs;
+    let toast_dur = config.main_menu.toast_duration_secs;
     let events = backend.poll_events();
     if events.is_empty() {
         return;
@@ -928,6 +969,13 @@ fn poll_backend_events_system(
             }
             BackendAsyncEvent::HistoryLoaded(hist) => {
                 state.is_loading = false;
+                if let Some(ref mut p) = state.profile {
+                    p.mmr = hist.summary.mmr;
+                    p.rank_tier = hist.summary.rank_tier.clone();
+                    p.wins = hist.summary.wins;
+                    p.losses = hist.summary.losses;
+                    p.abandoned_count = hist.summary.abandoned_count;
+                }
                 state.history = Some(hist);
                 state.selected_history_idx = 0;
                 state.ui_dirty = true;
@@ -1129,7 +1177,10 @@ fn poll_backend_events_system(
                 state.tab = PreGameTab::Hub;
                 push_notification(&mut state, "error", "MATCHMAKING ERROR", &message, notif_dur);
             }
-            BackendAsyncEvent::MatchmakingClosed => {
+            BackendAsyncEvent::MatchmakingClosed(conn_id) => {
+                if conn_id != backend.active_mm_conn_id() {
+                    continue;
+                }
                 if state.tab == PreGameTab::FindingMatch && !state.server_starting {
                     state.tab = PreGameTab::Hub;
                     state.ui_dirty = true;
@@ -1165,7 +1216,7 @@ fn poll_backend_events_system(
                         "password": pw,
                     }));
                 } else if !message.is_empty() && state.tab == PreGameTab::LobbyBrowser {
-                    set_toast(&mut state, &message, false);
+                    set_toast(&mut state, &message, false, toast_dur);
                 }
                 state.ui_dirty = true;
             }
@@ -1179,7 +1230,7 @@ fn poll_backend_events_system(
                 state.join_password_input.clear();
                 state.tab = PreGameTab::LobbyRoom;
                 if !message.is_empty() {
-                    set_toast(&mut state, &message, false);
+                    set_toast(&mut state, &message, false, toast_dur);
                 }
                 state.ui_dirty = true;
             }
@@ -1204,14 +1255,24 @@ fn poll_backend_events_system(
                 state.current_lobby = None;
                 state.lobbies = lobbies;
                 state.tab = PreGameTab::LobbyBrowser;
-                set_toast(&mut state, &message, false);
+                set_toast(&mut state, &message, false, toast_dur);
                 state.ui_dirty = true;
             }
             BackendAsyncEvent::LobbyError(err) => {
                 state.is_loading = false;
+                state.server_starting = false;
+                state.pending_create_lobby = None;
+                state.pending_join_lobby = None;
                 push_notification(&mut state, "error", "LOBBY ERROR", &err, notif_dur);
             }
-            BackendAsyncEvent::LobbyWsClosed => {
+            BackendAsyncEvent::LobbyWsClosed(conn_id) => {
+                if conn_id != backend.active_lobby_conn_id() {
+                    continue;
+                }
+                state.is_loading = false;
+                state.server_starting = false;
+                state.pending_create_lobby = None;
+                state.pending_join_lobby = None;
                 if matches!(state.tab, PreGameTab::LobbyBrowser | PreGameTab::LobbyRoom) {
                     state.current_lobby = None;
                     state.tab = PreGameTab::Hub;
@@ -1222,25 +1283,30 @@ fn poll_backend_events_system(
                         "Connection to lobby server closed.",
                         notif_dur,
                     );
+                } else {
+                    state.ui_dirty = true;
                 }
             }
-            BackendAsyncEvent::SocialWsClosed => {
+            BackendAsyncEvent::SocialWsClosed(conn_id) => {
+                if conn_id != backend.active_social_conn_id() {
+                    continue;
+                }
                 backend.disconnect_social_ws();
                 state.social_syncing = false;
-                state.social_reconnect_timer = 1.5;
+                state.social_reconnect_timer = config.main_menu.social_reconnect_interval_secs;
                 state.ui_dirty = true;
             }
         }
     }
 }
 
-fn set_toast(state: &mut PreGameSessionState, msg: &str, is_error: bool) {
+fn set_toast(state: &mut PreGameSessionState, msg: &str, is_error: bool, duration_secs: f32) {
     state.toast_message = sanitize_ascii_msg(
         msg,
         if is_error { "Operation failed." } else { "Updated." },
     );
     state.toast_is_error = is_error;
-    state.toast_timer = 5.0;
+    state.toast_timer = duration_secs;
     state.ui_dirty = true;
 }
 
@@ -1255,11 +1321,17 @@ fn handle_pregame_keyboard_system(
     mut backend: ResMut<BackendClient>,
     mut state: ResMut<PreGameSessionState>,
 ) {
+    if state.is_loading {
+        key_events.clear();
+        return;
+    }
+
     if state.confirm_modal.is_some() {
         if keys.just_pressed(KeyCode::Escape) {
             state.confirm_modal = None;
             state.ui_dirty = true;
         }
+        key_events.clear();
         return;
     }
 
@@ -1298,6 +1370,19 @@ fn handle_pregame_keyboard_system(
                 let target = active_input_mut(&mut state);
                 target.pop();
                 state.ui_dirty = true;
+            }
+            Key::Tab => {
+                let next_focus = match state.focused {
+                    FocusedInput::Username if state.auth_mode == AuthMode::Register => Some(FocusedInput::Email),
+                    FocusedInput::Email if state.auth_mode == AuthMode::Register => Some(FocusedInput::Username),
+                    FocusedInput::LobbyTitle => Some(FocusedInput::LobbyPassword),
+                    FocusedInput::LobbyPassword => Some(FocusedInput::LobbyTitle),
+                    _ => None,
+                };
+                if let Some(nf) = next_focus {
+                    state.focused = nf;
+                    state.ui_dirty = true;
+                }
             }
             Key::Enter => {
                 submit_pressed = true;
@@ -1461,23 +1546,115 @@ fn active_input_mut(state: &mut PreGameSessionState) -> &mut String {
 // پردازش کلیک دکمه‌های منو
 // =============================================================================
 
+fn is_action_allowed_for_active_modal(state: &PreGameSessionState, action: &PreGameBtnAction) -> bool {
+    if state.is_loading {
+        return false;
+    }
+    if state.confirm_modal.is_some() {
+        return matches!(
+            action,
+            PreGameBtnAction::ConfirmModalAccept | PreGameBtnAction::ConfirmModalCancel
+        );
+    }
+    if state.create_lobby_modal_open || state.edit_lobby_settings_open {
+        return matches!(
+            action,
+            PreGameBtnAction::FocusField(FocusedInput::LobbyTitle | FocusedInput::LobbyPassword)
+                | PreGameBtnAction::SelectLobbyCapacity(_)
+                | PreGameBtnAction::ToggleCreatePasswordVisibility
+                | PreGameBtnAction::CreateLobby
+                | PreGameBtnAction::SaveLobbySettings
+                | PreGameBtnAction::CloseLobbyModal
+        );
+    }
+    if state.join_target_lobby_id.is_some() {
+        return matches!(
+            action,
+            PreGameBtnAction::FocusField(FocusedInput::JoinPassword)
+                | PreGameBtnAction::ConfirmJoinLobby
+                | PreGameBtnAction::CancelJoinModal
+        );
+    }
+    if state.lobby_invite_modal_open {
+        return matches!(
+            action,
+            PreGameBtnAction::SendLobbyInvite(_) | PreGameBtnAction::CloseLobbyInviteModal
+        );
+    }
+    true
+}
+
+fn handle_pregame_scroll_system(
+    mut wheel_events: MessageReader<MouseWheel>,
+    state: Res<PreGameSessionState>,
+    mut scroll_q: Query<
+        (&mut ScrollPosition, &ComputedNode, &RelativeCursorPosition),
+        With<PreGameScrollableList>,
+    >,
+) {
+    if state.is_loading || state.confirm_modal.is_some() {
+        wheel_events.clear();
+        return;
+    }
+    let mut delta_y = 0.0_f32;
+    for ev in wheel_events.read() {
+        let step = match ev.unit {
+            MouseScrollUnit::Line => ev.y * 32.0,
+            MouseScrollUnit::Pixel => ev.y,
+        };
+        delta_y += step;
+    }
+    if delta_y.abs() < 0.01 {
+        return;
+    }
+    for (mut scroll, computed, rel_cursor) in &mut scroll_q {
+        if let Some(pos) = rel_cursor.normalized {
+            if pos.x >= 0.0 && pos.x <= 1.0 && pos.y >= 0.0 && pos.y <= 1.0 {
+                let max_y = (computed.content_size().y - computed.size().y).max(0.0);
+                scroll.y = (scroll.y - delta_y).clamp(0.0, max_y);
+            }
+        }
+    }
+}
+
 fn handle_pregame_buttons_system(
+    mut commands: Commands,
     config: Res<GameConfig>,
     mut backend: ResMut<BackendClient>,
     mut state: ResMut<PreGameSessionState>,
     mut app_exit: MessageWriter<AppExit>,
     mouse: Res<ButtonInput<MouseButton>>,
-    mut btn_q: Query<(&Hovered, Has<Pressed>, &PreGameBtnAction, &mut BorderColor), With<UiButton>>,
+    mut btn_q: Query<
+        (
+            Entity,
+            &Hovered,
+            Has<Pressed>,
+            &PreGameBtnAction,
+            &mut BorderColor,
+            Option<&PreGameBtnBaseBorder>,
+        ),
+        With<UiButton>,
+    >,
 ) {
     let mut triggered: Option<PreGameBtnAction> = None;
     let clicked_this_frame = mouse.just_pressed(MouseButton::Left);
-    for (hovered, pressed, action, mut border) in &mut btn_q {
-        if pressed {
+    for (ent, hovered, pressed, action, mut border, base_border) in &mut btn_q {
+        let saved_base = if let Some(b) = base_border {
+            b.0
+        } else {
+            let current = *border;
+            commands.entity(ent).insert(PreGameBtnBaseBorder(current));
+            current
+        };
+        let allowed = is_action_allowed_for_active_modal(&state, action);
+        if allowed && pressed {
             *border = BorderColor::all(Color::srgb(0.98, 0.84, 0.36));
-        } else if hovered.get() {
+        } else if allowed && hovered.get() {
             *border = BorderColor::all(Color::srgb(0.32, 0.96, 0.84));
+        } else {
+            *border = saved_base;
         }
-        if clicked_this_frame && hovered.get() && triggered.is_none() {
+        if clicked_this_frame && allowed && hovered.get() && triggered.is_none() {
             triggered = Some(action.clone());
         }
     }
@@ -1584,6 +1761,16 @@ fn handle_pregame_buttons_system(
                         );
                         return;
                     }
+                    if state.party.is_some() {
+                        push_notification(
+                            &mut state,
+                            "error",
+                            "LEAVE PARTY FIRST",
+                            "Leave your active squad before entering Custom Lobbies.",
+                            notif_dur,
+                        );
+                        return;
+                    }
                     state.tab = PreGameTab::LobbyBrowser;
                     state.is_loading = true;
                     state.loading_label = "CONNECTING TO LOBBY SERVER".to_string();
@@ -1641,7 +1828,7 @@ fn handle_pregame_buttons_system(
             } else {
                 state.tab = PreGameTab::FindingMatch;
                 state.queue_players = 1;
-                state.queue_required = 2;
+                state.queue_required = config.main_menu.default_queue_required_players;
                 state.server_starting = false;
                 state.ui_dirty = true;
                 backend.start_matchmaking(tok);
@@ -1735,7 +1922,17 @@ fn handle_pregame_buttons_system(
             }
         }
         PreGameBtnAction::InviteToParty(uid) => {
-            if state.pending_sent_invites.contains(&uid) {
+            if state.pending_sent_invites.contains_key(&uid) {
+                return;
+            }
+            if state.friends.friends.iter().any(|f| f.user_id == uid && f.in_party) {
+                push_notification(
+                    &mut state,
+                    "info",
+                    "ALREADY IN PARTY",
+                    "This friend is already in another squad.",
+                    notif_dur,
+                );
                 return;
             }
             if let Some(tok) = state.access_token.clone() {
@@ -1751,14 +1948,14 @@ fn handle_pregame_buttons_system(
                     return;
                 }
             }
-            state.pending_sent_invites.insert(uid.clone());
+            state
+                .pending_sent_invites
+                .insert(uid.clone(), config.main_menu.party_invite_timeout_secs);
             state.ui_dirty = true;
-            let mode = config
-                .main_menu
-                .game_modes
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "5v5 JUNGLE SKIRMISH".to_string());
+            let mode_idx = state
+                .selected_mode_idx
+                .min(config.main_menu.game_modes.len().saturating_sub(1));
+            let mode = config.main_menu.game_modes[mode_idx].clone();
             backend.send_social_action(serde_json::json!({
                 "action": "invite_to_party",
                 "target_user_id": uid,
@@ -1837,6 +2034,16 @@ fn handle_pregame_buttons_system(
                 );
                 return;
             }
+            if state.party.is_some() {
+                push_notification(
+                    &mut state,
+                    "error",
+                    "LEAVE PARTY FIRST",
+                    "Leave your active squad before creating a Custom Lobby.",
+                    notif_dur,
+                );
+                return;
+            }
             if state.create_title.trim().is_empty() {
                 let uname = state
                     .profile
@@ -1861,12 +2068,16 @@ fn handle_pregame_buttons_system(
             state.ui_dirty = true;
         }
         PreGameBtnAction::OpenLobbySettingsModal => {
-            if let Some((title, cap)) = state
+            if let Some((title, cap, is_starting)) = state
                 .current_lobby
                 .as_ref()
-                .map(|lb| (lb.title.clone(), lb.max_players))
+                .map(|lb| (lb.title.clone(), lb.max_players, lb.is_starting))
             {
+                if is_starting {
+                    return;
+                }
                 state.create_title = title;
+                state.create_password.clear();
                 state.create_capacity = cap;
                 state.edit_lobby_settings_open = true;
                 state.focused = FocusedInput::LobbyTitle;
@@ -1874,18 +2085,28 @@ fn handle_pregame_buttons_system(
             }
         }
         PreGameBtnAction::SaveLobbySettings => {
+            if state.current_lobby.as_ref().is_some_and(|lb| lb.is_starting) {
+                return;
+            }
             state.is_loading = true;
             state.loading_label = "SAVING LOBBY SETTINGS".to_string();
-            backend.send_lobby_action(serde_json::json!({
+            let mut payload = serde_json::json!({
                 "action": "update_settings",
                 "title": state.create_title.trim(),
-                "password": state.create_password.trim(),
                 "max_players": state.create_capacity,
-            }));
+            });
+            let pw = state.create_password.trim();
+            if !pw.is_empty() {
+                payload["password"] = serde_json::Value::String(pw.to_string());
+            }
+            backend.send_lobby_action(payload);
             state.ui_dirty = true;
         }
         PreGameBtnAction::SwapLobbyTeam => {
             if let Some(ref lb) = state.current_lobby {
+                if lb.is_starting {
+                    return;
+                }
                 let my_uid = state
                     .profile
                     .as_ref()
@@ -1935,6 +2156,17 @@ fn handle_pregame_buttons_system(
                 .pending_lobby_invites
                 .retain(|x| x.lobby_id != lobby_id);
             if accept {
+                if state.party.is_some() {
+                    push_notification(
+                        &mut state,
+                        "error",
+                        "LEAVE PARTY FIRST",
+                        "Leave your active squad before joining a Custom Lobby.",
+                        notif_dur,
+                    );
+                    state.ui_dirty = true;
+                    return;
+                }
                 if needs_pw {
                     state.join_target_lobby_id = Some(lobby_id);
                     state.join_password_input.clear();
@@ -2067,6 +2299,9 @@ fn handle_pregame_buttons_system(
             team_id,
             slot_index,
         } => {
+            if state.current_lobby.as_ref().is_some_and(|lb| lb.is_starting) {
+                return;
+            }
             backend.send_lobby_action(serde_json::json!({
                 "action": "switch_team",
                 "team_id": team_id,
@@ -2074,6 +2309,9 @@ fn handle_pregame_buttons_system(
             }));
         }
         PreGameBtnAction::KickLobbyPlayer(uid) => {
+            if state.current_lobby.as_ref().is_some_and(|lb| lb.is_starting) {
+                return;
+            }
             backend.send_lobby_action(serde_json::json!({
                 "action": "kick_player",
                 "target_user_id": uid
@@ -2243,7 +2481,7 @@ fn rebuild_pregame_ui_system(
 
         if let Some(ref profile) = state.profile {
             if !is_auth {
-                spawn_top_nav_bar(parent, profile, &state, backend.is_social_ws_connected());
+                spawn_top_nav_bar(parent, profile, &state, &config, backend.is_social_ws_connected());
             }
         }
 
@@ -2251,13 +2489,13 @@ fn rebuild_pregame_ui_system(
             PreGameTab::AuthEmail | PreGameTab::AuthOtp => spawn_auth_screen(parent, &state),
             PreGameTab::Hub => spawn_hub_screen(parent, &state, &config),
             PreGameTab::FindingMatch => spawn_finding_match_screen(parent, &state, &config),
-            PreGameTab::LobbyBrowser => spawn_lobby_browser_screen(parent, &state),
-            PreGameTab::LobbyRoom => spawn_lobby_room_screen(parent, &state),
+            PreGameTab::LobbyBrowser => spawn_lobby_browser_screen(parent, &state, &config),
+            PreGameTab::LobbyRoom => spawn_lobby_room_screen(parent, &state, &config),
             PreGameTab::MatchHistory => spawn_history_screen(parent, &state, &config),
         }
 
         if state.create_lobby_modal_open || state.edit_lobby_settings_open {
-            spawn_create_or_edit_lobby_modal(parent, &state);
+            spawn_create_or_edit_lobby_modal(parent, &state, &config);
         }
         if state.join_target_lobby_id.is_some() {
             spawn_join_password_modal(parent, &state);
@@ -2369,7 +2607,7 @@ fn rebuild_pregame_ui_system(
                 ),
                 ConfirmAction::AbandonMatch => (
                     "ABANDON ACTIVE MATCH?",
-                    "Abandoning deducts -25 MMR, records a loss, and prevents reconnecting to this match.",
+                    "ABANDON_BODY_DYNAMIC",
                     "ABANDON MATCH",
                 ),
             };
@@ -2410,8 +2648,16 @@ fn rebuild_pregame_ui_system(
                             },
                             TextColor(Color::srgb(1.0, 0.78, 0.78)),
                         ));
+                        let body_text = if body == "ABANDON_BODY_DYNAMIC" {
+                            format!(
+                                "Abandoning deducts -{} MMR, records a loss, and prevents reconnecting to this match.",
+                                config.main_menu.abandon_mmr_penalty
+                            )
+                        } else {
+                            body.to_string()
+                        };
                         modal.spawn((
-                            Text::new(body),
+                            Text::new(body_text),
                             TextFont {
                                 font_size: FontSize::Px(14.0),
                                 ..default()
@@ -2460,10 +2706,12 @@ fn spawn_top_nav_bar(
     parent: &mut ChildSpawnerCommands,
     profile: &PlayerProfile,
     state: &PreGameSessionState,
+    config: &GameConfig,
     ws_online: bool,
 ) {
     let level_est = (profile.wins + profile.losses + 1).max(1);
-    let mmr_progress_pct = ((profile.mmr % 500) as f32 / 500.0 * 100.0).clamp(8.0, 100.0);
+    let step = config.main_menu.mmr_tier_bar_step;
+    let mmr_progress_pct = (profile.mmr.rem_euclid(step) as f32 / step as f32 * 100.0).clamp(8.0, 100.0);
 
     parent
         .spawn((
@@ -3748,7 +3996,23 @@ fn spawn_left_friends_panel(parent: &mut ChildSpawnerCommands, state: &PreGameSe
                     TextColor(Color::srgb(0.60, 0.74, 0.74)),
                 ));
             } else {
-                for f in state.friends.friends.iter().take(7) {
+                panel
+                    .spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            flex_grow: 1.0,
+                            min_height: Val::Px(0.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(5.0),
+                            overflow: Overflow::scroll_y(),
+                            ..default()
+                        },
+                        ScrollPosition::default(),
+                        RelativeCursorPosition::default(),
+                        PreGameScrollableList,
+                    ))
+                    .with_children(|friends_scroll| {
+                for f in &state.friends.friends {
                     let dot_col = if !f.online {
                         Color::srgb(0.42, 0.48, 0.50)
                     } else if f.status == "in_party" || f.status == "in_queue" {
@@ -3761,9 +4025,9 @@ fn spawn_left_friends_panel(parent: &mut ChildSpawnerCommands, state: &PreGameSe
                         .as_ref()
                         .map(|p| p.members.iter().any(|m| m.user_id == f.user_id))
                         .unwrap_or(false);
-                    let is_inviting = state.pending_sent_invites.contains(&f.user_id);
+                    let is_inviting = state.pending_sent_invites.contains_key(&f.user_id);
 
-                    panel
+                    friends_scroll
                         .spawn((
                             Node {
                                 width: Val::Percent(100.0),
@@ -3865,6 +4129,15 @@ fn spawn_left_friends_panel(parent: &mut ChildSpawnerCommands, state: &PreGameSe
                                             TextColor(Color::srgb(0.98, 0.88, 0.45)),
                                         ));
                                     });
+                                } else if f.online && f.in_party {
+                                    acts.spawn((
+                                        Text::new("IN PARTY"),
+                                        TextFont {
+                                            font_size: FontSize::Px(9.5),
+                                            ..default()
+                                        },
+                                        TextColor(Color::srgb(0.96, 0.78, 0.28)),
+                                    ));
                                 } else if f.online {
                                     spawn_sized_button(
                                         acts,
@@ -3888,6 +4161,7 @@ fn spawn_left_friends_panel(parent: &mut ChildSpawnerCommands, state: &PreGameSe
                             });
                         });
                 }
+                });
             }
         });
 }
@@ -4495,7 +4769,11 @@ fn spawn_join_password_modal(parent: &mut ChildSpawnerCommands, state: &PreGameS
         });
 }
 
-fn spawn_lobby_browser_screen(parent: &mut ChildSpawnerCommands, state: &PreGameSessionState) {
+fn spawn_lobby_browser_screen(
+    parent: &mut ChildSpawnerCommands,
+    state: &PreGameSessionState,
+    config: &GameConfig,
+) {
     let gold = Color::srgb(0.98, 0.82, 0.30);
     let q_lower = state.lobby_search_input.trim().to_ascii_lowercase();
     let filtered: Vec<&LobbySummary> = state
@@ -4675,7 +4953,23 @@ fn spawn_lobby_browser_screen(parent: &mut ChildSpawnerCommands, state: &PreGame
                             ));
                         });
                 } else {
-                    for lb in filtered.iter().take(9) {
+                    table
+                        .spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                flex_grow: 1.0,
+                                min_height: Val::Px(0.0),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(6.0),
+                                overflow: Overflow::scroll_y(),
+                                ..default()
+                            },
+                            ScrollPosition::default(),
+                            RelativeCursorPosition::default(),
+                            PreGameScrollableList,
+                        ))
+                        .with_children(|rows_scroll| {
+                    for lb in &filtered {
                         let is_full = lb.current_players >= lb.max_players;
                         let is_selected = state
                             .selected_lobby_id
@@ -4708,13 +5002,14 @@ fn spawn_lobby_browser_screen(parent: &mut ChildSpawnerCommands, state: &PreGame
                             Color::srgb(0.92, 0.97, 0.96)
                         };
 
-                        table
+                        rows_scroll
                             .spawn((
                                 UiButton,
                                 Hovered::default(),
                                 Node {
                                     width: Val::Percent(100.0),
                                     height: Val::Px(46.0),
+                                    flex_shrink: 0.0,
                                     padding: UiRect::axes(Val::Px(14.0), Val::Px(6.0)),
                                     flex_direction: FlexDirection::Row,
                                     align_items: AlignItems::Center,
@@ -4732,7 +5027,7 @@ fn spawn_lobby_browser_screen(parent: &mut ChildSpawnerCommands, state: &PreGame
                                     (format!("{}{}", lb.title, lock_tag), 28.0, txt_col),
                                     (lb.host_username.clone(), 16.0, txt_col),
                                     (format!("{}v{} JUNGLE SKIRMISH", half, half), 20.0, txt_col),
-                                    ("ANCIENT RIVER TEMPLE".to_string(), 18.0, txt_col),
+                                    (config.main_menu.default_map_name.clone(), 18.0, txt_col),
                                     (
                                         format!("{} / {}", lb.current_players, lb.max_players),
                                         10.0,
@@ -4763,6 +5058,7 @@ fn spawn_lobby_browser_screen(parent: &mut ChildSpawnerCommands, state: &PreGame
                                 }
                             });
                     }
+                    });
                 }
             });
 
@@ -4815,7 +5111,11 @@ fn spawn_lobby_browser_screen(parent: &mut ChildSpawnerCommands, state: &PreGame
         });
 }
 
-fn spawn_create_or_edit_lobby_modal(parent: &mut ChildSpawnerCommands, state: &PreGameSessionState) {
+fn spawn_create_or_edit_lobby_modal(
+    parent: &mut ChildSpawnerCommands,
+    state: &PreGameSessionState,
+    config: &GameConfig,
+) {
     let is_edit = state.edit_lobby_settings_open;
     let title_txt = if is_edit { "LOBBY SETTINGS" } else { "CREATE CUSTOM LOBBY" };
     let submit_txt = if is_edit { "SAVE SETTINGS" } else { "CREATE LOBBY" };
@@ -4947,7 +5247,7 @@ fn spawn_create_or_edit_lobby_modal(parent: &mut ChildSpawnerCommands, state: &P
                                 ..default()
                             })
                             .with_children(|row| {
-                                for cap in [2usize, 4, 6, 8, 10] {
+                                for &cap in &config.main_menu.lobby_capacities {
                                     let sel = state.create_capacity == cap;
                                     let h = cap / 2;
                                     spawn_sized_button(
@@ -5000,7 +5300,7 @@ fn spawn_create_or_edit_lobby_modal(parent: &mut ChildSpawnerCommands, state: &P
                         ))
                         .with_children(|b| {
                             b.spawn((
-                                Text::new("ANCIENT RIVER TEMPLE"),
+                                Text::new(config.main_menu.default_map_name.clone()),
                                 TextFont { font_size: FontSize::Px(13.0), ..default() },
                                 TextColor(Color::srgb(0.88, 0.96, 0.95)),
                             ));
@@ -5143,7 +5443,11 @@ fn spawn_lobby_invite_modal(parent: &mut ChildSpawnerCommands, state: &PreGameSe
         });
 }
 
-fn spawn_lobby_room_screen(parent: &mut ChildSpawnerCommands, state: &PreGameSessionState) {
+fn spawn_lobby_room_screen(
+    parent: &mut ChildSpawnerCommands,
+    state: &PreGameSessionState,
+    config: &GameConfig,
+) {
     let Some(ref lobby) = state.current_lobby else {
         return;
     };
@@ -5218,7 +5522,7 @@ fn spawn_lobby_room_screen(parent: &mut ChildSpawnerCommands, state: &PreGameSes
                     for (k, v) in [
                         ("LOBBY ID", format!("#{}", lobby.lobby_id)),
                         ("GAME MODE", format!("{}v{} JUNGLE SKIRMISH", half, half)),
-                        ("MAP", "ANCIENT RIVER TEMPLE".to_string()),
+                        ("MAP", config.main_menu.default_map_name.clone()),
                     ] {
                         meta.spawn(Node {
                             flex_direction: FlexDirection::Column,
@@ -5890,7 +6194,22 @@ fn spawn_history_screen(
                             ));
                         });
                     } else {
-                        for (idx, m) in filtered_matches.iter().enumerate().take(8) {
+                        log.spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                flex_grow: 1.0,
+                                min_height: Val::Px(0.0),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(6.0),
+                                overflow: Overflow::scroll_y(),
+                                ..default()
+                            },
+                            ScrollPosition::default(),
+                            RelativeCursorPosition::default(),
+                            PreGameScrollableList,
+                        ))
+                        .with_children(|hist_scroll| {
+                        for (idx, m) in filtered_matches.iter().enumerate() {
                             let is_sel = idx == sel_idx;
                             let (outcome_lbl, accent) = match m.outcome.as_str() {
                                 "win" => ("VICTORY", emerald),
@@ -5909,11 +6228,12 @@ fn spawn_history_screen(
                             };
                             let dur_str = format!("{:02}:{:02}", m.duration_sec / 60, m.duration_sec % 60);
 
-                            log.spawn((
+                            hist_scroll.spawn((
                                 UiButton,
                                 Hovered::default(),
                                 Node {
                                     width: Val::Percent(100.0),
+                                    flex_shrink: 0.0,
                                     height: Val::Px(54.0),
                                     padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
                                     flex_direction: FlexDirection::Row,
@@ -5992,6 +6312,7 @@ fn spawn_history_screen(
                                     });
                             });
                         }
+                        });
                     }
                 });
 
@@ -6044,7 +6365,7 @@ fn spawn_history_screen(
                                     "SOLO"
                                 };
                                 det.spawn((
-                                    Text::new(format!("{}  |  ANCIENT RIVER TEMPLE  |  {}  [{}]", o_lbl, dur_str, tag)),
+                                    Text::new(format!("{}  |  {}  |  {}  [{}]", o_lbl, config.main_menu.default_map_name, dur_str, tag)),
                                     TextFont { font_size: FontSize::Px(11.5), ..default() },
                                     TextColor(o_col),
                                 ));
@@ -6261,137 +6582,6 @@ fn spawn_conceptual_loader(parent: &mut ChildSpawnerCommands, label: &str, color
                 TextColor(color),
             ));
         });
-}
-
-fn spawn_input_box(
-    parent: &mut ChildSpawnerCommands,
-    label: &str,
-    value: &str,
-    placeholder: &str,
-    is_focused: bool,
-    action: PreGameBtnAction,
-) {
-    let border_col = if is_focused {
-        Color::srgb(0.98, 0.80, 0.26)
-    } else {
-        Color::srgba(0.35, 0.48, 0.68, 0.6)
-    };
-    parent
-        .spawn((
-            UiButton,
-            Hovered::default(),
-            Node {
-                width: Val::Percent(100.0),
-                padding: UiRect::axes(Val::Px(14.0), Val::Px(10.0)),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(4.0),
-                border: UiRect::all(Val::Px(1.5)),
-                border_radius: BorderRadius::all(Val::Px(10.0)),
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.03, 0.05, 0.09, 0.95)),
-            BorderColor::all(border_col),
-            action,
-        ))
-        .with_children(|f| {
-            f.spawn((
-                Text::new(label),
-                TextFont { font_size: FontSize::Px(11.0), ..default() },
-                TextColor(border_col),
-            ));
-            let display_txt = if value.is_empty() {
-                placeholder.to_string()
-            } else if is_focused {
-                format!("{}|", value)
-            } else {
-                value.to_string()
-            };
-            f.spawn((
-                Text::new(display_txt),
-                TextFont { font_size: FontSize::Px(15.5), ..default() },
-                TextColor(if value.is_empty() {
-                    Color::srgb(0.45, 0.52, 0.64)
-                } else {
-                    Color::WHITE
-                }),
-            ));
-        });
-}
-
-fn spawn_action_button(
-    parent: &mut ChildSpawnerCommands,
-    label: &str,
-    color: Color,
-    action: PreGameBtnAction,
-) {
-    parent
-        .spawn((
-            UiButton,
-            Hovered::default(),
-            Node {
-                padding: UiRect::axes(Val::Px(22.0), Val::Px(11.0)),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border: UiRect::all(Val::Px(1.5)),
-                border_radius: BorderRadius::all(Val::Px(10.0)),
-                ..default()
-            },
-            BackgroundColor(color.with_alpha(0.22)),
-            BorderColor::all(color),
-            action,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new(label),
-                TextFont { font_size: FontSize::Px(14.5), ..default() },
-                TextColor(Color::WHITE),
-            ));
-        });
-}
-
-fn spawn_mini_stat_chip(parent: &mut ChildSpawnerCommands, label: &str, val: &str, color: Color) {
-    parent
-        .spawn((
-            Node {
-                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                border: UiRect::all(Val::Px(1.0)),
-                border_radius: BorderRadius::all(Val::Px(10.0)),
-                ..default()
-            },
-            BackgroundColor(color.with_alpha(0.12)),
-            BorderColor::all(color.with_alpha(0.6)),
-        ))
-        .with_children(|c| {
-            c.spawn((
-                Text::new(val),
-                TextFont { font_size: FontSize::Px(17.0), ..default() },
-                TextColor(Color::WHITE),
-            ));
-            c.spawn((
-                Text::new(label),
-                TextFont { font_size: FontSize::Px(11.0), ..default() },
-                TextColor(color),
-            ));
-        });
-}
-
-#[allow(dead_code)]
-fn rank_tier_color(tier: &str) -> Color {
-    if tier.contains("Immortal") {
-        Color::srgb(0.98, 0.35, 0.45)
-    } else if tier.contains("Champion") {
-        Color::srgb(0.82, 0.46, 0.98)
-    } else if tier.contains("Golden") {
-        Color::srgb(0.98, 0.80, 0.26)
-    } else if tier.contains("Silver") {
-        Color::srgb(0.75, 0.84, 0.95)
-    } else if tier.contains("Initiate") {
-        Color::srgb(0.24, 0.86, 0.62)
-    } else {
-        Color::srgb(0.78, 0.52, 0.32)
-    }
 }
 
 #[inline]

@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import os
 import secrets
@@ -7,9 +8,9 @@ import socket
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import timedelta
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs
 
 import redis
@@ -32,6 +33,356 @@ from .models import (
 )
 
 
+_REDIS_CLIENT_LOCK = threading.Lock()
+_REDIS_CLIENT_CACHE: Optional[redis.Redis] = None
+
+
+def _get_shared_redis() -> redis.Redis:
+    global _REDIS_CLIENT_CACHE
+    with _REDIS_CLIENT_LOCK:
+        if _REDIS_CLIENT_CACHE is not None:
+            try:
+                _REDIS_CLIENT_CACHE.ping()
+                return _REDIS_CLIENT_CACHE
+            except Exception:
+                _REDIS_CLIENT_CACHE = None
+
+        raw_urls = [
+            getattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/0"),
+            getattr(settings, "REDIS_FALLBACK_URL", "redis://172.21.13.50:6379/0"),
+        ]
+        seen_urls: List[str] = []
+        for u in raw_urls:
+            if u and u not in seen_urls:
+                seen_urls.append(u)
+
+        last_exc: Optional[Exception] = None
+        for url in seen_urls:
+            try:
+                client = redis.Redis.from_url(
+                    url,
+                    decode_responses=True,
+                    socket_connect_timeout=1.5,
+                    socket_timeout=2.0,
+                )
+                client.ping()
+                _REDIS_CLIENT_CACHE = client
+                return client
+            except Exception as exc:
+                last_exc = exc
+
+        raise RuntimeError(f"Cannot connect to Redis on {seen_urls}: {last_exc}")
+
+
+class _RedisHashStore:
+    """
+    ذخیره‌سازی توزیع‌شده ساختارها در Redis Hash با کش تراکنشی در محدوده هر Lock
+    تا هر تغییری روی آبجکت‌ها در پایان قفل به‌صورت خودکار در Redis ذخیره شود.
+    """
+
+    def __init__(self, redis_key: str, from_dict: Callable[[dict], Any]):
+        self.redis_key = redis_key
+        self._from_dict = from_dict
+        self._tx_var: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+            f"tx_{redis_key}", default=None
+        )
+        self._deleted_var: contextvars.ContextVar[Optional[set]] = contextvars.ContextVar(
+            f"del_{redis_key}", default=None
+        )
+
+    async def begin_tx_async(self) -> tuple:
+        t1 = self._tx_var.set({})
+        t2 = self._deleted_var.set(set())
+        return (t1, t2)
+
+    async def commit_and_end_tx_async(self, tokens: tuple) -> None:
+        cache = self._tx_var.get()
+        deleted = self._deleted_var.get()
+        self._tx_var.reset(tokens[0])
+        self._deleted_var.reset(tokens[1])
+        del_list = list(deleted) if deleted else []
+        mapping = {k: json.dumps(asdict(v)) for k, v in cache.items()} if cache else {}
+        if not del_list and not mapping:
+            return
+
+        def _flush():
+            r = _get_shared_redis()
+            if del_list:
+                r.hdel(self.redis_key, *del_list)
+            if mapping:
+                r.hset(self.redis_key, mapping=mapping)
+
+        try:
+            await asyncio.to_thread(_flush)
+        except Exception as exc:
+            print(f"[REDIS STORE ERROR] {self.redis_key}: {exc}", flush=True)
+
+    def _load_one(self, key: str) -> Any:
+        raw = _get_shared_redis().hget(self.redis_key, key)
+        if not raw:
+            return None
+        return self._from_dict(json.loads(raw))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        cache = self._tx_var.get()
+        deleted = self._deleted_var.get()
+        if deleted is not None and key in deleted:
+            return default
+        if cache is not None and key in cache:
+            return cache[key]
+        obj = self._load_one(key)
+        if obj is None:
+            return default
+        if cache is not None:
+            cache[key] = obj
+        return obj
+
+    def mget(self, keys: List[str]) -> Dict[str, Any]:
+        if not keys:
+            return {}
+        raw_vals = _get_shared_redis().hmget(self.redis_key, keys)
+        out: Dict[str, Any] = {}
+        for k, raw in zip(keys, raw_vals):
+            if raw:
+                out[k] = self._from_dict(json.loads(raw))
+        return out
+
+    def __getitem__(self, key: str) -> Any:
+        obj = self.get(key)
+        if obj is None:
+            raise KeyError(key)
+        return obj
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        cache = self._tx_var.get()
+        deleted = self._deleted_var.get()
+        if cache is not None:
+            cache[key] = value
+            if deleted is not None:
+                deleted.discard(key)
+        else:
+            _get_shared_redis().hset(self.redis_key, key, json.dumps(asdict(value)))
+
+    def pop(self, key: str, default: Any = None) -> Any:
+        cache = self._tx_var.get()
+        deleted = self._deleted_var.get()
+        val = self.get(key, default)
+        if cache is not None:
+            cache.pop(key, None)
+            if deleted is not None:
+                deleted.add(key)
+        else:
+            _get_shared_redis().hdel(self.redis_key, key)
+        return val
+
+    def __contains__(self, key: str) -> bool:
+        return self.get(key) is not None
+
+    def values(self) -> List[Any]:
+        return [v for _, v in self.items()]
+
+    def items(self) -> List[tuple]:
+        cache = self._tx_var.get()
+        deleted = self._deleted_var.get() or set()
+        raw_map = _get_shared_redis().hgetall(self.redis_key)
+        out: List[tuple] = []
+        seen = set()
+        for k, raw in raw_map.items():
+            if k in deleted:
+                continue
+            seen.add(k)
+            if cache is not None and k in cache:
+                out.append((k, cache[k]))
+            else:
+                obj = self._from_dict(json.loads(raw))
+                if cache is not None:
+                    cache[k] = obj
+                out.append((k, obj))
+        if cache is not None:
+            for k, v in cache.items():
+                if k not in seen and k not in deleted:
+                    out.append((k, v))
+        return out
+
+
+class _RedisChannelSet:
+    """
+    مجموعه کانال‌های مرورگر لابی در Redis Set برای پخش همگانی بین تمام Instanceها
+    """
+
+    def __init__(self, redis_key: str = "simorgh:lobby_browsers"):
+        self.redis_key = redis_key
+
+    def add(self, channel_name: str) -> None:
+        if channel_name:
+            _get_shared_redis().sadd(self.redis_key, channel_name)
+
+    def discard(self, channel_name: str) -> None:
+        if channel_name:
+            _get_shared_redis().srem(self.redis_key, channel_name)
+
+    def __iter__(self):
+        return iter(_get_shared_redis().smembers(self.redis_key))
+
+
+class _RedisQueueList:
+    """
+    صف توزیع‌شده Matchmaking در Redis (ذخیره‌شده زیر کلید JSON با همگام‌سازی در Lock)
+    """
+
+    def __init__(self, redis_key: str, from_dict: Callable[[dict], Any]):
+        self.redis_key = redis_key
+        self._from_dict = from_dict
+        self._tx_var: contextvars.ContextVar[Optional[List[Any]]] = contextvars.ContextVar(
+            f"tx_q_{redis_key}", default=None
+        )
+
+    async def begin_tx_async(self) -> contextvars.Token:
+        def _load():
+            raw = _get_shared_redis().get(self.redis_key)
+            return [self._from_dict(d) for d in json.loads(raw)] if raw else []
+
+        items = await asyncio.to_thread(_load)
+        return self._tx_var.set(items)
+
+    async def commit_and_end_tx_async(self, token: contextvars.Token) -> None:
+        items = self._tx_var.get()
+        self._tx_var.reset(token)
+        if items is None:
+            return
+        payload = json.dumps([asdict(x) for x in items])
+        try:
+            await asyncio.to_thread(lambda: _get_shared_redis().set(self.redis_key, payload))
+        except Exception as exc:
+            print(f"[REDIS QUEUE ERROR] {self.redis_key}: {exc}", flush=True)
+
+    def _items(self) -> List[Any]:
+        items = self._tx_var.get()
+        if items is not None:
+            return items
+        raw = _get_shared_redis().get(self.redis_key)
+        return [self._from_dict(d) for d in json.loads(raw)] if raw else []
+
+    def __len__(self) -> int:
+        return len(self._items())
+
+    def __iter__(self):
+        return iter(self._items())
+
+    def __getitem__(self, idx):
+        return self._items()[idx]
+
+    def __setitem__(self, idx, value) -> None:
+        items = self._tx_var.get()
+        if items is not None:
+            items[idx] = value
+        else:
+            cur = self._items()
+            cur[idx] = value
+            _get_shared_redis().set(self.redis_key, json.dumps([asdict(x) for x in cur]))
+
+    def append(self, value: Any) -> None:
+        items = self._tx_var.get()
+        if items is not None:
+            items.append(value)
+        else:
+            cur = self._items()
+            cur.append(value)
+            _get_shared_redis().set(self.redis_key, json.dumps([asdict(x) for x in cur]))
+
+
+class _RedisPortDict:
+    """
+    نگهداری توزیع‌شده پورت‌های رزروشده سرور بازی در Redis Hash (port -> unit_name)
+    """
+
+    def __init__(self, redis_key: str = "simorgh:active_ports"):
+        self.redis_key = redis_key
+
+    def __getitem__(self, port: int) -> str:
+        val = _get_shared_redis().hget(self.redis_key, str(port))
+        if val is None:
+            raise KeyError(port)
+        return val
+
+    def __setitem__(self, port: int, unit_name: str) -> None:
+        _get_shared_redis().hset(self.redis_key, str(port), unit_name)
+
+    def __contains__(self, port: object) -> bool:
+        try:
+            return bool(_get_shared_redis().hexists(self.redis_key, str(int(port))))  # type: ignore[arg-type]
+        except Exception:
+            return False
+
+    def pop(self, port: int, default: Any = None) -> Any:
+        r = _get_shared_redis()
+        key_s = str(port)
+        val = r.hget(self.redis_key, key_s)
+        if val is None:
+            return default
+        r.hdel(self.redis_key, key_s)
+        return val
+
+    def items(self) -> List[tuple]:
+        raw_map = _get_shared_redis().hgetall(self.redis_key)
+        return [(int(k), v) for k, v in raw_map.items()]
+
+
+class _RedisLockManager:
+    """
+    قفل توزیع‌شده غیرمسدودکننده Redis بین تمام پروسه‌ها و سرورهای بک‌اند + همگام‌سازی خودکار استورهای داخل قفل
+    """
+
+    _RELEASE_LUA = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end"
+    )
+
+    def __init__(self, lock_key: str, stores: List[Any], ttl_ms: int = 8000):
+        self.lock_key = lock_key
+        self.stores = stores
+        self.ttl_ms = ttl_ms
+        self._token_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+            f"lock_tok_{lock_key}", default=None
+        )
+        self._store_tokens_var: contextvars.ContextVar[Optional[List[tuple]]] = contextvars.ContextVar(
+            f"lock_st_{lock_key}", default=None
+        )
+
+    def _acquire_sync(self, token: str) -> bool:
+        return bool(_get_shared_redis().set(self.lock_key, token, nx=True, px=self.ttl_ms))
+
+    def _release_sync(self, token: str) -> None:
+        try:
+            _get_shared_redis().eval(self._RELEASE_LUA, 1, self.lock_key, token)
+        except Exception:
+            pass
+
+    async def __aenter__(self):
+        token = secrets.token_hex(12)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if await asyncio.to_thread(self._acquire_sync, token):
+                break
+            await asyncio.sleep(0.008)
+        self._token_var.set(token)
+        st_tokens = []
+        for st in self.stores:
+            st_tokens.append((st, await st.begin_tx_async()))
+        self._store_tokens_var.set(st_tokens)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        st_tokens = self._store_tokens_var.get() or []
+        for st, tok in reversed(st_tokens):
+            await st.commit_and_end_tx_async(tok)
+        self._store_tokens_var.set(None)
+        token = self._token_var.get()
+        self._token_var.set(None)
+        if token:
+            await asyncio.to_thread(self._release_sync, token)
+
+
 @dataclass
 class QueuedPlayerEntry:
     user_id: str
@@ -42,13 +393,25 @@ class QueuedPlayerEntry:
     client_ip: str = ""
     party_group_id: str = ""
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "QueuedPlayerEntry":
+        return cls(
+            user_id=str(d.get("user_id", "")),
+            username=str(d.get("username", "")),
+            mmr=int(d.get("mmr", 1000)),
+            channel_name=str(d.get("channel_name", "")),
+            player_pk=int(d.get("player_pk", 0)),
+            client_ip=str(d.get("client_ip", "")),
+            party_group_id=str(d.get("party_group_id", "")),
+        )
 
-# صف جهانی Matchmaking و قفل همگام‌سازی در حافظه ASGI
-_QUEUE_LOCK = asyncio.Lock()
-_WAITING_QUEUE: List[QueuedPlayerEntry] = []
+
+# صف جهانی Matchmaking و قفل همگام‌سازی توزیع‌شده در Redis
+_WAITING_QUEUE = _RedisQueueList("simorgh:mm_queue", QueuedPlayerEntry.from_dict)
+_QUEUE_LOCK = _RedisLockManager("simorgh:lock:mm_queue", [_WAITING_QUEUE])
 
 # نگهداری نام سرویس systemd فعال روی هر پورت: port -> "moba-server@4433_room-101_2.service"
-_ACTIVE_SERVICE_UNITS: Dict[int, str] = {}
+_ACTIVE_SERVICE_UNITS = _RedisPortDict("simorgh:active_ports")
 # برای سازگاری با پنل ادمین
 _RESERVED_PORTS = _ACTIVE_SERVICE_UNITS
 
@@ -1295,6 +1658,18 @@ class CustomLobbyMember:
     slot_index: int  # 0 .. (max_players // 2 - 1) در تیم مربوطه
     client_ip: str = ""
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "CustomLobbyMember":
+        return cls(
+            user_id=str(d.get("user_id", "")),
+            username=str(d.get("username", "")),
+            player_pk=int(d.get("player_pk", 0)),
+            channel_name=str(d.get("channel_name", "")),
+            team_id=int(d.get("team_id", 1)),
+            slot_index=int(d.get("slot_index", 0)),
+            client_ip=str(d.get("client_ip", "")),
+        )
+
 
 @dataclass
 class CustomLobbyRoom:
@@ -1308,10 +1683,24 @@ class CustomLobbyRoom:
     chat_history: List[dict]
     is_starting: bool = False
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "CustomLobbyRoom":
+        return cls(
+            lobby_id=str(d.get("lobby_id", "")),
+            title=str(d.get("title", "")),
+            password=str(d.get("password", "")),
+            max_players=int(d.get("max_players", 2)),
+            host_user_id=str(d.get("host_user_id", "")),
+            host_username=str(d.get("host_username", "")),
+            members=[CustomLobbyMember.from_dict(m) for m in d.get("members", [])],
+            chat_history=list(d.get("chat_history", [])),
+            is_starting=bool(d.get("is_starting", False)),
+        )
 
-_LOBBY_LOCK = asyncio.Lock()
-_ACTIVE_LOBBIES: Dict[str, CustomLobbyRoom] = {}
-_LOBBY_BROWSER_CHANNELS: set = set()
+
+_ACTIVE_LOBBIES = _RedisHashStore("simorgh:active_lobbies", CustomLobbyRoom.from_dict)
+_LOBBY_LOCK = _RedisLockManager("simorgh:lock:lobbies", [_ACTIVE_LOBBIES])
+_LOBBY_BROWSER_CHANNELS = _RedisChannelSet("simorgh:lobby_browsers")
 
 
 def _serialize_lobby_summary(lobby: CustomLobbyRoom) -> dict:
@@ -2261,6 +2650,20 @@ class OnlineUserSession:
     status: str = "online"  # online | in_party | in_queue | in_match
     party_id: Optional[str] = None
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "OnlineUserSession":
+        return cls(
+            user_id=str(d.get("user_id", "")),
+            username=str(d.get("username", "")),
+            mmr=int(d.get("mmr", 1000)),
+            rank_tier=str(d.get("rank_tier", "Simorgh Initiate")),
+            player_pk=int(d.get("player_pk", 0)),
+            channel_name=str(d.get("channel_name", "")),
+            client_ip=str(d.get("client_ip", "")),
+            status=str(d.get("status", "online")),
+            party_id=d.get("party_id"),
+        )
+
 
 @dataclass
 class PartyMember:
@@ -2273,6 +2676,19 @@ class PartyMember:
     client_ip: str = ""
     is_ready: bool = False
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "PartyMember":
+        return cls(
+            user_id=str(d.get("user_id", "")),
+            username=str(d.get("username", "")),
+            mmr=int(d.get("mmr", 1000)),
+            rank_tier=str(d.get("rank_tier", "Simorgh Initiate")),
+            player_pk=int(d.get("player_pk", 0)),
+            channel_name=str(d.get("channel_name", "")),
+            client_ip=str(d.get("client_ip", "")),
+            is_ready=bool(d.get("is_ready", False)),
+        )
+
 
 @dataclass
 class PartyRoom:
@@ -2283,6 +2699,18 @@ class PartyRoom:
     members: List[PartyMember]
     chat_history: List[dict]
     is_queuing: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PartyRoom":
+        return cls(
+            party_id=str(d.get("party_id", "")),
+            leader_user_id=str(d.get("leader_user_id", "")),
+            game_mode=str(d.get("game_mode", "")),
+            max_size=int(d.get("max_size", 5)),
+            members=[PartyMember.from_dict(m) for m in d.get("members", [])],
+            chat_history=list(d.get("chat_history", [])),
+            is_queuing=bool(d.get("is_queuing", False)),
+        )
 
 
 @dataclass
@@ -2296,11 +2724,27 @@ class PartyInvite:
     created_at: float
     expires_at: float
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "PartyInvite":
+        return cls(
+            invite_id=str(d.get("invite_id", "")),
+            party_id=str(d.get("party_id", "")),
+            from_user_id=str(d.get("from_user_id", "")),
+            from_username=str(d.get("from_username", "")),
+            to_user_id=str(d.get("to_user_id", "")),
+            game_mode=str(d.get("game_mode", "")),
+            created_at=float(d.get("created_at", 0.0)),
+            expires_at=float(d.get("expires_at", 0.0)),
+        )
 
-_SOCIAL_LOCK = asyncio.Lock()
-_ONLINE_USERS: Dict[str, OnlineUserSession] = {}
-_ACTIVE_PARTIES: Dict[str, PartyRoom] = {}
-_PENDING_PARTY_INVITES: Dict[str, PartyInvite] = {}
+
+_ONLINE_USERS = _RedisHashStore("simorgh:online_users", OnlineUserSession.from_dict)
+_ACTIVE_PARTIES = _RedisHashStore("simorgh:active_parties", PartyRoom.from_dict)
+_PENDING_PARTY_INVITES = _RedisHashStore("simorgh:party_invites", PartyInvite.from_dict)
+_SOCIAL_LOCK = _RedisLockManager(
+    "simorgh:lock:social",
+    [_ONLINE_USERS, _ACTIVE_PARTIES, _PENDING_PARTY_INVITES],
+)
 
 
 def get_player_presence_snapshot(user_id: str) -> dict:
@@ -2364,7 +2808,7 @@ def _serialize_party_state(party: PartyRoom) -> dict:
 
 
 def _serialize_party_invite(inv: PartyInvite) -> dict:
-    remaining = max(0, int(inv.expires_at - time.monotonic()))
+    remaining = max(0, int(inv.expires_at - time.time()))
     return {
         "invite_id": inv.invite_id,
         "party_id": inv.party_id,
@@ -2376,7 +2820,7 @@ def _serialize_party_invite(inv: PartyInvite) -> dict:
 
 
 def _prune_expired_invites() -> None:
-    now = time.monotonic()
+    now = time.time()
     expired = [
         iid for iid, inv in _PENDING_PARTY_INVITES.items() if inv.expires_at <= now
     ]
@@ -2394,13 +2838,23 @@ def build_friends_payload_for_player(player: Player) -> dict:
         )
     )
 
+    other_ids = [
+        (f.addressee.user_id if f.requester_id == player.id else f.requester.user_id)
+        for f in friendships
+    ]
+    online_map = _ONLINE_USERS.mget(other_ids)
+
     friends = []
     incoming = []
     outgoing = []
 
     for f in friendships:
         other = f.addressee if f.requester_id == player.id else f.requester
-        pres = get_player_presence_snapshot(other.user_id)
+        sess = online_map.get(other.user_id)
+        if sess:
+            pres = {"online": True, "status": sess.status, "party_id": sess.party_id}
+        else:
+            pres = {"online": False, "status": "offline", "party_id": None}
         if f.status == Friendship.STATUS_ACCEPTED:
             friends.append(
                 {
@@ -2571,11 +3025,11 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
             return
         friend_ids = await _get_friend_user_ids_async(self.player.pk)
         targets = []
-        async with _SOCIAL_LOCK:
-            for fid in friend_ids:
-                fsess = _ONLINE_USERS.get(fid)
-                if fsess and fsess.channel_name:
-                    targets.append(fsess.channel_name)
+        online_friends = await asyncio.to_thread(_ONLINE_USERS.mget, friend_ids)
+        for fid in friend_ids:
+            fsess = online_friends.get(fid)
+            if fsess and fsess.channel_name:
+                targets.append(fsess.channel_name)
 
         payload = {
             "event": "friend_presence",
@@ -2794,7 +3248,7 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 if inv.party_id == party.party_id and inv.to_user_id == target_uid:
                     _PENDING_PARTY_INVITES.pop(iid, None)
 
-            now = time.monotonic()
+            now = time.time()
             invite_id = f"inv_{secrets.token_hex(6)}"
             invite = PartyInvite(
                 invite_id=invite_id,

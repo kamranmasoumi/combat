@@ -73,12 +73,11 @@ DATABASES = {
 }
 
 # آدرس Redis (هم برای تیکت‌های سرور بازی Rust و هم در صورت نیاز برای Channels)
-REDIS_URL = os.environ.get("REDIS_URL", "redis://172.21.13.50:6379/0")
-REDIS_FALLBACK_URL = os.environ.get("REDIS_FALLBACK_URL", "redis://127.0.0.1:6379/0")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+REDIS_FALLBACK_URL = os.environ.get("REDIS_FALLBACK_URL", "redis://172.21.13.50:6379/0")
 
-# برای مدیریت وب‌سوکت‌ها در یک پروسه واحد از InMemoryChannelLayer استفاده می‌شود
-# (یا در صورت تنظیم USE_REDIS_CHANNEL_LAYER=1 از RedisChannelLayer استفاده می‌کند)
-if os.environ.get("USE_REDIS_CHANNEL_LAYER", "0") == "1":
+# پیش‌فرض روی RedisChannelLayer تنظیم شده تا چند Instance همزمان به‌درستی ارتباط داشته باشند
+if os.environ.get("USE_REDIS_CHANNEL_LAYER", "1") == "1":
     CHANNEL_LAYERS = {
         "default": {
             "BACKEND": "channels_redis.core.RedisChannelLayer",
@@ -95,7 +94,7 @@ else:
     }
 
 # تنظیمات Matchmaking و اجرای سرویس systemd سرور بازی
-MATCHMAKING_PLAYERS_PER_MATCH = int(os.environ.get("MATCHMAKING_PLAYERS_PER_MATCH", "1"))
+MATCHMAKING_PLAYERS_PER_MATCH = int(os.environ.get("MATCHMAKING_PLAYERS_PER_MATCH", "10"))
 GAME_SERVER_HOST = os.environ.get("GAME_SERVER_HOST", "127.0.0.1")
 GAME_SERVER_PORT_START = int(os.environ.get("GAME_SERVER_PORT_START", "4433"))
 GAME_SERVER_PORT_END = int(os.environ.get("GAME_SERVER_PORT_END", "4550"))

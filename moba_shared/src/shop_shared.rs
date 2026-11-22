@@ -2997,11 +2997,34 @@ pub fn resolve_teleport_destination(
     requested_pos: Vec3,
     from_minimap: bool,
 ) -> Option<Vec3> {
+    resolve_teleport_destination_with_target(
+        config,
+        items_cfg,
+        turrets,
+        barracks,
+        ancients,
+        team,
+        requested_pos,
+        from_minimap,
+    )
+    .map(|(pos, _)| pos)
+}
+
+pub fn resolve_teleport_destination_with_target(
+    config: &GameConfig,
+    items_cfg: &ItemsConfig,
+    turrets: &[TurretState],
+    barracks: &[BarracksState],
+    ancients: &[AncientState],
+    team: TeamId,
+    requested_pos: Vec3,
+    from_minimap: bool,
+) -> Option<(Vec3, Option<crate::TeleportTargetBuilding>)> {
     if team == TeamId::Neutral {
         return None;
     }
 
-    let mut best: Option<(f32, Vec3, f32, bool)> = None;
+    let mut best: Option<(f32, Vec3, f32, bool, Option<crate::TeleportTargetBuilding>)> = None;
 
     for t in turrets {
         if t.team != team || t.is_dead {
@@ -3011,8 +3034,8 @@ pub fn resolve_teleport_destination(
         let s = t_def.model_transform.scale_vec();
         let rad = t_def.base_radius * s.x.max(s.z);
         let d = Vec2::new(requested_pos.x - t.pos.x, requested_pos.z - t.pos.z).length();
-        if best.map_or(true, |(bd, _, _, _)| d < bd) {
-            best = Some((d, t.pos, rad, false));
+        if best.map_or(true, |(bd, _, _, _, _)| d < bd) {
+            best = Some((d, t.pos, rad, false, Some(crate::TeleportTargetBuilding::Turret(t.index))));
         }
     }
 
@@ -3024,8 +3047,8 @@ pub fn resolve_teleport_destination(
         let s = b_def.model_transform.scale_vec();
         let rad = 0.5 * (b_def.size.0 * s.x).max(b_def.size.2 * s.z);
         let d = Vec2::new(requested_pos.x - b.pos.x, requested_pos.z - b.pos.z).length();
-        if best.map_or(true, |(bd, _, _, _)| d < bd) {
-            best = Some((d, b.pos, rad, false));
+        if best.map_or(true, |(bd, _, _, _, _)| d < bd) {
+            best = Some((d, b.pos, rad, false, Some(crate::TeleportTargetBuilding::Barracks(b.index))));
         }
     }
 
@@ -3037,8 +3060,8 @@ pub fn resolve_teleport_destination(
         let s = a_def.model_transform.scale_vec();
         let rad = 0.5 * (a_def.base_size.0 * s.x).max(a_def.base_size.2 * s.z);
         let d = Vec2::new(requested_pos.x - a.pos.x, requested_pos.z - a.pos.z).length();
-        if best.map_or(true, |(bd, _, _, _)| d < bd) {
-            best = Some((d, a.pos, rad, false));
+        if best.map_or(true, |(bd, _, _, _, _)| d < bd) {
+            best = Some((d, a.pos, rad, false, Some(crate::TeleportTargetBuilding::Ancient(a.index))));
         }
     }
 
@@ -3048,12 +3071,12 @@ pub fn resolve_teleport_destination(
         }
         let f_pos = ftn.model_transform.location_vec();
         let d = Vec2::new(requested_pos.x - f_pos.x, requested_pos.z - f_pos.z).length();
-        if best.map_or(true, |(bd, _, _, _)| d < bd) {
-            best = Some((d, f_pos, 0.0, true));
+        if best.map_or(true, |(bd, _, _, _, _)| d < bd) {
+            best = Some((d, f_pos, 0.0, true, None));
         }
     }
 
-    let (dist_xz, b_pos, b_rad, is_fountain) = best?;
+    let (dist_xz, b_pos, b_rad, is_fountain, target_bldg) = best?;
     if !from_minimap && dist_xz > items_cfg.teleport.max_click_snap_distance {
         return None;
     }
@@ -3084,7 +3107,7 @@ pub fn resolve_teleport_destination(
     let final_z = b_pos.z + dir_xz.y * clamped_r;
     let final_y = sample_camera_focus_y(config, final_x, final_z);
 
-    Some(Vec3::new(final_x, final_y, final_z))
+    Some((Vec3::new(final_x, final_y, final_z), target_bldg))
 }
 
 
@@ -3215,7 +3238,11 @@ pub fn try_start_teleport(
     let Some(p) = world.players.get(slot_index) else {
         return false;
     };
-    if p.is_dead || p.traversal.is_active || p.wall_climb_mountain_index.is_some() {
+    if p.is_dead
+        || (!config.gameplay_rules.allow_teleport_in_water && p.in_water)
+        || p.traversal.is_active
+        || p.wall_climb_mountain_index.is_some()
+    {
         return false;
     }
     if p.teleport_cooldown_remaining > 0.0 || p.active_teleport.is_some() {
@@ -3236,7 +3263,7 @@ pub fn try_start_teleport(
         return false;
     }
 
-    let Some(mut dest_pos) = resolve_teleport_destination(
+    let Some((mut dest_pos, target_building)) = resolve_teleport_destination_with_target(
         config,
         items_cfg,
         &world.turrets,
@@ -3280,10 +3307,21 @@ pub fn try_start_teleport(
             total_secs: items_cfg.teleport.channel_duration_secs,
             cancel_on_left_click: items_cfg.teleport.cancel_on_left_click,
             cancel_on_move: items_cfg.teleport.cancel_on_move,
+            target_building,
         });
         p_mut.reload_remaining = None;
         p_mut.firing_anim_remaining = None;
         p_mut.active_beam_request = None;
+        if config.gameplay_rules.teleport_breaks_invisibility && p_mut.invisibility_remaining > 0.0 {
+            p_mut.invisibility_remaining = 0.0;
+            p_mut.invisibility_total_secs = 0.0;
+            p_mut.invis_move_speed_bonus_pct = 0.0;
+            p_mut.is_revealed_by_turret = false;
+            world.pending_fx.push(GameplayFxEvent::ShadowBladeEnded {
+                slot_index,
+                pos: origin_pos,
+            });
+        }
     }
 
     world.pending_fx.push(GameplayFxEvent::TeleportStarted {
@@ -3328,9 +3366,29 @@ pub fn step_teleports_system(
     let mut completed_slots: Vec<(usize, Vec3, Vec3, usize)> = Vec::new();
     let mut canceled_slots: Vec<(usize, Vec3)> = Vec::new();
 
+    let dead_turrets: Vec<bool> = world.turrets.iter().map(|t| t.is_dead).collect();
+    let dead_barracks: Vec<bool> = world.barracks.iter().map(|b| b.is_dead).collect();
+    let dead_ancients: Vec<bool> = world.ancients.iter().map(|a| a.is_dead).collect();
+
     for p in &mut world.players {
         if p.teleport_cooldown_remaining > 0.0 {
             p.teleport_cooldown_remaining = (p.teleport_cooldown_remaining - dt).max(0.0);
+        }
+
+        if config.gameplay_rules.cancel_teleport_on_building_destroyed {
+        if let Some(tb) = p.active_teleport.as_ref().and_then(|tp| tp.target_building) {
+            let target_destroyed = match tb {
+                crate::TeleportTargetBuilding::Turret(i) => dead_turrets.get(i).copied().unwrap_or(true),
+                crate::TeleportTargetBuilding::Barracks(i) => dead_barracks.get(i).copied().unwrap_or(true),
+                crate::TeleportTargetBuilding::Ancient(i) => dead_ancients.get(i).copied().unwrap_or(true),
+            };
+            if target_destroyed {
+                if let Some(tp) = p.active_teleport.take() {
+                    canceled_slots.push((p.slot_index, tp.origin_pos));
+                }
+                continue;
+            }
+        }
         }
 
         if let Some(ref mut tp) = p.active_teleport {
@@ -3417,10 +3475,15 @@ pub fn try_activate_shadow_blade(
     if !is_match_action_allowed(world) {
         return false;
     }
+    let allow_sb_during_tp = world.allow_shadow_blade_during_teleport;
     let Some(p) = world.players.get_mut(slot_index) else {
         return false;
     };
-    if p.is_dead || p.shadow_blade_cooldown_remaining > 0.0 || p.invisibility_remaining > 0.0 {
+    if p.is_dead
+        || (!allow_sb_during_tp && p.active_teleport.is_some())
+        || p.shadow_blade_cooldown_remaining > 0.0
+        || p.invisibility_remaining > 0.0
+    {
         return false;
     }
     let Some(inv_item) = p.inventory.iter().find(|it| it.slot == inv_index) else {
@@ -3446,6 +3509,7 @@ pub fn try_activate_shadow_blade(
 /// به‌روزرسانی تایمر غیبی، کولدان Shadow Blade و تشخیص دید واقعی (True Sight) توسط Turretهای دشمن
 pub fn step_shadow_blade_system(
     time: Res<Time<Fixed>>,
+    config: Res<GameConfig>,
     items_cfg: Res<ItemsConfig>,
     mut world: ResMut<AuthoritativeWorldState>,
 ) {
@@ -3469,12 +3533,21 @@ pub fn step_shadow_blade_system(
             p.shadow_blade_cooldown_remaining = (p.shadow_blade_cooldown_remaining - dt).max(0.0);
         }
         if p.invisibility_remaining > 0.0 {
-            p.is_revealed_by_turret = turrets_snapshot.iter().any(|&(t_team, t_pos, t_dead)| {
+            let revealed_by_turret = turrets_snapshot.iter().any(|&(t_team, t_pos, t_dead)| {
                 !t_dead
                     && t_team != p.hero_team
                     && Vec2::new(p.soldier_pos.x - t_pos.x, p.soldier_pos.z - t_pos.z).length()
                         <= true_sight_r
             });
+            let revealed_by_fountain = config.gameplay_rules.fountain_reveals_invisible_enemies
+                && config.map.fountains.iter().any(|ftn| {
+                let fpos = ftn.model_transform.location_vec();
+                ftn.team != p.hero_team
+                    && ftn.team != TeamId::Neutral
+                    && Vec2::new(p.soldier_pos.x - fpos.x, p.soldier_pos.z - fpos.z).length()
+                        <= ftn.true_sight_radius
+            });
+            p.is_revealed_by_turret = revealed_by_turret || revealed_by_fountain;
             p.invisibility_remaining = (p.invisibility_remaining - dt).max(0.0);
             if p.invisibility_remaining <= 0.0 {
                 p.invisibility_total_secs = 0.0;

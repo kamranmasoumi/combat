@@ -2864,6 +2864,35 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 )
                 return
 
+            async with _LOBBY_LOCK:
+                in_custom_lobby = any(
+                    any(m.user_id == self.player.user_id for m in lb.members)
+                    for lb in _ACTIVE_LOBBIES.values()
+                )
+            if in_custom_lobby:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "IN CUSTOM LOBBY",
+                        "message": "Leave your Custom Lobby before joining a party.",
+                    }
+                )
+                return
+
+            async with _QUEUE_LOCK:
+                in_solo_queue = any(q.user_id == self.player.user_id for q in _WAITING_QUEUE)
+            if in_solo_queue:
+                await self.send_json(
+                    {
+                        "event": "notification",
+                        "kind": "error",
+                        "title": "IN MATCHMAKING",
+                        "message": "Cancel matchmaking before joining a party.",
+                    }
+                )
+                return
+
         inviter_channel = None
         joined_party_members: List[PartyMember] = []
         joined_party_detail: Optional[dict] = None
@@ -3282,7 +3311,9 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 member_ids = {m.user_id for m in party.members} | {user_id}
                 async with _QUEUE_LOCK:
                     _WAITING_QUEUE[:] = [
-                        q for q in _WAITING_QUEUE if q.user_id not in member_ids
+                        q
+                        for q in _WAITING_QUEUE
+                        if q.user_id not in member_ids and q.party_group_id != party_id
                     ]
 
             if len(party.members) == 0:

@@ -231,6 +231,9 @@ struct PreGameEntity;
 struct PreGameHiddenHud(Visibility);
 
 #[derive(Component)]
+struct PreGameHiddenWorld(Visibility);
+
+#[derive(Component)]
 struct PreGameDeactivatedCamera;
 
 #[derive(Component, Clone, Copy)]
@@ -446,6 +449,10 @@ fn on_enter_pregame(
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
     mut old_cams_q: Query<(Entity, &mut Camera), (With<Camera3d>, Without<PreGameEntity>)>,
     mut hud_roots: Query<(Entity, &mut Visibility), (With<Node>, Without<ChildOf>, Without<PreGameEntity>)>,
+    mut world_roots: Query<
+        (Entity, &mut Visibility),
+        (Without<Node>, Without<ChildOf>, Without<PreGameEntity>, Without<PreGameHiddenHud>),
+    >,
 ) {
     let mm = &config.main_menu;
     backend.configure_network(
@@ -469,6 +476,10 @@ fn on_enter_pregame(
     }
     for (ent, mut vis) in &mut hud_roots {
         commands.entity(ent).insert(PreGameHiddenHud(*vis));
+        *vis = Visibility::Hidden;
+    }
+    for (ent, mut vis) in &mut world_roots {
+        commands.entity(ent).insert(PreGameHiddenWorld(*vis));
         *vis = Visibility::Hidden;
     }
     showcase.gltf_handle = Some(asset_server.load(mm.soldier_model_path.clone()));
@@ -628,7 +639,8 @@ fn on_exit_pregame(
     mut backend: ResMut<BackendClient>,
     mut showcase: ResMut<MenuShowcaseAssets>,
     query: Query<Entity, With<PreGameEntity>>,
-    mut hidden_huds: Query<(Entity, &mut Visibility, &PreGameHiddenHud)>,
+    mut hidden_huds: Query<(Entity, &mut Visibility, &PreGameHiddenHud), Without<PreGameHiddenWorld>>,
+    mut hidden_worlds: Query<(Entity, &mut Visibility, &PreGameHiddenWorld), Without<PreGameHiddenHud>>,
     mut deactivated_cams: Query<(Entity, &mut Camera), With<PreGameDeactivatedCamera>>,
 ) {
     backend.disconnect_social_ws();
@@ -641,6 +653,10 @@ fn on_exit_pregame(
     for (ent, mut vis, saved) in &mut hidden_huds {
         *vis = saved.0;
         commands.entity(ent).remove::<PreGameHiddenHud>();
+    }
+    for (ent, mut vis, saved) in &mut hidden_worlds {
+        *vis = saved.0;
+        commands.entity(ent).remove::<PreGameHiddenWorld>();
     }
     for (cam_ent, mut cam) in &mut deactivated_cams {
         cam.is_active = true;

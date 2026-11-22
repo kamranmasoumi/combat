@@ -783,6 +783,10 @@ impl Plugin for MobaVfxPlugin {
             .init_resource::<WeatherVfxState>()
             .add_systems(Startup, (init_hanabi_vfx_assets_system, init_bullet_vfx_registry_system))
             .add_systems(
+                OnExit(crate::pregame_ui::AppScreenState::InGame),
+                cleanup_ingame_vfx_on_exit_system,
+            )
+            .add_systems(
                 Update,
                 (
                     process_vfx_events_system,
@@ -2251,13 +2255,56 @@ struct VfxLifetimeQueries<'w, 's> {
     decal_q: Query<'w, 's, (Entity, &'static mut BloodGroundDecal)>,
 }
 
+fn cleanup_ingame_vfx_on_exit_system(
+    mut commands: Commands,
+    mut queue: ResMut<VfxEventQueue>,
+    q: VfxLifetimeQueries,
+) {
+    queue.0.clear();
+    let mut to_despawn = std::collections::HashSet::new();
+    for (ent, _) in &q.one_shot_q {
+        to_despawn.insert(ent);
+    }
+    for (ent, _, _) in &q.light_q {
+        to_despawn.insert(ent);
+    }
+    for (ent, _) in &q.trail_q {
+        to_despawn.insert(ent);
+    }
+    for (ent, _) in &q.flash_q {
+        to_despawn.insert(ent);
+    }
+    for (ent, _, _) in &q.ring_q {
+        to_despawn.insert(ent);
+    }
+    for (ent, _, _) in &q.fireball_q {
+        to_despawn.insert(ent);
+    }
+    for (ent, _, _) in &q.water_exp_q {
+        to_despawn.insert(ent);
+    }
+    for (ent, _) in &q.decal_q {
+        to_despawn.insert(ent);
+    }
+    for ent in to_despawn {
+        commands.entity(ent).despawn();
+    }
+}
+
 fn update_vfx_lifetimes_system(
     mut commands: Commands,
     time: Res<Time>,
+    world_opt: Option<Res<moba_shared::AuthoritativeWorldState>>,
     mut pool: ResMut<VfxMaterialPool>,
     mut mats: VfxLifetimeMaterials,
     mut q: VfxLifetimeQueries,
 ) {
+    if world_opt
+        .as_ref()
+        .is_some_and(|w| w.pause_phase != moba_shared::PausePhase::Running)
+    {
+        return;
+    }
     let dt = time.delta();
     let t = time.elapsed_secs();
 

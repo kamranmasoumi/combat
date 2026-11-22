@@ -1,12 +1,11 @@
-use bevy::app::ScheduleRunnerPlugin;
+use bevy::app::{AppExit, ScheduleRunnerPlugin};
 use bevy::prelude::*;
 use moba_shared::{
     create_shared_renet_server, parse_server_cli_args, step_couriers_system,
     step_shadow_blade_system, step_teleports_system, step_weather_and_environment_system,
     try_activate_shadow_blade, try_buy_cart, try_buy_item, try_cancel_teleport,
     try_courier_deliver, try_courier_move_to, try_courier_return_to_fountain, try_cycle_item_mode,
-    try_sell_courier_item, try_sell_item, try_start_teleport, try_swap_courier_slots,
-    try_swap_inventory_slots, try_swap_stash_slots,
+    try_sell_courier_item, try_sell_item, try_start_teleport, try_swap_courier_slots, try_swap_inventory_slots, try_swap_stash_slots,
     try_buy_recipe, try_move_courier_item_to_stash, try_move_hero_item_to_stash,
     try_move_stash_item_to_courier, try_move_stash_item_to_hero, try_sell_stash_item,
     try_take_all_stash_to_hero, try_transfer_courier_item_to_hero,
@@ -49,6 +48,13 @@ struct VerifiedTicketInfo {
 }
 
 /// وضعیت احراز هویت تیکت Redis و گزارش نتیجه به بکاند جنگو
+#[derive(Resource, Default)]
+struct ServerShutdownTracker {
+    post_match_elapsed: f32,
+    empty_room_elapsed: f32,
+    ever_had_client: bool,
+}
+
 #[derive(Resource)]
 struct ServerAuthState {
     room_id: Option<String>,
@@ -117,6 +123,7 @@ fn main() {
         )))
         .insert_resource(ServerNetwork { server, transport })
         .init_resource::<ServerScratchBuffers>()
+        .init_resource::<ServerShutdownTracker>()
         .add_systems(
             FixedUpdate,
             (
@@ -574,32 +581,6 @@ fn server_network_receive_system(
                             }
                         }
                     }
-                    ClientLobbyMessage::SwapCourierSlots { from_slot, to_slot } => {
-                        if match_state.phase == MatchPhase::InGame {
-                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
-                                try_swap_courier_slots(
-                                    &mut world,
-                                    slot_idx,
-                                    from_slot,
-                                    to_slot,
-                                    &config,
-                                );
-                            }
-                        }
-                    }
-                    ClientLobbyMessage::SwapStashSlots { from_slot, to_slot } => {
-                        if match_state.phase == MatchPhase::InGame {
-                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
-                                try_swap_stash_slots(
-                                    &mut world,
-                                    slot_idx,
-                                    from_slot,
-                                    to_slot,
-                                    &items_config,
-                                );
-                            }
-                        }
-                    }
                     ClientLobbyMessage::SellCourierItem { inv_index } => {
                         if match_state.phase == MatchPhase::InGame {
                             if let Some(slot_idx) = match_state.slot_for_client(client_id) {
@@ -777,6 +758,32 @@ fn server_network_receive_system(
                             }
                         }
                     }
+                    ClientLobbyMessage::SwapCourierSlots { from_slot, to_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_swap_courier_slots(
+                                    &mut world,
+                                    slot_idx,
+                                    from_slot,
+                                    to_slot,
+                                    &config,
+                                );
+                            }
+                        }
+                    }
+                    ClientLobbyMessage::SwapStashSlots { from_slot, to_slot } => {
+                        if match_state.phase == MatchPhase::InGame {
+                            if let Some(slot_idx) = match_state.slot_for_client(client_id) {
+                                try_swap_stash_slots(
+                                    &mut world,
+                                    slot_idx,
+                                    from_slot,
+                                    to_slot,
+                                    &items_config,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -804,6 +811,8 @@ fn server_match_tick_system(
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
     mut auth_state: ResMut<ServerAuthState>,
+    mut shutdown: ResMut<ServerShutdownTracker>,
+    mut app_exit: MessageWriter<AppExit>,
     existing_soldiers: Query<Entity, With<PhysicsSoldier>>,
 ) {
     if match_state.tick(time.delta_secs(), &config).is_some() {
@@ -866,6 +875,33 @@ fn server_match_tick_system(
             }
         }
     }
+
+    let dt = time.delta_secs();
+    if match_state.connected_count() > 0 {
+        shutdown.ever_had_client = true;
+        shutdown.empty_room_elapsed = 0.0;
+    } else if shutdown.ever_had_client || auth_state.room_id.is_some() {
+        shutdown.empty_room_elapsed += dt;
+        if shutdown.empty_room_elapsed >= config.network.empty_room_shutdown_secs {
+            println!(
+                "[SERVER SHUTDOWN] هیچ بازیکنی به مدت {:.0} ثانیه متصل نیست؛ خروج خودکار برای آزادسازی پورت {}.",
+                shutdown.empty_room_elapsed, auth_state.port
+            );
+            app_exit.write(AppExit::Success);
+            return;
+        }
+    }
+
+    if world.winning_team.is_some() {
+        shutdown.post_match_elapsed += dt;
+        if shutdown.post_match_elapsed >= config.network.post_match_shutdown_delay_secs {
+            println!(
+                "[SERVER SHUTDOWN] مسابقه به پایان رسید؛ خروج خودکار پس از {:.0} ثانیه برای آزادسازی پورت {}.",
+                shutdown.post_match_elapsed, auth_state.port
+            );
+            app_exit.write(AppExit::Success);
+        }
+    }
 }
 
 fn server_send_snapshot_system(
@@ -919,11 +955,22 @@ fn server_send_snapshot_system(
         }
 
         if !world.pending_fx.is_empty() {
-            scratch.serialize_buf.clear();
             let fx_batch: Vec<GameplayFxEvent> = world.pending_fx.drain(..).collect();
-            if bincode::serialize_into(&mut scratch.serialize_buf, &fx_batch).is_ok() {
-                net.server
-                    .broadcast_message(CHANNEL_RELIABLE_FX, scratch.serialize_buf.clone());
+            for p in &match_state.players {
+                if let (true, Some(cid)) = (p.connected, p.client_id) {
+                    let filtered_fx = world.filter_fx_for_slot(&config, p.slot_index, &fx_batch);
+                    if filtered_fx.is_empty() {
+                        continue;
+                    }
+                    scratch.serialize_buf.clear();
+                    if bincode::serialize_into(&mut scratch.serialize_buf, &filtered_fx).is_ok() {
+                        net.server.send_message(
+                            cid,
+                            CHANNEL_RELIABLE_FX,
+                            scratch.serialize_buf.clone(),
+                        );
+                    }
+                }
             }
         }
     }

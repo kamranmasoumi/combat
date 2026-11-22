@@ -359,6 +359,10 @@ impl Plugin for MobaAudioPlugin {
             .init_resource::<AudioRuntimeTimers>()
             .add_systems(Startup, init_audio_settings_and_vignette_system)
             .add_systems(
+                OnExit(crate::pregame_ui::AppScreenState::InGame),
+                cleanup_ingame_audio_on_exit_system,
+            )
+            .add_systems(
                 Update,
                 (
                     process_audio_events_system,
@@ -369,6 +373,23 @@ impl Plugin for MobaAudioPlugin {
                 )
                     .chain(),
             );
+    }
+}
+
+fn cleanup_ingame_audio_on_exit_system(
+    mut commands: Commands,
+    mut queue: ResMut<AudioEventQueue>,
+    mut ctx: ResMut<AudioFrameContext>,
+    audio_q: Query<Entity, With<TaggedAudio>>,
+    mut vignette_q: Query<&mut BackgroundColor, With<LowHpVignetteEdge>>,
+) {
+    queue.0.clear();
+    *ctx = AudioFrameContext::default();
+    for ent in &audio_q {
+        commands.entity(ent).despawn();
+    }
+    for mut bg in &mut vignette_q {
+        bg.0 = Color::NONE;
     }
 }
 

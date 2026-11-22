@@ -35,6 +35,7 @@ pub struct PingConfig {
     pub world_ring_radius: f32,
     pub beam_height: f32,
     pub minimap_pulse_speed: f32,
+    pub min_interval_secs: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -42,6 +43,7 @@ pub struct ChatConfig {
     pub max_message_len: usize,
     pub max_visible_messages: usize,
     pub message_fade_secs: f32,
+    pub min_interval_secs: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -366,8 +368,24 @@ pub struct MainMenuConfig {
     pub ws_poll_sleep_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameplayRulesConfig {
+    pub allow_shadow_blade_during_teleport: bool,
+    pub teleport_breaks_invisibility: bool,
+    pub allow_teleport_in_water: bool,
+    pub cancel_teleport_on_building_destroyed: bool,
+    pub courier_invulnerable_in_fountain: bool,
+    pub turret_prioritize_hero_on_ally_attack: bool,
+    pub fountain_attacks_enemies: bool,
+    pub fountain_reveals_invisible_enemies: bool,
+    pub neutral_camps_regen_on_leash: bool,
+    pub last_hitter_always_gets_xp: bool,
+    pub allow_beam_deny: bool,
+}
+
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
+    pub gameplay_rules: GameplayRulesConfig,
     pub main_menu: MainMenuConfig,
     pub weather: WeatherConfig,
     pub day_night: DayNightConfig,
@@ -472,6 +490,9 @@ impl GameConfig {
         assert!(!self.network.backend_http_url.trim().is_empty(), "network.backend_http_url cannot be empty");
         assert!(!self.network.backend_ws_url.trim().is_empty(), "network.backend_ws_url cannot be empty");
         assert!(!self.network.redis_addr.trim().is_empty(), "network.redis_addr cannot be empty");
+        assert!(self.network.battle_loading_max_wait_secs.is_finite() && self.network.battle_loading_max_wait_secs > 2.5, "network.battle_loading_max_wait_secs باید بزرگ‌تر از 2.5 ثانیه باشد");
+        assert!(self.network.post_match_shutdown_delay_secs.is_finite() && self.network.post_match_shutdown_delay_secs > 0.0, "network.post_match_shutdown_delay_secs باید بزرگ‌تر از صفر باشد");
+        assert!(self.network.empty_room_shutdown_secs.is_finite() && self.network.empty_room_shutdown_secs > 0.0, "network.empty_room_shutdown_secs باید بزرگ‌تر از صفر باشد");
         assert!(self.soldier.team_spawn_slot_spacing > 0.0, "soldier.team_spawn_slot_spacing باید بزرگ‌تر از صفر باشد");
         assert!(self.soldier.cliff_dive_speed > 0.0, "soldier.cliff_dive_speed must be > 0");
         assert!(self.soldier.cliff_dive_arc_boost > 0.0, "soldier.cliff_dive_arc_boost must be > 0");
@@ -618,6 +639,14 @@ impl GameConfig {
             self.combat.passive_gold_amount > 0,
             "passive_gold_amount باید بزرگ‌تر از صفر باشد"
         );
+        assert!(self.combat.hero_kill_gold > 0, "combat.hero_kill_gold باید بزرگ‌تر از صفر باشد");
+        assert!(self.combat.hero_kill_xp > 0, "combat.hero_kill_xp باید بزرگ‌تر از صفر باشد");
+        assert!(self.combat.hero_assist_gold > 0, "combat.hero_assist_gold باید بزرگ‌تر از صفر باشد");
+        assert!(self.combat.hero_assist_xp > 0, "combat.hero_assist_xp باید بزرگ‌تر از صفر باشد");
+        assert!(self.combat.hero_assist_window_secs.is_finite() && self.combat.hero_assist_window_secs > 0.0, "combat.hero_assist_window_secs نامعتبر است");
+        assert!(self.combat.hero_kill_credit_window_secs.is_finite() && self.combat.hero_kill_credit_window_secs > 0.0, "combat.hero_kill_credit_window_secs نامعتبر است");
+        assert!(self.combat.turret_hero_aggro_window_secs.is_finite() && self.combat.turret_hero_aggro_window_secs > 0.0, "combat.turret_hero_aggro_window_secs نامعتبر است");
+        assert!(self.combat.weapon_swap_min_cooldown_secs.is_finite() && self.combat.weapon_swap_min_cooldown_secs >= 0.0, "combat.weapon_swap_min_cooldown_secs نامعتبر است");
         assert!(self.soldier.jump_over_speed > 0.0, "soldier.jump_over_speed باید بزرگ‌تر از صفر باشد");
         assert!(self.soldier.jump_over_clearance_height > 0.0, "soldier.jump_over_clearance_height باید بزرگ‌تر از صفر باشد");
         assert!(self.soldier.space_hold_threshold_secs > 0.0, "soldier.space_hold_threshold_secs باید بزرگ‌تر از صفر باشد");
@@ -715,6 +744,7 @@ impl GameConfig {
         let nc = &self.neutral_camps;
         assert!(nc.respawn_interval_secs > 0.0, "respawn_interval_secs کمپ‌ها باید بزرگ‌تر از صفر باشد");
         assert!(nc.aggro_leash_radius > 0.0, "aggro_leash_radius کمپ‌ها باید بزرگ‌تر از صفر باشد");
+        assert!(nc.leash_regen_pct_per_sec.is_finite() && nc.leash_regen_pct_per_sec >= 0.0, "neutral_camps.leash_regen_pct_per_sec نامعتبر است");
         assert!(!nc.creep_types.is_empty(), "creep_types کمپ‌ها نمی‌تواند خالی باشد");
         for (k, ct) in &nc.creep_types {
             assert!(!ct.model_path.trim().is_empty(), "model_path سرباز کمپ '{}' خالی است", k);
@@ -973,6 +1003,7 @@ impl GameConfig {
         assert!(self.ping.world_ring_radius > 0.0, "ping.world_ring_radius باید بزرگ‌تر از صفر باشد");
         assert!(self.ping.beam_height > 0.0, "ping.beam_height باید بزرگ‌تر از صفر باشد");
         assert!(self.ping.minimap_pulse_speed > 0.0, "ping.minimap_pulse_speed باید بزرگ‌تر از صفر باشد");
+        assert!(self.ping.min_interval_secs.is_finite() && self.ping.min_interval_secs >= 0.0, "ping.min_interval_secs نامعتبر است");
     }
 
     pub fn validate_audio(&self) {
@@ -1099,6 +1130,7 @@ impl GameConfig {
         assert!(self.chat.max_message_len > 0, "chat.max_message_len باید بزرگ‌تر از صفر باشد");
         assert!(self.chat.max_visible_messages > 0, "chat.max_visible_messages باید بزرگ‌تر از صفر باشد");
         assert!(self.chat.message_fade_secs > 0.0, "chat.message_fade_secs باید بزرگ‌تر از صفر باشد");
+        assert!(self.chat.min_interval_secs.is_finite() && self.chat.min_interval_secs >= 0.0, "chat.min_interval_secs نامعتبر است");
     }
 
     pub fn validate_ancients(&self) {
@@ -1170,6 +1202,26 @@ impl GameConfig {
             assert!(
                 ftn.heal_per_sec > 0.0,
                 "خطای بحرانی کانفیگ: heal_per_sec چشمه '{}' باید بزرگ‌تر از صفر باشد!",
+                ftn.id
+            );
+            assert!(
+                ftn.enemy_damage_per_sec.is_finite() && ftn.enemy_damage_per_sec > 0.0,
+                "خطای بحرانی کانفیگ: enemy_damage_per_sec چشمه '{}' باید بزرگ‌تر از صفر باشد!",
+                ftn.id
+            );
+            assert!(
+                ftn.fire_rate_secs.is_finite() && ftn.fire_rate_secs > 0.0,
+                "خطای بحرانی کانفیگ: fire_rate_secs چشمه '{}' باید بزرگ‌تر از صفر باشد!",
+                ftn.id
+            );
+            assert!(
+                ftn.projectile_speed.is_finite() && ftn.projectile_speed > 0.0,
+                "خطای بحرانی کانفیگ: projectile_speed چشمه '{}' باید بزرگ‌تر از صفر باشد!",
+                ftn.id
+            );
+            assert!(
+                ftn.true_sight_radius.is_finite() && ftn.true_sight_radius > 0.0,
+                "خطای بحرانی کانفیگ: true_sight_radius چشمه '{}' باید بزرگ‌تر از صفر باشد!",
                 ftn.id
             );
         }
@@ -1375,6 +1427,9 @@ pub struct NetworkConfig {
     pub available_bytes_per_tick: u64,
     pub channel_max_memory_bytes: usize,
     pub reliable_resend_time_ms: u64,
+    pub battle_loading_max_wait_secs: f32,
+    pub post_match_shutdown_delay_secs: f32,
+    pub empty_room_shutdown_secs: f32,
     pub private_key: [u8; 32],
 }
 
@@ -1907,6 +1962,14 @@ pub struct CombatConfig {
     pub turret_bullet_spread_rad: f32,
     pub passive_gold_interval_secs: f32,
     pub passive_gold_amount: u32,
+    pub hero_kill_gold: u32,
+    pub hero_kill_xp: u32,
+    pub hero_assist_gold: u32,
+    pub hero_assist_xp: u32,
+    pub hero_assist_window_secs: f32,
+    pub hero_kill_credit_window_secs: f32,
+    pub turret_hero_aggro_window_secs: f32,
+    pub weapon_swap_min_cooldown_secs: f32,
     pub respawn_times_per_level: Vec<f32>,
     pub xp_thresholds_per_level: Vec<u32>,
 }
@@ -2053,6 +2116,7 @@ pub struct NeutralCampsConfig {
     pub respawn_interval_secs: f32,
     pub spawn_spacing: f32,
     pub aggro_leash_radius: f32,
+    pub leash_regen_pct_per_sec: f32,
     pub creep_types: HashMap<String, NeutralCreepTypeDef>,
     pub camps: Vec<NeutralCampDef>,
 }
@@ -2359,6 +2423,10 @@ pub struct FountainDef {
     pub rim_height: f32,
     pub heal_radius: f32,
     pub heal_per_sec: f32,
+    pub enemy_damage_per_sec: f32,
+    pub fire_rate_secs: f32,
+    pub projectile_speed: f32,
+    pub true_sight_radius: f32,
     pub stone_color_rgb: (f32, f32, f32),
     pub water_emissive_rgb: (f32, f32, f32),
 }
@@ -3279,7 +3347,10 @@ impl AuthoritativeMatchState {
                     .players
                     .iter()
                     .all(|p| !p.connected || p.map_loaded);
-                if all_loaded && self.connected_count() > 0 && self.battle_loading_timer >= 2.5 {
+                if self.connected_count() > 0
+                    && ((all_loaded && self.battle_loading_timer >= 2.5)
+                        || self.battle_loading_timer >= config.network.battle_loading_max_wait_secs)
+                {
                     self.phase = MatchPhase::InGame;
                     self.dirty = true;
                     let first_hero_id = self
@@ -3429,6 +3500,13 @@ pub struct ActiveTeleportSnapshot {
     pub progress: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeleportTargetBuilding {
+    Turret(usize),
+    Barracks(usize),
+    Ancient(usize),
+}
+
 #[derive(Clone, Debug)]
 pub struct ActiveTeleportState {
     pub inv_index: usize,
@@ -3439,6 +3517,7 @@ pub struct ActiveTeleportState {
     pub total_secs: f32,
     pub cancel_on_left_click: bool,
     pub cancel_on_move: bool,
+    pub target_building: Option<TeleportTargetBuilding>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -6704,7 +6783,7 @@ impl SharedFogOfWar {
         }
     }
 
-    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, hero_alive: bool, allied_creeps: &[Vec3], match_elapsed_secs: f32, weather: WeatherKind) {
+    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, hero_alive: bool, live_allied_structures: &[(Vec3, f32)], allied_creeps: &[Vec3], match_elapsed_secs: f32, weather: WeatherKind) {
         self.visible_now.fill(false);
 
         let struct_mult = config.effective_vision_multiplier(match_elapsed_secs, config.day_night.night_turret_vision_multiplier);
@@ -6728,8 +6807,7 @@ impl SharedFogOfWar {
             self.reveal_from_source(config, hero_pos, hero_range, 240);
         }
 
-        let allied = self.allied_sources.clone();
-        for (src_pos, src_range) in allied {
+        for &(src_pos, src_range) in live_allied_structures {
             self.reveal_from_source(config, src_pos, src_range * struct_mult, 72);
         }
         let creep_range = config.creeps.vision_range * creep_mult;
@@ -7008,6 +7086,10 @@ pub struct PlayerSlotState {
     pub invisibility_total_secs: f32,
     pub invis_move_speed_bonus_pct: f32,
     pub is_revealed_by_turret: bool,
+    pub recent_hero_damagers: Vec<(usize, f32)>,
+    pub last_attacked_enemy_hero_at: f32,
+    pub last_ping_at_secs: f32,
+    pub last_chat_at_secs: f32,
     pub traversal: SharedTraversalState,
 }
 
@@ -7108,6 +7190,8 @@ pub struct AuthoritativeWorldState {
     pub targets_visible: Vec<bool>,
     pub creeps: Vec<LaneCreepState>,
     pub turrets: Vec<TurretState>,
+    pub fountain_fire_cooldowns: Vec<f32>,
+    pub allow_shadow_blade_during_teleport: bool,
     pub barracks: Vec<BarracksState>,
     pub ancients: Vec<AncientState>,
     pub chat_history: Vec<ChatMessageEntry>,
@@ -7305,6 +7389,8 @@ impl AuthoritativeWorldState {
             targets_visible: vec![true; targets.len()],
             targets,
             creeps: Vec::new(),
+            fountain_fire_cooldowns: vec![0.0; config.map.fountains.len()],
+            allow_shadow_blade_during_teleport: config.gameplay_rules.allow_shadow_blade_during_teleport,
             turrets: config
                 .map
                 .turrets
@@ -7544,12 +7630,15 @@ impl AuthoritativeWorldState {
         }
         match self.pause_phase {
             PausePhase::Running => {
-                let any_disconnected = self.players.iter().any(|p| p.is_disconnected);
                 let (team, name, player_cd) = if let Some(p) = self.players.get(slot_index) {
                     (p.hero_team, p.hero_display_name.clone(), p.pause_cooldown_remaining)
                 } else {
                     (self.hero_team, self.hero_display_name.clone(), 0.0)
                 };
+                let any_disconnected = self
+                    .players
+                    .iter()
+                    .any(|p| p.is_disconnected && p.hero_team == team);
 
                 let (pauses_left, time_left) = match team {
                     TeamId::Dawn => (self.dawn_pauses_remaining, self.dawn_time_bank_secs),
@@ -7671,7 +7760,12 @@ impl AuthoritativeWorldState {
         if !world_pos.is_finite() {
             return;
         }
-        let (sender_name, sender_team) = if let Some(p) = self.players.get(slot_index) {
+        let now = self.match_elapsed_secs;
+        let (sender_name, sender_team) = if let Some(p) = self.players.get_mut(slot_index) {
+            if now - p.last_ping_at_secs < config.ping.min_interval_secs {
+                return;
+            }
+            p.last_ping_at_secs = now;
             (p.hero_display_name.clone(), p.hero_team)
         } else {
             (self.hero_display_name.clone(), self.hero_team)
@@ -7760,7 +7854,12 @@ impl AuthoritativeWorldState {
         if clean.is_empty() {
             return;
         }
-        let (sender_name, sender_team) = if let Some(p) = self.players.get(slot_index) {
+        let now = self.match_elapsed_secs;
+        let (sender_name, sender_team) = if let Some(p) = self.players.get_mut(slot_index) {
+            if now - p.last_chat_at_secs < config.chat.min_interval_secs {
+                return;
+            }
+            p.last_chat_at_secs = now;
             (p.hero_display_name.clone(), p.hero_team)
         } else {
             (self.hero_display_name.clone(), self.hero_team)
@@ -7974,6 +8073,10 @@ impl AuthoritativeWorldState {
                 invisibility_total_secs: 0.0,
                 invis_move_speed_bonus_pct: 0.0,
                 is_revealed_by_turret: false,
+                recent_hero_damagers: Vec::new(),
+                last_attacked_enemy_hero_at: -999.0,
+                last_ping_at_secs: -999.0,
+                last_chat_at_secs: -999.0,
                 traversal: SharedTraversalState {
                     is_active: false,
                     kind: TraversalKind::RunningJump,
@@ -8093,31 +8196,6 @@ impl AuthoritativeWorldState {
             .map(|p| p.slot_index)
             .collect();
 
-        let active_teleports: Vec<ActiveTeleportSnapshot> = self
-            .players
-            .iter()
-            .filter_map(|p| {
-                if p.hero_team != viewer_team
-                    && ((p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret)
-                        || water_hidden_slots.contains(&p.slot_index))
-                {
-                    return None;
-                }
-                let tp = p.active_teleport.as_ref()?;
-                Some(ActiveTeleportSnapshot {
-                    slot_index: p.slot_index,
-                    team: p.hero_team,
-                    hero_id: p.hero_id.clone(),
-                    model_path: p.hero_model_path.clone(),
-                    hero_scale: p.hero_scale,
-                    origin_pos: tp.origin_pos,
-                    dest_pos: tp.dest_pos,
-                    facing_dir: tp.facing_dir,
-                    progress: (tp.elapsed_secs / tp.total_secs.max(0.01)).clamp(0.0, 1.0),
-                })
-            })
-            .collect();
-
         let pre_swap_dawn_kills: u32 = self
             .players
             .iter()
@@ -8133,6 +8211,83 @@ impl AuthoritativeWorldState {
         self.swap_slot_in(slot_index);
         let mut snap = self.build_snapshot(config, items_cfg);
         snap.scoreboard_heroes = scoreboard_heroes;
+
+        // فیلتر مه جنگ برای پرتابه‌ها، نارنجک‌ها، استخر سمی، پرتوها و هدف تاورهای دشمن
+        snap.bullets
+            .retain(|b| self.fog_of_war.is_world_point_visible(config, b.translation.x, b.translation.z));
+        snap.grenades
+            .retain(|g| self.fog_of_war.is_world_point_visible(config, g.translation.x, g.translation.z));
+        snap.toxic_pools
+            .retain(|tp| self.fog_of_war.is_world_point_visible(config, tp.pos.x, tp.pos.z));
+        snap.electric_beams.retain(|eb| {
+            self.fog_of_war
+                .is_world_point_visible(config, eb.start_pos.x, eb.start_pos.z)
+                || self
+                    .fog_of_war
+                    .is_world_point_visible(config, eb.end_pos.x, eb.end_pos.z)
+        });
+        for t in &mut snap.turrets {
+            if t.team != viewer_team {
+                let t_pos = self.turrets.get(t.index).map(|ts| ts.pos).unwrap_or(Vec3::ZERO);
+                let turret_vis = self.fog_of_war.is_world_point_visible(config, t_pos.x, t_pos.z);
+                let target_vis = t.aim_target_pos.is_some_and(|ap| {
+                    self.fog_of_war.is_world_point_visible(config, ap.x, ap.z)
+                });
+                if !turret_vis || !target_vis {
+                    t.aim_target_pos = None;
+                }
+            }
+        }
+
+        // فیلتر مه جنگ و نامرئی‌شدن برای تلپورت‌های فعال (پس از swap_slot_in تا fog_of_war تیم بیننده فعال باشد)
+        let mut active_teleports: Vec<ActiveTeleportSnapshot> = Vec::new();
+        for p in &self.players {
+            let (p_team, p_invis, p_rev, p_tp_opt) = if p.slot_index == slot_index {
+                (
+                    self.hero_team,
+                    self.invisibility_remaining,
+                    self.is_revealed_by_turret,
+                    self.active_teleport.as_ref(),
+                )
+            } else {
+                (
+                    p.hero_team,
+                    p.invisibility_remaining,
+                    p.is_revealed_by_turret,
+                    p.active_teleport.as_ref(),
+                )
+            };
+            let Some(tp) = p_tp_opt else { continue };
+            let mut origin_pos = tp.origin_pos;
+            if p_team != viewer_team {
+                if (p_invis > 0.0 && !p_rev) || water_hidden_slots.contains(&p.slot_index) {
+                    continue;
+                }
+                let origin_vis = self
+                    .fog_of_war
+                    .is_world_point_visible(config, tp.origin_pos.x, tp.origin_pos.z);
+                let dest_vis = self
+                    .fog_of_war
+                    .is_world_point_visible(config, tp.dest_pos.x, tp.dest_pos.z);
+                if !origin_vis && !dest_vis {
+                    continue;
+                }
+                if !origin_vis {
+                    origin_pos = tp.dest_pos;
+                }
+            }
+            active_teleports.push(ActiveTeleportSnapshot {
+                slot_index: p.slot_index,
+                team: p_team,
+                hero_id: p.hero_id.clone(),
+                model_path: p.hero_model_path.clone(),
+                hero_scale: p.hero_scale,
+                origin_pos,
+                dest_pos: tp.dest_pos,
+                facing_dir: tp.facing_dir,
+                progress: (tp.elapsed_secs / tp.total_secs.max(0.01)).clamp(0.0, 1.0),
+            });
+        }
         snap.active_teleports = active_teleports;
         if let Some(me) = self.players.get(slot_index) {
             snap.hero.courier_hp = me.courier_hp;
@@ -8373,6 +8528,130 @@ impl AuthoritativeWorldState {
             .collect();
         self.swap_slot_in(slot_index);
         snap
+    }
+
+    pub fn filter_fx_for_slot(
+        &self,
+        config: &GameConfig,
+        slot_index: usize,
+        fx_batch: &[GameplayFxEvent],
+    ) -> Vec<GameplayFxEvent> {
+        let Some(viewer) = self.players.get(slot_index) else {
+            return fx_batch.to_vec();
+        };
+        let viewer_team = viewer.hero_team;
+        let fow = &viewer.fog_of_war;
+        let is_slot_hidden = |target_slot: usize| -> bool {
+            let Some(p) = self.players.get(target_slot) else {
+                return false;
+            };
+            if p.hero_team == viewer_team {
+                return false;
+            }
+            if p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret {
+                return true;
+            }
+            !is_swimming_hero_revealed_to_team(
+                &self.players,
+                p.slot_index,
+                viewer_team,
+                config,
+                self.match_elapsed_secs,
+                self.current_weather,
+            )
+        };
+
+        let mut out = Vec::with_capacity(fx_batch.len());
+        for ev in fx_batch {
+            let keep = match ev {
+                GameplayFxEvent::LightningStrike { .. }
+                | GameplayFxEvent::HeroKillFeed { .. } => true,
+                GameplayFxEvent::ShotFired { muzzle_pos, .. } => {
+                    fow.is_world_point_visible(config, muzzle_pos.x, muzzle_pos.z)
+                }
+                GameplayFxEvent::BulletTrailSegment { start, end, .. } => {
+                    fow.is_world_point_visible(config, start.x, start.z)
+                        || fow.is_world_point_visible(config, end.x, end.z)
+                }
+                GameplayFxEvent::BulletImpact { impact_pos, .. } => {
+                    fow.is_world_point_visible(config, impact_pos.x, impact_pos.z)
+                }
+                GameplayFxEvent::GrenadeExploded { pos, .. }
+                | GameplayFxEvent::SlideDust { pos }
+                | GameplayFxEvent::WaterSplash { pos, .. }
+                | GameplayFxEvent::HeroLeveledUp { pos, .. }
+                | GameplayFxEvent::LastHitGold { pos, .. }
+                | GameplayFxEvent::CreepDenied { pos } => {
+                    fow.is_world_point_visible(config, pos.x, pos.z)
+                }
+                GameplayFxEvent::TurretShotFired {
+                    turret_index,
+                    target_pos,
+                    ..
+                } => {
+                    let t_team_match = self
+                        .turrets
+                        .get(*turret_index)
+                        .is_some_and(|t| t.team == viewer_team);
+                    let t_vis = self
+                        .turrets
+                        .get(*turret_index)
+                        .is_some_and(|t| fow.is_world_point_visible(config, t.pos.x, t.pos.z));
+                    t_team_match
+                        || t_vis
+                        || fow.is_world_point_visible(config, target_pos.x, target_pos.z)
+                }
+                GameplayFxEvent::TeleportStarted {
+                    slot_index: tp_slot,
+                    origin_pos,
+                    dest_pos,
+                }
+                | GameplayFxEvent::TeleportCompleted {
+                    slot_index: tp_slot,
+                    origin_pos,
+                    dest_pos,
+                } => {
+                    let is_ally = self
+                        .players
+                        .get(*tp_slot)
+                        .is_some_and(|p| p.hero_team == viewer_team);
+                    is_ally
+                        || (!is_slot_hidden(*tp_slot)
+                            && (fow.is_world_point_visible(config, origin_pos.x, origin_pos.z)
+                                || fow.is_world_point_visible(config, dest_pos.x, dest_pos.z)))
+                }
+                GameplayFxEvent::TeleportCanceled {
+                    slot_index: tp_slot,
+                    origin_pos,
+                } => {
+                    let is_ally = self
+                        .players
+                        .get(*tp_slot)
+                        .is_some_and(|p| p.hero_team == viewer_team);
+                    is_ally
+                        || (!is_slot_hidden(*tp_slot)
+                            && fow.is_world_point_visible(config, origin_pos.x, origin_pos.z))
+                }
+                GameplayFxEvent::ShadowBladeActivated {
+                    slot_index: sb_slot,
+                    pos,
+                }
+                | GameplayFxEvent::ShadowBladeEnded {
+                    slot_index: sb_slot,
+                    pos,
+                } => {
+                    let is_ally = self
+                        .players
+                        .get(*sb_slot)
+                        .is_some_and(|p| p.hero_team == viewer_team);
+                    is_ally || fow.is_world_point_visible(config, pos.x, pos.z)
+                }
+            };
+            if keep {
+                out.push(ev.clone());
+            }
+        }
+        out
     }
 
     pub fn apply_selected_hero(&mut self, config: &GameConfig, hero_index: usize) {
@@ -8875,6 +9154,54 @@ pub fn fountain_regen_bonus_for_pos(config: &GameConfig, team: TeamId, pos: Vec3
     best_bonus
 }
 
+/// محاسبه آسیب دفاعی چشمه تیم حریف برای جلوگیری از Spawn Camping
+pub fn enemy_fountain_damage_for_pos(config: &GameConfig, hero_team: TeamId, pos: Vec3) -> f32 {
+    if hero_team == TeamId::Neutral {
+        return 0.0;
+    }
+    let mut best_dps = 0.0_f32;
+    for ftn in &config.map.fountains {
+        if ftn.team == hero_team || ftn.team == TeamId::Neutral {
+            continue;
+        }
+        let ftn_pos = ftn.model_transform.location_vec();
+        let dist_xz = Vec2::new(pos.x - ftn_pos.x, pos.z - ftn_pos.z).length();
+        if dist_xz <= ftn.heal_radius {
+            best_dps = best_dps.max(ftn.enemy_damage_per_sec);
+        }
+    }
+    best_dps
+}
+
+fn record_hero_damage_on_victim(
+    world: &mut AuthoritativeWorldState,
+    victim_idx: usize,
+    attacker_slot_opt: Option<usize>,
+    config: &GameConfig,
+) {
+    let Some(attacker_slot) = attacker_slot_opt else {
+        return;
+    };
+    let now = world.match_elapsed_secs;
+    let window = config.combat.hero_assist_window_secs;
+    let victim_team = world.players[victim_idx].hero_team;
+    if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == attacker_slot) {
+        if attacker.hero_team == victim_team {
+            return;
+        }
+        attacker.last_attacked_enemy_hero_at = now;
+    } else {
+        return;
+    }
+    let damagers = &mut world.players[victim_idx].recent_hero_damagers;
+    damagers.retain(|&(_, ts)| (now - ts) <= window);
+    if let Some(entry) = damagers.iter_mut().find(|(s, _)| *s == attacker_slot) {
+        entry.1 = now;
+    } else {
+        damagers.push((attacker_slot, now));
+    }
+}
+
 pub fn grant_xp_to_player_slot(
     p: &mut PlayerSlotState,
     amount: u32,
@@ -8924,10 +9251,30 @@ fn award_hero_kill_rewards(
     let victim_name = world.players[victim_idx].hero_display_name.clone();
     let victim_team = world.players[victim_idx].hero_team;
     let victim_pos = world.players[victim_idx].soldier_pos;
-    let kill_gold: u32 = 225;
-    let kill_xp: u32 = 150;
-    let assist_gold: u32 = 75;
-    let assist_xp: u32 = 75;
+    let now = world.match_elapsed_secs;
+    let kill_gold = config.combat.hero_kill_gold;
+    let kill_xp = config.combat.hero_kill_xp;
+    let assist_gold = config.combat.hero_assist_gold;
+    let assist_xp = config.combat.hero_assist_xp;
+    let assist_window = config.combat.hero_assist_window_secs;
+    let credit_window = config.combat.hero_kill_credit_window_secs;
+
+    let recent_damagers: Vec<(usize, f32)> = world.players[victim_idx]
+        .recent_hero_damagers
+        .iter()
+        .copied()
+        .filter(|&(_, ts)| (now - ts) <= assist_window)
+        .collect();
+    world.players[victim_idx].recent_hero_damagers.clear();
+
+    // اگر ضربه آخر توسط تاور/کریپ/چشمه بود، آخرین هیروی دشمن که در پنجره زمانی آسیب زده کیل را می‌گیرد
+    let effective_killer_slot = killer_slot_opt.or_else(|| {
+        recent_damagers
+            .iter()
+            .filter(|&&(_, ts)| (now - ts) <= credit_window)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|&(s, _)| s)
+    });
 
     let mut rewards: Vec<HeroKillRewardEntry> = Vec::new();
     let mut killer_name = if victim_team == TeamId::Dawn {
@@ -8941,7 +9288,7 @@ fn award_hero_kill_rewards(
         TeamId::Dawn
     };
 
-    if let Some(k_slot) = killer_slot_opt {
+    if let Some(k_slot) = effective_killer_slot {
         if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == k_slot) {
             attacker.kills += 1;
             attacker.hero_gold += kill_gold;
@@ -8960,15 +9307,15 @@ fn award_hero_kill_rewards(
             gold: kill_gold,
         });
 
-        // اعطای Assist و سهم XP/Gold به هم‌تیمی‌های نزدیک قاتل
-        let assist_radius = config.active_hero(0).xp_gain_radius.max(18.0);
+        // اعطای Assist به تمام هم‌تیمی‌هایی که در پنجره زمانی به قربانی آسیب زده‌اند (حتی اگر دور یا تازه مرده باشند) یا در شعاع XP خود زنده هستند
         let mut assister_indices: Vec<usize> = Vec::new();
         for (idx, p) in world.players.iter().enumerate() {
-            if p.slot_index != k_slot
-                && p.hero_team == killer_team
-                && !p.is_dead
-                && p.soldier_pos.distance(victim_pos) <= assist_radius
-            {
+            if p.slot_index == k_slot || p.hero_team != killer_team {
+                continue;
+            }
+            let dealt_recent_damage = recent_damagers.iter().any(|&(s, _)| s == p.slot_index);
+            let nearby_alive = !p.is_dead && p.soldier_pos.distance(victim_pos) <= p.hero_xp_gain_radius;
+            if dealt_recent_damage || nearby_alive {
                 assister_indices.push(idx);
             }
         }
@@ -9030,6 +9377,15 @@ fn trigger_random_death(world: &mut AuthoritativeWorldState, config: &GameConfig
     world.grenade_elapsed_and_duration = None;
     world.firing_anim_remaining = None;
     world.space_hold_secs = None;
+    world.active_beam_request = None;
+    world.traversal.is_active = false;
+    world.wall_climb_mountain_index = None;
+    world.in_water = false;
+    world.flame_armor_debuff_remaining = 0.0;
+    world.flame_armor_debuff_amount = 0.0;
+    world.electric_fire_rate_slow_remaining = 0.0;
+    world.electric_fire_rate_slow_ratio = 0.0;
+    world.toxic_slow_multiplier = 1.0;
 }
 
 fn resolve_muzzle_pos(
@@ -9650,6 +10006,14 @@ fn shared_drive_single_player(
             world.space_hold_secs = None;
             world.wall_climb_mountain_index = None;
             world.wall_climb_last_dir = 1;
+            world.traversal.is_active = false;
+            world.in_water = false;
+            world.active_beam_request = None;
+            world.flame_armor_debuff_remaining = 0.0;
+            world.flame_armor_debuff_amount = 0.0;
+            world.electric_fire_rate_slow_remaining = 0.0;
+            world.electric_fire_rate_slow_ratio = 0.0;
+            world.toxic_slow_multiplier = 1.0;
             world.active_weapon = ActiveWeaponSlot::Primary;
             world.beam_charge = world.hero_weapon.beam_max_charge;
             world.ammo_in_mag = if world.hero_weapon.weapon_kind == WeaponKind::ElectricBeam
@@ -9669,7 +10033,7 @@ fn shared_drive_single_player(
                 spawn_pos + Vec3::Y * config.physics.soldier_capsule_center_y;
         }
     } else {
-        // ۲. بازسازی سلامتی در ثانیه (HP Regen پایه + بونوس چشمه تیم خودی) و آپدیت تایمرهای بالاتنه
+        // ۲. بازسازی سلامتی در ثانیه (HP Regen پایه + بونوس چشمه تیم خودی)
         let fountain_bonus = fountain_regen_bonus_for_pos(config, world.hero_team, world.soldier_pos);
         let effective_hp_regen = world.hero_hp_regen_per_sec + fountain_bonus;
         world.hero_hp = (world.hero_hp + effective_hp_regen * dt).min(world.hero_max_hp);
@@ -9679,10 +10043,12 @@ fn shared_drive_single_player(
             && !world.traversal.is_active
             && world.grenade_elapsed_and_duration.is_none()
         {
-            // ضد تقلب ریلود: با تعویض اسلحه، ریلود نیمه‌تمام لغو می‌شود بدون اینکه خشاب پر شود!
+            // ضد تقلب ریلود و ضد اکسپلویت شلیک سریع با تعویض اسلحه: کولدان شلیک هرگز کوتاه‌تر نمی‌شود
             world.reload_remaining = None;
             world.firing_anim_remaining = None;
-            world.fire_cooldown_remaining = 0.0;
+            world.fire_cooldown_remaining = world
+                .fire_cooldown_remaining
+                .max(config.combat.weapon_swap_min_cooldown_secs);
             std::mem::swap(&mut world.ammo_in_mag, &mut world.other_weapon_ammo_in_mag);
             world.active_weapon = match world.active_weapon {
                 ActiveWeaponSlot::Primary => ActiveWeaponSlot::Pistol,
@@ -9756,11 +10122,13 @@ fn shared_drive_single_player(
             }
         }
 
+        let mut threw_grenade_this_tick = false;
         if input.grenade_just_pressed
             && world.grenade_charges > 0
             && world.grenade_elapsed_and_duration.is_none()
             && !world.traversal.is_active
         {
+            threw_grenade_this_tick = true;
             if world.grenade_charges == world.hero_grenade.max_charges {
                 world.grenade_recharge_remaining = world.hero_grenade.recharge_secs;
             }
@@ -9788,7 +10156,7 @@ fn shared_drive_single_player(
             && (((input.fire_just_pressed || input.fire_held)
                 && world.reload_remaining.is_none()
                 && has_fire_ammo)
-                || (input.grenade_just_pressed && world.grenade_charges > 0))
+                || threw_grenade_this_tick)
         {
             world.invisibility_remaining = 0.0;
             world.invisibility_total_secs = 0.0;
@@ -11843,6 +12211,7 @@ fn apply_aoe_explosion(
             let armor = world.players[p_idx].hero_armor - if world.players[p_idx].flame_armor_debuff_remaining > 0.0 { world.players[p_idx].flame_armor_debuff_amount } else { 0.0 };
             let eff_dmg = (dmg * dota2_armor_multiplier(armor)).max(1.0);
             world.players[p_idx].hero_hp = (world.players[p_idx].hero_hp - eff_dmg).max(0.0);
+            record_hero_damage_on_victim(world, p_idx, owner_slot, config);
             if world.players[p_idx].hero_hp <= 0.0 && !world.players[p_idx].is_dead {
                 world.swap_slot_in(p_idx);
                 trigger_random_death(world, config);
@@ -11905,7 +12274,9 @@ fn apply_aoe_explosion(
                     .filter(|(_, p)| {
                         !p.is_dead
                             && p.hero_team == owner_team
-                            && p.soldier_pos.distance(c_pos) <= p.hero_xp_gain_radius
+                            && (p.soldier_pos.distance(c_pos) <= p.hero_xp_gain_radius
+                                || (config.gameplay_rules.last_hitter_always_gets_xp
+                                    && owner_slot == Some(p.slot_index)))
                     })
                     .map(|(i, _)| i)
                     .collect();
@@ -11928,6 +12299,11 @@ fn apply_aoe_explosion(
         let h_cfg = config.active_hero(world.players[p_idx].hero_index).clone();
         let c_pos = world.players[p_idx].courier_pos;
         if c_pos.distance(pos) <= aoe_radius + h_cfg.courier.hit_radius {
+            if config.gameplay_rules.courier_invulnerable_in_fountain
+                && fountain_regen_bonus_for_pos(config, world.players[p_idx].hero_team, c_pos) > 0.0
+            {
+                continue;
+            }
             world.players[p_idx].courier_hp = (world.players[p_idx].courier_hp - dmg).max(0.0);
             if world.players[p_idx].courier_hp <= 0.0 && !world.players[p_idx].courier_is_dead {
                 world.players[p_idx].courier_is_dead = true;
@@ -12417,6 +12793,7 @@ fn shared_authoritative_react_system(
 
             world.players[enemy_idx].hero_hp =
                 (world.players[enemy_idx].hero_hp - effective_dmg).max(0.0);
+            record_hero_damage_on_victim(&mut world, enemy_idx, bullet.owner_slot, &config);
 
             let enemy_killed = world.players[enemy_idx].hero_hp <= 0.0
                 && !world.players[enemy_idx].is_dead;
@@ -12505,6 +12882,13 @@ fn shared_authoritative_react_system(
                 continue;
             }
             let h_cfg = config.active_hero(world.players[cour_p_idx].hero_index).clone();
+            let cour_pos_check = world.players[cour_p_idx].courier_pos;
+            if config.gameplay_rules.courier_invulnerable_in_fountain
+                && fountain_regen_bonus_for_pos(&config, world.players[cour_p_idx].hero_team, cour_pos_check) > 0.0
+            {
+                commands.entity(entity).despawn();
+                continue;
+            }
             world.players[cour_p_idx].courier_hp =
                 (world.players[cour_p_idx].courier_hp - bullet.damage).max(0.0);
             let cour_killed = world.players[cour_p_idx].courier_hp <= 0.0
@@ -12725,7 +13109,9 @@ fn shared_authoritative_react_system(
                         .filter(|(_, p)| {
                             !p.is_dead
                                 && p.hero_team == killer_team
-                                && p.soldier_pos.distance(creep_pos) <= p.hero_xp_gain_radius
+                                && (p.soldier_pos.distance(creep_pos) <= p.hero_xp_gain_radius
+                                    || (config.gameplay_rules.last_hitter_always_gets_xp
+                                        && bullet.owner_slot == Some(p.slot_index)))
                         })
                         .map(|(i, _)| i)
                         .collect();
@@ -13179,7 +13565,8 @@ fn shared_authoritative_react_system(
                 continue;
             }
             let is_enemy = c.team != owner_team;
-            let is_deniable = c.team == owner_team
+            let is_deniable = config.gameplay_rules.allow_beam_deny
+                && c.team == owner_team
                 && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio;
             if !is_enemy && !is_deniable {
                 continue;
@@ -13266,6 +13653,7 @@ fn shared_authoritative_react_system(
             let armor = world.players[enemy_idx].hero_armor - armor_debuff;
             let eff_dmg = tick_dmg * dota2_armor_multiplier(armor);
             world.players[enemy_idx].hero_hp = (world.players[enemy_idx].hero_hp - eff_dmg).max(0.0);
+            record_hero_damage_on_victim(&mut world, enemy_idx, Some(owner_slot), &config);
             if world.players[enemy_idx].hero_hp <= 0.0 && !world.players[enemy_idx].is_dead {
                 world.swap_slot_in(enemy_idx);
                 trigger_random_death(&mut world, &config);
@@ -13275,7 +13663,12 @@ fn shared_authoritative_react_system(
         } else if let Some(cour_idx) = hit_courier {
             hit_any_target = true;
             let h_cfg = config.active_hero(world.players[cour_idx].hero_index).clone();
-            world.players[cour_idx].courier_hp = (world.players[cour_idx].courier_hp - tick_dmg).max(0.0);
+            let cpos_check = world.players[cour_idx].courier_pos;
+            if !config.gameplay_rules.courier_invulnerable_in_fountain
+                || fountain_regen_bonus_for_pos(&config, world.players[cour_idx].hero_team, cpos_check) <= 0.0
+            {
+                world.players[cour_idx].courier_hp = (world.players[cour_idx].courier_hp - tick_dmg).max(0.0);
+            }
             if world.players[cour_idx].courier_hp <= 0.0 && !world.players[cour_idx].courier_is_dead {
                 world.players[cour_idx].courier_is_dead = true;
                 world.players[cour_idx].courier_respawn_remaining = h_cfg.courier.respawn_secs;
@@ -13516,6 +13909,7 @@ fn shared_authoritative_react_system(
                 let armor = world.players[p_idx].hero_armor - if world.players[p_idx].flame_armor_debuff_remaining > 0.0 { world.players[p_idx].flame_armor_debuff_amount } else { 0.0 };
                 let eff_dmg = tick_dmg * dota2_armor_multiplier(armor);
                 world.players[p_idx].hero_hp = (world.players[p_idx].hero_hp - eff_dmg).max(0.0);
+                record_hero_damage_on_victim(&mut world, p_idx, pool.owner_slot, &config);
                 if world.players[p_idx].hero_hp <= 0.0 && !world.players[p_idx].is_dead {
                     world.swap_slot_in(p_idx);
                     trigger_random_death(&mut world, &config);
@@ -13577,7 +13971,9 @@ fn shared_authoritative_react_system(
                         .filter(|(_, p)| {
                             !p.is_dead
                                 && p.hero_team == pool.owner_team
-                                && p.soldier_pos.distance(c_pos) <= p.hero_xp_gain_radius
+                                && (p.soldier_pos.distance(c_pos) <= p.hero_xp_gain_radius
+                                    || (config.gameplay_rules.last_hitter_always_gets_xp
+                                        && pool.owner_slot == Some(p.slot_index)))
                         })
                         .map(|(i, _)| i)
                         .collect();
@@ -13700,7 +14096,12 @@ fn shared_authoritative_react_system(
                         TeamId::Dusk => e_water_vis_dusk,
                         TeamId::Neutral => false,
                     };
-                    if e_slot == world.active_slot || e_team == world.hero_team || e_dead || !water_visible {
+                    if e_slot == world.active_slot
+                        || e_team == world.hero_team
+                        || e_dead
+                        || !water_visible
+                        || !world.fog_of_war.is_world_point_visible(&config, e_pos.x, e_pos.z)
+                    {
                         continue;
                     }
                     let h_rad = config.soldier.player_radius
@@ -13737,6 +14138,9 @@ fn shared_authoritative_react_system(
                     let is_deniable = c.team == world.hero_team
                         && (c.hp / c.max_hp) <= config.creeps.deny_hp_threshold_ratio;
                     if !is_enemy && !is_deniable {
+                        continue;
+                    }
+                    if is_enemy && !world.fog_of_war.is_world_point_visible(&config, c.pos.x, c.pos.z) {
                         continue;
                     }
                     if let Some(toi) = segment_hits_hero_capsule(
@@ -13782,9 +14186,36 @@ fn shared_authoritative_react_system(
             } else {
                 0.0
             };
+            let mut live_allied_structures: Vec<(Vec3, f32)> = Vec::new();
+            for ftn in &config.map.fountains {
+                if ftn.team == my_team {
+                    live_allied_structures.push((ftn.model_transform.location_vec(), 24.0));
+                }
+            }
+            for a in &world.ancients {
+                if !a.is_dead && a.team == my_team {
+                    live_allied_structures.push((a.pos, 26.0));
+                }
+            }
+            for t in &world.turrets {
+                if !t.is_dead && t.team == my_team {
+                    let rng = config
+                        .map
+                        .turrets
+                        .get(t.index)
+                        .map(|td| td.attack_range + 4.0)
+                        .unwrap_or(24.0);
+                    live_allied_structures.push((t.pos, rng));
+                }
+            }
+            for b in &world.barracks {
+                if !b.is_dead && b.team == my_team {
+                    live_allied_structures.push((b.pos, 20.0));
+                }
+            }
             world
                 .fog_of_war
-                .update_for_hero(&config, hero_pos, hero, hero_alive, &allied_creep_positions, elapsed_secs, cur_weather);
+                .update_for_hero(&config, hero_pos, hero, hero_alive, &live_allied_structures, &allied_creep_positions, elapsed_secs, cur_weather);
             for (c_pos, c_range) in allied_courier_vision {
                 world.fog_of_war.reveal_from_source(&config, c_pos, c_range * courier_mult, 48);
             }
@@ -14504,9 +14935,19 @@ fn step_lane_creeps_system(
         let c_stats = resolve_creep_stats(config, world.creeps[idx].creep_type_id.as_deref());
         let safety_margin = c_stats.collider_radius + config.creeps.river_barrier_margin;
         let is_neutral = my_team == TeamId::Neutral;
-        let leashed_back = is_neutral && my_pos.distance(my_home) > config.neutral_camps.aggro_leash_radius;
+        let dist_to_home = my_pos.distance(my_home);
+        let leashed_back = is_neutral && dist_to_home > config.neutral_camps.aggro_leash_radius;
         if leashed_back {
             world.creeps[idx].is_aggroed = false;
+        }
+        if config.gameplay_rules.neutral_camps_regen_on_leash
+            && is_neutral
+            && !world.creeps[idx].is_aggroed
+            && dist_to_home > 1.5
+            && world.creeps[idx].hp < world.creeps[idx].max_hp
+        {
+            let regen = world.creeps[idx].max_hp * config.neutral_camps.leash_regen_pct_per_sec * dt;
+            world.creeps[idx].hp = (world.creeps[idx].hp + regen).min(world.creeps[idx].max_hp);
         }
         let can_attack_now = !is_neutral || (world.creeps[idx].is_aggroed && !leashed_back);
 
@@ -15235,7 +15676,7 @@ fn step_turrets_system(
         .map(|c| (c.team, c.pos, c.is_dead, c.camp_index.is_none()))
         .collect();
 
-    let hero_snap: Vec<(TeamId, Vec3, bool, bool, bool)> = world
+    let hero_snap: Vec<(TeamId, Vec3, bool, bool, bool, f32)> = world
         .players
         .iter()
         .map(|p| {
@@ -15262,6 +15703,7 @@ fn step_turrets_system(
                 p.is_dead || hidden_invis,
                 water_vis_dawn,
                 water_vis_dusk,
+                p.last_attacked_enemy_hero_at,
             )
         })
         .collect();
@@ -15314,7 +15756,50 @@ fn step_turrets_system(
         world.turrets[idx].is_invulnerable = prev_tier_alive || !has_enemy_lane_creeps;
         world.turrets[idx].fire_cooldown = (world.turrets[idx].fire_cooldown - dt).max(0.0);
 
-        // ۳. انتخاب هدف تاور: اولویت با نزدیک‌ترین سرباز دشمن در برد، سپس هیروی دشمن
+        // ۳. انتخاب هدف تاور مطابق قوانین MOBA:
+        // اولویت ۰: هیروی دشمنی که اخیراً به هیروی هم‌تیمی زیر تاور آسیب زده (Tower-Dive Aggro)
+        let aggro_window = config.combat.turret_hero_aggro_window_secs;
+        let mut best_aggro_hero: Option<(Vec3, f32)> = None;
+        if config.gameplay_rules.turret_prioritize_hero_on_ally_attack {
+        for &(h_team, h_pos, h_dead, h_water_vis_dawn, h_water_vis_dusk, h_last_atk_hero) in &hero_snap {
+            let water_visible = match my_team {
+                TeamId::Dawn => h_water_vis_dawn,
+                TeamId::Dusk => h_water_vis_dusk,
+                TeamId::Neutral => false,
+            };
+            if h_team == my_team
+                || h_dead
+                || !water_visible
+                || (world.match_elapsed_secs - h_last_atk_hero) > aggro_window
+            {
+                continue;
+            }
+            let d = my_pos.distance(h_pos);
+            let to_h = Vec3::new(h_pos.x - my_pos.x, 0.0, h_pos.z - my_pos.z).normalize_or_zero();
+            let turret_ground_y = sample_terrain_top_y(config, my_pos.x, my_pos.z).max(my_pos.y);
+            let ray_start = Vec3::new(my_pos.x, turret_ground_y, my_pos.z) + to_h * (t_world_radius + 0.45);
+            if d <= t_def.attack_range
+                && best_aggro_hero.map_or(true, |(_, bd)| d < bd)
+                && can_observer_see_point_with_range(
+                    physics_world,
+                    config,
+                    ray_start,
+                    h_pos,
+                    1.65,
+                    t_def.vision_range
+                        * config.effective_vision_multiplier(
+                            world.match_elapsed_secs,
+                            config.day_night.night_turret_vision_multiplier,
+                        ),
+                    0.0,
+                )
+            {
+                best_aggro_hero = Some((h_pos + Vec3::Y * config.combat.hero_stand_aim_chest_height, d));
+            }
+        }
+        }
+
+        // اولویت ۱: نزدیک‌ترین سرباز دشمن در برد، سپس هیروی دشمن
         let mut best_creep: Option<(Vec3, f32)> = None;
         for &(c_team, c_pos, c_dead, is_lane_creep) in &creep_snap {
             if c_dead || !is_lane_creep || c_team == my_team || c_team == TeamId::Neutral {
@@ -15345,8 +15830,8 @@ fn step_turrets_system(
         }
 
         let mut best_hero: Option<(Vec3, f32)> = None;
-        if best_creep.is_none() {
-            for &(h_team, h_pos, h_dead, h_water_vis_dawn, h_water_vis_dusk) in &hero_snap {
+        if best_aggro_hero.is_none() && best_creep.is_none() {
+            for &(h_team, h_pos, h_dead, h_water_vis_dawn, h_water_vis_dusk, _) in &hero_snap {
                 let water_visible = match my_team {
                     TeamId::Dawn => h_water_vis_dawn,
                     TeamId::Dusk => h_water_vis_dusk,
@@ -15392,7 +15877,7 @@ fn step_turrets_system(
                 }
             }
         }
-        let chosen_target = best_creep.or(best_hero).or(best_courier).map(|(p, _)| p);
+        let chosen_target = best_aggro_hero.or(best_creep).or(best_hero).or(best_courier).map(|(p, _)| p);
         world.turrets[idx].aim_target_pos = chosen_target;
 
         // ۴. شلیک رگباری متناوب دولول
@@ -15436,6 +15921,73 @@ fn step_turrets_system(
                     target_pos,
                     shot_dir,
                 });
+            }
+        }
+    }
+
+    // ۵. شلیک واقعی و بصری چشمه پایگاه به دشمنان متجاوز (قابل کنترل از gameplay_rules.fountain_attacks_enemies)
+    if config.gameplay_rules.fountain_attacks_enemies {
+        if world.fountain_fire_cooldowns.len() != config.map.fountains.len() {
+            world.fountain_fire_cooldowns.resize(config.map.fountains.len(), 0.0);
+        }
+        for (f_idx, ftn) in config.map.fountains.iter().enumerate() {
+            if ftn.team == TeamId::Neutral {
+                continue;
+            }
+            world.fountain_fire_cooldowns[f_idx] = (world.fountain_fire_cooldowns[f_idx] - dt).max(0.0);
+            if world.fountain_fire_cooldowns[f_idx] > 0.0 {
+                continue;
+            }
+            let ftn_pos = ftn.model_transform.location_vec();
+            let mut best_target: Option<(Vec3, f32)> = None;
+            for p in &world.players {
+                if p.is_dead || p.hero_team == ftn.team || p.hero_team == TeamId::Neutral {
+                    continue;
+                }
+                let hidden_invis = p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret;
+                if hidden_invis {
+                    continue;
+                }
+                let d_xz = Vec2::new(p.soldier_pos.x - ftn_pos.x, p.soldier_pos.z - ftn_pos.z).length();
+                if d_xz <= ftn.heal_radius && best_target.map_or(true, |(_, bd)| d_xz < bd) {
+                    best_target = Some((p.soldier_pos + Vec3::Y * config.combat.hero_stand_aim_chest_height, d_xz));
+                }
+            }
+            if let Some((target_pos, _)) = best_target {
+                world.fountain_fire_cooldowns[f_idx] = ftn.fire_rate_secs;
+                let muzzle_origin = ftn_pos + Vec3::Y * (ftn.rim_height + 2.4);
+                let shot_dir = (target_pos - muzzle_origin).normalize_or_zero();
+                if shot_dir != Vec3::ZERO {
+                    let b_id = world.next_entity_id;
+                    world.next_entity_id += 1;
+                    let bolt_dmg = (ftn.enemy_damage_per_sec * ftn.fire_rate_secs).max(1.0);
+                    commands.spawn((
+                        PhysicsBullet {
+                            id: b_id,
+                            owner_slot: None,
+                            owner_team: ftn.team,
+                            vfx_source: BulletVfxSource::Turret,
+                            velocity: shot_dir * ftn.projectile_speed,
+                            damage: bolt_dmg,
+                            remaining_range: ftn.heal_radius + 10.0,
+                            gravity: 0.0,
+                            aoe_radius: 0.0,
+                            toxic_pool_duration_secs: 0.0,
+                            toxic_pool_dps: 0.0,
+                            toxic_slow_ratio: 0.0,
+                            piercing: false,
+                            hit_entity_keys: Vec::new(),
+                        },
+                        Transform::from_translation(muzzle_origin + shot_dir * 0.6),
+                    ));
+                    world.pending_fx.push(GameplayFxEvent::ShotFired {
+                        muzzle_pos: muzzle_origin,
+                        shot_dir,
+                        source: ShotAudioSource::Creep,
+                        trauma_add: 0.0,
+                        trauma_max: 0.0,
+                    });
+                }
             }
         }
     }

@@ -152,6 +152,14 @@ impl HeroEnvironmentStatModifier {
             grenade_aoe_bonus: self.grenade_aoe_bonus,
             grenade_max_charges_bonus: self.grenade_max_charges_bonus,
             grenade_recharge_speed_pct: self.grenade_recharge_speed_pct,
+            evasion_chance: 0.0,
+            true_strike_chance: 0.0,
+            crit_chance: 0.0,
+            crit_multiplier: 0.0,
+            lifesteal_ratio: 0.0,
+            on_hit_slow_ratio: 0.0,
+            on_hit_heal_reduction_ratio: 0.0,
+            on_hit_debuff_duration_secs: 0.0,
         }
     }
 }
@@ -200,6 +208,14 @@ pub struct ItemStatsModifier {
     pub grenade_aoe_bonus: f32,
     pub grenade_max_charges_bonus: i32,
     pub grenade_recharge_speed_pct: f32,
+    pub evasion_chance: f32,
+    pub true_strike_chance: f32,
+    pub crit_chance: f32,
+    pub crit_multiplier: f32,
+    pub lifesteal_ratio: f32,
+    pub on_hit_slow_ratio: f32,
+    pub on_hit_heal_reduction_ratio: f32,
+    pub on_hit_debuff_duration_secs: f32,
 }
 
 impl ItemStatsModifier {
@@ -225,6 +241,14 @@ impl ItemStatsModifier {
             grenade_aoe_bonus: 0.0,
             grenade_max_charges_bonus: 0,
             grenade_recharge_speed_pct: 0.0,
+            evasion_chance: 0.0,
+            true_strike_chance: 0.0,
+            crit_chance: 0.0,
+            crit_multiplier: 0.0,
+            lifesteal_ratio: 0.0,
+            on_hit_slow_ratio: 0.0,
+            on_hit_heal_reduction_ratio: 0.0,
+            on_hit_debuff_duration_secs: 0.0,
         }
     }
 
@@ -249,6 +273,23 @@ impl ItemStatsModifier {
         self.grenade_aoe_bonus += other.grenade_aoe_bonus;
         self.grenade_max_charges_bonus += other.grenade_max_charges_bonus;
         self.grenade_recharge_speed_pct += other.grenade_recharge_speed_pct;
+        // Evasion & True Strike stack multiplicatively (Dota 2 formula)
+        if other.evasion_chance > 0.0 {
+            self.evasion_chance = 1.0 - (1.0 - self.evasion_chance.clamp(0.0, 1.0)) * (1.0 - other.evasion_chance.clamp(0.0, 1.0));
+        }
+        if other.true_strike_chance > 0.0 {
+            self.true_strike_chance = 1.0 - (1.0 - self.true_strike_chance.clamp(0.0, 1.0)) * (1.0 - other.true_strike_chance.clamp(0.0, 1.0));
+        }
+        if other.crit_chance > 0.0 {
+            self.crit_chance = 1.0 - (1.0 - self.crit_chance.clamp(0.0, 1.0)) * (1.0 - other.crit_chance.clamp(0.0, 1.0));
+        }
+        if other.crit_multiplier > self.crit_multiplier {
+            self.crit_multiplier = other.crit_multiplier;
+        }
+        self.lifesteal_ratio += other.lifesteal_ratio;
+        self.on_hit_slow_ratio = self.on_hit_slow_ratio.max(other.on_hit_slow_ratio);
+        self.on_hit_heal_reduction_ratio = self.on_hit_heal_reduction_ratio.max(other.on_hit_heal_reduction_ratio);
+        self.on_hit_debuff_duration_secs = self.on_hit_debuff_duration_secs.max(other.on_hit_debuff_duration_secs);
     }
 
     pub fn split_buffs_and_debuffs(&self) -> (Vec<String>, Vec<String>) {
@@ -305,6 +346,14 @@ impl ItemStatsModifier {
         push_f32(&mut buffs, &mut debuffs, self.grenade_aoe_bonus, "Grenade AOE", "m");
         push_i32(&mut buffs, &mut debuffs, self.grenade_max_charges_bonus, "Grenade Max Charges");
         push_pct(&mut buffs, &mut debuffs, self.grenade_recharge_speed_pct, "Grenade Recharge Speed");
+        push_pct(&mut buffs, &mut debuffs, self.evasion_chance, "Evasion");
+        push_pct(&mut buffs, &mut debuffs, self.true_strike_chance, "True Strike");
+        if self.crit_chance > 0.0001 && self.crit_multiplier > 1.0 {
+            buffs.push(format!("{:.0}% Crit ({:.0}% DMG)", self.crit_chance * 100.0, self.crit_multiplier * 100.0));
+        }
+        push_pct(&mut buffs, &mut debuffs, self.lifesteal_ratio, "Lifesteal");
+        push_pct(&mut buffs, &mut debuffs, self.on_hit_slow_ratio, "On-Hit Cryo Slow");
+        push_pct(&mut buffs, &mut debuffs, self.on_hit_heal_reduction_ratio, "On-Hit Anti-Heal");
 
         (buffs, debuffs)
     }
@@ -322,6 +371,11 @@ pub enum ItemActiveAbility {
     None,
     Teleport,
     ShadowBlade,
+    ReflectArmor,
+    BulletImmunity,
+    NullPulse,
+    SonarReveal,
+    KineticDash,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -392,6 +446,68 @@ pub struct ShadowBladeConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CombatEffectsConfig {
+    pub evasion_night_or_rain_bonus: f32,
+    pub true_strike_bonus_damage: f32,
+    pub cryo_snow_or_water_duration_mult: f32,
+    pub popup_throttle_secs: f32,
+    pub evade_popup_color_rgb: (f32, f32, f32),
+    pub crit_popup_color_rgb: (f32, f32, f32),
+    pub immune_popup_color_rgb: (f32, f32, f32),
+    pub reflect_popup_color_rgb: (f32, f32, f32),
+    pub purge_popup_color_rgb: (f32, f32, f32),
+    pub sonar_popup_color_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ReflectArmorConfig {
+    pub item_id: String,
+    pub duration_secs: f32,
+    pub cooldown_secs: f32,
+    pub reflect_damage_ratio: f32,
+    pub buff_bar_color_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BulletImmunityConfig {
+    pub item_id: String,
+    pub duration_secs: f32,
+    pub cooldown_secs: f32,
+    pub cleanse_debuffs_on_activate: bool,
+    pub buff_bar_color_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NullPulseConfig {
+    pub item_id: String,
+    pub radius: f32,
+    pub rain_or_water_radius_mult: f32,
+    pub mute_duration_secs: f32,
+    pub cooldown_secs: f32,
+    pub pulse_color_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SonarRevealConfig {
+    pub item_id: String,
+    pub radius: f32,
+    pub reveal_duration_secs: f32,
+    pub cooldown_secs: f32,
+    pub pulse_color_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct KineticDashConfig {
+    pub item_id: String,
+    pub dash_distance: f32,
+    pub dash_duration_secs: f32,
+    pub stamina_restore: f32,
+    pub damage_lockout_secs: f32,
+    pub cooldown_secs: f32,
+    pub buff_bar_color_rgb: (f32, f32, f32),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ShopUiConfig {
     pub shop_panel_width_px: f32,
     pub shop_panel_height_px: f32,
@@ -447,6 +563,17 @@ pub struct StatLimitsConfig {
     pub flame_debuff_bar_color_rgb: (f32, f32, f32),
     pub electric_debuff_bar_color_rgb: (f32, f32, f32),
     pub toxic_debuff_bar_color_rgb: (f32, f32, f32),
+    pub max_evasion_chance: f32,
+    pub max_true_strike_chance: f32,
+    pub max_crit_chance: f32,
+    pub max_crit_multiplier: f32,
+    pub max_lifesteal_ratio: f32,
+    pub max_on_hit_slow_ratio: f32,
+    pub max_on_hit_heal_reduction_ratio: f32,
+    pub min_cryo_slow_multiplier: f32,
+    pub cryo_debuff_bar_color_rgb: (f32, f32, f32),
+    pub null_mute_debuff_bar_color_rgb: (f32, f32, f32),
+    pub sonar_debuff_bar_color_rgb: (f32, f32, f32),
 }
 
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
@@ -459,6 +586,12 @@ pub struct ItemsConfig {
     pub shop_ui: ShopUiConfig,
     pub teleport: TeleportConfig,
     pub shadow_blade: ShadowBladeConfig,
+    pub combat_effects: CombatEffectsConfig,
+    pub reflect_armor: ReflectArmorConfig,
+    pub bullet_immunity: BulletImmunityConfig,
+    pub null_pulse: NullPulseConfig,
+    pub sonar_reveal: SonarRevealConfig,
+    pub kinetic_dash: KineticDashConfig,
     pub items: Vec<ItemDef>,
 }
 
@@ -615,6 +748,23 @@ impl ItemsConfig {
                 comp_sum
             );
         }
+
+        // اعتبارسنجی دقیق کانفیگ‌های مکانیک‌های تاکتیکی (بدون مقادیر پیش‌فرض)
+        assert!(self.stat_limits.max_evasion_chance > 0.0 && self.stat_limits.max_evasion_chance < 1.0, "max_evasion_chance باید بین 0 و 1 باشد");
+        assert!(self.stat_limits.max_true_strike_chance > 0.0 && self.stat_limits.max_true_strike_chance <= 1.0, "max_true_strike_chance نامعتبر است");
+        assert!(self.stat_limits.max_crit_chance > 0.0 && self.stat_limits.max_crit_chance <= 1.0, "max_crit_chance نامعتبر است");
+        assert!(self.stat_limits.max_crit_multiplier >= 1.0, "max_crit_multiplier باید >= 1.0 باشد");
+        assert!(self.stat_limits.max_lifesteal_ratio > 0.0 && self.stat_limits.max_lifesteal_ratio <= 1.0, "max_lifesteal_ratio نامعتبر است");
+        assert!(self.stat_limits.min_cryo_slow_multiplier > 0.0 && self.stat_limits.min_cryo_slow_multiplier <= 1.0, "min_cryo_slow_multiplier نامعتبر است");
+        assert!(self.combat_effects.evasion_night_or_rain_bonus >= 0.0, "evasion_night_or_rain_bonus نامعتبر است");
+        assert!(self.combat_effects.true_strike_bonus_damage >= 0.0, "true_strike_bonus_damage نامعتبر است");
+        assert!(self.combat_effects.cryo_snow_or_water_duration_mult >= 1.0, "cryo_snow_or_water_duration_mult باید >= 1.0 باشد");
+        assert!(self.combat_effects.popup_throttle_secs > 0.0, "popup_throttle_secs باید > 0 باشد");
+        assert!(self.reflect_armor.duration_secs > 0.0 && self.reflect_armor.cooldown_secs > 0.0 && self.reflect_armor.reflect_damage_ratio > 0.0, "reflect_armor نامعتبر است");
+        assert!(self.bullet_immunity.duration_secs > 0.0 && self.bullet_immunity.cooldown_secs > 0.0, "bullet_immunity نامعتبر است");
+        assert!(self.null_pulse.radius > 0.0 && self.null_pulse.rain_or_water_radius_mult >= 1.0 && self.null_pulse.mute_duration_secs > 0.0 && self.null_pulse.cooldown_secs > 0.0, "null_pulse نامعتبر است");
+        assert!(self.sonar_reveal.radius > 0.0 && self.sonar_reveal.reveal_duration_secs > 0.0 && self.sonar_reveal.cooldown_secs > 0.0, "sonar_reveal نامعتبر است");
+        assert!(self.kinetic_dash.dash_distance > 0.0 && self.kinetic_dash.dash_duration_secs > 0.0 && self.kinetic_dash.cooldown_secs > 0.0 && self.kinetic_dash.damage_lockout_secs >= 0.0, "kinetic_dash نامعتبر است");
     }
 
     pub fn get_item(&self, id: &str) -> Option<&ItemDef> {
@@ -930,14 +1080,52 @@ pub fn recompute_player_slot_stats(
         .max(lim.min_stamina_regen_per_sec);
     p.hero_armor = base.armor + growth.armor_per_level * levels_gained + total_mod.armor_bonus;
 
+    // محاسبه ویژگی‌های پسیو تاکتیکی (Evasion با بونوس شب/باران، True Strike، Crit، Lifesteal، Cryo)
+    let env_evasion_bonus = if total_mod.evasion_chance > 0.0
+        && (p.active_is_night || p.active_weather == WeatherKind::Rainy)
+    {
+        items_cfg.combat_effects.evasion_night_or_rain_bonus
+    } else {
+        0.0
+    };
+    p.hero_evasion_chance = (total_mod.evasion_chance + env_evasion_bonus)
+        .clamp(0.0, lim.max_evasion_chance);
+    p.hero_true_strike_chance = total_mod
+        .true_strike_chance
+        .clamp(0.0, lim.max_true_strike_chance);
+    p.hero_crit_chance = total_mod.crit_chance.clamp(0.0, lim.max_crit_chance);
+    p.hero_crit_multiplier = if p.hero_crit_chance > 0.0 {
+        total_mod.crit_multiplier.clamp(1.0, lim.max_crit_multiplier)
+    } else {
+        1.0
+    };
+    p.hero_lifesteal_ratio = total_mod
+        .lifesteal_ratio
+        .clamp(0.0, lim.max_lifesteal_ratio);
+    p.hero_on_hit_slow_ratio = total_mod
+        .on_hit_slow_ratio
+        .clamp(0.0, lim.max_on_hit_slow_ratio);
+    p.hero_on_hit_heal_reduction_ratio = total_mod
+        .on_hit_heal_reduction_ratio
+        .clamp(0.0, lim.max_on_hit_heal_reduction_ratio);
+    p.hero_on_hit_debuff_duration_secs = total_mod.on_hit_debuff_duration_secs.max(0.0);
+
     // به‌روزرسانی آنی سرعت نمایشی (حتی وقتی هیرو ایستاده است)
     let invis_mult = if p.invisibility_remaining > 0.0 {
         1.0 + p.invis_move_speed_bonus_pct
     } else {
         1.0
     };
-    p.current_move_speed =
-        config.soldier.run_speed * p.hero_move_speed_multiplier * p.toxic_slow_multiplier * invis_mult;
+    let cryo_mult = if p.cryo_debuff_remaining > 0.0 {
+        (1.0 - p.cryo_slow_ratio).clamp(lim.min_cryo_slow_multiplier, 1.0)
+    } else {
+        1.0
+    };
+    p.current_move_speed = config.soldier.run_speed
+        * p.hero_move_speed_multiplier
+        * p.toxic_slow_multiplier
+        * cryo_mult
+        * invis_mult;
 
     // اسلحه اصلی (Primary) با پشتیبانی کامل از تمام WeaponKindها
     let base_p_rate =
@@ -3489,6 +3677,7 @@ pub fn try_activate_shadow_blade(
         return false;
     };
     if p.is_dead
+        || p.null_mute_remaining > 0.0
         || (!allow_sb_during_tp && p.active_teleport.is_some())
         || p.shadow_blade_cooldown_remaining > 0.0
         || p.invisibility_remaining > 0.0
@@ -3541,6 +3730,43 @@ pub fn step_shadow_blade_system(
         if p.shadow_blade_cooldown_remaining > 0.0 {
             p.shadow_blade_cooldown_remaining = (p.shadow_blade_cooldown_remaining - dt).max(0.0);
         }
+        if p.reflect_armor_cooldown_remaining > 0.0 {
+            p.reflect_armor_cooldown_remaining = (p.reflect_armor_cooldown_remaining - dt).max(0.0);
+        }
+        if p.bullet_immunity_cooldown_remaining > 0.0 {
+            p.bullet_immunity_cooldown_remaining = (p.bullet_immunity_cooldown_remaining - dt).max(0.0);
+        }
+        if p.null_pulse_cooldown_remaining > 0.0 {
+            p.null_pulse_cooldown_remaining = (p.null_pulse_cooldown_remaining - dt).max(0.0);
+        }
+        if p.sonar_reveal_cooldown_remaining > 0.0 {
+            p.sonar_reveal_cooldown_remaining = (p.sonar_reveal_cooldown_remaining - dt).max(0.0);
+        }
+        if p.kinetic_dash_cooldown_remaining > 0.0 {
+            p.kinetic_dash_cooldown_remaining = (p.kinetic_dash_cooldown_remaining - dt).max(0.0);
+        }
+        if p.reflect_armor_remaining > 0.0 {
+            p.reflect_armor_remaining = (p.reflect_armor_remaining - dt).max(0.0);
+        }
+        if p.bullet_immunity_remaining > 0.0 {
+            p.bullet_immunity_remaining = (p.bullet_immunity_remaining - dt).max(0.0);
+        }
+        if p.cryo_debuff_remaining > 0.0 {
+            p.cryo_debuff_remaining = (p.cryo_debuff_remaining - dt).max(0.0);
+            if p.cryo_debuff_remaining <= 0.0 {
+                p.cryo_slow_ratio = 0.0;
+                p.cryo_heal_reduction_ratio = 0.0;
+            }
+        }
+        if p.null_mute_remaining > 0.0 {
+            p.null_mute_remaining = (p.null_mute_remaining - dt).max(0.0);
+        }
+        if p.sonar_revealed_remaining > 0.0 {
+            p.sonar_revealed_remaining = (p.sonar_revealed_remaining - dt).max(0.0);
+        }
+        if p.popup_throttle_remaining > 0.0 {
+            p.popup_throttle_remaining = (p.popup_throttle_remaining - dt).max(0.0);
+        }
         if p.invisibility_remaining > 0.0 {
             let revealed_by_turret = turrets_snapshot.iter().any(|&(t_team, t_pos, t_dead)| {
                 !t_dead
@@ -3556,7 +3782,8 @@ pub fn step_shadow_blade_system(
                     && Vec2::new(p.soldier_pos.x - fpos.x, p.soldier_pos.z - fpos.z).length()
                         <= ftn.true_sight_radius
             });
-            p.is_revealed_by_turret = revealed_by_turret || revealed_by_fountain;
+            p.is_revealed_by_turret =
+                revealed_by_turret || revealed_by_fountain || p.sonar_revealed_remaining > 0.0;
             p.invisibility_remaining = (p.invisibility_remaining - dt).max(0.0);
             if p.invisibility_remaining <= 0.0 {
                 p.invisibility_total_secs = 0.0;
@@ -3573,5 +3800,246 @@ pub fn step_shadow_blade_system(
         world
             .pending_fx
             .push(GameplayFxEvent::ShadowBladeEnded { slot_index, pos });
+    }
+}
+
+/// فعال‌سازی یکپارچه تمام آیتم‌های فعال تاکتیکی توسط سرور (Server-Authoritative)
+pub fn try_activate_item_ability(
+    world: &mut AuthoritativeWorldState,
+    slot_index: usize,
+    inv_index: usize,
+    config: &GameConfig,
+    items_cfg: &ItemsConfig,
+) -> bool {
+    if !is_match_action_allowed(world) {
+        return false;
+    }
+    let Some(p_ref) = world.players.get(slot_index) else {
+        return false;
+    };
+    if p_ref.is_dead {
+        return false;
+    }
+    let Some(inv_item) = p_ref.inventory.iter().find(|it| it.slot == inv_index) else {
+        return false;
+    };
+    let Some(def) = items_cfg.get_item(&inv_item.item_id) else {
+        return false;
+    };
+    let ability = def.active_ability;
+    match ability {
+        ItemActiveAbility::None | ItemActiveAbility::Teleport => false,
+        ItemActiveAbility::ShadowBlade => {
+            try_activate_shadow_blade(world, slot_index, inv_index, items_cfg)
+        }
+        ItemActiveAbility::ReflectArmor => {
+            let p = &mut world.players[slot_index];
+            if p.null_mute_remaining > 0.0 || p.reflect_armor_cooldown_remaining > 0.0 {
+                return false;
+            }
+            let cfg = &items_cfg.reflect_armor;
+            p.reflect_armor_remaining = cfg.duration_secs;
+            p.reflect_armor_total_secs = cfg.duration_secs;
+            p.reflect_armor_cooldown_remaining = cfg.cooldown_secs;
+            let pos = p.soldier_pos;
+            world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                pos: pos + Vec3::Y * 2.1,
+                text: "MIRROR ARMOR".to_string(),
+                color_rgb: cfg.buff_bar_color_rgb,
+            });
+            world.pending_fx.push(GameplayFxEvent::TacticalPulse {
+                pos: pos + Vec3::Y * 0.6,
+                radius: 2.6,
+                color_rgb: cfg.buff_bar_color_rgb,
+            });
+            true
+        }
+        ItemActiveAbility::BulletImmunity => {
+            let p = &mut world.players[slot_index];
+            if p.null_mute_remaining > 0.0 || p.bullet_immunity_cooldown_remaining > 0.0 {
+                return false;
+            }
+            let cfg = &items_cfg.bullet_immunity;
+            p.bullet_immunity_remaining = cfg.duration_secs;
+            p.bullet_immunity_total_secs = cfg.duration_secs;
+            p.bullet_immunity_cooldown_remaining = cfg.cooldown_secs;
+            if cfg.cleanse_debuffs_on_activate {
+                p.cryo_debuff_remaining = 0.0;
+                p.cryo_slow_ratio = 0.0;
+                p.cryo_heal_reduction_ratio = 0.0;
+                p.flame_armor_debuff_remaining = 0.0;
+                p.flame_armor_debuff_amount = 0.0;
+                p.electric_fire_rate_slow_remaining = 0.0;
+                p.electric_fire_rate_slow_ratio = 0.0;
+            }
+            let pos = p.soldier_pos;
+            world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                pos: pos + Vec3::Y * 2.1,
+                text: "PHASE SHIELD".to_string(),
+                color_rgb: cfg.buff_bar_color_rgb,
+            });
+            world.pending_fx.push(GameplayFxEvent::TacticalPulse {
+                pos: pos + Vec3::Y * 0.6,
+                radius: 3.0,
+                color_rgb: cfg.buff_bar_color_rgb,
+            });
+            true
+        }
+        ItemActiveAbility::NullPulse => {
+            let (caster_team, caster_pos, caster_in_water) = {
+                let p = &mut world.players[slot_index];
+                if p.null_mute_remaining > 0.0 || p.null_pulse_cooldown_remaining > 0.0 {
+                    return false;
+                }
+                p.null_pulse_cooldown_remaining = items_cfg.null_pulse.cooldown_secs;
+                (p.hero_team, p.soldier_pos, p.in_water)
+            };
+            let cfg = &items_cfg.null_pulse;
+            let is_rain = world.current_weather == WeatherKind::Rainy;
+            let base_radius = if is_rain || caster_in_water {
+                cfg.radius * cfg.rain_or_water_radius_mult
+            } else {
+                cfg.radius
+            };
+            let mut purged_fx: Vec<(usize, Vec3)> = Vec::new();
+            let mut ended_sb: Vec<(usize, Vec3)> = Vec::new();
+            for enemy in &mut world.players {
+                if enemy.is_dead || enemy.hero_team == caster_team {
+                    continue;
+                }
+                let eff_r = if enemy.in_water {
+                    (cfg.radius * cfg.rain_or_water_radius_mult).max(base_radius)
+                } else {
+                    base_radius
+                };
+                let flat_d = Vec2::new(
+                    enemy.soldier_pos.x - caster_pos.x,
+                    enemy.soldier_pos.z - caster_pos.z,
+                )
+                .length();
+                if flat_d <= eff_r {
+                    let had_sb = enemy.invisibility_remaining > 0.0;
+                    enemy.bullet_immunity_remaining = 0.0;
+                    enemy.reflect_armor_remaining = 0.0;
+                    enemy.invisibility_remaining = 0.0;
+                    enemy.invisibility_total_secs = 0.0;
+                    enemy.invis_move_speed_bonus_pct = 0.0;
+                    enemy.is_revealed_by_turret = false;
+                    enemy.null_mute_remaining = cfg.mute_duration_secs;
+                    enemy.null_mute_total_secs = cfg.mute_duration_secs;
+                    purged_fx.push((enemy.slot_index, enemy.soldier_pos));
+                    if had_sb {
+                        ended_sb.push((enemy.slot_index, enemy.soldier_pos));
+                    }
+                }
+            }
+            world.pending_fx.push(GameplayFxEvent::TacticalPulse {
+                pos: caster_pos + Vec3::Y * 0.5,
+                radius: base_radius,
+                color_rgb: cfg.pulse_color_rgb,
+            });
+            for (_, epos) in purged_fx {
+                world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                    pos: epos + Vec3::Y * 2.1,
+                    text: "PURGED!".to_string(),
+                    color_rgb: items_cfg.combat_effects.purge_popup_color_rgb,
+                });
+            }
+            for (eslot, epos) in ended_sb {
+                world.pending_fx.push(GameplayFxEvent::ShadowBladeEnded {
+                    slot_index: eslot,
+                    pos: epos,
+                });
+            }
+            true
+        }
+        ItemActiveAbility::SonarReveal => {
+            let (caster_team, caster_pos) = {
+                let p = &mut world.players[slot_index];
+                if p.null_mute_remaining > 0.0 || p.sonar_reveal_cooldown_remaining > 0.0 {
+                    return false;
+                }
+                p.sonar_reveal_cooldown_remaining = items_cfg.sonar_reveal.cooldown_secs;
+                (p.hero_team, p.soldier_pos)
+            };
+            let cfg = &items_cfg.sonar_reveal;
+            let mut revealed_positions: Vec<Vec3> = Vec::new();
+            for enemy in &mut world.players {
+                if enemy.is_dead || enemy.hero_team == caster_team {
+                    continue;
+                }
+                let flat_d = Vec2::new(
+                    enemy.soldier_pos.x - caster_pos.x,
+                    enemy.soldier_pos.z - caster_pos.z,
+                )
+                .length();
+                if flat_d <= cfg.radius {
+                    enemy.sonar_revealed_remaining = cfg.reveal_duration_secs;
+                    enemy.sonar_revealed_total_secs = cfg.reveal_duration_secs;
+                    if enemy.invisibility_remaining > 0.0 {
+                        enemy.is_revealed_by_turret = true;
+                    }
+                    revealed_positions.push(enemy.soldier_pos);
+                }
+            }
+            world.pending_fx.push(GameplayFxEvent::TacticalPulse {
+                pos: caster_pos + Vec3::Y * 0.5,
+                radius: cfg.radius,
+                color_rgb: cfg.pulse_color_rgb,
+            });
+            for epos in revealed_positions {
+                world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                    pos: epos + Vec3::Y * 2.1,
+                    text: "DETECTED!".to_string(),
+                    color_rgb: items_cfg.combat_effects.sonar_popup_color_rgb,
+                });
+            }
+            true
+        }
+        ItemActiveAbility::KineticDash => {
+            let now = world.match_elapsed_secs;
+            let kd = &items_cfg.kinetic_dash;
+            let p = &mut world.players[slot_index];
+            if p.null_mute_remaining > 0.0
+                || p.kinetic_dash_cooldown_remaining > 0.0
+                || p.active_teleport.is_some()
+                || p.traversal.is_active
+                || p.wall_climb_mountain_index.is_some()
+            {
+                return false;
+            }
+            let recently_damaged = p
+                .recent_hero_damagers
+                .iter()
+                .any(|&(_, ts)| (now - ts) < kd.damage_lockout_secs);
+            if recently_damaged {
+                set_shop_notice(
+                    p,
+                    "Thruster locked briefly after taking hero damage",
+                    true,
+                );
+                return false;
+            }
+            let mut dir = Vec3::new(p.soldier_facing_dir.x, 0.0, p.soldier_facing_dir.z);
+            if dir.length_squared() < 0.0001 {
+                dir = Vec3::new(p.aim_world_dir.x, 0.0, p.aim_world_dir.z);
+            }
+            let dash_dir = dir.normalize_or_zero();
+            if dash_dir.length_squared() < 0.0001 {
+                return false;
+            }
+            p.kinetic_dash_remaining = kd.dash_duration_secs;
+            p.kinetic_dash_dir = dash_dir;
+            p.kinetic_dash_cooldown_remaining = kd.cooldown_secs;
+            p.hero_stamina = (p.hero_stamina + kd.stamina_restore).min(p.hero_max_stamina);
+            let pos = p.soldier_pos;
+            let _ = config;
+            world.pending_fx.push(GameplayFxEvent::TacticalPulse {
+                pos: pos + Vec3::Y * 0.4,
+                radius: 2.2,
+                color_rgb: kd.buff_bar_color_rgb,
+            });
+            true
+        }
     }
 }

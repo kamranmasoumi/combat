@@ -132,7 +132,14 @@ pub struct ShopContextSnapshot {
     pub is_teleporting: bool,
     pub teleport_progress: f32,
     pub shadow_blade_cooldown_remaining: f32,
+    pub reflect_armor_cooldown_remaining: f32,
+    pub bullet_immunity_cooldown_remaining: f32,
+    pub null_pulse_cooldown_remaining: f32,
+    pub sonar_reveal_cooldown_remaining: f32,
+    pub kinetic_dash_cooldown_remaining: f32,
     pub is_invisible: bool,
+    pub is_reflect_armor_active: bool,
+    pub is_bullet_immune: bool,
     pub active_buffs: Vec<ActiveBuffSnapshot>,
     pub courier_hp: f32,
     pub courier_max_hp: f32,
@@ -787,6 +794,19 @@ fn item_matches_search(item: &ItemDef, query_lower: &str) -> bool {
                 || s.grenade_recharge_speed_pct.abs() > 0.0001;
             let has_invis = item.active_ability == ItemActiveAbility::ShadowBlade;
             let has_tp = item.active_ability == ItemActiveAbility::Teleport;
+            let has_tactical_active = matches!(
+                item.active_ability,
+                ItemActiveAbility::ReflectArmor
+                    | ItemActiveAbility::BulletImmunity
+                    | ItemActiveAbility::NullPulse
+                    | ItemActiveAbility::SonarReveal
+                    | ItemActiveAbility::KineticDash
+            );
+            let has_evasion = s.evasion_chance > 0.0001;
+            let has_truestrike = s.true_strike_chance > 0.0001;
+            let has_crit = s.crit_chance > 0.0001;
+            let has_lifesteal = s.lifesteal_ratio > 0.0001;
+            let has_cryo = s.on_hit_slow_ratio > 0.0001 || s.on_hit_heal_reduction_ratio > 0.0001;
             let has_modes = !item.modes.is_empty();
 
             matched = (token == "speed" || token == "move" || token == "boot" || token == "boots") && has_speed
@@ -803,7 +823,13 @@ fn item_matches_search(item: &ItemDef, query_lower: &str) -> bool {
                 || (token == "invis" || token == "stealth" || token == "shadow") && has_invis
                 || (token == "tp" || token == "teleport" || token == "scroll") && has_tp
                 || (token == "mode" || token == "toggle" || token == "switch") && has_modes
-                || (token == "active") && (has_invis || has_tp || has_modes)
+                || (token == "evade" || token == "evasion" || token == "dodge" || token == "miss") && has_evasion
+                || (token == "true" || token == "strike" || token == "accuracy" || token == "pierce") && has_truestrike
+                || (token == "crit" || token == "critical") && has_crit
+                || (token == "lifesteal" || token == "vamp" || token == "siphon") && has_lifesteal
+                || (token == "cryo" || token == "slow" || token == "antiheal") && has_cryo
+                || (token == "reflect" || token == "mirror" || token == "immune" || token == "shield" || token == "purge" || token == "null" || token == "emp" || token == "sonar" || token == "reveal" || token == "dash" || token == "blink") && has_tactical_active
+                || (token == "active") && (has_invis || has_tp || has_tactical_active || has_modes)
                 || (token == "rifle" || token == "primary") && item.category == ItemCategory::PrimaryWeapon
                 || (token == "pistol" || token == "sidearm") && item.category == ItemCategory::Pistol;
         }
@@ -3394,7 +3420,10 @@ struct HudBarRebuildCache {
     last_tp_preview: bool,
     last_is_tp: bool,
     last_sb_cd: u32,
+    last_tactical_cds: [u32; 5],
     last_is_invis: bool,
+    last_is_reflect: bool,
+    last_is_immune: bool,
 }
 
 #[derive(SystemParam)]
@@ -3464,11 +3493,21 @@ fn rebuild_hud_inventory_bar_system(
     let sel_changed = cache.last_cour_sel != Some(courier_ctrl.selected);
     let tp_cd_ceil = ctx.teleport_cooldown_remaining.ceil().max(0.0) as u32;
     let sb_cd_ceil = ctx.shadow_blade_cooldown_remaining.ceil().max(0.0) as u32;
+    let tactical_cds = [
+        ctx.reflect_armor_cooldown_remaining.ceil().max(0.0) as u32,
+        ctx.bullet_immunity_cooldown_remaining.ceil().max(0.0) as u32,
+        ctx.null_pulse_cooldown_remaining.ceil().max(0.0) as u32,
+        ctx.sonar_reveal_cooldown_remaining.ceil().max(0.0) as u32,
+        ctx.kinetic_dash_cooldown_remaining.ceil().max(0.0) as u32,
+    ];
     let tp_changed = cache.last_tp_cd != tp_cd_ceil
         || cache.last_tp_preview != teleport_preview.active
         || cache.last_is_tp != ctx.is_teleporting
         || cache.last_sb_cd != sb_cd_ceil
-        || cache.last_is_invis != ctx.is_invisible;
+        || cache.last_tactical_cds != tactical_cds
+        || cache.last_is_invis != ctx.is_invisible
+        || cache.last_is_reflect != ctx.is_reflect_armor_active
+        || cache.last_is_immune != ctx.is_bullet_immune;
     if !cart_changed && !inv_changed && !stash_changed && !tp_slot_changed && !bind_changed && !sel_changed && !tp_changed {
         return;
     }
@@ -3484,7 +3523,10 @@ fn rebuild_hud_inventory_bar_system(
     cache.last_tp_preview = teleport_preview.active;
     cache.last_is_tp = ctx.is_teleporting;
     cache.last_sb_cd = sb_cd_ceil;
+    cache.last_tactical_cds = tactical_cds;
     cache.last_is_invis = ctx.is_invisible;
+    cache.last_is_reflect = ctx.is_reflect_armor_active;
+    cache.last_is_immune = ctx.is_bullet_immune;
 
     if let Ok(mut bc) = hq.root_border_q.single_mut() {
         *bc = if courier_ctrl.selected {
@@ -3813,11 +3855,21 @@ fn rebuild_hud_inventory_bar_system(
                                     ));
                                 });
                             }
-                            if item.active_ability == ItemActiveAbility::ShadowBlade
+                            if item.active_ability != ItemActiveAbility::None
+                                && item.active_ability != ItemActiveAbility::Teleport
                                 && !ctx.inspected_is_read_only
                                 && !courier_ctrl.selected
                             {
-                                if ctx.is_invisible {
+                                let (active_glow, slot_cd_ceil) = match item.active_ability {
+                                    ItemActiveAbility::ShadowBlade => (ctx.is_invisible, sb_cd_ceil),
+                                    ItemActiveAbility::ReflectArmor => (ctx.is_reflect_armor_active, tactical_cds[0]),
+                                    ItemActiveAbility::BulletImmunity => (ctx.is_bullet_immune, tactical_cds[1]),
+                                    ItemActiveAbility::NullPulse => (false, tactical_cds[2]),
+                                    ItemActiveAbility::SonarReveal => (false, tactical_cds[3]),
+                                    ItemActiveAbility::KineticDash => (false, tactical_cds[4]),
+                                    _ => (false, 0),
+                                };
+                                if active_glow {
                                     slot.spawn((
                                         Pickable::IGNORE,
                                         Node {
@@ -3832,7 +3884,7 @@ fn rebuild_hud_inventory_bar_system(
                                         BackgroundColor(Color::srgba(0.25, 0.55, 0.95, 0.18)),
                                     ));
                                 }
-                                if sb_cd_ceil > 0 {
+                                if slot_cd_ceil > 0 {
                                     slot.spawn((
                                         Pickable::IGNORE,
                                         Node {
@@ -3848,7 +3900,7 @@ fn rebuild_hud_inventory_bar_system(
                                     ))
                                     .with_children(|cd| {
                                         cd.spawn((
-                                            Text::new(format!("{}s", sb_cd_ceil)),
+                                            Text::new(format!("{}s", slot_cd_ceil)),
                                             TextFont {
                                                 font_size: FontSize::Px(13.0),
                                                 ..default()
@@ -5190,12 +5242,11 @@ fn inventory_shortcut_trigger_system(
             if input.just_pressed(&keys, &mouse) {
                 if let Some(inv_item) = ctx.inventory.iter().find(|it| it.slot == slot_idx) {
                     if let Some(def) = items_cfg.get_item(&inv_item.item_id) {
-                        if def.active_ability == ItemActiveAbility::ShadowBlade {
-                            if !ctx.is_dead
-                                && !ctx.is_invisible
-                                && ctx.shadow_blade_cooldown_remaining <= 0.0
-                            {
-                                outgoing.0.push(ClientLobbyMessage::ActivateShadowBlade {
+                        if def.active_ability != ItemActiveAbility::None
+                            && def.active_ability != ItemActiveAbility::Teleport
+                        {
+                            if !ctx.is_dead {
+                                outgoing.0.push(ClientLobbyMessage::ActivateItem {
                                     inv_index: slot_idx,
                                 });
                             }
@@ -5569,12 +5620,11 @@ fn hud_inventory_drag_and_drop_system(
             } else if !drag_state.pressed_is_courier && hovered_slot == Some(clicked_slot) {
                 if let Some(inv_item) = ctx.inventory.iter().find(|it| it.slot == clicked_slot) {
                     if let Some(def) = items_cfg.get_item(&inv_item.item_id) {
-                        if def.active_ability == ItemActiveAbility::ShadowBlade {
-                            if !ctx.is_dead
-                                && !ctx.is_invisible
-                                && ctx.shadow_blade_cooldown_remaining <= 0.0
-                            {
-                                outgoing.0.push(ClientLobbyMessage::ActivateShadowBlade {
+                        if def.active_ability != ItemActiveAbility::None
+                            && def.active_ability != ItemActiveAbility::Teleport
+                        {
+                            if !ctx.is_dead {
+                                outgoing.0.push(ClientLobbyMessage::ActivateItem {
                                     inv_index: clicked_slot,
                                 });
                                 teleport_preview.wait_left_release_after_confirm = true;

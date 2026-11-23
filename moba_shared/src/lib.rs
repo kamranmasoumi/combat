@@ -2802,6 +2802,16 @@ pub enum GameplayFxEvent {
         slot_index: usize,
         pos: Vec3,
     },
+    CombatPopup {
+        pos: Vec3,
+        text: String,
+        color_rgb: (f32, f32, f32),
+    },
+    TacticalPulse {
+        pos: Vec3,
+        radius: f32,
+        color_rgb: (f32, f32, f32),
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3030,6 +3040,7 @@ pub enum ClientLobbyMessage {
     },
     CancelTeleport,
     ActivateShadowBlade { inv_index: usize },
+    ActivateItem { inv_index: usize },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3482,8 +3493,15 @@ pub struct HeroSnapshot {
     pub is_teleporting: bool,
     pub teleport_progress: f32,
     pub shadow_blade_cooldown_remaining: f32,
+    pub reflect_armor_cooldown_remaining: f32,
+    pub bullet_immunity_cooldown_remaining: f32,
+    pub null_pulse_cooldown_remaining: f32,
+    pub sonar_reveal_cooldown_remaining: f32,
+    pub kinetic_dash_cooldown_remaining: f32,
     pub is_invisible: bool,
     pub invisibility_remaining: f32,
+    pub is_reflect_armor_active: bool,
+    pub is_bullet_immune: bool,
     pub active_buffs: Vec<ActiveBuffSnapshot>,
 }
 
@@ -4046,6 +4064,9 @@ pub fn is_swimming_hero_revealed_to_team(
         return false;
     };
     if target.hero_team == viewer_team {
+        return true;
+    }
+    if target.sonar_revealed_remaining > 0.0 {
         return true;
     }
     if !is_pos_in_deep_water(config, target.soldier_pos) {
@@ -7086,6 +7107,34 @@ pub struct PlayerSlotState {
     pub invisibility_total_secs: f32,
     pub invis_move_speed_bonus_pct: f32,
     pub is_revealed_by_turret: bool,
+    pub hero_evasion_chance: f32,
+    pub hero_true_strike_chance: f32,
+    pub hero_crit_chance: f32,
+    pub hero_crit_multiplier: f32,
+    pub hero_lifesteal_ratio: f32,
+    pub hero_on_hit_slow_ratio: f32,
+    pub hero_on_hit_heal_reduction_ratio: f32,
+    pub hero_on_hit_debuff_duration_secs: f32,
+    pub reflect_armor_cooldown_remaining: f32,
+    pub bullet_immunity_cooldown_remaining: f32,
+    pub null_pulse_cooldown_remaining: f32,
+    pub sonar_reveal_cooldown_remaining: f32,
+    pub kinetic_dash_cooldown_remaining: f32,
+    pub reflect_armor_remaining: f32,
+    pub reflect_armor_total_secs: f32,
+    pub bullet_immunity_remaining: f32,
+    pub bullet_immunity_total_secs: f32,
+    pub cryo_debuff_remaining: f32,
+    pub cryo_debuff_total_secs: f32,
+    pub cryo_slow_ratio: f32,
+    pub cryo_heal_reduction_ratio: f32,
+    pub null_mute_remaining: f32,
+    pub null_mute_total_secs: f32,
+    pub sonar_revealed_remaining: f32,
+    pub sonar_revealed_total_secs: f32,
+    pub kinetic_dash_remaining: f32,
+    pub kinetic_dash_dir: Vec3,
+    pub popup_throttle_remaining: f32,
     pub recent_hero_damagers: Vec<(usize, f32)>,
     pub last_attacked_enemy_hero_at: f32,
     pub last_ping_at_secs: f32,
@@ -7185,6 +7234,34 @@ pub struct AuthoritativeWorldState {
     pub invisibility_total_secs: f32,
     pub invis_move_speed_bonus_pct: f32,
     pub is_revealed_by_turret: bool,
+    pub hero_evasion_chance: f32,
+    pub hero_true_strike_chance: f32,
+    pub hero_crit_chance: f32,
+    pub hero_crit_multiplier: f32,
+    pub hero_lifesteal_ratio: f32,
+    pub hero_on_hit_slow_ratio: f32,
+    pub hero_on_hit_heal_reduction_ratio: f32,
+    pub hero_on_hit_debuff_duration_secs: f32,
+    pub reflect_armor_cooldown_remaining: f32,
+    pub bullet_immunity_cooldown_remaining: f32,
+    pub null_pulse_cooldown_remaining: f32,
+    pub sonar_reveal_cooldown_remaining: f32,
+    pub kinetic_dash_cooldown_remaining: f32,
+    pub reflect_armor_remaining: f32,
+    pub reflect_armor_total_secs: f32,
+    pub bullet_immunity_remaining: f32,
+    pub bullet_immunity_total_secs: f32,
+    pub cryo_debuff_remaining: f32,
+    pub cryo_debuff_total_secs: f32,
+    pub cryo_slow_ratio: f32,
+    pub cryo_heal_reduction_ratio: f32,
+    pub null_mute_remaining: f32,
+    pub null_mute_total_secs: f32,
+    pub sonar_revealed_remaining: f32,
+    pub sonar_revealed_total_secs: f32,
+    pub kinetic_dash_remaining: f32,
+    pub kinetic_dash_dir: Vec3,
+    pub popup_throttle_remaining: f32,
     pub traversal: SharedTraversalState,
     pub targets: Vec<SharedTarget>,
     pub targets_visible: Vec<bool>,
@@ -7371,6 +7448,34 @@ impl AuthoritativeWorldState {
             invisibility_total_secs: 0.0,
             invis_move_speed_bonus_pct: 0.0,
             is_revealed_by_turret: false,
+            hero_evasion_chance: 0.0,
+            hero_true_strike_chance: 0.0,
+            hero_crit_chance: 0.0,
+            hero_crit_multiplier: 1.0,
+            hero_lifesteal_ratio: 0.0,
+            hero_on_hit_slow_ratio: 0.0,
+            hero_on_hit_heal_reduction_ratio: 0.0,
+            hero_on_hit_debuff_duration_secs: 0.0,
+            reflect_armor_cooldown_remaining: 0.0,
+            bullet_immunity_cooldown_remaining: 0.0,
+            null_pulse_cooldown_remaining: 0.0,
+            sonar_reveal_cooldown_remaining: 0.0,
+            kinetic_dash_cooldown_remaining: 0.0,
+            reflect_armor_remaining: 0.0,
+            reflect_armor_total_secs: 0.0,
+            bullet_immunity_remaining: 0.0,
+            bullet_immunity_total_secs: 0.0,
+            cryo_debuff_remaining: 0.0,
+            cryo_debuff_total_secs: 0.0,
+            cryo_slow_ratio: 0.0,
+            cryo_heal_reduction_ratio: 0.0,
+            null_mute_remaining: 0.0,
+            null_mute_total_secs: 0.0,
+            sonar_revealed_remaining: 0.0,
+            sonar_revealed_total_secs: 0.0,
+            kinetic_dash_remaining: 0.0,
+            kinetic_dash_dir: Vec3::ZERO,
+            popup_throttle_remaining: 0.0,
             traversal: SharedTraversalState {
                 is_active: false,
                 kind: TraversalKind::RunningJump,
@@ -7597,6 +7702,34 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.invisibility_total_secs, &mut p.invisibility_total_secs);
         std::mem::swap(&mut self.invis_move_speed_bonus_pct, &mut p.invis_move_speed_bonus_pct);
         std::mem::swap(&mut self.is_revealed_by_turret, &mut p.is_revealed_by_turret);
+        std::mem::swap(&mut self.hero_evasion_chance, &mut p.hero_evasion_chance);
+        std::mem::swap(&mut self.hero_true_strike_chance, &mut p.hero_true_strike_chance);
+        std::mem::swap(&mut self.hero_crit_chance, &mut p.hero_crit_chance);
+        std::mem::swap(&mut self.hero_crit_multiplier, &mut p.hero_crit_multiplier);
+        std::mem::swap(&mut self.hero_lifesteal_ratio, &mut p.hero_lifesteal_ratio);
+        std::mem::swap(&mut self.hero_on_hit_slow_ratio, &mut p.hero_on_hit_slow_ratio);
+        std::mem::swap(&mut self.hero_on_hit_heal_reduction_ratio, &mut p.hero_on_hit_heal_reduction_ratio);
+        std::mem::swap(&mut self.hero_on_hit_debuff_duration_secs, &mut p.hero_on_hit_debuff_duration_secs);
+        std::mem::swap(&mut self.reflect_armor_cooldown_remaining, &mut p.reflect_armor_cooldown_remaining);
+        std::mem::swap(&mut self.bullet_immunity_cooldown_remaining, &mut p.bullet_immunity_cooldown_remaining);
+        std::mem::swap(&mut self.null_pulse_cooldown_remaining, &mut p.null_pulse_cooldown_remaining);
+        std::mem::swap(&mut self.sonar_reveal_cooldown_remaining, &mut p.sonar_reveal_cooldown_remaining);
+        std::mem::swap(&mut self.kinetic_dash_cooldown_remaining, &mut p.kinetic_dash_cooldown_remaining);
+        std::mem::swap(&mut self.reflect_armor_remaining, &mut p.reflect_armor_remaining);
+        std::mem::swap(&mut self.reflect_armor_total_secs, &mut p.reflect_armor_total_secs);
+        std::mem::swap(&mut self.bullet_immunity_remaining, &mut p.bullet_immunity_remaining);
+        std::mem::swap(&mut self.bullet_immunity_total_secs, &mut p.bullet_immunity_total_secs);
+        std::mem::swap(&mut self.cryo_debuff_remaining, &mut p.cryo_debuff_remaining);
+        std::mem::swap(&mut self.cryo_debuff_total_secs, &mut p.cryo_debuff_total_secs);
+        std::mem::swap(&mut self.cryo_slow_ratio, &mut p.cryo_slow_ratio);
+        std::mem::swap(&mut self.cryo_heal_reduction_ratio, &mut p.cryo_heal_reduction_ratio);
+        std::mem::swap(&mut self.null_mute_remaining, &mut p.null_mute_remaining);
+        std::mem::swap(&mut self.null_mute_total_secs, &mut p.null_mute_total_secs);
+        std::mem::swap(&mut self.sonar_revealed_remaining, &mut p.sonar_revealed_remaining);
+        std::mem::swap(&mut self.sonar_revealed_total_secs, &mut p.sonar_revealed_total_secs);
+        std::mem::swap(&mut self.kinetic_dash_remaining, &mut p.kinetic_dash_remaining);
+        std::mem::swap(&mut self.kinetic_dash_dir, &mut p.kinetic_dash_dir);
+        std::mem::swap(&mut self.popup_throttle_remaining, &mut p.popup_throttle_remaining);
         std::mem::swap(&mut self.traversal, &mut p.traversal);
         self.active_slot = idx;
     }
@@ -8076,6 +8209,34 @@ impl AuthoritativeWorldState {
                 invisibility_total_secs: 0.0,
                 invis_move_speed_bonus_pct: 0.0,
                 is_revealed_by_turret: false,
+                hero_evasion_chance: 0.0,
+                hero_true_strike_chance: 0.0,
+                hero_crit_chance: 0.0,
+                hero_crit_multiplier: 1.0,
+                hero_lifesteal_ratio: 0.0,
+                hero_on_hit_slow_ratio: 0.0,
+                hero_on_hit_heal_reduction_ratio: 0.0,
+                hero_on_hit_debuff_duration_secs: 0.0,
+                reflect_armor_cooldown_remaining: 0.0,
+                bullet_immunity_cooldown_remaining: 0.0,
+                null_pulse_cooldown_remaining: 0.0,
+                sonar_reveal_cooldown_remaining: 0.0,
+                kinetic_dash_cooldown_remaining: 0.0,
+                reflect_armor_remaining: 0.0,
+                reflect_armor_total_secs: 0.0,
+                bullet_immunity_remaining: 0.0,
+                bullet_immunity_total_secs: 0.0,
+                cryo_debuff_remaining: 0.0,
+                cryo_debuff_total_secs: 0.0,
+                cryo_slow_ratio: 0.0,
+                cryo_heal_reduction_ratio: 0.0,
+                null_mute_remaining: 0.0,
+                null_mute_total_secs: 0.0,
+                sonar_revealed_remaining: 0.0,
+                sonar_revealed_total_secs: 0.0,
+                kinetic_dash_remaining: 0.0,
+                kinetic_dash_dir: Vec3::ZERO,
+                popup_throttle_remaining: 0.0,
                 recent_hero_damagers: Vec::new(),
                 last_attacked_enemy_hero_at: -999.0,
                 last_ping_at_secs: -999.0,
@@ -8336,11 +8497,14 @@ impl AuthoritativeWorldState {
             }
             let hidden_by_invis = p.hero_team != self.hero_team
                 && p.invisibility_remaining > 0.0
-                && !p.is_revealed_by_turret;
-            let hidden_by_water = water_hidden_slots.contains(&p.slot_index);
+                && !p.is_revealed_by_turret
+                && p.sonar_revealed_remaining <= 0.0;
+            let hidden_by_water = water_hidden_slots.contains(&p.slot_index)
+                && p.sonar_revealed_remaining <= 0.0;
             let is_vis = !hidden_by_invis
                 && !hidden_by_water
                 && (p.hero_team == self.hero_team
+                    || p.sonar_revealed_remaining > 0.0
                     || self.fog_of_war.is_world_point_visible(config, p.soldier_pos.x, p.soldier_pos.z));
             // Server Authority: اگر دشمن در مه جنگ باشد، مختصات و اطلاعات او اصلاً به کلاینت ارسال نمی‌شود!
             if !is_vis {
@@ -8551,7 +8715,7 @@ impl AuthoritativeWorldState {
             if p.hero_team == viewer_team {
                 return false;
             }
-            if p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret {
+            if p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret && p.sonar_revealed_remaining <= 0.0 {
                 return true;
             }
             !is_swimming_hero_revealed_to_team(
@@ -8649,6 +8813,10 @@ impl AuthoritativeWorldState {
                         .get(*sb_slot)
                         .is_some_and(|p| p.hero_team == viewer_team);
                     is_ally || fow.is_world_point_visible(config, pos.x, pos.z)
+                }
+                GameplayFxEvent::CombatPopup { pos, .. }
+                | GameplayFxEvent::TacticalPulse { pos, .. } => {
+                    fow.is_world_point_visible(config, pos.x, pos.z)
                 }
             };
             if keep {
@@ -8766,7 +8934,12 @@ impl AuthoritativeWorldState {
                     } else {
                         fountain_regen_bonus_for_pos(config, self.hero_team, self.soldier_pos)
                     };
-                    self.hero_hp_regen_per_sec + fountain_bonus
+                    let cryo_heal_mult = if self.cryo_debuff_remaining > 0.0 {
+                        (1.0 - self.cryo_heal_reduction_ratio).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    (self.hero_hp_regen_per_sec + fountain_bonus) * cryo_heal_mult
                 },
                 in_fountain: !self.is_dead
                     && fountain_regen_bonus_for_pos(config, self.hero_team, self.soldier_pos) > 0.0,
@@ -8854,8 +9027,15 @@ impl AuthoritativeWorldState {
                     .map(|tp| (tp.elapsed_secs / tp.total_secs.max(0.01)).clamp(0.0, 1.0))
                     .unwrap_or(0.0),
                 shadow_blade_cooldown_remaining: self.shadow_blade_cooldown_remaining.max(0.0),
+                reflect_armor_cooldown_remaining: self.reflect_armor_cooldown_remaining.max(0.0),
+                bullet_immunity_cooldown_remaining: self.bullet_immunity_cooldown_remaining.max(0.0),
+                null_pulse_cooldown_remaining: self.null_pulse_cooldown_remaining.max(0.0),
+                sonar_reveal_cooldown_remaining: self.sonar_reveal_cooldown_remaining.max(0.0),
+                kinetic_dash_cooldown_remaining: self.kinetic_dash_cooldown_remaining.max(0.0),
                 is_invisible: self.invisibility_remaining > 0.0,
                 invisibility_remaining: self.invisibility_remaining.max(0.0),
+                is_reflect_armor_active: self.reflect_armor_remaining > 0.0,
+                is_bullet_immune: self.bullet_immunity_remaining > 0.0,
                 active_buffs: {
                     let mut buffs = Vec::new();
                     if let Some(ref tp) = self.active_teleport {
@@ -8906,6 +9086,60 @@ impl AuthoritativeWorldState {
                             remaining_secs: 1.0,
                             total_secs: 1.0,
                             color_rgb: items_cfg.stat_limits.toxic_debuff_bar_color_rgb,
+                        });
+                    }
+                    if self.reflect_armor_remaining > 0.0 {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "reflect_armor".to_string(),
+                            item_id: items_cfg.reflect_armor.item_id.clone(),
+                            label: format!("MIRROR {:.0}%", items_cfg.reflect_armor.reflect_damage_ratio * 100.0),
+                            remaining_secs: self.reflect_armor_remaining.max(0.0),
+                            total_secs: self.reflect_armor_total_secs.max(0.01),
+                            color_rgb: items_cfg.reflect_armor.buff_bar_color_rgb,
+                        });
+                    }
+                    if self.bullet_immunity_remaining > 0.0 {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "bullet_immunity".to_string(),
+                            item_id: items_cfg.bullet_immunity.item_id.clone(),
+                            label: "PHASE IMMUNE".to_string(),
+                            remaining_secs: self.bullet_immunity_remaining.max(0.0),
+                            total_secs: self.bullet_immunity_total_secs.max(0.01),
+                            color_rgb: items_cfg.bullet_immunity.buff_bar_color_rgb,
+                        });
+                    }
+                    if self.cryo_debuff_remaining > 0.0 {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "cryo_debuff".to_string(),
+                            item_id: String::new(),
+                            label: format!(
+                                "CRYO -{:.0}% / HEAL -{:.0}%",
+                                self.cryo_slow_ratio * 100.0,
+                                self.cryo_heal_reduction_ratio * 100.0
+                            ),
+                            remaining_secs: self.cryo_debuff_remaining.max(0.0),
+                            total_secs: self.cryo_debuff_total_secs.max(0.01),
+                            color_rgb: items_cfg.stat_limits.cryo_debuff_bar_color_rgb,
+                        });
+                    }
+                    if self.null_mute_remaining > 0.0 {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "null_mute".to_string(),
+                            item_id: String::new(),
+                            label: "ITEMS MUTED".to_string(),
+                            remaining_secs: self.null_mute_remaining.max(0.0),
+                            total_secs: self.null_mute_total_secs.max(0.01),
+                            color_rgb: items_cfg.stat_limits.null_mute_debuff_bar_color_rgb,
+                        });
+                    }
+                    if self.sonar_revealed_remaining > 0.0 {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "sonar_revealed".to_string(),
+                            item_id: String::new(),
+                            label: "SONAR TRACKED".to_string(),
+                            remaining_secs: self.sonar_revealed_remaining.max(0.0),
+                            total_secs: self.sonar_revealed_total_secs.max(0.01),
+                            color_rgb: items_cfg.stat_limits.sonar_debuff_bar_color_rgb,
                         });
                     }
                     buffs
@@ -9398,6 +9632,14 @@ fn trigger_random_death(world: &mut AuthoritativeWorldState, config: &GameConfig
     world.electric_fire_rate_slow_remaining = 0.0;
     world.electric_fire_rate_slow_ratio = 0.0;
     world.toxic_slow_multiplier = 1.0;
+    world.reflect_armor_remaining = 0.0;
+    world.bullet_immunity_remaining = 0.0;
+    world.cryo_debuff_remaining = 0.0;
+    world.cryo_slow_ratio = 0.0;
+    world.cryo_heal_reduction_ratio = 0.0;
+    world.null_mute_remaining = 0.0;
+    world.sonar_revealed_remaining = 0.0;
+    world.kinetic_dash_remaining = 0.0;
 }
 
 fn resolve_muzzle_pos(
@@ -10026,6 +10268,14 @@ fn shared_drive_single_player(
             world.electric_fire_rate_slow_remaining = 0.0;
             world.electric_fire_rate_slow_ratio = 0.0;
             world.toxic_slow_multiplier = 1.0;
+            world.reflect_armor_remaining = 0.0;
+            world.bullet_immunity_remaining = 0.0;
+            world.cryo_debuff_remaining = 0.0;
+            world.cryo_slow_ratio = 0.0;
+            world.cryo_heal_reduction_ratio = 0.0;
+            world.null_mute_remaining = 0.0;
+            world.sonar_revealed_remaining = 0.0;
+            world.kinetic_dash_remaining = 0.0;
             world.active_weapon = ActiveWeaponSlot::Primary;
             world.beam_charge = world.hero_weapon.beam_max_charge;
             world.ammo_in_mag = if world.hero_weapon.weapon_kind == WeaponKind::ElectricBeam
@@ -10045,9 +10295,14 @@ fn shared_drive_single_player(
                 spawn_pos + Vec3::Y * config.physics.soldier_capsule_center_y;
         }
     } else {
-        // ۲. بازسازی سلامتی در ثانیه (HP Regen پایه + بونوس چشمه تیم خودی)
+        // ۲. بازسازی سلامتی در ثانیه (HP Regen پایه + بونوس چشمه تیم خودی با اعمال کاهش درمان Cryo)
         let fountain_bonus = fountain_regen_bonus_for_pos(config, world.hero_team, world.soldier_pos);
-        let effective_hp_regen = world.hero_hp_regen_per_sec + fountain_bonus;
+        let cryo_heal_mult = if world.cryo_debuff_remaining > 0.0 {
+            (1.0 - world.cryo_heal_reduction_ratio).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let effective_hp_regen = (world.hero_hp_regen_per_sec + fountain_bonus) * cryo_heal_mult;
         world.hero_hp = (world.hero_hp + effective_hp_regen * dt).min(world.hero_max_hp);
         world.hero_stamina = (world.hero_stamina + world.hero_stamina_regen_per_sec * dt).min(world.hero_max_stamina);
 
@@ -10550,7 +10805,12 @@ fn shared_drive_single_player(
             let is_deep_water = water_depth >= config.physics.deep_water_swim_depth;
 
             let hero_cfg = config.active_hero(world.hero_index);
-            let hero_move_mult = world.hero_move_speed_multiplier * world.toxic_slow_multiplier * if world.invisibility_remaining > 0.0 { 1.0 + world.invis_move_speed_bonus_pct } else { 1.0 };
+            let cryo_slow_mult = if world.cryo_debuff_remaining > 0.0 {
+                (1.0 - world.cryo_slow_ratio).clamp(items_cfg.stat_limits.min_cryo_slow_multiplier, 1.0)
+            } else {
+                1.0
+            };
+            let hero_move_mult = world.hero_move_speed_multiplier * world.toxic_slow_multiplier * cryo_slow_mult * if world.invisibility_remaining > 0.0 { 1.0 + world.invis_move_speed_bonus_pct } else { 1.0 };
             let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
             let deep_mult = hero_cfg.deep_water_speed_multiplier;
 
@@ -10608,8 +10868,23 @@ fn shared_drive_single_player(
             }
         } else if !world.traversal.is_active && world.wall_climb_mountain_index.is_none() {
             let grav_y = config.physics.character_gravity_step_y * dt;
+            if world.kinetic_dash_remaining > 0.0 {
+                let step_dt = dt.min(world.kinetic_dash_remaining);
+                world.kinetic_dash_remaining = (world.kinetic_dash_remaining - dt).max(0.0);
+                let dash_speed = items_cfg.kinetic_dash.dash_distance
+                    / items_cfg.kinetic_dash.dash_duration_secs.max(0.01);
+                let delta = world.kinetic_dash_dir * dash_speed * step_dt;
+                world.current_move_speed = dash_speed;
+                controller.translation = Some(Vec3::new(delta.x, grav_y, delta.z));
+            } else {
+            let cryo_slow_mult = if world.cryo_debuff_remaining > 0.0 {
+                (1.0 - world.cryo_slow_ratio).clamp(items_cfg.stat_limits.min_cryo_slow_multiplier, 1.0)
+            } else {
+                1.0
+            };
             let hero_move_mult = world.hero_move_speed_multiplier
                 * world.toxic_slow_multiplier
+                * cryo_slow_mult
                 * if world.invisibility_remaining > 0.0 {
                     1.0 + world.invis_move_speed_bonus_pct
                 } else {
@@ -10626,6 +10901,7 @@ fn shared_drive_single_player(
                 controller.translation = Some(Vec3::new(desired_delta.x, grav_y, desired_delta.z));
             } else {
                 controller.translation = Some(Vec3::new(0.0, grav_y, 0.0));
+            }
             }
         }
     }
@@ -11969,6 +12245,185 @@ fn step_shooting_and_grenade_spawn(
 
 /// اعمال یکپارچه دمیج و پاداش نابودی روی Turret (مشترک بین Bullet، Beam و AOE)
 #[allow(clippy::too_many_arguments)]
+
+/// اعمال متمرکز و بدون باگ تمام مکانیک‌های تاکتیکی آسیب به هیرو:
+/// BulletImmunity، Evasion در برابر TrueStrike، Critical Strike (پشتیبانی کامل از تمام سلاح‌ها از جمله Beam)،
+/// Cryo Slow + Anti-Heal (با بونوس برف و آب)، Lifesteal و ReflectArmor (با محافظ ضد حلقه بی‌نهایت).
+pub fn apply_combat_damage_to_hero(
+    world: &mut AuthoritativeWorldState,
+    victim_idx: usize,
+    attacker_slot: Option<usize>,
+    mut raw_pre_armor_dmg: f32,
+    min_hit_dmg: f32,
+    is_evadable: bool,
+    is_continuous_tick: bool,
+    can_apply_on_hit: bool,
+    impact_pos: Vec3,
+    config: &GameConfig,
+    items_cfg: &ItemsConfig,
+) -> (f32, bool) {
+    if victim_idx >= world.players.len() || world.players[victim_idx].is_dead {
+        return (0.0, false);
+    }
+    let ce = &items_cfg.combat_effects;
+
+    // 1. بررسی مصونیت کامل از تیر/اشعه/انفجار (Quantum Phase Shield)
+    if world.players[victim_idx].bullet_immunity_remaining > 0.0 {
+        if world.players[victim_idx].popup_throttle_remaining <= 0.0 {
+            world.players[victim_idx].popup_throttle_remaining = ce.popup_throttle_secs;
+            world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                pos: impact_pos + Vec3::Y * 1.4,
+                text: "IMMUNE".to_string(),
+                color_rgb: ce.immune_popup_color_rgb,
+            });
+        }
+        return (0.0, false);
+    }
+
+    let attacker_idx = attacker_slot.and_then(|s| world.players.iter().position(|p| p.slot_index == s));
+
+    // 2. بررسی Evasion در برابر True Strike (فقط برای گلوله‌ها و تیغه‌های پرتابی؛ Beam و انفجار از Evasion رد می‌شوند)
+    if is_evadable {
+        let evasion = world.players[victim_idx].hero_evasion_chance;
+        if evasion > 0.0 && world.next_rand() < evasion {
+            let true_strike = attacker_idx
+                .map(|ai| world.players[ai].hero_true_strike_chance)
+                .unwrap_or(0.0);
+            if true_strike > 0.0 && world.next_rand() < true_strike {
+                raw_pre_armor_dmg += ce.true_strike_bonus_damage;
+            } else {
+                if world.players[victim_idx].popup_throttle_remaining <= 0.0 {
+                    world.players[victim_idx].popup_throttle_remaining = ce.popup_throttle_secs * 0.5;
+                    world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                        pos: impact_pos + Vec3::Y * 1.35,
+                        text: "EVADE".to_string(),
+                        color_rgb: ce.evade_popup_color_rgb,
+                    });
+                }
+                return (0.0, false);
+            }
+        }
+    }
+
+    // 3. ضربه بحرانی (Critical Strike)
+    if let Some(ai) = attacker_idx {
+        let crit_chance = world.players[ai].hero_crit_chance;
+        let crit_mult = world.players[ai].hero_crit_multiplier;
+        if crit_chance > 0.0 && crit_mult > 1.0 {
+            if is_continuous_tick {
+                // برای Beamها: مقیاس‌بندی دقیق امید ریاضی DPS بدون اسپم 60Hz پاپ‌آپ
+                raw_pre_armor_dmg *= 1.0 + crit_chance * (crit_mult - 1.0);
+            } else if world.next_rand() < crit_chance {
+                raw_pre_armor_dmg *= crit_mult;
+                world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                    pos: impact_pos + Vec3::Y * 1.6,
+                    text: "CRIT!".to_string(),
+                    color_rgb: ce.crit_popup_color_rgb,
+                });
+            }
+        }
+    }
+
+    // 4. محاسبه آرمور (فرمول دوتا ۲ + دیباف شعله)
+    let armor = world.players[victim_idx].hero_armor
+        - if world.players[victim_idx].flame_armor_debuff_remaining > 0.0 {
+            world.players[victim_idx].flame_armor_debuff_amount
+        } else {
+            0.0
+        };
+    let eff_dmg = (raw_pre_armor_dmg * dota2_armor_multiplier(armor)).max(min_hit_dmg);
+
+    world.players[victim_idx].hero_hp = (world.players[victim_idx].hero_hp - eff_dmg).max(0.0);
+    record_hero_damage_on_victim(world, victim_idx, attacker_slot, config);
+
+    // 5. اعمال دیباف Cryo (کندشدن + کاهش درمان با بونوس برف یا آب)
+    if can_apply_on_hit {
+        if let Some(ai) = attacker_idx {
+            let base_dur = world.players[ai].hero_on_hit_debuff_duration_secs;
+            if base_dur > 0.0 {
+                let slow_r = world.players[ai].hero_on_hit_slow_ratio;
+                let heal_r = world.players[ai].hero_on_hit_heal_reduction_ratio;
+                let env_mult = if world.current_weather == WeatherKind::Snowy
+                    || world.players[victim_idx].in_water
+                {
+                    ce.cryo_snow_or_water_duration_mult
+                } else {
+                    1.0
+                };
+                let dur = base_dur * env_mult;
+                world.players[victim_idx].cryo_debuff_remaining = dur;
+                world.players[victim_idx].cryo_debuff_total_secs = dur;
+                world.players[victim_idx].cryo_slow_ratio = slow_r;
+                world.players[victim_idx].cryo_heal_reduction_ratio = heal_r;
+                if world.players[victim_idx].slot_index == world.active_slot {
+                    world.cryo_debuff_remaining = dur;
+                    world.cryo_debuff_total_secs = dur;
+                    world.cryo_slow_ratio = slow_r;
+                    world.cryo_heal_reduction_ratio = heal_r;
+                }
+            }
+        }
+    }
+
+    // 6. مکش سلامتی (Lifesteal) برای مهاجم با اعمال Anti-Heal حریف
+    if let Some(ai) = attacker_idx {
+        if !world.players[ai].is_dead && ai != victim_idx {
+            let ls = world.players[ai].hero_lifesteal_ratio;
+            if ls > 0.0 {
+                let heal_mult = if world.players[ai].cryo_debuff_remaining > 0.0 {
+                    (1.0 - world.players[ai].cryo_heal_reduction_ratio).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                let heal = eff_dmg * ls * heal_mult;
+                world.players[ai].hero_hp =
+                    (world.players[ai].hero_hp + heal).min(world.players[ai].hero_max_hp);
+            }
+        }
+    }
+
+    // 7. بازتاب آسیب (Aegis Mirror Harness / ReflectArmor) با محافظ ضد حلقه بی‌نهایت
+    if world.players[victim_idx].reflect_armor_remaining > 0.0 {
+        if let Some(ai) = attacker_idx {
+            if ai != victim_idx
+                && !world.players[ai].is_dead
+                && world.players[ai].bullet_immunity_remaining <= 0.0
+            {
+                let victim_slot = world.players[victim_idx].slot_index;
+                let reflected_dmg = eff_dmg * items_cfg.reflect_armor.reflect_damage_ratio;
+                world.players[ai].hero_hp = (world.players[ai].hero_hp - reflected_dmg).max(0.0);
+                record_hero_damage_on_victim(world, ai, Some(victim_slot), config);
+                if world.players[ai].popup_throttle_remaining <= 0.0 {
+                    world.players[ai].popup_throttle_remaining = ce.popup_throttle_secs;
+                    let apos = world.players[ai].soldier_pos;
+                    world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                        pos: apos + Vec3::Y * 1.9,
+                        text: "REFLECT".to_string(),
+                        color_rgb: ce.reflect_popup_color_rgb,
+                    });
+                }
+                if world.players[ai].hero_hp <= 0.0 && !world.players[ai].is_dead {
+                    world.swap_slot_in(ai);
+                    trigger_random_death(world, config);
+                    world.swap_slot_in(ai);
+                    award_hero_kill_rewards(world, ai, Some(victim_slot), config, items_cfg);
+                }
+            }
+        }
+    }
+
+    // 8. بررسی مرگ قربانی
+    let victim_killed = world.players[victim_idx].hero_hp <= 0.0 && !world.players[victim_idx].is_dead;
+    if victim_killed {
+        world.swap_slot_in(victim_idx);
+        trigger_random_death(world, config);
+        world.swap_slot_in(victim_idx);
+        award_hero_kill_rewards(world, victim_idx, attacker_slot, config, items_cfg);
+    }
+
+    (eff_dmg, victim_killed)
+}
+
 fn apply_damage_to_turret(
     commands: &mut Commands,
     config: &GameConfig,
@@ -12226,17 +12681,19 @@ fn apply_aoe_explosion(
         }
         let h_pos = world.players[p_idx].soldier_pos + Vec3::Y * 0.9;
         if h_pos.distance(pos) <= aoe_radius {
-            let armor = world.players[p_idx].hero_armor - if world.players[p_idx].flame_armor_debuff_remaining > 0.0 { world.players[p_idx].flame_armor_debuff_amount } else { 0.0 };
-            let eff_dmg = (dmg * dota2_armor_multiplier(armor)).max(1.0);
-            world.players[p_idx].hero_hp = (world.players[p_idx].hero_hp - eff_dmg).max(0.0);
-            record_hero_damage_on_victim(world, p_idx, owner_slot, config);
-            if world.players[p_idx].hero_hp <= 0.0 && !world.players[p_idx].is_dead {
-                world.swap_slot_in(p_idx);
-                trigger_random_death(world, config);
-                world.swap_slot_in(p_idx);
-
-                award_hero_kill_rewards(world, p_idx, owner_slot, config, items_cfg);
-            }
+            apply_combat_damage_to_hero(
+                world,
+                p_idx,
+                owner_slot,
+                dmg,
+                1.0,
+                false,
+                false,
+                true,
+                h_pos,
+                config,
+                items_cfg,
+            );
         }
     }
 
@@ -12805,29 +13262,25 @@ fn shared_authoritative_react_system(
                 commands.entity(entity).despawn();
                 continue;
             }
-            let armor = world.players[enemy_idx].hero_armor - if world.players[enemy_idx].flame_armor_debuff_remaining > 0.0 { world.players[enemy_idx].flame_armor_debuff_amount } else { 0.0 };
-            let dmg_mult = dota2_armor_multiplier(armor);
             let min_hit_dmg = match &bullet.vfx_source {
                 BulletVfxSource::Hero { weapon_kind: WeaponKind::Shotgun, .. } => {
                     items_cfg.stat_limits.min_pellet_effective_damage
                 }
                 _ => items_cfg.stat_limits.min_weapon_damage,
             };
-            let effective_dmg = (bullet.damage * dmg_mult).max(min_hit_dmg);
-
-            world.players[enemy_idx].hero_hp =
-                (world.players[enemy_idx].hero_hp - effective_dmg).max(0.0);
-            record_hero_damage_on_victim(&mut world, enemy_idx, bullet.owner_slot, &config);
-
-            let enemy_killed = world.players[enemy_idx].hero_hp <= 0.0
-                && !world.players[enemy_idx].is_dead;
-            if enemy_killed {
-                world.swap_slot_in(enemy_idx);
-                trigger_random_death(&mut world, &config);
-                world.swap_slot_in(enemy_idx);
-
-                award_hero_kill_rewards(&mut world, enemy_idx, bullet.owner_slot, &config, &items_cfg);
-            }
+            let (_, enemy_killed) = apply_combat_damage_to_hero(
+                &mut world,
+                enemy_idx,
+                bullet.owner_slot,
+                bullet.damage,
+                min_hit_dmg,
+                true,
+                false,
+                true,
+                impact_pos,
+                &config,
+                &items_cfg,
+            );
 
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
                 start: old_pos,
@@ -13675,21 +14128,19 @@ fn shared_authoritative_react_system(
                     world.electric_fire_rate_slow_ratio = slow_ratio;
                 }
             }
-            let armor_debuff = if world.players[enemy_idx].flame_armor_debuff_remaining > 0.0 {
-                world.players[enemy_idx].flame_armor_debuff_amount
-            } else {
-                0.0
-            };
-            let armor = world.players[enemy_idx].hero_armor - armor_debuff;
-            let eff_dmg = tick_dmg * dota2_armor_multiplier(armor);
-            world.players[enemy_idx].hero_hp = (world.players[enemy_idx].hero_hp - eff_dmg).max(0.0);
-            record_hero_damage_on_victim(&mut world, enemy_idx, Some(owner_slot), &config);
-            if world.players[enemy_idx].hero_hp <= 0.0 && !world.players[enemy_idx].is_dead {
-                world.swap_slot_in(enemy_idx);
-                trigger_random_death(&mut world, &config);
-                world.swap_slot_in(enemy_idx);
-                award_hero_kill_rewards(&mut world, enemy_idx, Some(owner_slot), &config, &items_cfg);
-            }
+            apply_combat_damage_to_hero(
+                &mut world,
+                enemy_idx,
+                Some(owner_slot),
+                tick_dmg,
+                0.0,
+                false,
+                true,
+                true,
+                end_pos,
+                &config,
+                &items_cfg,
+            );
         } else if let Some(cour_idx) = hit_courier {
             hit_any_target = true;
             let h_cfg = config.active_hero(world.players[cour_idx].hero_index).clone();
@@ -13936,16 +14387,19 @@ fn shared_authoritative_react_system(
                 if world.players[p_idx].slot_index == world.active_slot {
                     world.toxic_slow_multiplier = world.toxic_slow_multiplier.min(slow_mult);
                 }
-                let armor = world.players[p_idx].hero_armor - if world.players[p_idx].flame_armor_debuff_remaining > 0.0 { world.players[p_idx].flame_armor_debuff_amount } else { 0.0 };
-                let eff_dmg = tick_dmg * dota2_armor_multiplier(armor);
-                world.players[p_idx].hero_hp = (world.players[p_idx].hero_hp - eff_dmg).max(0.0);
-                record_hero_damage_on_victim(&mut world, p_idx, pool.owner_slot, &config);
-                if world.players[p_idx].hero_hp <= 0.0 && !world.players[p_idx].is_dead {
-                    world.swap_slot_in(p_idx);
-                    trigger_random_death(&mut world, &config);
-                    world.swap_slot_in(p_idx);
-                    award_hero_kill_rewards(&mut world, p_idx, pool.owner_slot, &config, &items_cfg);
-                }
+                apply_combat_damage_to_hero(
+                    &mut world,
+                    p_idx,
+                    pool.owner_slot,
+                    tick_dmg,
+                    0.0,
+                    false,
+                    true,
+                    false,
+                    h_pos + Vec3::Y * 0.9,
+                    &config,
+                    &items_cfg,
+                );
             }
         }
 

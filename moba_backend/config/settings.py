@@ -91,8 +91,8 @@ CHANNEL_LAYERS = {
 }
 
 # تنظیمات Matchmaking و اجرای سرویس systemd سرور بازی
-MATCHMAKING_PLAYERS_PER_MATCH = int(os.environ.get("MATCHMAKING_PLAYERS_PER_MATCH", "10"))
-GAME_SERVER_HOST = os.environ.get("GAME_SERVER_HOST", "46.245.72.142")
+MATCHMAKING_PLAYERS_PER_MATCH = int(os.environ.get("MATCHMAKING_PLAYERS_PER_MATCH", "1"))
+GAME_SERVER_HOST = os.environ.get("GAME_SERVER_HOST", "172.21.13.50")
 GAME_SERVER_PORT_START = int(os.environ.get("GAME_SERVER_PORT_START", "4433"))
 GAME_SERVER_PORT_END = int(os.environ.get("GAME_SERVER_PORT_END", "4550"))
 GAME_SERVER_SERVICE_NAME = os.environ.get("GAME_SERVER_SERVICE_NAME", "moba-server")

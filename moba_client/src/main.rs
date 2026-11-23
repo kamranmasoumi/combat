@@ -15,7 +15,7 @@ use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalA
 use bevy::diagnostic::{DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::SystemParam;
 use bevy::render::diagnostic::RenderDiagnosticsPlugin;
-use bevy::render::settings::{RenderCreation, WgpuSettings};
+use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
@@ -213,21 +213,20 @@ fn main() {
             is_teleporting: false,
             teleport_progress: 0.0,
             shadow_blade_cooldown_remaining: 0.0,
+            reflect_armor_cooldown_remaining: 0.0,
+            bullet_immunity_cooldown_remaining: 0.0,
+            null_pulse_cooldown_remaining: 0.0,
+            sonar_reveal_cooldown_remaining: 0.0,
+            kinetic_dash_cooldown_remaining: 0.0,
             is_invisible: false,
             invisibility_remaining: 0.0,
+            is_reflect_armor_active: false,
+            is_bullet_immune: false,
             active_buffs: Vec::new(),
         }
     };
 
-    #[allow(unused_mut)]
-    let mut wgpu_settings = WgpuSettings::default();
-    #[cfg(target_os = "windows")]
-    if std::env::var_os("WGPU_BACKEND").is_none() {
-        // Legacy Windows Intel HD 520/530 Vulkan drivers can crash (0xc0000005)
-        // right after adapter creation on subsequent launches; default to DX12
-        // on Windows while still allowing explicit WGPU_BACKEND overrides.
-        wgpu_settings.backends = Some(bevy::render::settings::Backends::DX12);
-    }
+    let (wgpu_settings, gpu_guard) = build_wgpu_settings_with_guard();
 
     App::new()
         .set_error_handler(bevy::ecs::error::warn)
@@ -248,6 +247,8 @@ fn main() {
                     ..default()
                 }),
         )
+        .insert_resource(gpu_guard)
+        .add_systems(Update, gpu_startup_guard_system)
         .insert_resource(DirectionalLightShadowMap {
             size: config.lighting.shadow_map_size,
         })
@@ -5185,6 +5186,69 @@ fn spawn_fx_from_server_event(
         GameplayFxEvent::ShadowBladeEnded { slot_index: _, pos } => {
             audio_q.0.push(ClientAudioEvent::ShadowBladeEnd { pos });
         }
+        GameplayFxEvent::CombatPopup {
+            pos,
+            text,
+            color_rgb,
+        } => {
+            commands
+                .spawn((
+                    FloatingWorldPopup {
+                        world_pos: pos,
+                        timer: Timer::from_seconds(
+                            config.fx.floating_popup_duration_secs,
+                            TimerMode::Once,
+                        ),
+                    },
+                    Pickable::IGNORE,
+                    GlobalZIndex(185),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        padding: UiRect::axes(px(7.0), px(3.0)),
+                        border_radius: BorderRadius::all(px(5.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.05, 0.07, 0.12, 0.82)),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        Text::new(text),
+                        TextFont {
+                            font_size: FontSize::Px(15.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(color_rgb.0, color_rgb.1, color_rgb.2)),
+                    ));
+                });
+        }
+        GameplayFxEvent::TacticalPulse {
+            pos,
+            radius,
+            color_rgb,
+        } => {
+            audio_q.0.push(ClientAudioEvent::ShadowBladeActivate { pos });
+            let ring_count = 16_usize;
+            for i in 0..ring_count {
+                let angle = (i as f32) * (std::f32::consts::TAU / ring_count as f32);
+                let spd = (radius * 1.45).clamp(4.0, 32.0);
+                let vel = Vec3::new(angle.cos() * spd, 0.8, angle.sin() * spd);
+                commands.spawn((
+                    Mesh3d(shared_fx.coin_mesh.clone()),
+                    MeshMaterial3d(shared_fx.coin_mat.clone()),
+                    particle_physics_bundle(
+                        config,
+                        pos + Vec3::new(angle.cos() * 0.4, 0.35, angle.sin() * 0.4),
+                        vel,
+                        0.45,
+                        false,
+                    ),
+                    NotShadowCaster,
+                ));
+            }
+            let _ = color_rgb;
+        }
     }
 }
 
@@ -9727,7 +9791,7 @@ fn hero_preview_system(
             tf.rotate_y(0.50 * time.delta_secs());
             for desc in sc.children_query.iter_descendants(root_ent) {
                 if let Some(assets) = cached_opt {
-                    let idle_node = assets.get_or_fallback("rifle_aiming_idle", "idle");
+                    let idle_node = assets.get_or_fallback("idle", "rifle_aiming_idle");
                     if let Ok((p_ent, mut player, graph_opt)) = sc.anim_player_query.get_mut(desc) {
                         if graph_opt.map_or(true, |g| g.0 != assets.graph_handle) {
                             commands
@@ -9975,9 +10039,9 @@ struct MatchOverlayUiQueries<'w, 's> {
     hs_root_q: Query<'w, 's, &'static mut Node, (With<HeroSelectWorkspaceRoot>, Without<MatchDynamicContentRoot>, Without<MatchOverlayRoot>, Without<MatchTimerFillBar>, Without<MatchBottomBarFill>)>,
     specs_root_q: Query<'w, 's, Entity, With<HeroSpecsPanelRoot>>,
     draft_strip_q: Query<'w, 's, Entity, With<DraftStripRoot>>,
-    hero_btn_q: Query<'w, 's, (&'static Hovered, Has<Pressed>, &'static HeroPickButton, &'static mut BackgroundColor, &'static mut BorderColor), (Without<MatchOverlayRoot>, Without<HeroLockInButton>, Without<MatchTimerFillBar>)>,
+    hero_btn_q: Query<'w, 's, (&'static Hovered, &'static HeroPickButton, &'static mut BackgroundColor, &'static mut BorderColor), (Without<MatchOverlayRoot>, Without<HeroLockInButton>, Without<MatchTimerFillBar>)>,
     hero_badge_q: Query<'w, 's, (&'static HeroPickStatusBadge, &'static mut Text, &'static mut TextColor), (Without<MatchPhaseBadgeText>, Without<MatchPhaseHeaderText>, Without<MatchTurnBannerText>, Without<MatchTimerText>, Without<MatchBottomStatusText>)>,
-    lock_btn_q: Query<'w, 's, (&'static Hovered, Has<Pressed>, &'static mut BackgroundColor, &'static mut BorderColor), (With<HeroLockInButton>, Without<MatchOverlayRoot>, Without<MatchTimerFillBar>)>,
+    lock_btn_q: Query<'w, 's, (&'static Hovered, &'static mut BackgroundColor, &'static mut BorderColor), (With<HeroLockInButton>, Without<MatchOverlayRoot>, Without<MatchTimerFillBar>)>,
     lock_txt_q: Query<'w, 's, &'static mut Text, (With<HeroLockInButtonText>, Without<HeroPickStatusBadge>, Without<MatchPhaseBadgeText>, Without<MatchPhaseHeaderText>, Without<MatchTurnBannerText>, Without<MatchTimerText>, Without<MatchBottomStatusText>)>,
     pulse_dots_q: Query<'w, 's, (&'static PulseAnimatedDot, &'static mut BackgroundColor), (Without<MatchOverlayRoot>, Without<HeroLockInButton>, Without<HeroPickButton>, Without<MatchTimerFillBar>)>,
     children_q: Query<'w, 's, &'static Children>,
@@ -9994,6 +10058,7 @@ fn despawn_children_of(commands: &mut Commands, parent: Entity, children_q: &Que
 fn match_overlay_ui_system(
     mut commands: Commands,
     time: Res<Time>,
+    mouse: Res<ButtonInput<MouseButton>>,
     config: Res<GameConfig>,
     mut net: ResMut<ClientNetwork>,
     mut match_flow: ResMut<ClientMatchFlow>,
@@ -10056,14 +10121,16 @@ fn match_overlay_ui_system(
         .as_ref()
         .is_some_and(|s| s.current_pick_slot == match_flow.your_slot);
 
-    for (hovered, pressed, btn, mut bg, mut border) in &mut ui.hero_btn_q {
+    let left_just_pressed = mouse.just_pressed(MouseButton::Left);
+
+    for (hovered, btn, mut bg, mut border) in &mut ui.hero_btn_q {
         let hero = config.active_hero(btn.hero_index);
-        let is_selected = btn.hero_index == match_flow.preview_hero_index;
         let is_taken = taken_ids.contains(&hero.id);
 
-        if pressed {
+        if phase == MatchPhase::HeroSelect && hovered.get() && left_just_pressed {
             match_flow.preview_hero_index = btn.hero_index;
         }
+        let is_selected = btn.hero_index == match_flow.preview_hero_index;
 
         let (target_bg, target_border) = if is_selected {
             (
@@ -10109,9 +10176,9 @@ fn match_overlay_ui_system(
 
     let preview_hero = config.active_hero(match_flow.preview_hero_index);
     let preview_taken = taken_ids.contains(&preview_hero.id);
-    if let Ok((hovered, pressed, mut bg, mut border)) = ui.lock_btn_q.single_mut() {
+    if let Ok((hovered, mut bg, mut border)) = ui.lock_btn_q.single_mut() {
         let can_lock = phase == MatchPhase::HeroSelect && is_my_turn && !preview_taken;
-        if pressed && can_lock {
+        if hovered.get() && left_just_pressed && can_lock {
             if let Ok(bytes) = bincode::serialize(&ClientLobbyMessage::SelectHero {
                 hero_id: preview_hero.id.clone(),
             }) {
@@ -15384,7 +15451,14 @@ fn sync_shop_context_and_network_system(
         || ctx.is_teleporting != hero_hud.0.is_teleporting
         || (ctx.shadow_blade_cooldown_remaining > 0.0) != (hero_hud.0.shadow_blade_cooldown_remaining > 0.0)
         || (ctx.shadow_blade_cooldown_remaining - hero_hud.0.shadow_blade_cooldown_remaining).abs() > 0.1
+        || (ctx.reflect_armor_cooldown_remaining - hero_hud.0.reflect_armor_cooldown_remaining).abs() > 0.1
+        || (ctx.bullet_immunity_cooldown_remaining - hero_hud.0.bullet_immunity_cooldown_remaining).abs() > 0.1
+        || (ctx.null_pulse_cooldown_remaining - hero_hud.0.null_pulse_cooldown_remaining).abs() > 0.1
+        || (ctx.sonar_reveal_cooldown_remaining - hero_hud.0.sonar_reveal_cooldown_remaining).abs() > 0.1
+        || (ctx.kinetic_dash_cooldown_remaining - hero_hud.0.kinetic_dash_cooldown_remaining).abs() > 0.1
         || ctx.is_invisible != hero_hud.0.is_invisible
+        || ctx.is_reflect_armor_active != hero_hud.0.is_reflect_armor_active
+        || ctx.is_bullet_immune != hero_hud.0.is_bullet_immune
         || ctx.active_buffs != hero_hud.0.active_buffs
         || (ctx.courier_hp - hero_hud.0.courier_hp).abs() > 0.1
         || (ctx.courier_max_hp - hero_hud.0.courier_max_hp).abs() > 0.1
@@ -15409,7 +15483,14 @@ fn sync_shop_context_and_network_system(
         ctx.is_teleporting = hero_hud.0.is_teleporting;
         ctx.teleport_progress = hero_hud.0.teleport_progress;
         ctx.shadow_blade_cooldown_remaining = hero_hud.0.shadow_blade_cooldown_remaining;
+        ctx.reflect_armor_cooldown_remaining = hero_hud.0.reflect_armor_cooldown_remaining;
+        ctx.bullet_immunity_cooldown_remaining = hero_hud.0.bullet_immunity_cooldown_remaining;
+        ctx.null_pulse_cooldown_remaining = hero_hud.0.null_pulse_cooldown_remaining;
+        ctx.sonar_reveal_cooldown_remaining = hero_hud.0.sonar_reveal_cooldown_remaining;
+        ctx.kinetic_dash_cooldown_remaining = hero_hud.0.kinetic_dash_cooldown_remaining;
         ctx.is_invisible = hero_hud.0.is_invisible;
+        ctx.is_reflect_armor_active = hero_hud.0.is_reflect_armor_active;
+        ctx.is_bullet_immune = hero_hud.0.is_bullet_immune;
         ctx.active_buffs = hero_hud.0.active_buffs.clone();
         ctx.courier_hp = hero_hud.0.courier_hp;
         ctx.courier_max_hp = hero_hud.0.courier_max_hp;
@@ -17682,4 +17763,231 @@ fn safe_despawn(commands: &mut Commands, entity: Entity) {
             em.despawn();
         }
     });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuBackendChoice {
+    AutoVulkanFirst,
+    Dx12,
+    EnvOverride,
+}
+
+#[derive(Resource)]
+struct GpuStartupGuard {
+    choice: GpuBackendChoice,
+    gpu_signature: String,
+    frames_rendered: u32,
+    committed: bool,
+}
+
+fn gpu_state_file_path() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let dir = std::path::PathBuf::from(local_app_data).join("moba_client");
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.join("gpu_backend_state.txt");
+    }
+    std::env::temp_dir().join("moba_client_gpu_backend_state.txt")
+}
+
+fn write_gpu_state_file(status: &str, gpu_signature: &str) {
+    let path = gpu_state_file_path();
+    let payload = format!("status={}\nsig={}\n", status, gpu_signature);
+    let _ = std::fs::write(path, payload);
+}
+
+#[cfg(target_os = "windows")]
+fn read_gpu_state_file() -> Option<(String, String)> {
+    let content = std::fs::read_to_string(gpu_state_file_path()).ok()?;
+    let mut status = None;
+    let mut sig = String::new();
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("status=") {
+            status = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("sig=") {
+            sig = v.trim().to_string();
+        }
+    }
+    Some((status?, sig))
+}
+
+#[cfg(target_os = "windows")]
+fn detect_windows_gpu_adapters() -> Vec<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
+            "/s",
+            "/v",
+            "DriverDesc",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    let Ok(out) = output else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut adapters = Vec::new();
+    for line in stdout.lines() {
+        if let Some(idx) = line.find("REG_SZ") {
+            let name = line[idx + "REG_SZ".len()..].trim();
+            if !name.is_empty() && !adapters.iter().any(|existing: &String| existing.eq_ignore_ascii_case(name)) {
+                adapters.push(name.to_string());
+            }
+        }
+    }
+    adapters.sort();
+    adapters
+}
+
+#[cfg(target_os = "windows")]
+fn is_discrete_gpu_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("nvidia")
+        || lower.contains("geforce")
+        || lower.contains("quadro")
+        || lower.contains(" rtx ")
+        || lower.contains(" gtx ")
+        || lower.contains("radeon rx")
+        || lower.contains("radeon pro")
+        || lower.contains("radeon r9")
+        || lower.contains("radeon r7")
+        || lower.contains("radeon hd")
+        || lower.contains("radeon vii")
+        || lower.contains("firepro")
+        || lower.contains("intel(r) arc")
+        || lower.contains("intel arc")
+}
+
+#[cfg(target_os = "windows")]
+fn is_legacy_intel_igpu_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if !lower.contains("intel") {
+        return false;
+    }
+    // Covers legacy Intel HD Graphics (2000/3000/4000/4400/4600/500/510/515/520/530/540/550/580/610/620/630/5000/5500)
+    // while keeping modern Intel UHD / Iris Xe / Arc on Vulkan by default.
+    (lower.contains("hd graphics") && !lower.contains("uhd graphics"))
+        || lower.contains("gma ")
+        || lower.contains("express chipset")
+}
+
+fn build_wgpu_settings_with_guard() -> (WgpuSettings, GpuStartupGuard) {
+    #[allow(unused_mut)]
+    let mut wgpu_settings = WgpuSettings {
+        power_preference: PowerPreference::HighPerformance,
+        ..default()
+    };
+
+    if std::env::var_os("WGPU_BACKEND").is_some() {
+        return (
+            wgpu_settings,
+            GpuStartupGuard {
+                choice: GpuBackendChoice::EnvOverride,
+                gpu_signature: String::new(),
+                frames_rendered: 0,
+                committed: true,
+            },
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use bevy::render::settings::Backends;
+
+        let adapters = detect_windows_gpu_adapters();
+        let gpu_signature = adapters.join(" | ");
+        let has_discrete = adapters.iter().any(|a| is_discrete_gpu_name(a));
+        let only_legacy_intel = !has_discrete
+            && !adapters.is_empty()
+            && adapters.iter().all(|a| {
+                is_legacy_intel_igpu_name(a)
+                    || a.to_ascii_lowercase().contains("microsoft basic")
+            });
+
+        let mut choice = if only_legacy_intel {
+            GpuBackendChoice::Dx12
+        } else {
+            GpuBackendChoice::AutoVulkanFirst
+        };
+
+        if let Some((prev_status, prev_sig)) = read_gpu_state_file() {
+            if prev_sig == gpu_signature {
+                match prev_status.as_str() {
+                    "PREFER_DX12" => {
+                        choice = GpuBackendChoice::Dx12;
+                    }
+                    "INIT_STARTED:vulkan" => {
+                        // Previous launch crashed during Vulkan init before rendering frames;
+                        // automatically recover by switching to DX12.
+                        choice = GpuBackendChoice::Dx12;
+                    }
+                    "INIT_STARTED:dx12" => {
+                        // Previous launch failed on DX12; fall back to Vulkan/auto.
+                        choice = GpuBackendChoice::AutoVulkanFirst;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        match choice {
+            GpuBackendChoice::Dx12 => {
+                wgpu_settings.backends = Some(Backends::DX12);
+                write_gpu_state_file("INIT_STARTED:dx12", &gpu_signature);
+            }
+            GpuBackendChoice::AutoVulkanFirst => {
+                // Prefer Vulkan for maximum FPS; automatically falls back to DX12 if no Vulkan ICD exists.
+                wgpu_settings.backends = Some(Backends::VULKAN | Backends::DX12);
+                write_gpu_state_file("INIT_STARTED:vulkan", &gpu_signature);
+            }
+            GpuBackendChoice::EnvOverride => {}
+        }
+
+        return (
+            wgpu_settings,
+            GpuStartupGuard {
+                choice,
+                gpu_signature,
+                frames_rendered: 0,
+                committed: false,
+            },
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        (
+            wgpu_settings,
+            GpuStartupGuard {
+                choice: GpuBackendChoice::AutoVulkanFirst,
+                gpu_signature: String::new(),
+                frames_rendered: 0,
+                committed: true,
+            },
+        )
+    }
+}
+
+fn gpu_startup_guard_system(mut guard: ResMut<GpuStartupGuard>) {
+    if guard.committed {
+        return;
+    }
+    guard.frames_rendered = guard.frames_rendered.saturating_add(1);
+    if guard.frames_rendered >= 15 {
+        match guard.choice {
+            GpuBackendChoice::Dx12 => {
+                write_gpu_state_file("PREFER_DX12", &guard.gpu_signature);
+            }
+            GpuBackendChoice::AutoVulkanFirst => {
+                write_gpu_state_file("INIT_OK:vulkan", &guard.gpu_signature);
+            }
+            GpuBackendChoice::EnvOverride => {}
+        }
+        guard.committed = true;
+    }
 }

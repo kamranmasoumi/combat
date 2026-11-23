@@ -7226,6 +7226,8 @@ pub struct AuthoritativeWorldState {
     pub toxic_pools_snapshot: Vec<ToxicPoolSnapshot>,
     pub electric_beams_snapshot: Vec<ElectricBeamSnapshot>,
     pub pending_fx: Vec<GameplayFxEvent>,
+    /// رویدادهای خصوصی که فقط برای اسلات مشخص‌شده ارسال می‌شوند (LastHitGold، HeroLeveledUp)
+    pub pending_private_fx: Vec<(usize, GameplayFxEvent)>,
 }
 
 #[derive(Clone, Debug)]
@@ -7484,6 +7486,7 @@ impl AuthoritativeWorldState {
             toxic_pools_snapshot: Vec::new(),
             electric_beams_snapshot: Vec::new(),
             pending_fx: Vec::new(),
+            pending_private_fx: Vec::new(),
         }
     }
 
@@ -8565,7 +8568,8 @@ impl AuthoritativeWorldState {
         for ev in fx_batch {
             let keep = match ev {
                 GameplayFxEvent::LightningStrike { .. }
-                | GameplayFxEvent::HeroKillFeed { .. } => true,
+                | GameplayFxEvent::HeroKillFeed { .. }
+                | GameplayFxEvent::CreepDenied { .. } => true,
                 GameplayFxEvent::ShotFired { muzzle_pos, .. } => {
                     fow.is_world_point_visible(config, muzzle_pos.x, muzzle_pos.z)
                 }
@@ -8578,12 +8582,12 @@ impl AuthoritativeWorldState {
                 }
                 GameplayFxEvent::GrenadeExploded { pos, .. }
                 | GameplayFxEvent::SlideDust { pos }
-                | GameplayFxEvent::WaterSplash { pos, .. }
-                | GameplayFxEvent::HeroLeveledUp { pos, .. }
-                | GameplayFxEvent::LastHitGold { pos, .. }
-                | GameplayFxEvent::CreepDenied { pos } => {
+                | GameplayFxEvent::WaterSplash { pos, .. } => {
                     fow.is_world_point_visible(config, pos.x, pos.z)
                 }
+                // این دو رویداد صرفاً از طریق pending_private_fx برای خود بازیکن ارسال می‌شوند
+                GameplayFxEvent::HeroLeveledUp { .. }
+                | GameplayFxEvent::LastHitGold { .. } => false,
                 GameplayFxEvent::TurretShotFired {
                     turret_index,
                     target_pos,
@@ -8996,7 +9000,9 @@ impl AuthoritativeWorldState {
     }
 
     pub fn take_fx_events(&mut self) -> Vec<GameplayFxEvent> {
-        std::mem::take(&mut self.pending_fx)
+        let mut out = std::mem::take(&mut self.pending_fx);
+        out.extend(self.pending_private_fx.drain(..).map(|(_, ev)| ev));
+        out
     }
 }
 
@@ -9207,7 +9213,7 @@ pub fn grant_xp_to_player_slot(
     amount: u32,
     config: &GameConfig,
     items_cfg: &crate::shop_shared::ItemsConfig,
-    pending_fx: &mut Vec<GameplayFxEvent>,
+    pending_private_fx: &mut Vec<(usize, GameplayFxEvent)>,
 ) {
     if amount == 0 || p.hero_level >= 25 {
         return;
@@ -9221,10 +9227,13 @@ pub fn grant_xp_to_player_slot(
         if p.hero_xp >= config.combat.xp_thresholds_per_level[next_idx] {
             p.hero_level += 1;
             levels_up += 1;
-            pending_fx.push(GameplayFxEvent::HeroLeveledUp {
-                pos: p.soldier_pos,
-                new_level: p.hero_level,
-            });
+            pending_private_fx.push((
+                p.slot_index,
+                GameplayFxEvent::HeroLeveledUp {
+                    pos: p.soldier_pos,
+                    new_level: p.hero_level,
+                },
+            ));
         } else {
             break;
         }
@@ -9294,7 +9303,7 @@ fn award_hero_kill_rewards(
             attacker.hero_gold += kill_gold;
             killer_name = attacker.hero_display_name.clone();
             killer_team = attacker.hero_team;
-            grant_xp_to_player_slot(attacker, kill_xp, config, items_cfg, &mut world.pending_fx);
+            grant_xp_to_player_slot(attacker, kill_xp, config, items_cfg, &mut world.pending_private_fx);
             rewards.push(HeroKillRewardEntry {
                 player_name: attacker.hero_display_name.clone(),
                 is_killer: true,
@@ -9302,10 +9311,13 @@ fn award_hero_kill_rewards(
                 xp: kill_xp,
             });
         }
-        world.pending_fx.push(GameplayFxEvent::LastHitGold {
-            pos: victim_pos,
-            gold: kill_gold,
-        });
+        world.pending_private_fx.push((
+            k_slot,
+            GameplayFxEvent::LastHitGold {
+                pos: victim_pos,
+                gold: kill_gold,
+            },
+        ));
 
         // اعطای Assist به تمام هم‌تیمی‌هایی که در پنجره زمانی به قربانی آسیب زده‌اند (حتی اگر دور یا تازه مرده باشند) یا در شعاع XP خود زنده هستند
         let mut assister_indices: Vec<usize> = Vec::new();
@@ -9324,7 +9336,7 @@ fn award_hero_kill_rewards(
             p.assists += 1;
             p.hero_gold += assist_gold;
             let pname = p.hero_display_name.clone();
-            grant_xp_to_player_slot(p, assist_xp, config, items_cfg, &mut world.pending_fx);
+            grant_xp_to_player_slot(p, assist_xp, config, items_cfg, &mut world.pending_private_fx);
             rewards.push(HeroKillRewardEntry {
                 player_name: pname,
                 is_killer: false,
@@ -11992,10 +12004,13 @@ fn apply_damage_to_turret(
             if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == o_slot) {
                 killer.last_hits += 1;
                 killer.hero_gold += gold_b;
-                world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
-                    pos: tur_pos + Vec3::Y * 2.5,
-                    gold: gold_b,
-                });
+                world_inner.pending_private_fx.push((
+                    o_slot,
+                    GameplayFxEvent::LastHitGold {
+                        pos: tur_pos + Vec3::Y * 2.5,
+                        gold: gold_b,
+                    },
+                ));
             }
         }
         let eligible: Vec<usize> = world
@@ -12018,7 +12033,7 @@ fn apply_damage_to_turret(
                     share,
                     config,
                     items_cfg,
-                    &mut world_inner.pending_fx,
+                    &mut world_inner.pending_private_fx,
                 );
             }
         }
@@ -12074,10 +12089,13 @@ fn apply_damage_to_barracks(
             if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == o_slot) {
                 killer.last_hits += 1;
                 killer.hero_gold += gold_b;
-                world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
-                    pos: bar_pos + Vec3::Y * 2.5,
-                    gold: gold_b,
-                });
+                world_inner.pending_private_fx.push((
+                    o_slot,
+                    GameplayFxEvent::LastHitGold {
+                        pos: bar_pos + Vec3::Y * 2.5,
+                        gold: gold_b,
+                    },
+                ));
             }
         }
         let eligible: Vec<usize> = world
@@ -12100,7 +12118,7 @@ fn apply_damage_to_barracks(
                     share,
                     config,
                     items_cfg,
-                    &mut world_inner.pending_fx,
+                    &mut world_inner.pending_private_fx,
                 );
             }
         }
@@ -12193,7 +12211,7 @@ fn apply_aoe_explosion(
                         attacker.last_hits += 1;
                         attacker.hero_gold += 35;
                         if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
-                            grant_xp_to_player_slot(attacker, 45, config, items_cfg, &mut world.pending_fx);
+                            grant_xp_to_player_slot(attacker, 45, config, items_cfg, &mut world.pending_private_fx);
                         }
                     }
                 }
@@ -12261,10 +12279,13 @@ fn apply_aoe_explosion(
                     if let Some(killer) = world.players.iter_mut().find(|p| p.slot_index == o_slot) {
                         killer.last_hits += 1;
                         killer.hero_gold += gold_bounty;
-                        world.pending_fx.push(GameplayFxEvent::LastHitGold {
-                            pos: c_pos,
-                            gold: gold_bounty,
-                        });
+                        world.pending_private_fx.push((
+                            o_slot,
+                            GameplayFxEvent::LastHitGold {
+                                pos: c_pos,
+                                gold: gold_bounty,
+                            },
+                        ));
                     }
                 }
                 let eligible_indices: Vec<usize> = world
@@ -12284,7 +12305,7 @@ fn apply_aoe_explosion(
                     let share = xp_bounty / (eligible_indices.len() as u32);
                     for idx in eligible_indices {
                         let p = &mut world.players[idx];
-                        grant_xp_to_player_slot(p, share, config, items_cfg, &mut world.pending_fx);
+                        grant_xp_to_player_slot(p, share, config, items_cfg, &mut world.pending_private_fx);
                     }
                 }
             }
@@ -12314,10 +12335,13 @@ fn apply_aoe_explosion(
                     if let Some(killer) = w_inner.players.iter_mut().find(|p| p.slot_index == o_slot) {
                         killer.last_hits += 1;
                         killer.hero_gold = killer.hero_gold.saturating_add(h_cfg.courier.bounty_gold);
-                        w_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
-                            pos: c_pos,
-                            gold: h_cfg.courier.bounty_gold,
-                        });
+                        w_inner.pending_private_fx.push((
+                            o_slot,
+                            GameplayFxEvent::LastHitGold {
+                                pos: c_pos,
+                                gold: h_cfg.courier.bounty_gold,
+                            },
+                        ));
                     }
                 }
             }
@@ -12903,10 +12927,13 @@ fn shared_authoritative_react_system(
                     if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
                         killer.last_hits += 1;
                         killer.hero_gold = killer.hero_gold.saturating_add(h_cfg.courier.bounty_gold);
-                        world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
-                            pos: cour_pos,
-                            gold: h_cfg.courier.bounty_gold,
-                        });
+                        world_inner.pending_private_fx.push((
+                            owner_slot,
+                            GameplayFxEvent::LastHitGold {
+                                pos: cour_pos,
+                                gold: h_cfg.courier.bounty_gold,
+                            },
+                        ));
                     }
                 }
                 world.pending_fx.push(GameplayFxEvent::GrenadeExploded {
@@ -13085,7 +13112,7 @@ fn shared_authoritative_react_system(
                                 share,
                                 &config,
                                 &items_cfg,
-                                &mut world_inner.pending_fx,
+                                &mut world_inner.pending_private_fx,
                             );
                         }
                     }
@@ -13095,10 +13122,13 @@ fn shared_authoritative_react_system(
                         if let Some(killer) = world_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
                             killer.last_hits += 1;
                             killer.hero_gold += gold_bounty;
-                            world_inner.pending_fx.push(GameplayFxEvent::LastHitGold {
-                                pos: creep_pos,
-                                gold: gold_bounty,
-                            });
+                            world_inner.pending_private_fx.push((
+                                owner_slot,
+                                GameplayFxEvent::LastHitGold {
+                                    pos: creep_pos,
+                                    gold: gold_bounty,
+                                },
+                            ));
                         }
                     }
                     let killer_team = bullet.owner_team;
@@ -13124,7 +13154,7 @@ fn shared_authoritative_react_system(
                                 share,
                                 &config,
                                 &items_cfg,
-                                &mut world_inner.pending_fx,
+                                &mut world_inner.pending_private_fx,
                             );
                         }
                     }
@@ -13263,7 +13293,7 @@ fn shared_authoritative_react_system(
                             attacker.last_hits += 1;
                             attacker.hero_gold += 35;
                             if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
-                                grant_xp_to_player_slot(attacker, 45, &config, &items_cfg, &mut world_inner.pending_fx);
+                                grant_xp_to_player_slot(attacker, 45, &config, &items_cfg, &mut world_inner.pending_private_fx);
                             }
                         }
                     } else {
@@ -13678,7 +13708,7 @@ fn shared_authoritative_react_system(
                 if let Some(killer) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
                     killer.last_hits += 1;
                     killer.hero_gold = killer.hero_gold.saturating_add(h_cfg.courier.bounty_gold);
-                    w_inner.pending_fx.push(GameplayFxEvent::LastHitGold { pos: cpos, gold: h_cfg.courier.bounty_gold });
+                    w_inner.pending_private_fx.push((owner_slot, GameplayFxEvent::LastHitGold { pos: cpos, gold: h_cfg.courier.bounty_gold }));
                 }
             }
         } else if let Some(c_idx) = hit_creep {
@@ -13732,7 +13762,7 @@ fn shared_authoritative_react_system(
                                 share,
                                 &config,
                                 &items_cfg,
-                                &mut w_inner.pending_fx,
+                                &mut w_inner.pending_private_fx,
                             );
                         }
                     }
@@ -13741,7 +13771,7 @@ fn shared_authoritative_react_system(
                     if let Some(killer) = w_inner.players.iter_mut().find(|p| p.slot_index == owner_slot) {
                         killer.last_hits += 1;
                         killer.hero_gold += gb;
-                        w_inner.pending_fx.push(GameplayFxEvent::LastHitGold { pos: cpos, gold: gb });
+                        w_inner.pending_private_fx.push((owner_slot, GameplayFxEvent::LastHitGold { pos: cpos, gold: gb }));
                     }
                     let eligible: Vec<usize> = world
                         .players
@@ -13763,7 +13793,7 @@ fn shared_authoritative_react_system(
                                 share,
                                 &config,
                                 &items_cfg,
-                                &mut w_inner.pending_fx,
+                                &mut w_inner.pending_private_fx,
                             );
                         }
                     }
@@ -13785,7 +13815,7 @@ fn shared_authoritative_react_system(
                         attacker.last_hits += 1;
                         attacker.hero_gold += 35;
                         if attacker.soldier_pos.distance(tpos) <= attacker.hero_xp_gain_radius {
-                            grant_xp_to_player_slot(attacker, 45, &config, &items_cfg, &mut w_inner.pending_fx);
+                            grant_xp_to_player_slot(attacker, 45, &config, &items_cfg, &mut w_inner.pending_private_fx);
                         }
                     }
                 }
@@ -13886,7 +13916,7 @@ fn shared_authoritative_react_system(
                             attacker.last_hits += 1;
                             attacker.hero_gold += 35;
                             if attacker.soldier_pos.distance(t_pos) <= attacker.hero_xp_gain_radius {
-                                grant_xp_to_player_slot(attacker, 45, &config, &items_cfg, &mut w_inner.pending_fx);
+                                grant_xp_to_player_slot(attacker, 45, &config, &items_cfg, &mut w_inner.pending_private_fx);
                             }
                         }
                     }
@@ -13958,10 +13988,13 @@ fn shared_authoritative_react_system(
                         if let Some(killer) = world.players.iter_mut().find(|p| p.slot_index == o_slot) {
                             killer.last_hits += 1;
                             killer.hero_gold += gold_bounty;
-                            world.pending_fx.push(GameplayFxEvent::LastHitGold {
-                                pos: c_pos,
-                                gold: gold_bounty,
-                            });
+                            world.pending_private_fx.push((
+                                o_slot,
+                                GameplayFxEvent::LastHitGold {
+                                    pos: c_pos,
+                                    gold: gold_bounty,
+                                },
+                            ));
                         }
                     }
                     let eligible_indices: Vec<usize> = world
@@ -13982,7 +14015,7 @@ fn shared_authoritative_react_system(
                         let w_inner = &mut *world;
                         for idx in eligible_indices {
                             let p = &mut w_inner.players[idx];
-                            grant_xp_to_player_slot(p, share, &config, &items_cfg, &mut w_inner.pending_fx);
+                            grant_xp_to_player_slot(p, share, &config, &items_cfg, &mut w_inner.pending_private_fx);
                         }
                     }
                 }

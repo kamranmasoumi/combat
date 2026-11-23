@@ -954,11 +954,19 @@ fn server_send_snapshot_system(
             }
         }
 
-        if !world.pending_fx.is_empty() {
+        if !world.pending_fx.is_empty() || !world.pending_private_fx.is_empty() {
             let fx_batch: Vec<GameplayFxEvent> = world.pending_fx.drain(..).collect();
+            let private_fx_batch: Vec<(usize, GameplayFxEvent)> =
+                world.pending_private_fx.drain(..).collect();
             for p in &match_state.players {
                 if let (true, Some(cid)) = (p.connected, p.client_id) {
-                    let filtered_fx = world.filter_fx_for_slot(&config, p.slot_index, &fx_batch);
+                    let mut filtered_fx =
+                        world.filter_fx_for_slot(&config, p.slot_index, &fx_batch);
+                    for (target_slot, ev) in &private_fx_batch {
+                        if *target_slot == p.slot_index {
+                            filtered_fx.push(ev.clone());
+                        }
+                    }
                     if filtered_fx.is_empty() {
                         continue;
                     }

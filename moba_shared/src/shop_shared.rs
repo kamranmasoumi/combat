@@ -425,6 +425,8 @@ pub struct StatLimitsConfig {
     pub max_reload_speed_multiplier: f32,
     pub min_weapon_damage: f32,
     pub min_weapon_range: f32,
+    pub max_weapon_range: f32,
+    pub max_pistol_range: f32,
     pub min_grenade_aoe: f32,
     pub min_grenade_recharge_mult: f32,
     pub min_grenade_recharge_secs: f32,
@@ -503,7 +505,14 @@ impl ItemsConfig {
         assert!(lim.min_fire_rate_multiplier > 0.0 && lim.max_fire_rate_multiplier >= lim.min_fire_rate_multiplier, "stat_limits fire_rate_multiplier نامعتبر است");
         assert!(lim.min_reload_speed_multiplier > 0.0 && lim.max_reload_speed_multiplier >= lim.min_reload_speed_multiplier, "stat_limits reload_speed_multiplier نامعتبر است");
         assert!(lim.min_weapon_damage > 0.0, "stat_limits.min_weapon_damage باید مثبت باشد");
-        assert!(lim.min_weapon_range > 0.0, "stat_limits.min_weapon_range باید مثبت باشد");
+        assert!(
+            lim.min_weapon_range > 0.0 && lim.max_weapon_range >= lim.min_weapon_range,
+            "stat_limits.min_weapon_range / max_weapon_range نامعتبر است"
+        );
+        assert!(
+            lim.max_pistol_range >= lim.min_weapon_range,
+            "stat_limits.max_pistol_range باید بزرگ‌تر یا مساوی min_weapon_range باشد"
+        );
         assert!(lim.min_grenade_aoe > 0.0, "stat_limits.min_grenade_aoe باید مثبت باشد");
         assert!(lim.min_grenade_recharge_mult > 0.0, "stat_limits.min_grenade_recharge_mult باید مثبت باشد");
         assert!(lim.min_grenade_recharge_secs > 0.0, "stat_limits.min_grenade_recharge_secs باید مثبت باشد");
@@ -959,7 +968,7 @@ pub fn recompute_player_slot_stats(
     p.hero_weapon.max_range = (base.weapon.max_range
         + growth.max_range_per_level * levels_gained
         + total_mod.primary_range_bonus)
-        .max(lim.min_weapon_range);
+        .clamp(lim.min_weapon_range, lim.max_weapon_range);
 
     // سلاح‌های Beam (ElectricBeam و FlameBeam): اعمال کامل دمیج، سرعت شلیک، خشاب و رشد سطح
     if base.weapon.weapon_kind == WeaponKind::ElectricBeam
@@ -1013,8 +1022,8 @@ pub fn recompute_player_slot_stats(
         (base.pistol.damage + total_mod.pistol_damage_bonus).max(lim.min_weapon_damage);
     p.hero_pistol.magazine_size =
         ((base.pistol.magazine_size as i32) + total_mod.pistol_magazine_bonus).max(1) as u32;
-    p.hero_pistol.max_range =
-        (base.pistol.max_range + total_mod.pistol_range_bonus).max(lim.min_weapon_range);
+    p.hero_pistol.max_range = (base.pistol.max_range + total_mod.pistol_range_bonus)
+        .clamp(lim.min_weapon_range, lim.max_pistol_range);
 
     let is_beam_primary = base.weapon.weapon_kind == WeaponKind::ElectricBeam
         || base.weapon.weapon_kind == WeaponKind::FlameBeam;

@@ -1,11 +1,11 @@
 GameConfig(
     network: NetworkConfig(
         server_bind_addr: "0.0.0.0:5000",
-        server_public_addr: "172.21.13.50:5000", // 172.21.13.50 or 46.245.72.142
+        server_public_addr: "46.245.72.142:5000", // 172.21.13.50 or 46.245.72.142
         client_bind_addr: "0.0.0.0:0",
-        backend_http_url: "http://127.0.0.1:8000", // 127.0.0.1 or 46.245.72.142
-        backend_ws_url: "ws://127.0.0.1:8000", // 127.0.0.1 or 46.245.72.142
-        redis_addr: "172.21.13.50:6379", // 172.21.13.50 or 127.0.0.1
+        backend_http_url: "http://46.245.72.142:8000", // 127.0.0.1 or 46.245.72.142
+        backend_ws_url: "ws://46.245.72.142:8000", // 127.0.0.1 or 46.245.72.142
+        redis_addr: "127.0.0.1:6379", // 172.21.13.50 or 127.0.0.1
         server_tick_rate_hz: 60.0,
         protocol_id: 7001,
         max_clients: 10,
@@ -787,7 +787,7 @@ GameConfig(
                 reload_duration_secs: 1.50,
                 damage: 14.0,
                 projectile_speed: 82.0,
-                max_range: 25.0,
+                max_range: 18.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.016,
                 gravity: 0.0,
@@ -1076,7 +1076,7 @@ GameConfig(
                 reload_duration_secs: 2.50,
                 damage: 64.0,
                 projectile_speed: 135.0,
-                max_range: 30.0,
+                max_range: 20.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.004,
                 gravity: 0.0,
@@ -1100,7 +1100,7 @@ GameConfig(
                 reload_duration_secs: 1.55,
                 damage: 18.0,
                 projectile_speed: 88.0,
-                max_range: 25.0,
+                max_range: 17.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.012,
                 gravity: 0.0,
@@ -1413,7 +1413,7 @@ GameConfig(
                 reload_duration_secs: 1.65,
                 damage: 22.0,
                 projectile_speed: 78.0,
-                max_range: 25.0,
+                max_range: 18.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.020,
                 gravity: 0.0,
@@ -1726,7 +1726,7 @@ GameConfig(
                 reload_duration_secs: 1.40,
                 damage: 13.0,
                 projectile_speed: 84.0,
-                max_range: 25.0,
+                max_range: 17.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.018,
                 gravity: 0.0,
@@ -2015,7 +2015,7 @@ GameConfig(
                 reload_duration_secs: 2.35,
                 damage: 20.0,
                 projectile_speed: 22.0,
-                max_range: 20.0,
+                max_range: 17.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.030,
                 gravity: 34.0,
@@ -2039,7 +2039,7 @@ GameConfig(
                 reload_duration_secs: 1.40,
                 damage: 13.0,
                 projectile_speed: 84.0,
-                max_range: 25.0,
+                max_range: 18.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.018,
                 gravity: 0.0,
@@ -2352,7 +2352,7 @@ GameConfig(
                 reload_duration_secs: 1.40,
                 damage: 13.0,
                 projectile_speed: 84.0,
-                max_range: 25.0,
+                max_range: 20.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.018,
                 gravity: 0.0,
@@ -2665,7 +2665,7 @@ GameConfig(
                 reload_duration_secs: 1.40,
                 damage: 13.0,
                 projectile_speed: 84.0,
-                max_range: 25.0,
+                max_range: 20.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.018,
                 gravity: 0.0,
@@ -2978,7 +2978,7 @@ GameConfig(
                 reload_duration_secs: 1.40,
                 damage: 13.0,
                 projectile_speed: 84.0,
-                max_range: 25.0,
+                max_range: 20.0,
                 pellets_per_shot: 1,
                 spread_rad: 0.018,
                 gravity: 0.0,

@@ -19,7 +19,7 @@ use bevy::render::settings::{PowerPreference, RenderCreation, WgpuSettings};
 use bevy::render::RenderPlugin;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{Pressed, RelativeCursorPosition};
+use bevy::ui::RelativeCursorPosition;
 use bevy::ui_widgets::Button as UiButton;
 use bevy::transform::TransformSystems;
 use bevy::window::{CursorOptions, MonitorSelection, PresentMode, PrimaryWindow, WindowMode, WindowResolution};
@@ -52,6 +52,7 @@ use std::time::Duration;
 
 mod audio_client;
 mod backend_client;
+mod demo_client;
 mod pregame_ui;
 mod vfx_client;
 use backend_client::BackendClient;
@@ -265,6 +266,7 @@ fn main() {
         })
         .insert_resource(backend_client)
         .add_plugins(PreGamePlugin)
+        .add_plugins(demo_client::DemoHeroClientPlugin)
         .add_plugins(ShopPlugin)
         .add_plugins(MobaAudioPlugin)
         .add_plugins((
@@ -288,6 +290,7 @@ fn main() {
         .insert_resource(LatestCouriers::default())
         .insert_resource(InspectedUnit::default())
         .insert_resource(HeroClickMoveTarget::default())
+        .insert_resource(RightClickDragBoxState::default())
         .insert_resource(LatestTopBarState::default())
         .insert_resource(LatestHeroKillFeed::default())
         .insert_resource(WeatherLightningFlashState::default())
@@ -977,6 +980,7 @@ struct SoldierGltfHandle {
 #[derive(Resource)]
 struct SoldierAnimationAssets {
     model_path: String,
+    hero_id: String,
     graph_handle: Handle<AnimationGraph>,
     nodes: HashMap<String, AnimationNodeIndex>,
     durations: HashMap<String, f32>,
@@ -1303,11 +1307,12 @@ fn ingame_exit_button_system(
     mouse: Res<ButtonInput<MouseButton>>,
     backend: Res<BackendClient>,
     pregame_state: Res<PreGameSessionState>,
+    demo_session: Res<demo_client::ActiveDemoSession>,
     match_result: Res<LatestMatchResult>,
     mut next_screen: ResMut<NextState<AppScreenState>>,
     mut exit_btn_q: Query<(&Hovered, &mut BackgroundColor), With<InGameExitMenuBtn>>,
 ) {
-    let mut want_exit = match_result.0.is_some() && keys.just_pressed(KeyCode::Escape);
+    let mut want_exit = (match_result.0.is_some() || demo_session.is_active) && keys.just_pressed(KeyCode::Escape);
     let left_clicked = mouse.just_pressed(MouseButton::Left);
     for (hovered, mut bg) in &mut exit_btn_q {
         if hovered.get() {
@@ -1320,7 +1325,7 @@ fn ingame_exit_button_system(
         }
     }
     if want_exit {
-        if match_result.0.is_none() {
+        if !demo_session.is_active && match_result.0.is_none() {
             if let Some(ref tok) = pregame_state.access_token {
                 backend.disconnect_match(tok.clone());
             }
@@ -3632,6 +3637,9 @@ fn load_gltf_and_build_graph(
     old_upper_q: Query<Entity, With<UpperBodyAnimationPlayer>>,
 ) {
     let selected_hero_opt = resolve_local_selected_hero(&config, &match_flow, &hero_hud);
+    let desired_hero_id = selected_hero_opt
+        .map(|h| h.id.clone())
+        .unwrap_or_else(|| config.active_hero(0).id.clone());
     let desired_model_path = selected_hero_opt
         .map(|h| h.model_path.clone())
         .unwrap_or_else(|| config.animations.model_path.clone());
@@ -3646,7 +3654,10 @@ fn load_gltf_and_build_graph(
     }
 
     if let Some(ref ready) = assets_ready {
-        if ready.model_path == desired_model_path && !old_soldier_q.is_empty() {
+        if ready.model_path == desired_model_path
+            && ready.hero_id == desired_hero_id
+            && !old_soldier_q.is_empty()
+        {
             return;
         }
     }
@@ -3696,6 +3707,7 @@ fn load_gltf_and_build_graph(
     let graph_handle = animation_graphs.add(graph);
     commands.insert_resource(SoldierAnimationAssets {
         model_path: desired_model_path,
+        hero_id: desired_hero_id,
         graph_handle,
         nodes,
         durations,
@@ -15921,6 +15933,117 @@ struct ManualMoveUiGuards<'w> {
     physics_world: Res<'w, CustomPhysicsWorld>,
 }
 
+#[derive(Resource, Default)]
+struct RightClickDragBoxState {
+    active: bool,
+    is_dragging: bool,
+    start_pos: Vec2,
+    current_pos: Vec2,
+}
+
+#[derive(Component)]
+struct RightClickSelectionBoxUi;
+
+/// انتخاب بهترین موجودیت (هیرو، کوریر، تاور، باراکس، انشنت یا کریپ) درون کادر مستطیلی آبی انتخاب
+fn find_best_unit_in_selection_box(
+    min_pt: Vec2,
+    max_pt: Vec2,
+    camera: &Camera,
+    cam_gt: &GlobalTransform,
+    config: &GameConfig,
+    q: &ManualMoveQueries,
+    own_hero_pos: Vec3,
+    my_slot: Option<usize>,
+) -> Option<InspectedUnit> {
+    let center = (min_pt + max_pt) * 0.5;
+    let mut best: Option<(u8, f32, InspectedUnit)> = None;
+
+    let mut consider = |priority: u8, world_points: &[Vec3], unit: InspectedUnit| {
+        for &wp in world_points {
+            if let Ok(sp) = camera.world_to_viewport(cam_gt, wp) {
+                if sp.x >= min_pt.x && sp.x <= max_pt.x && sp.y >= min_pt.y && sp.y <= max_pt.y {
+                    let dist_sq = sp.distance_squared(center);
+                    let replace = match &best {
+                        None => true,
+                        Some((bp, bd, _)) => priority < *bp || (priority == *bp && dist_sq < *bd),
+                    };
+                    if replace {
+                        best = Some((priority, dist_sq, unit));
+                    }
+                    break;
+                }
+            }
+        }
+    };
+
+    // اولویت ۰: هیروهای دیگر (دشمن و هم‌تیمی)
+    for rp in &q.latest_remotes.0 {
+        if rp.is_visible {
+            consider(
+                0,
+                &[rp.pos, rp.pos + Vec3::Y * 1.1],
+                InspectedUnit::RemoteHero(rp.slot_index),
+            );
+        }
+    }
+    // اولویت ۱: هیروی خود بازیکن
+    consider(
+        1,
+        &[own_hero_pos, own_hero_pos + Vec3::Y * 1.1],
+        InspectedUnit::OwnHero,
+    );
+    // اولویت ۲: کوریرها
+    for c in &q.latest_couriers.0 {
+        if !c.is_visible || c.is_dead {
+            continue;
+        }
+        let u = if Some(c.owner_slot) == my_slot {
+            InspectedUnit::OwnCourier
+        } else {
+            InspectedUnit::EnemyCourier(c.owner_slot)
+        };
+        consider(2, &[c.pos, c.pos + Vec3::Y * 0.8], u);
+    }
+    // اولویت ۳: تاورها
+    for (idx, td) in config.map.turrets.iter().enumerate() {
+        if q.latest_turrets.0.get(idx).is_some_and(|t| !t.is_dead) {
+            let p = td.model_transform.location_vec();
+            consider(3, &[p, p + Vec3::Y * 2.5], InspectedUnit::Turret(idx));
+        }
+    }
+    // اولویت ۴: باراکس‌ها
+    for (idx, bd) in config.map.barracks.iter().enumerate() {
+        if q.latest_barracks.0.get(idx).is_some_and(|b| !b.is_dead) {
+            let p = bd.model_transform.location_vec();
+            consider(4, &[p, p + Vec3::Y * 1.8], InspectedUnit::Barracks(idx));
+        }
+    }
+    // اولویت ۵: انشنت‌ها
+    for (idx, ad) in config.map.ancients.iter().enumerate() {
+        if q.latest_ancients.0.get(idx).is_some_and(|a| !a.is_dead) {
+            let p = ad.model_transform.location_vec();
+            consider(5, &[p, p + Vec3::Y * 2.5], InspectedUnit::Ancient(idx));
+        }
+    }
+    // اولویت ۶: سربازان لاین و کمپ‌های جنگل
+    for cr in &q.latest_creeps.0 {
+        if cr.is_visible && !cr.is_dead {
+            consider(6, &[cr.pos, cr.pos + Vec3::Y * 0.8], InspectedUnit::Creep(cr.id));
+        }
+    }
+
+    best.map(|(_, _, u)| u)
+}
+
+#[derive(SystemParam)]
+struct RightClickBoxInputParams<'w, 's> {
+    drag_box: ResMut<'w, RightClickDragBoxState>,
+    box_ui_q: Query<'w, 's, (&'static mut Node, &'static mut Visibility), With<RightClickSelectionBoxUi>>,
+    window_q: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    cam_q: Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<MobaCamera>>,
+    map_obj_q: Query<'w, 's, &'static MapObjectId>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn courier_manual_move_input_system(
     mut commands: Commands,
@@ -15933,13 +16056,16 @@ fn courier_manual_move_input_system(
     mut courier_ctrl: ResMut<CourierControlState>,
     mut inspected: ResMut<InspectedUnit>,
     mut hero_move_target: ResMut<HeroClickMoveTarget>,
+    mut rbox: RightClickBoxInputParams,
     mouse: Res<ButtonInput<MouseButton>>,
-    window_q: Query<&Window, With<PrimaryWindow>>,
-    cam_q: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
-    map_obj_q: Query<&MapObjectId>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
 ) {
-    if !match_flow.is_in_game()
+    let drag_box = &mut rbox.drag_box;
+    let box_ui_q = &mut rbox.box_ui_q;
+    let window_q = &rbox.window_q;
+    let cam_q = &rbox.cam_q;
+    let map_obj_q = &rbox.map_obj_q;
+    let blocked_by_ui = !match_flow.is_in_game()
         || guards.shop_ui.is_open
         || guards.shop_ui.is_pointer_over_hud_ui
         || guards.shop_ui.pending_sell_slot.is_some()
@@ -15947,27 +16073,136 @@ fn courier_manual_move_input_system(
         || guards.settings_ui.is_open
         || guards.chat_state.is_open
         || guards.camera_control.is_pointer_over_minimap
-        || guards.camera_control.is_dragging_minimap
-    {
+        || guards.camera_control.is_dragging_minimap;
+
+    // ساخت تنبل (Lazy) کادر مستطیلی آبی انتخاب مشابه ویندوز و Dota 2
+    if box_ui_q.is_empty() && match_flow.is_in_game() {
+        commands.spawn((
+            RightClickSelectionBoxUi,
+            Pickable::IGNORE,
+            GlobalZIndex(205),
+            Visibility::Hidden,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: px(0.0),
+                height: px(0.0),
+                border: UiRect::all(px(1.5)),
+                border_radius: BorderRadius::all(px(2.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.18, 0.58, 1.0, 0.22)),
+            BorderColor::all(Color::srgba(0.36, 0.80, 1.0, 0.94)),
+        ));
+    }
+
+    if blocked_by_ui {
+        if drag_box.active {
+            drag_box.active = false;
+            drag_box.is_dragging = false;
+            if let Ok((_, mut vis)) = box_ui_q.single_mut() {
+                *vis = Visibility::Hidden;
+            }
+        }
         return;
     }
-    if !mouse.just_pressed(MouseButton::Right) {
-        return;
-    }
+
     let Ok(window) = window_q.single() else {
         return;
     };
     let Some(cursor_pos) = window.cursor_position() else {
+        if drag_box.active && !mouse.pressed(MouseButton::Right) {
+            drag_box.active = false;
+            drag_box.is_dragging = false;
+            if let Ok((_, mut vis)) = box_ui_q.single_mut() {
+                *vis = Visibility::Hidden;
+            }
+        }
         return;
     };
     let Ok((camera, cam_gt)) = cam_q.single() else {
         return;
     };
+    let my_slot = match_flow.your_slot;
+
+    // ۱. شروع نگه داشتن کلیک راست
+    if mouse.just_pressed(MouseButton::Right) {
+        drag_box.active = true;
+        drag_box.is_dragging = false;
+        drag_box.start_pos = cursor_pos;
+        drag_box.current_pos = cursor_pos;
+        if let Ok((_, mut vis)) = box_ui_q.single_mut() {
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
+
+    // ۲. کشیدن موس هنگام نگه داشتن کلیک راست -> نمایش کادر آبی + هاور زنده روی موجودیت‌ها
+    if drag_box.active && mouse.pressed(MouseButton::Right) {
+        drag_box.current_pos = cursor_pos;
+        let drag_dist = drag_box.current_pos.distance(drag_box.start_pos);
+        if drag_dist >= 8.0 {
+            drag_box.is_dragging = true;
+            let min_pt = drag_box.start_pos.min(drag_box.current_pos);
+            let max_pt = drag_box.start_pos.max(drag_box.current_pos);
+            if let Ok((mut node, mut vis)) = box_ui_q.single_mut() {
+                node.left = px(min_pt.x);
+                node.top = px(min_pt.y);
+                node.width = px((max_pt.x - min_pt.x).max(1.0));
+                node.height = px((max_pt.y - min_pt.y).max(1.0));
+                *vis = Visibility::Visible;
+            }
+            if let Some(best_unit) = find_best_unit_in_selection_box(
+                min_pt,
+                max_pt,
+                camera,
+                cam_gt,
+                &config,
+                &q,
+                guards.render_state.soldier_pos,
+                my_slot,
+            ) {
+                courier_ctrl.selected = best_unit == InspectedUnit::OwnCourier;
+                *inspected = best_unit;
+            }
+        }
+        return;
+    }
+
+    // ۳. رها کردن کلیک راست
+    if !drag_box.active {
+        return;
+    }
+    let was_dragging = drag_box.is_dragging;
+    let min_pt = drag_box.start_pos.min(cursor_pos);
+    let max_pt = drag_box.start_pos.max(cursor_pos);
+    drag_box.active = false;
+    drag_box.is_dragging = false;
+    if let Ok((_, mut vis)) = box_ui_q.single_mut() {
+        *vis = Visibility::Hidden;
+    }
+
+    if was_dragging {
+        if let Some(best_unit) = find_best_unit_in_selection_box(
+            min_pt,
+            max_pt,
+            camera,
+            cam_gt,
+            &config,
+            &q,
+            guards.render_state.soldier_pos,
+            my_slot,
+        ) {
+            courier_ctrl.selected = best_unit == InspectedUnit::OwnCourier;
+            *inspected = best_unit;
+        }
+        return;
+    }
     let Ok(ray) = camera.viewport_to_world(cam_gt, cursor_pos) else {
         return;
     };
     let ray_dir = *ray.direction;
-    let my_slot = match_flow.your_slot;
 
     for c in &q.latest_couriers.0 {
         if !c.is_visible || c.is_dead {

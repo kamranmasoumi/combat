@@ -774,6 +774,8 @@ fn server_network_receive_system(
                             }
                         }
                     }
+                    // امنیت سرور آنلاین: دستورات Demo Hero هرگز روی سرور اصلی اجرا نمی‌شوند
+                    ClientLobbyMessage::DemoCommand(_) => {}
                     ClientLobbyMessage::SwapCourierSlots { from_slot, to_slot } => {
                         if match_state.phase == MatchPhase::InGame {
                             if let Some(slot_idx) = match_state.slot_for_client(client_id) {

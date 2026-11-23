@@ -16,6 +16,7 @@ use bevy::prelude::*;
 use bevy::ui::{Pressed, RelativeCursorPosition};
 use bevy::ui_widgets::Button as UiButton;
 use bevy::window::{CursorOptions, PrimaryWindow};
+use crate::demo_client::PendingDemoLaunch;
 use moba_shared::GameConfig;
 use std::collections::HashMap;
 use std::f32::consts::TAU;
@@ -40,6 +41,7 @@ pub enum PreGameTab {
     LobbyBrowser,
     LobbyRoom,
     MatchHistory,
+    DemoHero,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +346,7 @@ enum PreGameBtnAction {
     ConfirmModalAccept,
     ConfirmModalCancel,
     FocusField(FocusedInput),
+    LaunchDemoHero(String),
 }
 
 // =============================================================================
@@ -1677,6 +1680,7 @@ fn handle_pregame_buttons_system(
     config: Res<GameConfig>,
     mut backend: ResMut<BackendClient>,
     mut state: ResMut<PreGameSessionState>,
+    mut pending_demo: ResMut<PendingDemoLaunch>,
     mut app_exit: MessageWriter<AppExit>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut btn_q: Query<
@@ -1721,6 +1725,21 @@ fn handle_pregame_buttons_system(
         PreGameBtnAction::FocusField(f) => {
             state.focused = f;
             state.ui_dirty = true;
+        }
+        PreGameBtnAction::LaunchDemoHero(hero_id) => {
+            if state.active_match.is_some() {
+                push_notification(
+                    &mut state,
+                    "error",
+                    "ACTIVE MATCH",
+                    "Reconnect or abandon your active match before entering Demo Hero.",
+                    notif_dur,
+                );
+                return;
+            }
+            backend.stop_matchmaking();
+            backend.disconnect_lobby_ws();
+            pending_demo.0 = Some(hero_id);
         }
         PreGameBtnAction::SwitchAuthMode(mode) => {
             state.auth_mode = mode;
@@ -2611,6 +2630,7 @@ fn rebuild_pregame_ui_system(
             PreGameTab::LobbyBrowser => spawn_lobby_browser_screen(parent, &state, &config),
             PreGameTab::LobbyRoom => spawn_lobby_room_screen(parent, &state, &config),
             PreGameTab::MatchHistory => spawn_history_screen(parent, &state, &config),
+            PreGameTab::DemoHero => spawn_demo_hero_screen(parent, &config),
         }
 
         if state.create_lobby_modal_open || state.edit_lobby_settings_open {
@@ -2978,6 +2998,12 @@ fn spawn_top_nav_bar(
                     "MATCH HISTORY",
                     state.tab == PreGameTab::MatchHistory,
                     PreGameBtnAction::SwitchTab(PreGameTab::MatchHistory),
+                );
+                spawn_nav_pill(
+                    tabs,
+                    "DEMO HERO",
+                    state.tab == PreGameTab::DemoHero,
+                    PreGameBtnAction::SwitchTab(PreGameTab::DemoHero),
                 );
             });
 
@@ -6987,4 +7013,141 @@ fn safe_despawn(commands: &mut Commands, entity: Entity) {
             em.despawn();
         }
     });
+}
+// =============================================================================
+// صفحه انتخاب هیرو برای ورود به محیط Demo Hero (در دسترس همه بازیکنان از منوی اصلی)
+// =============================================================================
+
+fn spawn_demo_hero_screen(parent: &mut ChildSpawnerCommands, config: &GameConfig) {
+    let gold = Color::srgb(0.98, 0.84, 0.34);
+    let teal = Color::srgb(0.28, 0.94, 0.82);
+
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_grow: 1.0,
+            padding: UiRect::axes(Val::Px(26.0), Val::Px(18.0)),
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::SpaceBetween,
+            row_gap: Val::Px(14.0),
+            ..default()
+        })
+        .with_children(|wrap| {
+            wrap.spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    padding: UiRect::axes(Val::Px(18.0), Val::Px(12.0)),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.025, 0.088, 0.105, 0.92)),
+                BorderColor::all(Color::srgba(0.26, 0.78, 0.74, 0.70)),
+            ))
+            .with_children(|hdr| {
+                hdr.spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(3.0),
+                    ..default()
+                })
+                .with_children(|col| {
+                    col.spawn((
+                        Text::new("DEMO HERO // TACTICAL SANDBOX"),
+                        TextFont { font_size: FontSize::Px(20.0), ..default() },
+                        TextColor(gold),
+                    ));
+                    col.spawn((
+                        Text::new("Test any hero, weapon, item counter, weather, day/night, turrets, creeps, and enemy dummies locally with zero latency."),
+                        TextFont { font_size: FontSize::Px(12.0), ..default() },
+                        TextColor(Color::srgb(0.76, 0.90, 0.90)),
+                    ));
+                });
+
+                spawn_sized_button(
+                    hdr,
+                    "BACK TO MENU",
+                    PreGameBtnAction::SwitchTab(PreGameTab::Hub),
+                    Color::srgba(0.06, 0.16, 0.19, 0.94),
+                    Color::srgb(0.32, 0.78, 0.76),
+                    156.0,
+                    40.0,
+                );
+            });
+
+            wrap.spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    flex_grow: 1.0,
+                    min_height: Val::Px(0.0),
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    align_content: AlignContent::FlexStart,
+                    column_gap: Val::Px(14.0),
+                    row_gap: Val::Px(14.0),
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                },
+                ScrollPosition::default(),
+                RelativeCursorPosition::default(),
+                PreGameScrollableList,
+            ))
+            .with_children(|grid| {
+                for hero in &config.heroes {
+                    grid.spawn((
+                        Node {
+                            width: Val::Px(276.0),
+                            padding: UiRect::all(Val::Px(14.0)),
+                            flex_direction: FlexDirection::Column,
+                            justify_content: JustifyContent::SpaceBetween,
+                            row_gap: Val::Px(10.0),
+                            border: UiRect::all(Val::Px(1.5)),
+                            border_radius: BorderRadius::all(Val::Px(6.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.025, 0.082, 0.098, 0.92)),
+                        BorderColor::all(Color::srgba(0.26, 0.68, 0.68, 0.65)),
+                    ))
+                    .with_children(|card| {
+                        card.spawn(Node {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(4.0),
+                            ..default()
+                        })
+                        .with_children(|info| {
+                            info.spawn((
+                                Text::new(hero.display_name.to_uppercase()),
+                                TextFont { font_size: FontSize::Px(16.0), ..default() },
+                                TextColor(Color::WHITE),
+                            ));
+                            info.spawn((
+                                Text::new(format!("WEAPON: {:?}", hero.weapon.weapon_kind)),
+                                TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                TextColor(teal),
+                            ));
+                            info.spawn((
+                                Text::new(format!(
+                                    "HP: {:.0}   |   ARMOR: {:.1}   |   DMG: {:.0}",
+                                    hero.max_hp, hero.armor, hero.weapon.damage
+                                )),
+                                TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                TextColor(Color::srgb(0.82, 0.92, 0.92)),
+                            ));
+                        });
+
+                        spawn_sized_button(
+                            card,
+                            "LAUNCH DEMO HERO",
+                            PreGameBtnAction::LaunchDemoHero(hero.id.clone()),
+                            Color::srgba(0.64, 0.46, 0.10, 0.95),
+                            gold,
+                            246.0,
+                            38.0,
+                        );
+                    });
+                }
+            });
+        });
 }

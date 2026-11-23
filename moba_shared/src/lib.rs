@@ -11,7 +11,9 @@ use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub mod demo_shared;
 pub mod shop_shared;
+pub use demo_shared::*;
 pub use shop_shared::*;
 
 // -----------------------------------------------------------------------------
@@ -1966,6 +1968,22 @@ pub struct CombatConfig {
     pub hero_kill_xp: u32,
     pub hero_assist_gold: u32,
     pub hero_assist_xp: u32,
+    pub hero_kill_gold_per_victim_level: f32,
+    pub hero_kill_xp_per_victim_level: f32,
+    pub hero_assist_gold_per_victim_level: f32,
+    pub hero_assist_xp_per_victim_level: f32,
+    pub underdog_gold_mult_per_level: f32,
+    pub underdog_xp_mult_per_level: f32,
+    pub overlevel_gold_penalty_per_level: f32,
+    pub overlevel_xp_penalty_per_level: f32,
+    pub min_bounty_gold_mult: f32,
+    pub max_bounty_gold_mult: f32,
+    pub min_bounty_xp_mult: f32,
+    pub max_bounty_xp_mult: f32,
+    pub streak_bonus_min_kills: u32,
+    pub streak_bonus_max_steps: u32,
+    pub streak_gold_bonus_per_kill: u32,
+    pub streak_xp_bonus_per_kill: u32,
     pub hero_assist_window_secs: f32,
     pub hero_kill_credit_window_secs: f32,
     pub turret_hero_aggro_window_secs: f32,
@@ -3041,6 +3059,7 @@ pub enum ClientLobbyMessage {
     CancelTeleport,
     ActivateShadowBlade { inv_index: usize },
     ActivateItem { inv_index: usize },
+    DemoCommand(crate::demo_shared::DemoCommand),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -7080,6 +7099,7 @@ pub struct PlayerSlotState {
     pub assists: u32,
     pub kills: u32,
     pub deaths: u32,
+    pub kill_streak: u32,
     pub inventory: Vec<InventoryItemState>,
     pub tp_slot: Option<InventoryItemState>,
     pub courier_pos: Vec3,
@@ -7221,6 +7241,7 @@ pub struct AuthoritativeWorldState {
     pub assists: u32,
     pub kills: u32,
     pub deaths: u32,
+    pub kill_streak: u32,
     pub inventory: Vec<InventoryItemState>,
     pub tp_slot: Option<InventoryItemState>,
     pub fog_of_war: SharedFogOfWar,
@@ -7269,6 +7290,7 @@ pub struct AuthoritativeWorldState {
     pub turrets: Vec<TurretState>,
     pub fountain_fire_cooldowns: Vec<f32>,
     pub allow_shadow_blade_during_teleport: bool,
+    pub demo_reveal_full_map: bool,
     pub barracks: Vec<BarracksState>,
     pub ancients: Vec<AncientState>,
     pub chat_history: Vec<ChatMessageEntry>,
@@ -7435,6 +7457,7 @@ impl AuthoritativeWorldState {
             assists: 0,
             kills: 0,
             deaths: 0,
+            kill_streak: 0,
             inventory: Vec::new(),
             tp_slot: None,
             fog_of_war,
@@ -7498,6 +7521,7 @@ impl AuthoritativeWorldState {
             creeps: Vec::new(),
             fountain_fire_cooldowns: vec![0.0; config.map.fountains.len()],
             allow_shadow_blade_during_teleport: config.gameplay_rules.allow_shadow_blade_during_teleport,
+            demo_reveal_full_map: false,
             turrets: config
                 .map
                 .turrets
@@ -7689,6 +7713,7 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.assists, &mut p.assists);
         std::mem::swap(&mut self.kills, &mut p.kills);
         std::mem::swap(&mut self.deaths, &mut p.deaths);
+        std::mem::swap(&mut self.kill_streak, &mut p.kill_streak);
         std::mem::swap(&mut self.inventory, &mut p.inventory);
         std::mem::swap(&mut self.tp_slot, &mut p.tp_slot);
         std::mem::swap(&mut self.fog_of_war, &mut p.fog_of_war);
@@ -8182,6 +8207,7 @@ impl AuthoritativeWorldState {
                 assists: 0,
                 kills: 0,
                 deaths: 0,
+                kill_streak: 0,
                 inventory: Vec::new(),
                 tp_slot: None,
                 courier_pos: Vec3::new(spawn_pos.x, hero.courier.fly_height, spawn_pos.z),
@@ -8260,6 +8286,198 @@ impl AuthoritativeWorldState {
                 },
             });
         }
+    }
+
+
+    /// افزودن پویا و امن یک هیروی جدید به زمین بازی (مخصوص Demo Hero چندنفره تا ۵v۵)
+    pub fn spawn_single_player_slot(
+        &mut self,
+        config: &GameConfig,
+        lp: &LobbyPlayerInfo,
+        spawn_pos: Vec3,
+        commands: &mut Commands,
+    ) {
+        let hero_id = lp
+            .selected_hero_id
+            .as_deref()
+            .unwrap_or(&config.heroes[0].id);
+        let hero_index = config
+            .heroes
+            .iter()
+            .position(|h| h.id == hero_id)
+            .unwrap_or(0);
+        let hero = config.active_hero(hero_index).clone();
+        let facing_dir = match lp.team {
+            TeamId::Dusk => Vec3::new(-1.0, 0.0, 0.0),
+            _ => Vec3::new(1.0, 0.0, 0.0),
+        };
+        let aim_hit = spawn_pos + facing_dir * 12.0;
+
+        commands.spawn(soldier_physics_bundle_for_slot(
+            config,
+            lp.slot_index,
+            spawn_pos,
+            hero.hero_scale,
+        ));
+
+        self.players.push(PlayerSlotState {
+                slot_index: lp.slot_index,
+                client_id: lp.client_id,
+                is_disconnected: !lp.connected,
+                pause_cooldown_remaining: 0.0,
+                active_input: None,
+                soldier_pos: spawn_pos,
+                soldier_facing_dir: facing_dir,
+                spawn_pos,
+                base_stance: Stance::Run,
+                effective_stance: Stance::Run,
+                current_locomotion: "idle".to_string(),
+                aim_world_dir: facing_dir,
+                aim_hit_pos: aim_hit,
+                laser_hit_pos: aim_hit,
+                aim_locked_on_enemy: false,
+                hovered_creep_id: None,
+                hovered_turret_index: None,
+            hovered_barracks_index: None,
+            hovered_ancient_index: None,
+                is_moving: false,
+                move_input: Vec3::ZERO,
+                fire_cooldown_remaining: 0.0,
+                firing_anim_remaining: None,
+                reload_remaining: None,
+                grenade_elapsed_and_duration: None,
+                grenade_spawned_for_throw: false,
+                is_dead: false,
+                death_anim_name: "die_1".to_string(),
+                respawn_remaining: 0.0,
+                hero_index,
+                hero_id: hero.id,
+                hero_display_name: hero.display_name,
+                hero_model_path: hero.model_path,
+                hero_team: lp.team,
+                hero_gold: hero.starting_gold,
+                hero_level: 1,
+                hero_xp: 0,
+                hero_xp_gain_radius: hero.xp_gain_radius,
+                hero_hp: hero.max_hp,
+                hero_max_hp: hero.max_hp,
+                hero_hp_regen_per_sec: hero.hp_regen_per_sec,
+                hero_stamina: hero.max_stamina,
+                hero_max_stamina: hero.max_stamina,
+                hero_stamina_regen_per_sec: hero.stamina_regen_per_sec,
+                hero_slide_stamina_cost: hero.slide_stamina_cost,
+                hero_jump_over_stamina_cost: hero.jump_over_stamina_cost,
+                space_hold_secs: None,
+                wall_climb_mountain_index: None,
+                wall_climb_last_dir: 1,
+                hero_armor: hero.armor,
+                hero_scale: hero.hero_scale,
+                hero_move_speed_multiplier: hero.move_speed_multiplier,
+                toxic_slow_multiplier: 1.0,
+                beam_charge: hero.weapon.beam_max_charge,
+                electric_fire_rate_slow_remaining: 0.0,
+                electric_fire_rate_slow_ratio: 0.0,
+                flame_armor_debuff_remaining: 0.0,
+                flame_armor_debuff_amount: 0.0,
+                active_beam_request: None,
+                hero_shallow_water_speed_multiplier: hero.shallow_water_speed_multiplier,
+                hero_deep_water_speed_multiplier: hero.deep_water_speed_multiplier,
+                hero_vision_range: hero.vision_range,
+                active_is_night: false,
+                active_weather: config.weather.initial_weather,
+                ammo_in_mag: hero.weapon.magazine_size,
+                hero_weapon: hero.weapon,
+                hero_pistol: hero.pistol,
+                hero_grenade: hero.grenade,
+                grenade_charges: hero.grenade.max_charges,
+                grenade_recharge_remaining: 0.0,
+                active_weapon: ActiveWeaponSlot::Primary,
+                other_weapon_ammo_in_mag: hero.pistol.magazine_size,
+                current_move_speed: config.soldier.run_speed * hero.move_speed_multiplier,
+                last_hits: 0,
+                denies: 0,
+                assists: 0,
+                kills: 0,
+                deaths: 0,
+                kill_streak: 0,
+                inventory: Vec::new(),
+                tp_slot: None,
+                courier_pos: Vec3::new(spawn_pos.x, hero.courier.fly_height, spawn_pos.z),
+                courier_facing_dir: facing_dir,
+                courier_hp: hero.courier.max_hp,
+                courier_max_hp: hero.courier.max_hp,
+                courier_is_dead: false,
+                courier_respawn_remaining: 0.0,
+                courier_order: CourierOrder::Idle,
+                courier_target_pos: Vec3::new(spawn_pos.x, hero.courier.fly_height, spawn_pos.z),
+                courier_inventory: Vec::new(),
+                stash: Vec::new(),
+                shop_notice_seq: 0,
+                shop_notice_text: String::new(),
+                shop_notice_is_error: false,
+                pending_hero_to_courier_slot: None,
+                fog_of_war: SharedFogOfWar::from_config(config, lp.team),
+                in_water: false,
+                water_splash_cooldown: 0.0,
+                teleport_cooldown_remaining: 0.0,
+                active_teleport: None,
+                mode_cycle_cooldown_remaining: 0.0,
+                shadow_blade_cooldown_remaining: 0.0,
+                invisibility_remaining: 0.0,
+                invisibility_total_secs: 0.0,
+                invis_move_speed_bonus_pct: 0.0,
+                is_revealed_by_turret: false,
+                hero_evasion_chance: 0.0,
+                hero_true_strike_chance: 0.0,
+                hero_crit_chance: 0.0,
+                hero_crit_multiplier: 1.0,
+                hero_lifesteal_ratio: 0.0,
+                hero_on_hit_slow_ratio: 0.0,
+                hero_on_hit_heal_reduction_ratio: 0.0,
+                hero_on_hit_debuff_duration_secs: 0.0,
+                reflect_armor_cooldown_remaining: 0.0,
+                bullet_immunity_cooldown_remaining: 0.0,
+                null_pulse_cooldown_remaining: 0.0,
+                sonar_reveal_cooldown_remaining: 0.0,
+                kinetic_dash_cooldown_remaining: 0.0,
+                reflect_armor_remaining: 0.0,
+                reflect_armor_total_secs: 0.0,
+                bullet_immunity_remaining: 0.0,
+                bullet_immunity_total_secs: 0.0,
+                cryo_debuff_remaining: 0.0,
+                cryo_debuff_total_secs: 0.0,
+                cryo_slow_ratio: 0.0,
+                cryo_heal_reduction_ratio: 0.0,
+                null_mute_remaining: 0.0,
+                null_mute_total_secs: 0.0,
+                sonar_revealed_remaining: 0.0,
+                sonar_revealed_total_secs: 0.0,
+                kinetic_dash_remaining: 0.0,
+                kinetic_dash_dir: Vec3::ZERO,
+                popup_throttle_remaining: 0.0,
+                recent_hero_damagers: Vec::new(),
+                last_attacked_enemy_hero_at: -999.0,
+                last_ping_at_secs: -999.0,
+                last_chat_at_secs: -999.0,
+                traversal: SharedTraversalState {
+                    is_active: false,
+                    kind: TraversalKind::RunningJump,
+                    anim_name: String::new(),
+                    elapsed: 0.0,
+                    duration: 0.0,
+                    start_pos: spawn_pos,
+                    target_pos: spawn_pos,
+                    travel_dir: facing_dir,
+                    vault_peak_lift: 0.0,
+                    chain_dive_after: false,
+                    swing_arc_sag: 0.0,
+                    swing_total_duration: 0.0,
+                    swing_pulley_pos: None,
+                    swing_throw_progress: 0.0,
+                    fall_vel: Vec3::ZERO,
+                },
+            });
+        self.env_stats_initialized = false;
     }
 
     pub fn build_snapshot_for_slot(&mut self, config: &GameConfig, items_cfg: &ItemsConfig, slot_index: usize) -> ServerWorldSnapshot {
@@ -8504,6 +8722,7 @@ impl AuthoritativeWorldState {
             let is_vis = !hidden_by_invis
                 && !hidden_by_water
                 && (p.hero_team == self.hero_team
+                    || self.demo_reveal_full_map
                     || p.sonar_revealed_remaining > 0.0
                     || self.fog_of_war.is_world_point_visible(config, p.soldier_pos.x, p.soldier_pos.z));
             // Server Authority: اگر دشمن در مه جنگ باشد، مختصات و اطلاعات او اصلاً به کلاینت ارسال نمی‌شود!
@@ -9484,6 +9703,33 @@ pub fn grant_xp_to_player_slot(
     }
 }
 
+/// محاسبه ضریب کامبک/تعدیل بر اساس اختلاف لول قربانی و مهاجم (کاملاً از config.ron)
+#[inline]
+fn compute_level_diff_bounty_multipliers(
+    victim_level: u32,
+    earner_level: u32,
+    c: &CombatConfig,
+) -> (f32, f32) {
+    let diff = (victim_level as i32) - (earner_level as i32);
+    if diff > 0 {
+        let d = diff as f32;
+        let g_mult = (1.0 + d * c.underdog_gold_mult_per_level)
+            .clamp(c.min_bounty_gold_mult, c.max_bounty_gold_mult);
+        let x_mult = (1.0 + d * c.underdog_xp_mult_per_level)
+            .clamp(c.min_bounty_xp_mult, c.max_bounty_xp_mult);
+        (g_mult, x_mult)
+    } else if diff < 0 {
+        let d = (-diff) as f32;
+        let g_mult = (1.0 - d * c.overlevel_gold_penalty_per_level)
+            .clamp(c.min_bounty_gold_mult, 1.0);
+        let x_mult = (1.0 - d * c.overlevel_xp_penalty_per_level)
+            .clamp(c.min_bounty_xp_mult, 1.0);
+        (g_mult, x_mult)
+    } else {
+        (1.0, 1.0)
+    }
+}
+
 fn award_hero_kill_rewards(
     world: &mut AuthoritativeWorldState,
     victim_idx: usize,
@@ -9491,16 +9737,17 @@ fn award_hero_kill_rewards(
     config: &GameConfig,
     items_cfg: &crate::shop_shared::ItemsConfig,
 ) {
+    let c = &config.combat;
     let victim_name = world.players[victim_idx].hero_display_name.clone();
     let victim_team = world.players[victim_idx].hero_team;
     let victim_pos = world.players[victim_idx].soldier_pos;
+    let victim_level = world.players[victim_idx].hero_level.max(1);
+    let victim_streak = world.players[victim_idx].kill_streak;
+    world.players[victim_idx].kill_streak = 0;
+
     let now = world.match_elapsed_secs;
-    let kill_gold = config.combat.hero_kill_gold;
-    let kill_xp = config.combat.hero_kill_xp;
-    let assist_gold = config.combat.hero_assist_gold;
-    let assist_xp = config.combat.hero_assist_xp;
-    let assist_window = config.combat.hero_assist_window_secs;
-    let credit_window = config.combat.hero_kill_credit_window_secs;
+    let assist_window = c.hero_assist_window_secs;
+    let credit_window = c.hero_kill_credit_window_secs;
 
     let recent_damagers: Vec<(usize, f32)> = world.players[victim_idx]
         .recent_hero_damagers
@@ -9519,6 +9766,25 @@ fn award_hero_kill_rewards(
             .map(|&(s, _)| s)
     });
 
+    let victim_lvl_above_1 = victim_level.saturating_sub(1) as f32;
+    let base_kill_gold =
+        (c.hero_kill_gold as f32) + victim_lvl_above_1 * c.hero_kill_gold_per_victim_level;
+    let base_kill_xp =
+        (c.hero_kill_xp as f32) + victim_lvl_above_1 * c.hero_kill_xp_per_victim_level;
+    let base_assist_gold =
+        (c.hero_assist_gold as f32) + victim_lvl_above_1 * c.hero_assist_gold_per_victim_level;
+    let base_assist_xp =
+        (c.hero_assist_xp as f32) + victim_lvl_above_1 * c.hero_assist_xp_per_victim_level;
+
+    // پاداش قطع کردن Kill Streak حریف (Shutdown Bounty)
+    let streak_steps = if victim_streak >= c.streak_bonus_min_kills {
+        (victim_streak - c.streak_bonus_min_kills + 1).min(c.streak_bonus_max_steps)
+    } else {
+        0
+    };
+    let streak_gold_bonus = streak_steps.saturating_mul(c.streak_gold_bonus_per_kill);
+    let streak_xp_bonus = streak_steps.saturating_mul(c.streak_xp_bonus_per_kill);
+
     let mut rewards: Vec<HeroKillRewardEntry> = Vec::new();
     let mut killer_name = if victim_team == TeamId::Dawn {
         "Dusk".to_string()
@@ -9532,12 +9798,33 @@ fn award_hero_kill_rewards(
     };
 
     if let Some(k_slot) = effective_killer_slot {
+        let mut awarded_kill_gold = 0_u32;
+        let mut killer_level_diff = 0_i32;
+
         if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == k_slot) {
+            let attacker_level = attacker.hero_level.max(1);
+            killer_level_diff = (victim_level as i32) - (attacker_level as i32);
+            let (g_mult, x_mult) =
+                compute_level_diff_bounty_multipliers(victim_level, attacker_level, c);
+
+            let kill_gold = ((base_kill_gold * g_mult).round().max(1.0) as u32)
+                .saturating_add(streak_gold_bonus);
+            let kill_xp = ((base_kill_xp * x_mult).round().max(1.0) as u32)
+                .saturating_add(streak_xp_bonus);
+            awarded_kill_gold = kill_gold;
+
             attacker.kills += 1;
-            attacker.hero_gold += kill_gold;
+            attacker.kill_streak = attacker.kill_streak.saturating_add(1);
+            attacker.hero_gold = attacker.hero_gold.saturating_add(kill_gold);
             killer_name = attacker.hero_display_name.clone();
             killer_team = attacker.hero_team;
-            grant_xp_to_player_slot(attacker, kill_xp, config, items_cfg, &mut world.pending_private_fx);
+            grant_xp_to_player_slot(
+                attacker,
+                kill_xp,
+                config,
+                items_cfg,
+                &mut world.pending_private_fx,
+            );
             rewards.push(HeroKillRewardEntry {
                 player_name: attacker.hero_display_name.clone(),
                 is_killer: true,
@@ -9545,32 +9832,60 @@ fn award_hero_kill_rewards(
                 xp: kill_xp,
             });
         }
-        world.pending_private_fx.push((
-            k_slot,
-            GameplayFxEvent::LastHitGold {
-                pos: victim_pos,
-                gold: kill_gold,
-            },
-        ));
 
-        // اعطای Assist به تمام هم‌تیمی‌هایی که در پنجره زمانی به قربانی آسیب زده‌اند (حتی اگر دور یا تازه مرده باشند) یا در شعاع XP خود زنده هستند
+        if awarded_kill_gold > 0 {
+            world.pending_private_fx.push((
+                k_slot,
+                GameplayFxEvent::LastHitGold {
+                    pos: victim_pos,
+                    gold: awarded_kill_gold,
+                },
+            ));
+        }
+
+        if streak_steps > 0 {
+            world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                pos: victim_pos + Vec3::Y * 2.4,
+                text: format!("SHUTDOWN +{}g!", streak_gold_bonus),
+                color_rgb: (1.0, 0.78, 0.20),
+            });
+        } else if killer_level_diff >= 3 {
+            world.pending_fx.push(GameplayFxEvent::CombatPopup {
+                pos: victim_pos + Vec3::Y * 2.4,
+                text: "COMEBACK BONUS!".to_string(),
+                color_rgb: (0.35, 0.96, 0.72),
+            });
+        }
+
+        // اعطای Assist پویا به هم‌تیمی‌ها (متناسب با لول قربانی و اختلاف لول هر Assister)
         let mut assister_indices: Vec<usize> = Vec::new();
         for (idx, p) in world.players.iter().enumerate() {
             if p.slot_index == k_slot || p.hero_team != killer_team {
                 continue;
             }
             let dealt_recent_damage = recent_damagers.iter().any(|&(s, _)| s == p.slot_index);
-            let nearby_alive = !p.is_dead && p.soldier_pos.distance(victim_pos) <= p.hero_xp_gain_radius;
+            let nearby_alive =
+                !p.is_dead && p.soldier_pos.distance(victim_pos) <= p.hero_xp_gain_radius;
             if dealt_recent_damage || nearby_alive {
                 assister_indices.push(idx);
             }
         }
         for idx in assister_indices {
             let p = &mut world.players[idx];
+            let (ag_mult, ax_mult) =
+                compute_level_diff_bounty_multipliers(victim_level, p.hero_level.max(1), c);
+            let assist_gold = (base_assist_gold * ag_mult).round().max(1.0) as u32;
+            let assist_xp = (base_assist_xp * ax_mult).round().max(1.0) as u32;
             p.assists += 1;
-            p.hero_gold += assist_gold;
+            p.hero_gold = p.hero_gold.saturating_add(assist_gold);
             let pname = p.hero_display_name.clone();
-            grant_xp_to_player_slot(p, assist_xp, config, items_cfg, &mut world.pending_private_fx);
+            grant_xp_to_player_slot(
+                p,
+                assist_xp,
+                config,
+                items_cfg,
+                &mut world.pending_private_fx,
+            );
             rewards.push(HeroKillRewardEntry {
                 player_name: pname,
                 is_killer: false,

@@ -47,31 +47,15 @@ def _get_shared_redis() -> redis.Redis:
             except Exception:
                 _REDIS_CLIENT_CACHE = None
 
-        raw_urls = [
-            getattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/0"),
-            getattr(settings, "REDIS_FALLBACK_URL", "redis://172.21.13.50:6379/0"),
-        ]
-        seen_urls: List[str] = []
-        for u in raw_urls:
-            if u and u not in seen_urls:
-                seen_urls.append(u)
-
-        last_exc: Optional[Exception] = None
-        for url in seen_urls:
-            try:
-                client = redis.Redis.from_url(
-                    url,
-                    decode_responses=True,
-                    socket_connect_timeout=1.5,
-                    socket_timeout=2.0,
-                )
-                client.ping()
-                _REDIS_CLIENT_CACHE = client
-                return client
-            except Exception as exc:
-                last_exc = exc
-
-        raise RuntimeError(f"Cannot connect to Redis on {seen_urls}: {last_exc}")
+        client = redis.Redis.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=2.0,
+            socket_timeout=2.0,
+        )
+        client.ping()
+        _REDIS_CLIENT_CACHE = client
+        return client
 
 
 class _RedisHashStore:
@@ -299,6 +283,10 @@ class _RedisPortDict:
     def __init__(self, redis_key: str = "simorgh:active_ports"):
         self.redis_key = redis_key
 
+    def get(self, port: int, default: Any = None) -> Any:
+        val = _get_shared_redis().hget(self.redis_key, str(port))
+        return val if val is not None else default
+
     def __getitem__(self, port: int) -> str:
         val = _get_shared_redis().hget(self.redis_key, str(port))
         if val is None:
@@ -307,6 +295,20 @@ class _RedisPortDict:
 
     def __setitem__(self, port: int, unit_name: str) -> None:
         _get_shared_redis().hset(self.redis_key, str(port), unit_name)
+
+    def __delitem__(self, port: int) -> None:
+        removed = _get_shared_redis().hdel(self.redis_key, str(port))
+        if not removed:
+            raise KeyError(port)
+
+    def __len__(self) -> int:
+        return int(_get_shared_redis().hlen(self.redis_key))
+
+    def keys(self) -> List[int]:
+        return [int(k) for k in _get_shared_redis().hkeys(self.redis_key)]
+
+    def values(self) -> List[str]:
+        return list(_get_shared_redis().hvals(self.redis_key))
 
     def __contains__(self, port: object) -> bool:
         try:
@@ -534,36 +536,14 @@ _find_available_udp_port_async = database_sync_to_async(find_available_udp_port)
 
 def resolve_game_server_host(client_ip: Optional[str] = None) -> str:
     """
-    تعیین آدرس IP سرور بازی برای اتصال UDP کلاینت‌ها.
+    تعیین آدرس IP سرور بازی از روی متغیر GAME_SERVER_HOST در settings.py.
     """
-    env_host = os.environ.get("GAME_SERVER_HOST", "").strip()
-    if env_host:
-        return env_host
-
-    probe_targets = []
-    if client_ip and client_ip not in ("127.0.0.1", "::1", "localhost"):
-        probe_targets.append(client_ip)
-    if os.name != "nt" and os.path.isdir("/mnt/c"):
-        probe_targets.append("172.21.0.1")
-
-    for target in probe_targets:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.connect((target, 80))
-            local_ip = sock.getsockname()[0]
-            if local_ip and not local_ip.startswith("127."):
-                return local_ip
-        except OSError:
-            pass
-        finally:
-            sock.close()
-
-    return getattr(settings, "GAME_SERVER_HOST", "127.0.0.1")
+    return str(settings.GAME_SERVER_HOST).strip()
 
 
 def store_ticket_in_redis(ticket_id: str, room_id: str, user_id: str, username: str) -> None:
     """
-    ذخیره تیکت بازیکن در تمام آدرس‌های Redis تنظیم‌شده با فرمت مورد انتظار سرور بازی Rust:
+    ذخیره تیکت بازیکن در Redis با فرمت مورد انتظار سرور بازی Rust:
     key = ticket:{ticket_id}
     value = {"room_id": ..., "user_id": ..., "username": ...}
     """
@@ -574,49 +554,20 @@ def store_ticket_in_redis(ticket_id: str, room_id: str, user_id: str, username: 
             "username": username,
         }
     )
-    key = f"ticket:{ticket_id}"
-    raw_urls = [
-        getattr(settings, "REDIS_URL", "redis://172.21.13.50:6379/0"),
-        getattr(settings, "REDIS_FALLBACK_URL", "redis://127.0.0.1:6379/0"),
-    ]
-    seen_urls = []
-    for u in raw_urls:
-        if u and u not in seen_urls:
-            seen_urls.append(u)
-
-    wrote_any = False
-    for url in seen_urls:
-        try:
-            r = redis.Redis.from_url(url, socket_connect_timeout=1.5, socket_timeout=1.5)
-            r.setex(key, 7200, payload)
-            wrote_any = True
-        except Exception as exc:
-            print(f"[REDIS WARNING] Could not write ticket to {url}: {exc}", flush=True)
-
-    if not wrote_any:
-        print(f"[REDIS ERROR] Failed to store ticket {key} on any Redis instance!", flush=True)
+    try:
+        _get_shared_redis().setex(f"ticket:{ticket_id}", 7200, payload)
+    except Exception as exc:
+        print(f"[REDIS ERROR] Failed to store ticket ticket:{ticket_id}: {exc}", flush=True)
 
 
 def delete_ticket_from_redis(ticket_id: str) -> None:
     """
     حذف تیکت بازیکن از Redis پس از ترک نهایی بازی (Abandon) یا اتمام مسابقه
     """
-    key = f"ticket:{ticket_id}"
-    raw_urls = [
-        getattr(settings, "REDIS_URL", "redis://172.21.13.50:6379/0"),
-        getattr(settings, "REDIS_FALLBACK_URL", "redis://127.0.0.1:6379/0"),
-    ]
-    seen_urls = []
-    for u in raw_urls:
-        if u and u not in seen_urls:
-            seen_urls.append(u)
-
-    for url in seen_urls:
-        try:
-            r = redis.Redis.from_url(url, socket_connect_timeout=1.5, socket_timeout=1.5)
-            r.delete(key)
-        except Exception:
-            pass
+    try:
+        _get_shared_redis().delete(f"ticket:{ticket_id}")
+    except Exception:
+        pass
 
 
 def terminate_game_server_instance(
@@ -1910,7 +1861,21 @@ class LobbyConsumer(AsyncWebsocketConsumer):
 
         async with _SOCIAL_LOCK:
             usess = _ONLINE_USERS.get(self.player.user_id)
-            in_party_now = bool(usess and usess.party_id)
+            in_party_now = False
+            if usess and usess.party_id:
+                p_obj = _ACTIVE_PARTIES.get(usess.party_id)
+                if p_obj and len(p_obj.members) >= 2:
+                    in_party_now = True
+                else:
+                    old_pid = usess.party_id
+                    if p_obj:
+                        _ACTIVE_PARTIES.pop(old_pid, None)
+                    for iid, inv in list(_PENDING_PARTY_INVITES.items()):
+                        if inv.party_id == old_pid:
+                            _PENDING_PARTY_INVITES.pop(iid, None)
+                    usess.party_id = None
+                    if usess.status == "in_party":
+                        usess.status = "online"
         if in_party_now:
             await self.send_json(
                 {
@@ -2018,7 +1983,21 @@ class LobbyConsumer(AsyncWebsocketConsumer):
 
         async with _SOCIAL_LOCK:
             usess = _ONLINE_USERS.get(self.player.user_id)
-            in_party_now = bool(usess and usess.party_id)
+            in_party_now = False
+            if usess and usess.party_id:
+                p_obj = _ACTIVE_PARTIES.get(usess.party_id)
+                if p_obj and len(p_obj.members) >= 2:
+                    in_party_now = True
+                else:
+                    old_pid = usess.party_id
+                    if p_obj:
+                        _ACTIVE_PARTIES.pop(old_pid, None)
+                    for iid, inv in list(_PENDING_PARTY_INVITES.items()):
+                        if inv.party_id == old_pid:
+                            _PENDING_PARTY_INVITES.pop(iid, None)
+                    usess.party_id = None
+                    if usess.status == "in_party":
+                        usess.status = "online"
         if in_party_now:
             await self.send_json(
                 {
@@ -2852,9 +2831,17 @@ def build_friends_payload_for_player(player: Player) -> dict:
         other = f.addressee if f.requester_id == player.id else f.requester
         sess = online_map.get(other.user_id)
         if sess:
-            pres = {"online": True, "status": sess.status, "party_id": sess.party_id}
+            eff_in_party = False
+            eff_status = sess.status
+            if sess.party_id:
+                p_obj = _ACTIVE_PARTIES.get(sess.party_id)
+                if p_obj and len(p_obj.members) >= 2:
+                    eff_in_party = True
+                elif eff_status == "in_party":
+                    eff_status = "online"
+            pres = {"online": True, "status": eff_status, "in_party": eff_in_party}
         else:
-            pres = {"online": False, "status": "offline", "party_id": None}
+            pres = {"online": False, "status": "offline", "in_party": False}
         if f.status == Friendship.STATUS_ACCEPTED:
             friends.append(
                 {
@@ -2864,7 +2851,7 @@ def build_friends_payload_for_player(player: Player) -> dict:
                     "rank_tier": other.rank_tier,
                     "online": pres["online"],
                     "status": pres["status"],
-                    "in_party": pres["party_id"] is not None,
+                    "in_party": pres["in_party"],
                 }
             )
         elif f.status == Friendship.STATUS_PENDING:
@@ -3018,12 +3005,18 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
     async def send_json(self, payload: dict) -> None:
         await self.send(text_data=json.dumps(payload))
 
-    async def _broadcast_presence_to_friends(
-        self, online: bool, status: str, in_party: bool
+    async def _broadcast_presence_for_user(
+        self,
+        player_pk: int,
+        user_id: str,
+        username: str,
+        online: bool,
+        status: str,
+        in_party: bool,
     ) -> None:
-        if not self.player:
+        friend_ids = await _get_friend_user_ids_async(player_pk)
+        if not friend_ids:
             return
-        friend_ids = await _get_friend_user_ids_async(self.player.pk)
         targets = []
         online_friends = await asyncio.to_thread(_ONLINE_USERS.mget, friend_ids)
         for fid in friend_ids:
@@ -3033,8 +3026,8 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
 
         payload = {
             "event": "friend_presence",
-            "user_id": self.player.user_id,
-            "username": self.player.username,
+            "user_id": user_id,
+            "username": username,
             "online": online,
             "status": status,
             "in_party": in_party,
@@ -3047,6 +3040,20 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                     "payload": payload,
                 },
             )
+
+    async def _broadcast_presence_to_friends(
+        self, online: bool, status: str, in_party: bool
+    ) -> None:
+        if not self.player:
+            return
+        await self._broadcast_presence_for_user(
+            self.player.pk,
+            self.player.user_id,
+            self.player.username,
+            online=online,
+            status=status,
+            in_party=in_party,
+        )
 
     async def _broadcast_to_party(self, party: PartyRoom, payload: dict) -> None:
         for m in list(party.members):
@@ -3074,6 +3081,8 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
             await self._handle_refresh_social()
         elif action == "invite_to_party":
             await self._handle_invite_to_party(msg)
+        elif action == "cancel_party_invite":
+            await self._handle_cancel_party_invite(msg)
         elif action == "respond_party_invite":
             await self._handle_respond_party_invite(msg)
         elif action == "toggle_ready":
@@ -3103,7 +3112,9 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
             _prune_expired_invites()
             sess = _ONLINE_USERS.get(self.player.user_id)
             if sess and sess.party_id and sess.party_id in _ACTIVE_PARTIES:
-                party_payload = _serialize_party_state(_ACTIVE_PARTIES[sess.party_id])
+                p_obj = _ACTIVE_PARTIES[sess.party_id]
+                if len(p_obj.members) >= 2:
+                    party_payload = _serialize_party_state(p_obj)
             for inv in _PENDING_PARTY_INVITES.values():
                 if inv.to_user_id == self.player.user_id:
                     pending_invites_payload.append(_serialize_party_invite(inv))
@@ -3197,7 +3208,6 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 )
                 _ACTIVE_PARTIES[party_id] = party
                 me_sess.party_id = party_id
-                me_sess.status = "in_party"
 
             if party.leader_user_id != self.player.user_id:
                 await self.send_json(
@@ -3266,12 +3276,13 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
             party_state_payload = _serialize_party_state(party)
 
         if party_state_payload:
-            await self.send_json(
-                {
-                    "event": "party_state",
-                    "party": party_state_payload,
-                }
-            )
+            if len(party_state_payload.get("members", [])) >= 2:
+                await self.send_json(
+                    {
+                        "event": "party_state",
+                        "party": party_state_payload,
+                    }
+                )
             await self.send_json(
                 {
                     "event": "notification",
@@ -3293,6 +3304,68 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                         "message": f"{self.player.username} invited you to join their squad ({invite_payload['game_mode']}).",
                     },
                 },
+            )
+
+    async def _handle_cancel_party_invite(self, msg: dict) -> None:
+        assert self.player is not None
+        target_uid = str(msg.get("target_user_id", "")).strip()
+        if not target_uid:
+            return
+
+        canceled_inv_ids: List[str] = []
+        target_channel: Optional[str] = None
+        disbanded_solo = False
+
+        async with _SOCIAL_LOCK:
+            _prune_expired_invites()
+            me_sess = _ONLINE_USERS.get(self.player.user_id)
+            target_sess = _ONLINE_USERS.get(target_uid)
+            if target_sess:
+                target_channel = target_sess.channel_name
+
+            for iid, inv in list(_PENDING_PARTY_INVITES.items()):
+                if inv.from_user_id == self.player.user_id and inv.to_user_id == target_uid:
+                    _PENDING_PARTY_INVITES.pop(iid, None)
+                    canceled_inv_ids.append(iid)
+
+            if me_sess and me_sess.party_id:
+                party = _ACTIVE_PARTIES.get(me_sess.party_id)
+                if party and len(party.members) <= 1:
+                    has_other_invites = any(
+                        inv.party_id == party.party_id for inv in _PENDING_PARTY_INVITES.values()
+                    )
+                    if not has_other_invites:
+                        _ACTIVE_PARTIES.pop(party.party_id, None)
+                        me_sess.party_id = None
+                        if me_sess.status == "in_party":
+                            me_sess.status = "online"
+                        disbanded_solo = True
+
+        if target_channel:
+            for iid in canceled_inv_ids:
+                await self.channel_layer.send(
+                    target_channel,
+                    {
+                        "type": "social.event",
+                        "payload": {
+                            "event": "party_invite_cleared",
+                            "invite_id": iid,
+                        },
+                    },
+                )
+
+        if canceled_inv_ids:
+            await self.send_json(
+                {
+                    "event": "party_invite_result",
+                    "target_user_id": target_uid,
+                    "accepted": False,
+                    "message": "Party invite canceled.",
+                }
+            )
+        if disbanded_solo:
+            await self._broadcast_presence_to_friends(
+                online=True, status="online", in_party=False
             )
 
     async def _handle_respond_party_invite(self, msg: dict) -> None:
@@ -3371,6 +3444,18 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 inviter_channel = inviter_sess.channel_name
 
             if not accept:
+                inv_party = _ACTIVE_PARTIES.get(inv.party_id)
+                if inv_party and len(inv_party.members) <= 1:
+                    has_more = any(
+                        p_inv.party_id == inv.party_id
+                        for p_inv in _PENDING_PARTY_INVITES.values()
+                    )
+                    if not has_more:
+                        _ACTIVE_PARTIES.pop(inv.party_id, None)
+                        if inviter_sess and inviter_sess.party_id == inv.party_id:
+                            inviter_sess.party_id = None
+                            if inviter_sess.status == "in_party":
+                                inviter_sess.status = "online"
                 await self.send_json(
                     {
                         "event": "party_invite_cleared",
@@ -3459,10 +3544,11 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                         "is_system": True,
                     }
                 )
-            me_sess = _ONLINE_USERS.get(self.player.user_id)
-            if me_sess:
-                me_sess.party_id = party.party_id
-                me_sess.status = "in_party"
+            for m in party.members:
+                ms = _ONLINE_USERS.get(m.user_id)
+                if ms:
+                    ms.party_id = party.party_id
+                    ms.status = "in_party"
 
             joined_party_members = list(party.members)
             joined_party_detail = _serialize_party_state(party)
@@ -3492,9 +3578,15 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                             },
                         },
                     )
-            await self._broadcast_presence_to_friends(
-                online=True, status="in_party", in_party=True
-            )
+            for m in joined_party_members:
+                await self._broadcast_presence_for_user(
+                    m.player_pk,
+                    m.user_id,
+                    m.username,
+                    online=True,
+                    status="in_party",
+                    in_party=True,
+                )
 
     async def _handle_toggle_ready(self) -> None:
         assert self.player is not None
@@ -3570,6 +3662,8 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
         kicked_member: Optional[PartyMember] = None
         detail = None
         remaining_members: List[PartyMember] = []
+        disbanded_sole_member: Optional[PartyMember] = None
+        cleared_invites: List[tuple] = []
 
         async with _SOCIAL_LOCK:
             sess = _ONLINE_USERS.get(self.player.user_id)
@@ -3585,34 +3679,88 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
             if not kicked_member:
                 return
             party.members = [m for m in party.members if m.user_id != target_uid]
-            party.chat_history.append(
-                {
-                    "sender": "SYSTEM",
-                    "text": f"{kicked_member.username} was removed from the squad.",
-                    "is_system": True,
-                }
-            )
             ksess = _ONLINE_USERS.get(target_uid)
             if ksess:
                 ksess.party_id = None
                 ksess.status = "online"
 
-            detail = _serialize_party_state(party)
-            remaining_members = list(party.members)
+            if len(party.members) <= 1:
+                _ACTIVE_PARTIES.pop(party.party_id, None)
+                for iid, inv in list(_PENDING_PARTY_INVITES.items()):
+                    if inv.party_id == party.party_id:
+                        _PENDING_PARTY_INVITES.pop(iid, None)
+                        ts = _ONLINE_USERS.get(inv.to_user_id)
+                        if ts and ts.channel_name:
+                            cleared_invites.append((ts.channel_name, iid))
+                if len(party.members) == 1:
+                    disbanded_sole_member = party.members[0]
+                    sole_sess = _ONLINE_USERS.get(disbanded_sole_member.user_id)
+                    if sole_sess:
+                        sole_sess.party_id = None
+                        sole_sess.status = "online"
+            else:
+                party.chat_history.append(
+                    {
+                        "sender": "SYSTEM",
+                        "text": f"{kicked_member.username} was removed from the squad.",
+                        "is_system": True,
+                    }
+                )
+                detail = _serialize_party_state(party)
+                remaining_members = list(party.members)
 
-        if kicked_member and kicked_member.channel_name:
+        for ch, iid in cleared_invites:
             await self.channel_layer.send(
-                kicked_member.channel_name,
+                ch,
                 {
                     "type": "social.event",
-                    "payload": {
-                        "event": "party_kicked",
-                        "title": "REMOVED FROM PARTY",
-                        "message": f"You were removed from the squad by {self.player.username}.",
-                    },
+                    "payload": {"event": "party_invite_cleared", "invite_id": iid},
                 },
             )
-        if detail:
+
+        if kicked_member:
+            if kicked_member.channel_name:
+                await self.channel_layer.send(
+                    kicked_member.channel_name,
+                    {
+                        "type": "social.event",
+                        "payload": {
+                            "event": "party_kicked",
+                            "title": "REMOVED FROM PARTY",
+                            "message": f"You were removed from the squad by {self.player.username}.",
+                        },
+                    },
+                )
+            await self._broadcast_presence_for_user(
+                kicked_member.player_pk,
+                kicked_member.user_id,
+                kicked_member.username,
+                online=True,
+                status="online",
+                in_party=False,
+            )
+
+        if disbanded_sole_member:
+            if disbanded_sole_member.channel_name:
+                await self.channel_layer.send(
+                    disbanded_sole_member.channel_name,
+                    {
+                        "type": "social.event",
+                        "payload": {
+                            "event": "party_left",
+                            "message": f"{kicked_member.username} was removed. Party disbanded.",
+                        },
+                    },
+                )
+            await self._broadcast_presence_for_user(
+                disbanded_sole_member.player_pk,
+                disbanded_sole_member.user_id,
+                disbanded_sole_member.username,
+                online=True,
+                status="online",
+                in_party=False,
+            )
+        elif detail:
             for m in remaining_members:
                 if m.channel_name:
                     await self.channel_layer.send(
@@ -3723,8 +3871,11 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
     async def _remove_user_from_party(self, user_id: str, reason: str = "left") -> None:
         leaver_channel = None
         leaver_name = user_id
+        leaver_pk: Optional[int] = None
         remaining_members: List[PartyMember] = []
         updated_detail = None
+        disbanded_sole_member: Optional[PartyMember] = None
+        cleared_invites: List[tuple] = []
         canceled_queue_channels: List[str] = []
 
         async with _SOCIAL_LOCK:
@@ -3750,6 +3901,7 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 if m.user_id == user_id:
                     leaver_channel = m.channel_name
                     leaver_name = m.username
+                    leaver_pk = m.player_pk
                     break
 
             was_queuing = party.is_queuing
@@ -3770,8 +3922,20 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                         if q.user_id not in member_ids and q.party_group_id != party_id
                     ]
 
-            if len(party.members) == 0:
+            if len(party.members) <= 1:
                 _ACTIVE_PARTIES.pop(party_id, None)
+                for iid, inv in list(_PENDING_PARTY_INVITES.items()):
+                    if inv.party_id == party_id:
+                        _PENDING_PARTY_INVITES.pop(iid, None)
+                        ts = _ONLINE_USERS.get(inv.to_user_id)
+                        if ts and ts.channel_name:
+                            cleared_invites.append((ts.channel_name, iid))
+                if len(party.members) == 1:
+                    disbanded_sole_member = party.members[0]
+                    sole_sess = _ONLINE_USERS.get(disbanded_sole_member.user_id)
+                    if sole_sess:
+                        sole_sess.party_id = None
+                        sole_sess.status = "online"
             else:
                 if party.leader_user_id == user_id:
                     party.leader_user_id = party.members[0].user_id
@@ -3797,6 +3961,15 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 updated_detail = _serialize_party_state(party)
                 remaining_members = list(party.members)
 
+        for ch, iid in cleared_invites:
+            await self.channel_layer.send(
+                ch,
+                {
+                    "type": "social.event",
+                    "payload": {"event": "party_invite_cleared", "invite_id": iid},
+                },
+            )
+
         if reason == "left" and leaver_channel:
             await self.channel_layer.send(
                 leaver_channel,
@@ -3808,9 +3981,15 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                     },
                 },
             )
-            await self._broadcast_presence_to_friends(
-                online=True, status="online", in_party=False
-            )
+            if leaver_pk is not None:
+                await self._broadcast_presence_for_user(
+                    leaver_pk,
+                    user_id,
+                    leaver_name,
+                    online=True,
+                    status="online",
+                    in_party=False,
+                )
 
         for ch in canceled_queue_channels:
             await self.channel_layer.send(
@@ -3824,7 +4003,27 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
                 },
             )
 
-        if updated_detail:
+        if disbanded_sole_member:
+            if disbanded_sole_member.channel_name:
+                await self.channel_layer.send(
+                    disbanded_sole_member.channel_name,
+                    {
+                        "type": "social.event",
+                        "payload": {
+                            "event": "party_left",
+                            "message": f"{leaver_name} left. Party disbanded.",
+                        },
+                    },
+                )
+            await self._broadcast_presence_for_user(
+                disbanded_sole_member.player_pk,
+                disbanded_sole_member.user_id,
+                disbanded_sole_member.username,
+                online=True,
+                status="online",
+                in_party=False,
+            )
+        elif updated_detail:
             for m in remaining_members:
                 if m.channel_name:
                     await self.channel_layer.send(

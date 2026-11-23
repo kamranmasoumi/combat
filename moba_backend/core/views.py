@@ -801,10 +801,22 @@ def remove_friend_view(request: HttpRequest) -> JsonResponse:
     if not other:
         return JsonResponse({"error": "Player not found"}, status=404)
 
-    deleted_count, _ = Friendship.objects.filter(
+    qs = Friendship.objects.filter(
         (Q(requester=player) & Q(addressee=other))
         | (Q(requester=other) & Q(addressee=player))
-    ).delete()
+    )
+    existing_rel = qs.first()
+    action_message = "No relationship found."
+    if existing_rel:
+        if existing_rel.status == Friendship.STATUS_PENDING:
+            if existing_rel.requester_id == player.id:
+                action_message = f"Canceled friend request to {other.username}."
+            else:
+                action_message = f"Declined friend request from {other.username}."
+        else:
+            action_message = f"Removed {other.username} from friends."
+
+    deleted_count, _ = qs.delete()
 
     if deleted_count > 0:
         push_social_event_to_user_sync(
@@ -816,6 +828,7 @@ def remove_friend_view(request: HttpRequest) -> JsonResponse:
         {
             "status": "ok",
             "removed": deleted_count > 0,
+            "message": action_message,
             **build_friends_payload_for_player(player),
         },
         status=200,

@@ -113,12 +113,14 @@ pub struct PreGameSessionState {
     pub friend_search_input: String,
     pub friend_search_results: Vec<PlayerSearchResult>,
     pub friend_searching: bool,
+    pub friend_search_executed: bool,
     pub social_syncing: bool,
     pub social_reconnect_timer: f32,
     pub pending_sent_invites: HashMap<String, f32>,
     pub party: Option<PartyState>,
     pub pending_party_invites: Vec<PartyInviteInfo>,
     pub party_chat_open: bool,
+    pub party_chat_unread: usize,
     pub party_chat_input: String,
     // Custom Lobby state
     pub lobbies: Vec<LobbySummary>,
@@ -147,11 +149,12 @@ pub struct PreGameSessionState {
     pub ui_dirty: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmAction {
     Logout,
     QuitApp,
     AbandonMatch,
+    RemoveFriend { user_id: String, username: String },
 }
 
 impl Default for PreGameSessionState {
@@ -181,12 +184,14 @@ impl Default for PreGameSessionState {
             friend_search_input: String::new(),
             friend_search_results: Vec::new(),
             friend_searching: false,
+            friend_search_executed: false,
             social_syncing: false,
             social_reconnect_timer: 0.0,
             pending_sent_invites: HashMap::new(),
             party: None,
             pending_party_invites: Vec::new(),
             party_chat_open: false,
+            party_chat_unread: 0,
             party_chat_input: String::new(),
             lobbies: Vec::new(),
             current_lobby: None,
@@ -291,10 +296,14 @@ enum PreGameBtnAction {
     // Social / Friends / Party actions
     RefreshFriends,
     SearchPlayers,
+    ClearFriendSearch,
     SendFriendRequest(String),
     RespondFriendRequest { request_id: i64, accept: bool },
+    CancelFriendRequest(String),
+    RequestRemoveFriendConfirm { user_id: String, username: String },
     RemoveFriend(String),
     InviteToParty(String),
+    CancelPartyInvite(String),
     RespondPartyInvite { invite_id: String, accept: bool },
     TogglePartyReady,
     KickPartyMember(String),
@@ -392,6 +401,10 @@ fn push_notification(
         state.notifications.remove(0);
     }
     state.ui_dirty = true;
+}
+
+fn is_in_active_squad(state: &PreGameSessionState) -> bool {
+    state.party.as_ref().map(|p| p.members.len() >= 2).unwrap_or(false)
 }
 
 fn sync_search_results_with_friends(state: &mut PreGameSessionState) {
@@ -1009,12 +1022,16 @@ fn poll_backend_events_system(
                 state.social_syncing = false;
                 state.friends = friends;
                 sync_search_results_with_friends(&mut state);
-                if let Some(ref p) = party {
+                let normalized_party = party.filter(|p| p.members.len() >= 2);
+                if let Some(ref p) = normalized_party {
                     for m in &p.members {
                         state.pending_sent_invites.remove(&m.user_id);
                     }
+                } else {
+                    state.party_chat_open = false;
+                    state.party_chat_unread = 0;
                 }
-                state.party = party;
+                state.party = normalized_party;
                 state.pending_party_invites = pending_invites;
                 state.ui_dirty = true;
             }
@@ -1026,6 +1043,7 @@ fn poll_backend_events_system(
             }
             BackendAsyncEvent::FriendSearchResults(res) => {
                 state.friend_searching = false;
+                state.friend_search_executed = true;
                 state.friend_search_results = res;
                 sync_search_results_with_friends(&mut state);
                 state.ui_dirty = true;
@@ -1085,18 +1103,39 @@ fn poll_backend_events_system(
                 }
             }
             BackendAsyncEvent::PartyStateUpdated(ps) => {
-                for m in &ps.members {
-                    state.pending_sent_invites.remove(&m.user_id);
+                if ps.members.len() < 2 {
+                    state.party = None;
+                    state.party_chat_open = false;
+                    state.party_chat_unread = 0;
+                    state.ui_dirty = true;
+                } else {
+                    let prev_chat_len = state
+                        .party
+                        .as_ref()
+                        .map(|old| old.chat_messages.len())
+                        .unwrap_or(0);
+                    let new_chat_len = ps.chat_messages.len();
+                    if new_chat_len > prev_chat_len && !state.party_chat_open {
+                        let non_sys_delta = ps.chat_messages[prev_chat_len..]
+                            .iter()
+                            .filter(|m| !m.is_system)
+                            .count();
+                        state.party_chat_unread = state.party_chat_unread.saturating_add(non_sys_delta);
+                    }
+                    for m in &ps.members {
+                        state.pending_sent_invites.remove(&m.user_id);
+                    }
+                    if ps.is_queuing && state.tab == PreGameTab::Hub {
+                        state.tab = PreGameTab::FindingMatch;
+                    }
+                    state.party = Some(ps);
+                    state.ui_dirty = true;
                 }
-                if ps.is_queuing && state.tab == PreGameTab::Hub {
-                    state.tab = PreGameTab::FindingMatch;
-                }
-                state.party = Some(ps);
-                state.ui_dirty = true;
             }
             BackendAsyncEvent::PartyCleared { reason } => {
                 state.party = None;
                 state.party_chat_open = false;
+                state.party_chat_unread = 0;
                 state.pending_sent_invites.clear();
                 if state.tab == PreGameTab::FindingMatch {
                     state.tab = PreGameTab::Hub;
@@ -1777,7 +1816,7 @@ fn handle_pregame_buttons_system(
                         );
                         return;
                     }
-                    if state.party.is_some() {
+                    if is_in_active_squad(&state) {
                         push_notification(
                             &mut state,
                             "error",
@@ -1786,6 +1825,12 @@ fn handle_pregame_buttons_system(
                             notif_dur,
                         );
                         return;
+                    }
+                    if state.party.is_some() {
+                        state.party = None;
+                        state.party_chat_open = false;
+                        state.party_chat_unread = 0;
+                        backend.send_social_action(serde_json::json!({ "action": "leave_party" }));
                     }
                     state.tab = PreGameTab::LobbyBrowser;
                     state.is_loading = true;
@@ -1821,20 +1866,21 @@ fn handle_pregame_buttons_system(
                 );
                 return;
             }
-            if let Some(ref p) = state.party {
-                let my_uid = state
-                    .profile
+            if is_in_active_squad(&state) {
+                let is_leader = state
+                    .party
                     .as_ref()
-                    .map(|pr| pr.user_id.as_str())
-                    .unwrap_or("");
-                if p.leader_user_id != my_uid {
-                    push_notification(
-                        &mut state,
-                        "info",
-                        "PARTY LEADER ONLY",
-                        "Only the squad leader can start matchmaking.",
-                        notif_dur,
-                    );
+                    .map(|p| {
+                        let my_uid = state
+                            .profile
+                            .as_ref()
+                            .map(|pr| pr.user_id.as_str())
+                            .unwrap_or("");
+                        p.leader_user_id == my_uid
+                    })
+                    .unwrap_or(false);
+                if !is_leader {
+                    backend.send_social_action(serde_json::json!({ "action": "toggle_ready" }));
                     return;
                 }
                 state.server_starting = false;
@@ -1842,6 +1888,12 @@ fn handle_pregame_buttons_system(
                     "action": "start_party_matchmaking"
                 }));
             } else {
+                if state.party.is_some() {
+                    state.party = None;
+                    state.party_chat_open = false;
+                    state.party_chat_unread = 0;
+                    backend.send_social_action(serde_json::json!({ "action": "leave_party" }));
+                }
                 state.tab = PreGameTab::FindingMatch;
                 state.queue_players = 1;
                 state.queue_required = config.main_menu.default_queue_required_players;
@@ -1851,7 +1903,7 @@ fn handle_pregame_buttons_system(
             }
         }
         PreGameBtnAction::CancelFindMatch => {
-            if state.party.is_some() {
+            if is_in_active_squad(&state) {
                 backend.send_social_action(serde_json::json!({
                     "action": "cancel_party_matchmaking"
                 }));
@@ -1929,6 +1981,32 @@ fn handle_pregame_buttons_system(
                 backend.respond_friend_request(tok, request_id, accept);
             }
         }
+        PreGameBtnAction::ClearFriendSearch => {
+            state.friend_search_input.clear();
+            state.friend_search_results.clear();
+            state.friend_search_executed = false;
+            if state.focused == FocusedInput::FriendSearch {
+                state.focused = FocusedInput::None;
+            }
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::CancelFriendRequest(uid) => {
+            if let Some(tok) = state.access_token.clone() {
+                for res in &mut state.friend_search_results {
+                    if res.user_id == uid {
+                        res.relationship = "none".to_string();
+                    }
+                }
+                state.is_loading = true;
+                state.loading_label = "CANCELING FRIEND REQUEST".to_string();
+                state.ui_dirty = true;
+                backend.remove_friend(tok, uid);
+            }
+        }
+        PreGameBtnAction::RequestRemoveFriendConfirm { user_id, username } => {
+            state.confirm_modal = Some(ConfirmAction::RemoveFriend { user_id, username });
+            state.ui_dirty = true;
+        }
         PreGameBtnAction::RemoveFriend(uid) => {
             if let Some(tok) = state.access_token.clone() {
                 state.is_loading = true;
@@ -1936,6 +2014,14 @@ fn handle_pregame_buttons_system(
                 state.ui_dirty = true;
                 backend.remove_friend(tok, uid);
             }
+        }
+        PreGameBtnAction::CancelPartyInvite(uid) => {
+            state.pending_sent_invites.remove(&uid);
+            backend.send_social_action(serde_json::json!({
+                "action": "cancel_party_invite",
+                "target_user_id": uid
+            }));
+            state.ui_dirty = true;
         }
         PreGameBtnAction::InviteToParty(uid) => {
             if state.pending_sent_invites.contains_key(&uid) {
@@ -2010,6 +2096,7 @@ fn handle_pregame_buttons_system(
         PreGameBtnAction::TogglePartyChat => {
             state.party_chat_open = !state.party_chat_open;
             if state.party_chat_open {
+                state.party_chat_unread = 0;
                 state.focused = FocusedInput::PartyChat;
             } else if state.focused == FocusedInput::PartyChat {
                 state.focused = FocusedInput::None;
@@ -2050,7 +2137,7 @@ fn handle_pregame_buttons_system(
                 );
                 return;
             }
-            if state.party.is_some() {
+            if is_in_active_squad(&state) {
                 push_notification(
                     &mut state,
                     "error",
@@ -2059,6 +2146,12 @@ fn handle_pregame_buttons_system(
                     notif_dur,
                 );
                 return;
+            }
+            if state.party.is_some() {
+                state.party = None;
+                state.party_chat_open = false;
+                state.party_chat_unread = 0;
+                backend.send_social_action(serde_json::json!({ "action": "leave_party" }));
             }
             if state.create_title.trim().is_empty() {
                 let uname = state
@@ -2383,8 +2476,11 @@ fn handle_pregame_buttons_system(
                     state.profile = None;
                     state.active_match = None;
                     state.party = None;
+                    state.party_chat_open = false;
+                    state.party_chat_unread = 0;
                     state.friends = FriendsSnapshot::default();
                     state.friend_search_results.clear();
+                    state.friend_search_executed = false;
                     state.pending_party_invites.clear();
                     state.pending_sent_invites.clear();
                     state.current_lobby = None;
@@ -2411,6 +2507,13 @@ fn handle_pregame_buttons_system(
                         state.is_loading = true;
                         state.loading_label = "ABANDONING MATCH".to_string();
                         backend.abandon_match(tok);
+                    }
+                }
+                Some(ConfirmAction::RemoveFriend { user_id, username: _ }) => {
+                    if let Some(tok) = state.access_token.clone() {
+                        state.is_loading = true;
+                        state.loading_label = "REMOVING FRIEND".to_string();
+                        backend.remove_friend(tok, user_id);
                     }
                 }
                 None => {}
@@ -2609,22 +2712,33 @@ fn rebuild_pregame_ui_system(
                 });
         }
 
-        if let Some(confirm) = state.confirm_modal {
-            let (title, body, ok_label) = match confirm {
+        if let Some(ref confirm) = state.confirm_modal {
+            let (title, body_text, ok_label): (&str, String, &str) = match confirm {
                 ConfirmAction::Logout => (
                     "CONFIRM LOG OUT",
-                    "Are you sure you want to log out of your account?",
+                    "Are you sure you want to log out of your account?".to_string(),
                     "LOG OUT",
                 ),
                 ConfirmAction::QuitApp => (
                     "EXIT GAME",
-                    "Are you sure you want to close the game client?",
+                    "Are you sure you want to close the game client?".to_string(),
                     "EXIT GAME",
                 ),
                 ConfirmAction::AbandonMatch => (
                     "ABANDON ACTIVE MATCH?",
-                    "ABANDON_BODY_DYNAMIC",
+                    format!(
+                        "Abandoning deducts -{} MMR, records a loss, and prevents reconnecting to this match.",
+                        config.main_menu.abandon_mmr_penalty
+                    ),
                     "ABANDON MATCH",
+                ),
+                ConfirmAction::RemoveFriend { username, .. } => (
+                    "REMOVE FRIEND?",
+                    format!(
+                        "Are you sure you want to remove '{}' from your friends list?",
+                        username
+                    ),
+                    "REMOVE",
                 ),
             };
             parent
@@ -2664,14 +2778,7 @@ fn rebuild_pregame_ui_system(
                             },
                             TextColor(Color::srgb(1.0, 0.78, 0.78)),
                         ));
-                        let body_text = if body == "ABANDON_BODY_DYNAMIC" {
-                            format!(
-                                "Abandoning deducts -{} MMR, records a loss, and prevents reconnecting to this match.",
-                                config.main_menu.abandon_mmr_penalty
-                            )
-                        } else {
-                            body.to_string()
-                        };
+
                         modal.spawn((
                             Text::new(body_text),
                             TextFont {
@@ -3286,8 +3393,8 @@ fn spawn_hub_screen(
         .unwrap_or("SOLDIER");
     let max_party = config.main_menu.party_max_size;
     let party_members_count = state.party.as_ref().map(|p| p.members.len()).unwrap_or(1);
-    let in_party = state.party.is_some();
-    let show_party_controls = party_members_count >= 2;
+    let in_party = is_in_active_squad(state);
+    let show_party_controls = in_party;
     let is_party_leader = state
         .party
         .as_ref()
@@ -3397,13 +3504,26 @@ fn spawn_hub_screen(
                                                 78.0,
                                                 22.0,
                                             );
+                                            let chat_lbl = if state.party_chat_unread > 0 {
+                                                format!("CHAT({})", state.party_chat_unread)
+                                            } else {
+                                                "CHAT".to_string()
+                                            };
                                             spawn_sized_button(
                                                 acts,
-                                                "CHAT",
+                                                &chat_lbl,
                                                 PreGameBtnAction::TogglePartyChat,
-                                                Color::srgb(0.08, 0.24, 0.28),
-                                                Color::srgb(0.30, 0.80, 0.82),
-                                                46.0,
+                                                if state.party_chat_unread > 0 {
+                                                    Color::srgb(0.42, 0.30, 0.06)
+                                                } else {
+                                                    Color::srgb(0.08, 0.24, 0.28)
+                                                },
+                                                if state.party_chat_unread > 0 {
+                                                    Color::srgb(1.0, 0.84, 0.30)
+                                                } else {
+                                                    Color::srgb(0.30, 0.80, 0.82)
+                                                },
+                                                if state.party_chat_unread > 0 { 62.0 } else { 46.0 },
                                                 22.0,
                                             );
                                             spawn_sized_button(
@@ -3493,28 +3613,58 @@ fn spawn_hub_screen(
                                                         TextColor(Color::WHITE),
                                                     ));
                                                     if is_party_leader && !is_self {
-                                                        cell.spawn((
-                                                            UiButton,
-                                                            Hovered::default(),
-                                                            Node {
-                                                                padding: UiRect::axes(Val::Px(5.0), Val::Px(1.0)),
-                                                                border: UiRect::all(Val::Px(1.0)),
-                                                                border_radius: BorderRadius::all(Val::Px(2.0)),
-                                                                ..default()
-                                                            },
-                                                            BackgroundColor(Color::srgb(0.48, 0.12, 0.14)),
-                                                            BorderColor::all(Color::srgb(0.95, 0.36, 0.38)),
-                                                            PreGameBtnAction::KickPartyMember(m.user_id.clone()),
-                                                        ))
-                                                        .with_children(|kb| {
-                                                            kb.spawn((
-                                                                Text::new("KICK"),
-                                                                TextFont {
-                                                                    font_size: FontSize::Px(8.5),
+                                                        cell.spawn(Node {
+                                                            flex_direction: FlexDirection::Row,
+                                                            column_gap: Val::Px(2.0),
+                                                            ..default()
+                                                        })
+                                                        .with_children(|macts| {
+                                                            macts.spawn((
+                                                                UiButton,
+                                                                Hovered::default(),
+                                                                Node {
+                                                                    padding: UiRect::axes(Val::Px(3.0), Val::Px(1.0)),
+                                                                    border: UiRect::all(Val::Px(1.0)),
+                                                                    border_radius: BorderRadius::all(Val::Px(2.0)),
                                                                     ..default()
                                                                 },
-                                                                TextColor(Color::WHITE),
-                                                            ));
+                                                                BackgroundColor(Color::srgb(0.40, 0.30, 0.06)),
+                                                                BorderColor::all(Color::srgb(0.96, 0.80, 0.30)),
+                                                                PreGameBtnAction::PromotePartyLeader(m.user_id.clone()),
+                                                            ))
+                                                            .with_children(|pb| {
+                                                                pb.spawn((
+                                                                    Text::new("^"),
+                                                                    TextFont {
+                                                                        font_size: FontSize::Px(8.5),
+                                                                        ..default()
+                                                                    },
+                                                                    TextColor(Color::srgb(1.0, 0.90, 0.45)),
+                                                                ));
+                                                            });
+                                                            macts.spawn((
+                                                                UiButton,
+                                                                Hovered::default(),
+                                                                Node {
+                                                                    padding: UiRect::axes(Val::Px(4.0), Val::Px(1.0)),
+                                                                    border: UiRect::all(Val::Px(1.0)),
+                                                                    border_radius: BorderRadius::all(Val::Px(2.0)),
+                                                                    ..default()
+                                                                },
+                                                                BackgroundColor(Color::srgb(0.48, 0.12, 0.14)),
+                                                                BorderColor::all(Color::srgb(0.95, 0.36, 0.38)),
+                                                                PreGameBtnAction::KickPartyMember(m.user_id.clone()),
+                                                            ))
+                                                            .with_children(|kb| {
+                                                                kb.spawn((
+                                                                    Text::new("X"),
+                                                                    TextFont {
+                                                                        font_size: FontSize::Px(8.5),
+                                                                        ..default()
+                                                                    },
+                                                                    TextColor(Color::WHITE),
+                                                                ));
+                                                            });
                                                         });
                                                     } else {
                                                         let short: String =
@@ -3765,21 +3915,57 @@ fn spawn_hub_screen(
                             218.0,
                             62.0,
                         );
-                        let find_lbl = if show_party_controls {
+                        let (find_lbl, find_act, find_bg, find_bdr) = if show_party_controls {
                             if is_party_leader {
-                                format!("FIND MATCH ({})", party_members_count)
+                                let ready_cnt = state
+                                    .party
+                                    .as_ref()
+                                    .map(|p| p.members.iter().filter(|m| m.is_ready).count())
+                                    .unwrap_or(0);
+                                if ready_cnt < party_members_count {
+                                    (
+                                        format!("WAIT READY ({}/{})", ready_cnt, party_members_count),
+                                        PreGameBtnAction::StartFindMatch,
+                                        Color::srgba(0.44, 0.30, 0.08, 0.92),
+                                        Color::srgb(0.94, 0.72, 0.28),
+                                    )
+                                } else {
+                                    (
+                                        format!("FIND MATCH ({})", party_members_count),
+                                        PreGameBtnAction::StartFindMatch,
+                                        Color::srgba(0.68, 0.48, 0.10, 0.96),
+                                        Color::srgb(1.0, 0.86, 0.36),
+                                    )
+                                }
+                            } else if am_i_ready {
+                                (
+                                    "CANCEL READY".to_string(),
+                                    PreGameBtnAction::TogglePartyReady,
+                                    Color::srgba(0.10, 0.46, 0.28, 0.96),
+                                    Color::srgb(0.32, 0.98, 0.62),
+                                )
                             } else {
-                                "SQUAD READY".to_string()
+                                (
+                                    "READY UP".to_string(),
+                                    PreGameBtnAction::TogglePartyReady,
+                                    Color::srgba(0.66, 0.38, 0.08, 0.96),
+                                    Color::srgb(1.0, 0.74, 0.26),
+                                )
                             }
                         } else {
-                            "FIND MATCH".to_string()
+                            (
+                                "FIND MATCH".to_string(),
+                                PreGameBtnAction::StartFindMatch,
+                                Color::srgba(0.68, 0.48, 0.10, 0.96),
+                                Color::srgb(1.0, 0.86, 0.36),
+                            )
                         };
                         spawn_sized_button(
                             btns,
                             &find_lbl,
-                            PreGameBtnAction::StartFindMatch,
-                            Color::srgba(0.68, 0.48, 0.10, 0.96),
-                            Color::srgb(1.0, 0.86, 0.36),
+                            find_act,
+                            find_bg,
+                            find_bdr,
                             248.0,
                             62.0,
                         );
@@ -3794,6 +3980,28 @@ fn spawn_hub_screen(
 
 fn spawn_left_friends_panel(parent: &mut ChildSpawnerCommands, state: &PreGameSessionState) {
     let online_cnt = state.friends.friends.iter().filter(|f| f.online).count();
+    let my_uid = state
+        .profile
+        .as_ref()
+        .map(|p| p.user_id.as_str())
+        .unwrap_or("");
+    let in_squad = is_in_active_squad(state);
+    let is_party_leader = state
+        .party
+        .as_ref()
+        .map(|p| p.leader_user_id == my_uid)
+        .unwrap_or(true);
+    let party_is_queuing = state
+        .party
+        .as_ref()
+        .map(|p| p.is_queuing)
+        .unwrap_or(false);
+    let party_is_full = state
+        .party
+        .as_ref()
+        .map(|p| p.members.len() >= p.max_size)
+        .unwrap_or(false);
+
     parent
         .spawn((
             Node {
@@ -3843,13 +4051,13 @@ fn spawn_left_friends_panel(parent: &mut ChildSpawnerCommands, state: &PreGameSe
                     );
                 });
 
-            // جستجوی بازیکن
+            // جستجوی بازیکن + دکمه پاک‌سازی جستجو
             panel
                 .spawn(Node {
                     width: Val::Percent(100.0),
                     flex_direction: FlexDirection::Row,
                     align_items: AlignItems::FlexEnd,
-                    column_gap: Val::Px(6.0),
+                    column_gap: Val::Px(5.0),
                     ..default()
                 })
                 .with_children(|search_row| {
@@ -3862,323 +4070,495 @@ fn spawn_left_friends_panel(parent: &mut ChildSpawnerCommands, state: &PreGameSe
                         FocusedInput::FriendSearch,
                         false,
                     );
+                    if !state.friend_search_input.is_empty()
+                        || !state.friend_search_results.is_empty()
+                        || state.friend_search_executed
+                    {
+                        spawn_sized_button(
+                            search_row,
+                            "X",
+                            PreGameBtnAction::ClearFriendSearch,
+                            Color::srgb(0.28, 0.14, 0.16),
+                            Color::srgb(0.84, 0.38, 0.40),
+                            28.0,
+                            36.0,
+                        );
+                    }
                     spawn_sized_button(
                         search_row,
                         if state.friend_searching { "..." } else { "FIND" },
                         PreGameBtnAction::SearchPlayers,
                         Color::srgb(0.10, 0.40, 0.36),
                         Color::srgb(0.30, 0.94, 0.82),
-                        58.0,
+                        52.0,
                         36.0,
                     );
                 });
 
-            // نتایج جستجو
-            if !state.friend_search_results.is_empty() {
-                for res in state.friend_search_results.iter().take(3) {
-                    panel
-                        .spawn((
-                            Node {
-                                width: Val::Percent(100.0),
-                                padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
-                                flex_direction: FlexDirection::Row,
-                                justify_content: JustifyContent::SpaceBetween,
-                                align_items: AlignItems::Center,
-                                border_radius: BorderRadius::all(Val::Px(4.0)),
-                                ..default()
-                            },
-                            BackgroundColor(Color::srgba(0.06, 0.16, 0.19, 0.92)),
-                        ))
-                        .with_children(|row| {
-                            row.spawn((
-                                Text::new(format!("{} ({})", res.username, res.mmr)),
-                                TextFont {
-                                    font_size: FontSize::Px(11.5),
-                                    ..default()
-                                },
-                                TextColor(Color::WHITE),
-                            ));
-                            if res.relationship == "none" || res.relationship == "declined" {
-                                spawn_sized_button(
-                                    row,
-                                    "+ ADD",
-                                    PreGameBtnAction::SendFriendRequest(res.user_id.clone()),
-                                    Color::srgb(0.10, 0.42, 0.28),
-                                    Color::srgb(0.32, 0.95, 0.62),
-                                    58.0,
-                                    22.0,
-                                );
-                            } else {
-                                let badge = match res.relationship.as_str() {
-                                    "friend" => "FRIEND",
-                                    "outgoing_pending" => "PENDING",
-                                    "incoming_pending" => "INCOMING",
-                                    _ => "ADDED",
-                                };
-                                row.spawn((
-                                    Text::new(badge),
-                                    TextFont {
-                                        font_size: FontSize::Px(10.0),
-                                        ..default()
-                                    },
-                                    TextColor(Color::srgb(0.58, 0.92, 0.72)),
-                                ));
-                            }
-                        });
-                }
-            }
-
-            // درخواست‌های دوستی ورودی
-            if !state.friends.incoming_requests.is_empty() {
-                panel.spawn((
-                    Text::new(format!(
-                        "REQUESTS ({})",
-                        state.friends.incoming_requests.len()
-                    )),
-                    TextFont {
-                        font_size: FontSize::Px(10.5),
+            // ناحیه اسکرول‌پذیر یکپارچه برای نتایج جستجو، درخواست‌های ورودی، درخواست‌های ارسالی و لیست دوستان
+            panel
+                .spawn((
+                    Node {
+                        width: Val::Percent(100.0),
+                        flex_grow: 1.0,
+                        min_height: Val::Px(0.0),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(6.0),
+                        overflow: Overflow::scroll_y(),
                         ..default()
                     },
-                    TextColor(Color::srgb(0.98, 0.82, 0.34)),
-                ));
-                for req in state.friends.incoming_requests.iter().take(3) {
-                    panel
-                        .spawn((
-                            Node {
-                                width: Val::Percent(100.0),
-                                padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
-                                flex_direction: FlexDirection::Row,
-                                justify_content: JustifyContent::SpaceBetween,
-                                align_items: AlignItems::Center,
-                                border: UiRect::all(Val::Px(1.0)),
-                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ScrollPosition::default(),
+                    RelativeCursorPosition::default(),
+                    PreGameScrollableList,
+                ))
+                .with_children(|scroll| {
+                    // ۱. نتایج جستجو
+                    if state.friend_search_executed && state.friend_search_results.is_empty() {
+                        scroll.spawn((
+                            Text::new("No players found matching your search."),
+                            TextFont {
+                                font_size: FontSize::Px(11.0),
                                 ..default()
                             },
-                            BackgroundColor(Color::srgba(0.18, 0.15, 0.05, 0.90)),
-                            BorderColor::all(Color::srgb(0.92, 0.74, 0.26)),
-                        ))
-                        .with_children(|row| {
-                            row.spawn((
-                                Text::new(req.username.clone()),
-                                TextFont {
-                                    font_size: FontSize::Px(12.0),
-                                    ..default()
-                                },
-                                TextColor(Color::WHITE),
-                            ));
-                            row.spawn(Node {
-                                flex_direction: FlexDirection::Row,
-                                column_gap: Val::Px(4.0),
-                                ..default()
-                            })
-                            .with_children(|btns| {
-                                spawn_sized_button(
-                                    btns,
-                                    "OK",
-                                    PreGameBtnAction::RespondFriendRequest {
-                                        request_id: req.request_id,
-                                        accept: true,
-                                    },
-                                    Color::srgb(0.10, 0.46, 0.28),
-                                    Color::srgb(0.32, 0.96, 0.62),
-                                    36.0,
-                                    22.0,
-                                );
-                                spawn_sized_button(
-                                    btns,
-                                    "NO",
-                                    PreGameBtnAction::RespondFriendRequest {
-                                        request_id: req.request_id,
-                                        accept: false,
-                                    },
-                                    Color::srgb(0.46, 0.14, 0.14),
-                                    Color::srgb(0.94, 0.38, 0.38),
-                                    36.0,
-                                    22.0,
-                                );
-                            });
-                        });
-                }
-            }
-
-            // لیست دوستان همراه با وضعیت زنده و دکمه INVITE / INVITING...
-            if state.friends.friends.is_empty() {
-                panel.spawn((
-                    Text::new("No friends yet. Search by username above!"),
-                    TextFont {
-                        font_size: FontSize::Px(11.5),
-                        ..default()
-                    },
-                    TextColor(Color::srgb(0.60, 0.74, 0.74)),
-                ));
-            } else {
-                panel
-                    .spawn((
-                        Node {
-                            width: Val::Percent(100.0),
-                            flex_grow: 1.0,
-                            min_height: Val::Px(0.0),
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(5.0),
-                            overflow: Overflow::scroll_y(),
-                            ..default()
-                        },
-                        ScrollPosition::default(),
-                        RelativeCursorPosition::default(),
-                        PreGameScrollableList,
-                    ))
-                    .with_children(|friends_scroll| {
-                for f in &state.friends.friends {
-                    let dot_col = if !f.online {
-                        Color::srgb(0.42, 0.48, 0.50)
-                    } else if f.status == "in_party" || f.status == "in_queue" {
-                        Color::srgb(0.96, 0.78, 0.28)
-                    } else {
-                        Color::srgb(0.24, 0.96, 0.58)
-                    };
-                    let already_in_my_party = state
-                        .party
-                        .as_ref()
-                        .map(|p| p.members.iter().any(|m| m.user_id == f.user_id))
-                        .unwrap_or(false);
-                    let is_inviting = state.pending_sent_invites.contains_key(&f.user_id);
-
-                    friends_scroll
-                        .spawn((
-                            Node {
-                                width: Val::Percent(100.0),
-                                padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
-                                flex_direction: FlexDirection::Row,
-                                justify_content: JustifyContent::SpaceBetween,
-                                align_items: AlignItems::Center,
-                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                            TextColor(Color::srgb(0.82, 0.64, 0.44)),
+                        ));
+                    } else if !state.friend_search_results.is_empty() {
+                        scroll.spawn((
+                            Text::new(format!(
+                                "SEARCH RESULTS ({})",
+                                state.friend_search_results.len()
+                            )),
+                            TextFont {
+                                font_size: FontSize::Px(10.0),
                                 ..default()
                             },
-                            BackgroundColor(Color::srgba(0.045, 0.13, 0.155, 0.90)),
-                        ))
-                        .with_children(|row| {
-                            row.spawn(Node {
-                                flex_direction: FlexDirection::Row,
-                                align_items: AlignItems::Center,
-                                column_gap: Val::Px(7.0),
-                                ..default()
-                            })
-                            .with_children(|info| {
-                                info.spawn((
+                            TextColor(Color::srgb(0.45, 0.92, 0.86)),
+                        ));
+                        for res in state.friend_search_results.iter().take(6) {
+                            scroll
+                                .spawn((
                                     Node {
-                                        width: Val::Px(8.0),
-                                        height: Val::Px(8.0),
+                                        width: Val::Percent(100.0),
+                                        flex_shrink: 0.0,
+                                        padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        align_items: AlignItems::Center,
                                         border_radius: BorderRadius::all(Val::Px(4.0)),
                                         ..default()
                                     },
-                                    BackgroundColor(dot_col),
-                                ));
-                                info.spawn(Node {
-                                    flex_direction: FlexDirection::Column,
-                                    ..default()
-                                })
-                                .with_children(|col| {
-                                    col.spawn((
-                                        Text::new(f.username.clone()),
+                                    BackgroundColor(Color::srgba(0.06, 0.16, 0.19, 0.92)),
+                                ))
+                                .with_children(|row| {
+                                    row.spawn((
+                                        Text::new(format!("{} ({})", res.username, res.mmr)),
                                         TextFont {
-                                            font_size: FontSize::Px(12.5),
+                                            font_size: FontSize::Px(11.5),
                                             ..default()
                                         },
-                                        TextColor(if f.online {
-                                            Color::WHITE
+                                        TextColor(Color::WHITE),
+                                    ));
+                                    if res.relationship == "none" || res.relationship == "declined" {
+                                        spawn_sized_button(
+                                            row,
+                                            "+ ADD",
+                                            PreGameBtnAction::SendFriendRequest(res.user_id.clone()),
+                                            Color::srgb(0.10, 0.42, 0.28),
+                                            Color::srgb(0.32, 0.95, 0.62),
+                                            58.0,
+                                            22.0,
+                                        );
+                                    } else if res.relationship == "outgoing_pending" {
+                                        spawn_sized_button(
+                                            row,
+                                            "CANCEL",
+                                            PreGameBtnAction::CancelFriendRequest(res.user_id.clone()),
+                                            Color::srgb(0.44, 0.22, 0.10),
+                                            Color::srgb(0.96, 0.56, 0.28),
+                                            62.0,
+                                            22.0,
+                                        );
+                                    } else if res.relationship == "incoming_pending" {
+                                        if let Some(inc) = state
+                                            .friends
+                                            .incoming_requests
+                                            .iter()
+                                            .find(|r| r.user_id == res.user_id)
+                                        {
+                                            spawn_sized_button(
+                                                row,
+                                                "ACCEPT",
+                                                PreGameBtnAction::RespondFriendRequest {
+                                                    request_id: inc.request_id,
+                                                    accept: true,
+                                                },
+                                                Color::srgb(0.10, 0.46, 0.28),
+                                                Color::srgb(0.32, 0.96, 0.62),
+                                                62.0,
+                                                22.0,
+                                            );
                                         } else {
-                                            Color::srgb(0.60, 0.68, 0.70)
-                                        }),
-                                    ));
-                                    col.spawn((
-                                        Text::new(format!(
-                                            "{} | {} MMR",
-                                            f.status.to_uppercase(),
-                                            f.mmr
-                                        )),
-                                        TextFont {
-                                            font_size: FontSize::Px(9.5),
-                                            ..default()
-                                        },
-                                        TextColor(dot_col),
-                                    ));
-                                });
-                            });
-
-                            row.spawn(Node {
-                                flex_direction: FlexDirection::Row,
-                                column_gap: Val::Px(4.0),
-                                ..default()
-                            })
-                            .with_children(|acts| {
-                                if already_in_my_party {
-                                    acts.spawn((
-                                        Text::new("IN SQUAD"),
-                                        TextFont {
-                                            font_size: FontSize::Px(9.5),
-                                            ..default()
-                                        },
-                                        TextColor(Color::srgb(0.45, 0.94, 0.72)),
-                                    ));
-                                } else if is_inviting {
-                                    acts.spawn((
-                                        Node {
-                                            width: Val::Px(68.0),
-                                            height: Val::Px(24.0),
-                                            justify_content: JustifyContent::Center,
-                                            align_items: AlignItems::Center,
-                                            border: UiRect::all(Val::Px(1.0)),
-                                            border_radius: BorderRadius::all(Val::Px(4.0)),
-                                            ..default()
-                                        },
-                                        BackgroundColor(Color::srgba(0.32, 0.24, 0.06, 0.95)),
-                                        BorderColor::all(Color::srgb(0.98, 0.80, 0.28)),
-                                        PulseGlowNode { speed: 5.0 },
-                                    ))
-                                    .with_children(|invb| {
-                                        invb.spawn((
-                                            Text::new("INVITING.."),
+                                            row.spawn((
+                                                Text::new("INCOMING"),
+                                                TextFont {
+                                                    font_size: FontSize::Px(10.0),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(0.98, 0.82, 0.34)),
+                                            ));
+                                        }
+                                    } else {
+                                        row.spawn((
+                                            Text::new("FRIEND"),
                                             TextFont {
-                                                font_size: FontSize::Px(9.5),
+                                                font_size: FontSize::Px(10.0),
                                                 ..default()
                                             },
-                                            TextColor(Color::srgb(0.98, 0.88, 0.45)),
+                                            TextColor(Color::srgb(0.58, 0.92, 0.72)),
                                         ));
-                                    });
-                                } else if f.online && f.in_party {
-                                    acts.spawn((
-                                        Text::new("IN PARTY"),
+                                    }
+                                });
+                        }
+                    }
+
+                    // ۲. درخواست‌های دوستی ورودی
+                    if !state.friends.incoming_requests.is_empty() {
+                        scroll.spawn((
+                            Text::new(format!(
+                                "INCOMING REQUESTS ({})",
+                                state.friends.incoming_requests.len()
+                            )),
+                            TextFont {
+                                font_size: FontSize::Px(10.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.98, 0.82, 0.34)),
+                        ));
+                        for req in &state.friends.incoming_requests {
+                            scroll
+                                .spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        flex_shrink: 0.0,
+                                        padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        align_items: AlignItems::Center,
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        border_radius: BorderRadius::all(Val::Px(4.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.18, 0.15, 0.05, 0.90)),
+                                    BorderColor::all(Color::srgb(0.92, 0.74, 0.26)),
+                                ))
+                                .with_children(|row| {
+                                    row.spawn((
+                                        Text::new(req.username.clone()),
                                         TextFont {
-                                            font_size: FontSize::Px(9.5),
+                                            font_size: FontSize::Px(12.0),
                                             ..default()
                                         },
-                                        TextColor(Color::srgb(0.96, 0.78, 0.28)),
+                                        TextColor(Color::WHITE),
                                     ));
-                                } else if f.online {
+                                    row.spawn(Node {
+                                        flex_direction: FlexDirection::Row,
+                                        column_gap: Val::Px(4.0),
+                                        ..default()
+                                    })
+                                    .with_children(|btns| {
+                                        spawn_sized_button(
+                                            btns,
+                                            "OK",
+                                            PreGameBtnAction::RespondFriendRequest {
+                                                request_id: req.request_id,
+                                                accept: true,
+                                            },
+                                            Color::srgb(0.10, 0.46, 0.28),
+                                            Color::srgb(0.32, 0.96, 0.62),
+                                            36.0,
+                                            22.0,
+                                        );
+                                        spawn_sized_button(
+                                            btns,
+                                            "NO",
+                                            PreGameBtnAction::RespondFriendRequest {
+                                                request_id: req.request_id,
+                                                accept: false,
+                                            },
+                                            Color::srgb(0.46, 0.14, 0.14),
+                                            Color::srgb(0.94, 0.38, 0.38),
+                                            36.0,
+                                            22.0,
+                                        );
+                                    });
+                                });
+                        }
+                    }
+
+                    // ۳. درخواست‌های دوستی ارسالی (با قابلیت لغو درخواست)
+                    if !state.friends.outgoing_requests.is_empty() {
+                        scroll.spawn((
+                            Text::new(format!(
+                                "SENT REQUESTS ({})",
+                                state.friends.outgoing_requests.len()
+                            )),
+                            TextFont {
+                                font_size: FontSize::Px(10.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.72, 0.86, 0.96)),
+                        ));
+                        for req in &state.friends.outgoing_requests {
+                            scroll
+                                .spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        flex_shrink: 0.0,
+                                        padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        align_items: AlignItems::Center,
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        border_radius: BorderRadius::all(Val::Px(4.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.06, 0.14, 0.20, 0.88)),
+                                    BorderColor::all(Color::srgba(0.36, 0.64, 0.84, 0.65)),
+                                ))
+                                .with_children(|row| {
+                                    row.spawn((
+                                        Text::new(req.username.clone()),
+                                        TextFont {
+                                            font_size: FontSize::Px(11.5),
+                                            ..default()
+                                        },
+                                        TextColor(Color::srgb(0.88, 0.94, 0.98)),
+                                    ));
                                     spawn_sized_button(
-                                        acts,
-                                        "INVITE",
-                                        PreGameBtnAction::InviteToParty(f.user_id.clone()),
-                                        Color::srgb(0.10, 0.44, 0.34),
-                                        Color::srgb(0.30, 0.96, 0.76),
-                                        56.0,
-                                        24.0,
+                                        row,
+                                        "CANCEL",
+                                        PreGameBtnAction::CancelFriendRequest(req.user_id.clone()),
+                                        Color::srgb(0.44, 0.18, 0.12),
+                                        Color::srgb(0.96, 0.48, 0.34),
+                                        62.0,
+                                        22.0,
                                     );
-                                }
-                                spawn_sized_button(
-                                    acts,
-                                    "X",
-                                    PreGameBtnAction::RemoveFriend(f.user_id.clone()),
-                                    Color::srgb(0.32, 0.12, 0.14),
-                                    Color::srgb(0.76, 0.30, 0.32),
-                                    24.0,
-                                    24.0,
-                                );
-                            });
-                        });
-                }
+                                });
+                        }
+                    }
+
+                    // ۴. لیست دوستان همراه با وضعیت زنده، دعوت/لغو دعوت پارتی و تایید حذف دوست
+                    if state.friends.friends.is_empty() {
+                        scroll.spawn((
+                            Text::new("No friends yet. Search by username above!"),
+                            TextFont {
+                                font_size: FontSize::Px(11.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.60, 0.74, 0.74)),
+                        ));
+                    } else {
+                        for f in &state.friends.friends {
+                            let dot_col = if !f.online {
+                                Color::srgb(0.42, 0.48, 0.50)
+                            } else if f.status == "in_party"
+                                || f.status == "in_queue"
+                                || f.status == "in_match"
+                                || f.status == "in_game"
+                            {
+                                Color::srgb(0.96, 0.78, 0.28)
+                            } else {
+                                Color::srgb(0.24, 0.96, 0.58)
+                            };
+                            let already_in_my_party = state
+                                .party
+                                .as_ref()
+                                .map(|p| p.members.iter().any(|m| m.user_id == f.user_id))
+                                .unwrap_or(false);
+                            let is_inviting = state.pending_sent_invites.contains_key(&f.user_id);
+
+                            scroll
+                                .spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        flex_shrink: 0.0,
+                                        padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        align_items: AlignItems::Center,
+                                        border_radius: BorderRadius::all(Val::Px(4.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.045, 0.13, 0.155, 0.90)),
+                                ))
+                                .with_children(|row| {
+                                    row.spawn(Node {
+                                        flex_direction: FlexDirection::Row,
+                                        align_items: AlignItems::Center,
+                                        column_gap: Val::Px(7.0),
+                                        ..default()
+                                    })
+                                    .with_children(|info| {
+                                        info.spawn((
+                                            Node {
+                                                width: Val::Px(8.0),
+                                                height: Val::Px(8.0),
+                                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                                ..default()
+                                            },
+                                            BackgroundColor(dot_col),
+                                        ));
+                                        info.spawn(Node {
+                                            flex_direction: FlexDirection::Column,
+                                            ..default()
+                                        })
+                                        .with_children(|col| {
+                                            col.spawn((
+                                                Text::new(f.username.clone()),
+                                                TextFont {
+                                                    font_size: FontSize::Px(12.5),
+                                                    ..default()
+                                                },
+                                                TextColor(if f.online {
+                                                    Color::WHITE
+                                                } else {
+                                                    Color::srgb(0.60, 0.68, 0.70)
+                                                }),
+                                            ));
+                                            col.spawn((
+                                                Text::new(format!(
+                                                    "{} | {} MMR",
+                                                    f.status.replace('_', " ").to_uppercase(),
+                                                    f.mmr
+                                                )),
+                                                TextFont {
+                                                    font_size: FontSize::Px(9.5),
+                                                    ..default()
+                                                },
+                                                TextColor(dot_col),
+                                            ));
+                                        });
+                                    });
+
+                                    row.spawn(Node {
+                                        flex_direction: FlexDirection::Row,
+                                        align_items: AlignItems::Center,
+                                        column_gap: Val::Px(4.0),
+                                        ..default()
+                                    })
+                                    .with_children(|acts| {
+                                        if already_in_my_party {
+                                            acts.spawn((
+                                                Text::new("IN SQUAD"),
+                                                TextFont {
+                                                    font_size: FontSize::Px(9.5),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(0.45, 0.94, 0.72)),
+                                            ));
+                                        } else if is_inviting {
+                                            acts.spawn((
+                                                UiButton,
+                                                Hovered::default(),
+                                                Node {
+                                                    width: Val::Px(68.0),
+                                                    height: Val::Px(24.0),
+                                                    justify_content: JustifyContent::Center,
+                                                    align_items: AlignItems::Center,
+                                                    border: UiRect::all(Val::Px(1.0)),
+                                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                                    ..default()
+                                                },
+                                                BackgroundColor(Color::srgba(0.32, 0.24, 0.06, 0.95)),
+                                                BorderColor::all(Color::srgb(0.98, 0.80, 0.28)),
+                                                PulseGlowNode { speed: 5.0 },
+                                                PreGameBtnAction::CancelPartyInvite(f.user_id.clone()),
+                                            ))
+                                            .with_children(|invb| {
+                                                invb.spawn((
+                                                    Text::new("CANCEL"),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(9.5),
+                                                        ..default()
+                                                    },
+                                                    TextColor(Color::srgb(0.98, 0.88, 0.45)),
+                                                ));
+                                            });
+                                        } else if f.online && (f.status == "in_match" || f.status == "in_game") {
+                                            acts.spawn((
+                                                Text::new("IN MATCH"),
+                                                TextFont {
+                                                    font_size: FontSize::Px(9.5),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(0.96, 0.78, 0.28)),
+                                            ));
+                                        } else if f.online && f.status == "in_queue" {
+                                            acts.spawn((
+                                                Text::new("IN QUEUE"),
+                                                TextFont {
+                                                    font_size: FontSize::Px(9.5),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(0.96, 0.78, 0.28)),
+                                            ));
+                                        } else if f.online && f.in_party {
+                                            acts.spawn((
+                                                Text::new("IN PARTY"),
+                                                TextFont {
+                                                    font_size: FontSize::Px(9.5),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(0.96, 0.78, 0.28)),
+                                            ));
+                                        } else if f.online {
+                                            if party_is_full {
+                                                acts.spawn((
+                                                    Text::new("FULL"),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(9.5),
+                                                        ..default()
+                                                    },
+                                                    TextColor(Color::srgb(0.68, 0.74, 0.74)),
+                                                ));
+                                            } else if in_squad && (!is_party_leader || party_is_queuing) {
+                                                acts.spawn((
+                                                    Text::new(if party_is_queuing { "QUEUING" } else { "ONLINE" }),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(9.5),
+                                                        ..default()
+                                                    },
+                                                    TextColor(Color::srgb(0.54, 0.82, 0.78)),
+                                                ));
+                                            } else {
+                                                spawn_sized_button(
+                                                    acts,
+                                                    "INVITE",
+                                                    PreGameBtnAction::InviteToParty(f.user_id.clone()),
+                                                    Color::srgb(0.10, 0.44, 0.34),
+                                                    Color::srgb(0.30, 0.96, 0.76),
+                                                    56.0,
+                                                    24.0,
+                                                );
+                                            }
+                                        }
+                                        spawn_sized_button(
+                                            acts,
+                                            "X",
+                                            PreGameBtnAction::RequestRemoveFriendConfirm {
+                                                user_id: f.user_id.clone(),
+                                                username: f.username.clone(),
+                                            },
+                                            Color::srgb(0.32, 0.12, 0.14),
+                                            Color::srgb(0.76, 0.30, 0.32),
+                                            24.0,
+                                            24.0,
+                                        );
+                                    });
+                                });
+                        }
+                    }
                 });
-            }
         });
 }
 

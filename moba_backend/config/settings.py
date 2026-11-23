@@ -72,30 +72,27 @@ DATABASES = {
     }
 }
 
-# آدرس Redis (هم برای تیکت‌های سرور بازی Rust و هم در صورت نیاز برای Channels)
+# آدرس یکتای Redis (در کل بک‌اند فقط از همین یک متغیر استفاده می‌شود)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
-REDIS_FALLBACK_URL = os.environ.get("REDIS_FALLBACK_URL", "redis://172.21.13.50:6379/0")
 
-# پیش‌فرض روی RedisChannelLayer تنظیم شده تا چند Instance همزمان به‌درستی ارتباط داشته باشند
-if os.environ.get("USE_REDIS_CHANNEL_LAYER", "1") == "1":
-    CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels_redis.core.RedisChannelLayer",
-            "CONFIG": {
-                "hosts": [REDIS_URL],
-            },
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [
+                {
+                    "address": REDIS_URL,
+                    "socket_timeout": None,
+                    "socket_connect_timeout": 5,
+                }
+            ],
         },
-    }
-else:
-    CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels.layers.InMemoryChannelLayer",
-        },
-    }
+    },
+}
 
 # تنظیمات Matchmaking و اجرای سرویس systemd سرور بازی
-MATCHMAKING_PLAYERS_PER_MATCH = int(os.environ.get("MATCHMAKING_PLAYERS_PER_MATCH", "10"))
-GAME_SERVER_HOST = os.environ.get("GAME_SERVER_HOST", "127.0.0.1")
+MATCHMAKING_PLAYERS_PER_MATCH = int(os.environ.get("MATCHMAKING_PLAYERS_PER_MATCH", "1"))
+GAME_SERVER_HOST = os.environ.get("GAME_SERVER_HOST", "172.21.13.50")
 GAME_SERVER_PORT_START = int(os.environ.get("GAME_SERVER_PORT_START", "4433"))
 GAME_SERVER_PORT_END = int(os.environ.get("GAME_SERVER_PORT_END", "4550"))
 GAME_SERVER_SERVICE_NAME = os.environ.get("GAME_SERVER_SERVICE_NAME", "moba-server")

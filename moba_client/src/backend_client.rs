@@ -1277,10 +1277,15 @@ impl BackendClient {
                 Ok(r) => match r.into_string() {
                     Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
                         Ok(v) => {
+                            let msg = v
+                                .get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("Friends list updated.")
+                                .to_string();
                             let snap: FriendsSnapshot =
                                 serde_json::from_value(v).unwrap_or_default();
                             let _ = tx.send(BackendAsyncEvent::FriendActionDone {
-                                message: "Friend removed.".to_string(),
+                                message: msg,
                                 snapshot: snap,
                             });
                         }

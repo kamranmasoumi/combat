@@ -15,6 +15,8 @@ use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalA
 use bevy::diagnostic::{DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin};
 use bevy::ecs::system::SystemParam;
 use bevy::render::diagnostic::RenderDiagnosticsPlugin;
+use bevy::render::settings::{RenderCreation, WgpuSettings};
+use bevy::render::RenderPlugin;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::ui::{Pressed, RelativeCursorPosition};
@@ -217,18 +219,35 @@ fn main() {
         }
     };
 
+    #[allow(unused_mut)]
+    let mut wgpu_settings = WgpuSettings::default();
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        // Legacy Windows Intel HD 520/530 Vulkan drivers can crash (0xc0000005)
+        // right after adapter creation on subsequent launches; default to DX12
+        // on Windows while still allowing explicit WGPU_BACKEND overrides.
+        wgpu_settings.backends = Some(bevy::render::settings::Backends::DX12);
+    }
+
     App::new()
         .set_error_handler(bevy::ecs::error::warn)
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: config.window.title.clone(),
-                resolution: WindowResolution::new(config.window.width, config.window.height),
-                present_mode: PresentMode::AutoVsync,
-                mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: config.window.title.clone(),
+                        resolution: WindowResolution::new(config.window.width, config.window.height),
+                        present_mode: PresentMode::AutoVsync,
+                        mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(RenderPlugin {
+                    render_creation: RenderCreation::Automatic(Box::new(wgpu_settings)),
+                    ..default()
+                }),
+        )
         .insert_resource(DirectionalLightShadowMap {
             size: config.lighting.shadow_map_size,
         })
@@ -1164,7 +1183,7 @@ fn on_enter_ingame_connect_system(
     mut cam_q: Query<&mut Camera, With<Camera3d>>,
 ) {
     post_match.started = false;
-    post_match.countdown_secs = 5.0;
+    post_match.countdown_secs = POST_MATCH_COUNTDOWN_SECS;
     for mut cam in &mut cam_q {
         cam.is_active = true;
     }
@@ -9090,6 +9109,8 @@ struct LatestActiveTeleports(Vec<ActiveTeleportSnapshot>);
 #[derive(Resource, Default)]
 struct LatestMatchResult(Option<TeamId>);
 
+const POST_MATCH_COUNTDOWN_SECS: f32 = 9.0;
+
 #[derive(Resource)]
 struct PostMatchFlowState {
     started: bool,
@@ -9100,7 +9121,7 @@ impl Default for PostMatchFlowState {
     fn default() -> Self {
         Self {
             started: false,
-            countdown_secs: 5.0,
+            countdown_secs: POST_MATCH_COUNTDOWN_SECS,
         }
     }
 }
@@ -13783,7 +13804,7 @@ fn end_of_match_overlay_system(
 
     if !post_match.started {
         post_match.started = true;
-        post_match.countdown_secs = 5.0;
+        post_match.countdown_secs = POST_MATCH_COUNTDOWN_SECS;
     } else {
         post_match.countdown_secs = (post_match.countdown_secs - time.delta_secs()).max(0.0);
         if post_match.countdown_secs <= 0.0 {

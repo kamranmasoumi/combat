@@ -222,10 +222,13 @@ fn post_json_to_django_async(base_http_url: &str, path: &str, json_body: String)
             .or_else(|| url.strip_prefix("https://"))
             .unwrap_or(&url);
         let host_port = addr.split('/').next().unwrap_or(addr);
+        let webhook_secret = std::env::var("INTERNAL_WEBHOOK_SECRET")
+            .unwrap_or_else(|_| "simorgh-internal-webhook-secret-2026".to_string());
         let req = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-Internal-Secret: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             path,
             host_port,
+            webhook_secret,
             json_body.len(),
             json_body
         );

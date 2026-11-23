@@ -438,6 +438,7 @@ pub fn spawn_item_icon_badge(
         .with_children(|box_node| {
             if let Some(icon_h) = icon_cache.get_or_load(&item.icon_path, asset_server) {
                 box_node.spawn((
+                    Pickable::IGNORE,
                     ImageNode::new(icon_h),
                     Node {
                         width: percent(100),
@@ -447,6 +448,7 @@ pub fn spawn_item_icon_badge(
                 ));
             } else {
                 box_node.spawn((
+                    Pickable::IGNORE,
                     Text::new(&item.short_code),
                     TextFont {
                         font_size: FontSize::Px(font_px),
@@ -5896,6 +5898,7 @@ struct TooltipQueries<'w, 's> {
 
 fn shop_hover_tooltip_system(
     mut commands: Commands,
+    time: Res<Time>,
     asset_server: Res<AssetServer>,
     mut icon_cache: ResMut<ItemIconCache>,
     items_cfg: Res<ItemsConfig>,
@@ -5904,6 +5907,7 @@ fn shop_hover_tooltip_system(
     courier_ctrl: Res<CourierControlState>,
     mut q: TooltipQueries,
     mut last_target: Local<Option<TooltipTarget>>,
+    mut hide_grace: Local<f32>,
 ) {
     let Ok((tip_ent, mut tip_node, tip_ch)) = q.tip_q.single_mut() else {
         return;
@@ -5911,6 +5915,7 @@ fn shop_hover_tooltip_system(
     if !ctx.in_game || ui_state.is_dragging_item {
         tip_node.display = Display::None;
         *last_target = None;
+        *hide_grace = 0.0;
         return;
     }
 
@@ -6016,10 +6021,20 @@ fn shop_hover_tooltip_system(
     }
 
     let Some(ref cur_target) = target else {
+        let should_keep_briefly = last_target.as_ref().is_some_and(|prev| match prev {
+            TooltipTarget::Item { from_hud, .. } => *from_hud || ui_state.is_open,
+            TooltipTarget::RecipeScroll { .. } => ui_state.is_open,
+        });
+        if should_keep_briefly && *hide_grace > 0.0 {
+            *hide_grace = (*hide_grace - time.delta_secs()).max(0.0);
+            return;
+        }
         tip_node.display = Display::None;
         *last_target = None;
+        *hide_grace = 0.0;
         return;
     };
+    *hide_grace = 0.09;
 
     if let Ok(win) = q.window_q.single() {
         if let Some(cpos) = win.cursor_position() {
@@ -6058,16 +6073,19 @@ fn shop_hover_tooltip_system(
             let fee = items_cfg.recipe_fee(parent_item_id);
             commands.entity(tip_ent).with_children(|tip| {
                 tip.spawn((
+                    Pickable::IGNORE,
                     Text::new(format!("{} - Recipe", item.name)),
                     TextFont { font_size: FontSize::Px(13.0), ..default() },
                     TextColor(Color::srgb(1.0, 0.88, 0.42)),
                 ));
                 tip.spawn((
+                    Pickable::IGNORE,
                     Text::new(format!("Combine Fee: {} Gold  |  Total Item Cost: {} Gold", fee, item.cost)),
                     TextFont { font_size: FontSize::Px(11.0), ..default() },
                     TextColor(Color::srgb(0.95, 0.82, 0.32)),
                 ));
                 tip.spawn((
+                    Pickable::IGNORE,
                     Text::new("Click to pay the remaining combine cost once you own the required components (or buy the full item now)."),
                     TextFont { font_size: FontSize::Px(10.5), ..default() },
                     TextColor(Color::srgb(0.76, 0.82, 0.90)),
@@ -6087,21 +6105,22 @@ fn shop_hover_tooltip_system(
             let rec_fee = items_cfg.recipe_fee(item_id);
 
             commands.entity(tip_ent).with_children(|tip| {
-                tip.spawn(Node {
+                tip.spawn((Pickable::IGNORE, Node {
                     flex_direction: FlexDirection::Row,
                     column_gap: px(8.0),
                     align_items: AlignItems::Center,
                     ..default()
-                })
+                }))
                 .with_children(|hdr| {
                     spawn_item_icon_badge(hdr, &asset_server, &mut icon_cache, item, 34.0, 10.5);
-                    hdr.spawn(Node {
+                    hdr.spawn((Pickable::IGNORE, Node {
                         flex_direction: FlexDirection::Column,
                         row_gap: px(1.0),
                         ..default()
-                    })
+                    }))
                     .with_children(|t| {
                         t.spawn((
+                            Pickable::IGNORE,
                             Text::new(&item.name),
                             TextFont { font_size: FontSize::Px(13.0), ..default() },
                             TextColor(Color::WHITE),
@@ -6114,6 +6133,7 @@ fn shop_hover_tooltip_system(
                             format!("{} Gold | Sell: {}g", eff_cost, sell_val)
                         };
                         t.spawn((
+                            Pickable::IGNORE,
                             Text::new(sub),
                             TextFont { font_size: FontSize::Px(10.5), ..default() },
                             TextColor(Color::srgb(1.0, 0.84, 0.28)),
@@ -6124,6 +6144,7 @@ fn shop_hover_tooltip_system(
                 let (buffs, debuffs) = item.stats.split_buffs_and_debuffs();
                 for line in buffs {
                     tip.spawn((
+                        Pickable::IGNORE,
                         Text::new(line),
                         TextFont { font_size: FontSize::Px(11.0), ..default() },
                         TextColor(Color::srgb(0.42, 0.94, 0.62)),
@@ -6131,6 +6152,7 @@ fn shop_hover_tooltip_system(
                 }
                 for line in debuffs {
                     tip.spawn((
+                        Pickable::IGNORE,
                         Text::new(format!("{} [DEBUFF]", line)),
                         TextFont { font_size: FontSize::Px(11.0), ..default() },
                         TextColor(Color::srgb(0.96, 0.40, 0.38)),
@@ -6149,6 +6171,7 @@ fn shop_hover_tooltip_system(
                         ));
                         if !md.is_empty() {
                             tip.spawn((
+                                Pickable::IGNORE,
                                 Text::new(format!("    Debuff: {}", md.join(", "))),
                                 TextFont { font_size: FontSize::Px(10.0), ..default() },
                                 TextColor(Color::srgb(0.95, 0.42, 0.40)),
@@ -6159,6 +6182,7 @@ fn shop_hover_tooltip_system(
 
                 if !item.description.is_empty() {
                     tip.spawn((
+                        Pickable::IGNORE,
                         Text::new(&item.description),
                         TextFont { font_size: FontSize::Px(10.5), ..default() },
                         TextColor(Color::srgb(0.76, 0.82, 0.90)),
@@ -6172,6 +6196,7 @@ fn shop_hover_tooltip_system(
                         "Right-Click: Sell (in shop) | Drag onto Courier: Hand over"
                     };
                     tip.spawn((
+                        Pickable::IGNORE,
                         Text::new(hint),
                         TextFont { font_size: FontSize::Px(9.5), ..default() },
                         TextColor(Color::srgb(0.56, 0.72, 0.88)),

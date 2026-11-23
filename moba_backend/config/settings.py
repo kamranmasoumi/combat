@@ -91,11 +91,12 @@ CHANNEL_LAYERS = {
 }
 
 # تنظیمات Matchmaking و اجرای سرویس systemd سرور بازی
-MATCHMAKING_PLAYERS_PER_MATCH = int(os.environ.get("MATCHMAKING_PLAYERS_PER_MATCH", "1"))
-GAME_SERVER_HOST = os.environ.get("GAME_SERVER_HOST", "172.21.13.50")
+MATCHMAKING_PLAYERS_PER_MATCH = int(os.environ.get("MATCHMAKING_PLAYERS_PER_MATCH", "10"))
+GAME_SERVER_HOST = os.environ.get("GAME_SERVER_HOST", "46.245.72.142")
 GAME_SERVER_PORT_START = int(os.environ.get("GAME_SERVER_PORT_START", "4433"))
 GAME_SERVER_PORT_END = int(os.environ.get("GAME_SERVER_PORT_END", "4550"))
 GAME_SERVER_SERVICE_NAME = os.environ.get("GAME_SERVER_SERVICE_NAME", "moba-server")
+INTERNAL_WEBHOOK_SECRET = os.environ.get("INTERNAL_WEBHOOK_SECRET", "simorgh-internal-webhook-secret-2026")
 
 LANGUAGE_CODE = "fa-ir"
 TIME_ZONE = "Asia/Tehran"

@@ -36,11 +36,18 @@ from .models import (
 
 def _is_internal_webhook_authorized(request: HttpRequest) -> bool:
     configured_secret = str(getattr(settings, "INTERNAL_WEBHOOK_SECRET", "") or "").strip()
-    if configured_secret:
-        provided = str(request.headers.get("X-Internal-Secret", "") or "").strip()
-        return bool(provided) and hmac.compare_digest(provided, configured_secret)
+    provided = str(request.headers.get("X-Internal-Secret", "") or "").strip()
+    if configured_secret and provided and hmac.compare_digest(provided, configured_secret):
+        return True
     remote_addr = str(request.META.get("REMOTE_ADDR", "") or "").strip()
-    return remote_addr in ("127.0.0.1", "::1", "localhost")
+    game_host = str(getattr(settings, "GAME_SERVER_HOST", "") or "").strip()
+    allowed_ips = {"127.0.0.1", "::1", "localhost"}
+    if game_host:
+        allowed_ips.add(game_host)
+    if remote_addr in allowed_ips:
+        return True
+    forwarded_for = str(request.META.get("HTTP_X_FORWARDED_FOR", "") or "").split(",")[0].strip()
+    return bool(forwarded_for and forwarded_for in allowed_ips)
 
 
 def _parse_json_body(request: HttpRequest) -> dict:
@@ -468,6 +475,8 @@ def match_history_view(request: HttpRequest) -> JsonResponse:
             outcome = "running"
         elif room.winner_team in (1, 2):
             outcome = "win" if part.team_id == room.winner_team else "loss"
+        elif room.status == GameMatchRoom.STATUS_FINISHED:
+            outcome = "win" if part.is_winner else "loss"
         else:
             outcome = "canceled"
 

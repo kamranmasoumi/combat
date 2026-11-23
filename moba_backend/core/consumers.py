@@ -507,11 +507,27 @@ def _cleanup_finished_processes() -> None:
         if not is_udp_port_bound(port) and not is_systemd_unit_active(unit_name):
             dead_ports.append(port)
 
+    now = timezone.now()
     for port in dead_ports:
         _ACTIVE_SERVICE_UNITS.pop(port, None)
-        GameMatchRoom.objects.filter(
-            server_port=port, status=GameMatchRoom.STATUS_RUNNING
-        ).update(status=GameMatchRoom.STATUS_FINISHED)
+        dead_room_ids = list(
+            GameMatchRoom.objects.filter(
+                server_port=port, status=GameMatchRoom.STATUS_RUNNING
+            ).values_list("id", flat=True)
+        )
+        if dead_room_ids:
+            GameMatchRoom.objects.filter(id__in=dead_room_ids).update(
+                status=GameMatchRoom.STATUS_FINISHED,
+                finished_at=now,
+            )
+            MatchParticipant.objects.filter(
+                match_room_id__in=dead_room_ids,
+                status__in=[
+                    MatchParticipant.STATUS_ASSIGNED,
+                    MatchParticipant.STATUS_CONNECTED,
+                    MatchParticipant.STATUS_DISCONNECTED,
+                ],
+            ).update(status=MatchParticipant.STATUS_COMPLETED, left_at=now)
 
 
 def find_available_udp_port() -> int:
@@ -674,6 +690,19 @@ def get_active_match_for_player(player: Player, client_ip: Optional[str] = None)
     now = timezone.now()
     for part in participants:
         room = part.match_room
+        if room.finished_at is not None or room.winner_team in (1, 2):
+            if room.status == GameMatchRoom.STATUS_RUNNING:
+                room.status = GameMatchRoom.STATUS_FINISHED
+                room.finished_at = room.finished_at or now
+                room.save(update_fields=["status", "finished_at"])
+            if part.status not in (
+                MatchParticipant.STATUS_ABANDONED,
+                MatchParticipant.STATUS_COMPLETED,
+            ):
+                part.status = MatchParticipant.STATUS_COMPLETED
+                part.left_at = part.left_at or now
+                part.save(update_fields=["status", "left_at"])
+            continue
         port = room.server_port
         unit_name = _ACTIVE_SERVICE_UNITS.get(port) or get_game_server_unit_name(
             port, room.room_id, room.max_players
@@ -708,10 +737,18 @@ def get_active_match_for_player(player: Player, client_ip: Optional[str] = None)
                 "game_link": game_link,
             }
         else:
-            # سرور بازی دیگر روی این پورت فعال نیست؛ وضعیت اتاق را در دیتابیس پایان یافته ثبت کن
+            # سرور بازی دیگر روی این پورت فعال نیست؛ وضعیت اتاق و بازیکنان را در دیتابیس پایان یافته ثبت کن
             room.status = GameMatchRoom.STATUS_FINISHED
             room.finished_at = now
             room.save(update_fields=["status", "finished_at"])
+            MatchParticipant.objects.filter(
+                match_room=room,
+                status__in=[
+                    MatchParticipant.STATUS_ASSIGNED,
+                    MatchParticipant.STATUS_CONNECTED,
+                    MatchParticipant.STATUS_DISCONNECTED,
+                ],
+            ).update(status=MatchParticipant.STATUS_COMPLETED, left_at=now)
 
     return None
 
@@ -1168,14 +1205,24 @@ def record_match_result_from_server(data: dict) -> dict:
 
             part.save()
 
-    # زمان‌بندی توقف سرویس systemd و Kill پروسه لوپ بازی پس از ۵.۵ ثانیه (فقط در اولین ثبت نتیجه)
+    # برگرداندن وضعیت آنلاین بازیکنان از in_match به online در Redis
+    try:
+        for part in participants:
+            usess = _ONLINE_USERS.get(part.player.user_id)
+            if usess and usess.status == "in_match":
+                usess.status = "online"
+                _ONLINE_USERS[part.player.user_id] = usess
+    except Exception:
+        pass
+
+    # زمان‌بندی توقف سرویس systemd و Kill پروسه لوپ بازی پس از ۱۰.۵ ثانیه (متناسب با افزایش ۴ ثانیه‌ای شمارش معکوس پایان بازی)
     if not already_finished:
         _schedule_server_termination(
             port=room.server_port,
             room_id=room.room_id,
             player_count=room.max_players,
             process_pid=room.process_pid,
-            delay_sec=5.5,
+            delay_sec=10.5,
         )
         print(
             f"[MATCH RESULT SAVED] Room: {room.room_id} | Winner Team: {winner_team} | Duration: {duration_sec}s | Updated Players: {updated_players}",

@@ -279,6 +279,7 @@ impl Plugin for ClientUpdaterPlugin {
                     poll_updater_events_system,
                     updater_overlay_interaction_system,
                     rebuild_updater_ui_system,
+                    animate_coordinator_banner_system,
                 )
                     .chain(),
             );
@@ -287,6 +288,18 @@ impl Plugin for ClientUpdaterPlugin {
 
 #[derive(Component)]
 struct CoordinatorBannerRoot;
+
+#[derive(Component)]
+struct CoordinatorPulseDot;
+
+#[derive(Component)]
+struct CoordinatorScannerFill;
+
+#[derive(Component)]
+struct CoordinatorLoadingText;
+
+#[derive(Component)]
+struct VersionWatermarkRoot;
 
 #[derive(Component)]
 struct UpdaterModalRoot;
@@ -546,12 +559,42 @@ fn updater_overlay_interaction_system(
     }
 }
 
+fn animate_coordinator_banner_system(
+    time: Res<Time>,
+    mut dot_q: Query<&mut BackgroundColor, With<CoordinatorPulseDot>>,
+    mut scan_q: Query<&mut Node, With<CoordinatorScannerFill>>,
+    mut txt_q: Query<&mut Text, With<CoordinatorLoadingText>>,
+) {
+    let t = time.elapsed_secs();
+    let pulse = 0.45 + 0.55 * (t * 4.5).sin().abs();
+    for mut bg in &mut dot_q {
+        bg.0 = Color::srgba(1.0, 0.36 + 0.45 * pulse, 0.34 + 0.40 * pulse, 0.55 + 0.45 * pulse);
+    }
+    // حرکت رفت‌وبرگشتی نرم نوار اسکنر لودینگ مفهومی (بین ۰ تا ۷۲ درصد عرض)
+    let sweep = 0.5 - 0.5 * (t * 2.4).cos();
+    for mut node in &mut scan_q {
+        node.left = Val::Percent(sweep * 72.0);
+    }
+    let dots = match ((t * 2.2) as usize) % 4 {
+        0 => "SYNCING WITH GAME COORDINATOR",
+        1 => "SYNCING WITH GAME COORDINATOR.",
+        2 => "SYNCING WITH GAME COORDINATOR..",
+        _ => "SYNCING WITH GAME COORDINATOR...",
+    };
+    for mut txt in &mut txt_q {
+        if txt.0 != dots {
+            txt.0 = dots.to_string();
+        }
+    }
+}
+
 fn rebuild_updater_ui_system(
     mut commands: Commands,
     screen: Res<State<AppScreenState>>,
     pregame: Option<Res<PreGameSessionState>>,
     mut updater: ResMut<ClientUpdaterState>,
     banner_q: Query<Entity, With<CoordinatorBannerRoot>>,
+    watermark_q: Query<Entity, With<VersionWatermarkRoot>>,
     modal_q: Query<Entity, With<UpdaterModalRoot>>,
 ) {
     let in_game = *screen.get() == AppScreenState::InGame;
@@ -561,20 +604,19 @@ fn rebuild_updater_ui_system(
 
     if in_game {
         // در میانه نبرد هیچ‌گونه مودال مسدودکننده‌ای نمایش داده نمی‌شود
-        if !modal_q.is_empty() {
-            for e in &modal_q {
-                commands.entity(e).despawn();
-            }
+        for e in &modal_q {
+            commands.entity(e).despawn();
         }
-        if !banner_q.is_empty() {
-            for e in &banner_q {
-                commands.entity(e).despawn();
-            }
+        for e in &banner_q {
+            commands.entity(e).despawn();
+        }
+        for e in &watermark_q {
+            commands.entity(e).despawn();
         }
         return;
     }
 
-    if !updater.ui_dirty && (!banner_q.is_empty() || !modal_q.is_empty() || !updater.has_newer_patch() && updater.coordinator_mode == "online" && updater.stage == UpdateStage::Idle) {
+    if !updater.ui_dirty && !watermark_q.is_empty() {
         return;
     }
     updater.ui_dirty = false;
@@ -582,77 +624,217 @@ fn rebuild_updater_ui_system(
     for e in &banner_q {
         commands.entity(e).despawn();
     }
+    for e in &watermark_q {
+        commands.entity(e).despawn();
+    }
     for e in &modal_q {
         commands.entity(e).despawn();
     }
 
-    // ۱. بنر بالای صفحه Game Coordinator (مشابه بنر آبی/نارنجی Dota 2)
-    let show_coord_banner =
-        updater.coordinator_mode != "online" || updater.block_matchmaking || (updater.has_newer_patch() && has_active_ranked_match);
+    // ۰. نمایش ظریف نسخه فعلی اپلیکیشن و شماره پچ در گوشه پایین سمت چپ
+    let mut ver_label = format!("v{}  •  Patch #{}", updater.local_version, updater.local_build);
+    if updater.coordinator_mode != "online" {
+        ver_label.push_str("  •  COORDINATOR UPDATING");
+    } else if let Some(ref p) = updater.latest_patch {
+        if p.build_number > updater.local_build {
+            ver_label.push_str(&format!("  •  Update v{} (#{}) ready", p.version, p.build_number));
+        }
+    }
+    commands
+        .spawn((
+            VersionWatermarkRoot,
+            Pickable::IGNORE,
+            GlobalZIndex(250),
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(10.0),
+                left: Val::Px(14.0),
+                padding: UiRect::axes(Val::Px(9.0), Val::Px(4.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.05, 0.06, 0.09, 0.74)),
+            BorderColor::all(Color::srgba(0.28, 0.34, 0.42, 0.55)),
+        ))
+        .with_children(|wm| {
+            wm.spawn((
+                Text::new(ver_label),
+                TextFont {
+                    font_size: FontSize::Px(10.5),
+                    ..default()
+                },
+                TextColor(if updater.coordinator_mode != "online" {
+                    Color::srgb(0.98, 0.52, 0.48)
+                } else {
+                    Color::srgba(0.76, 0.82, 0.88, 0.88)
+                }),
+            ));
+        });
+
+    // ۱. بنر قرمز چشم‌گیر Game Coordinator با لودینگ مفهومی انیمیشنی (مشابه Dota 2)
+    let show_coord_banner = updater.coordinator_mode != "online"
+        || updater.block_matchmaking
+        || (updater.has_newer_patch() && has_active_ranked_match);
     if show_coord_banner {
-        let (bg_col, border_col, text_msg) = if updater.coordinator_mode != "online" {
+        let is_coord_red = updater.coordinator_mode != "online" || updater.block_matchmaking;
+        let (bg_col, border_col, badge_bg, badge_txt, headline_msg, show_loader) = if is_coord_red {
+            let badge = if updater.coordinator_mode == "maintenance" {
+                "MAINTENANCE"
+            } else {
+                "COORDINATOR UPDATING"
+            };
             let msg = if updater.banner_message.is_empty() {
-                "GAME COORDINATOR IS UPDATING — Matchmaking is paused. Active ranked matches are unaffected."
+                "Game Coordinator is currently updating — Matchmaking is paused. Active ranked matches are unaffected."
                     .to_string()
             } else {
                 updater.banner_message.clone()
             };
             (
-                Color::srgba(0.11, 0.24, 0.42, 0.96),
-                Color::srgb(0.32, 0.68, 0.96),
+                Color::srgba(0.42, 0.06, 0.08, 0.96),
+                Color::srgb(0.96, 0.28, 0.26),
+                Color::srgb(0.76, 0.14, 0.16),
+                badge,
                 msg,
+                true,
             )
-        } else if has_active_ranked_match && updater.has_newer_patch() {
+        } else {
             let v = updater
                 .latest_patch
                 .as_ref()
                 .map(|p| p.version.as_str())
                 .unwrap_or("new");
             (
-                Color::srgba(0.36, 0.24, 0.07, 0.96),
-                Color::srgb(0.95, 0.72, 0.24),
+                Color::srgba(0.38, 0.22, 0.06, 0.96),
+                Color::srgb(0.96, 0.72, 0.24),
+                Color::srgb(0.68, 0.42, 0.08),
+                "PATCH READY",
                 format!(
-                    "PATCH v{} READY — Reconnect and finish your active ranked match first; update will install afterward.",
+                    "Patch v{} is ready — Reconnect and finish your active ranked match first; update will install afterward.",
                     v
                 ),
-            )
-        } else {
-            (
-                Color::srgba(0.32, 0.14, 0.14, 0.96),
-                Color::srgb(0.88, 0.36, 0.32),
-                "Matchmaking temporarily paused by Game Coordinator.".to_string(),
+                false,
             )
         };
 
         commands
             .spawn((
                 CoordinatorBannerRoot,
-                GlobalZIndex(260),
+                GlobalZIndex(265),
                 Node {
                     position_type: PositionType::Absolute,
-                    top: Val::Px(8.0),
-                    left: Val::Percent(18.0),
-                    right: Val::Percent(18.0),
-                    min_height: Val::Px(36.0),
-                    padding: UiRect::axes(Val::Px(16.0), Val::Px(8.0)),
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    border: UiRect::all(Val::Px(1.5)),
-                    border_radius: BorderRadius::all(Val::Px(5.0)),
+                    top: Val::Px(10.0),
+                    left: Val::Percent(16.0),
+                    right: Val::Percent(16.0),
+                    padding: UiRect::axes(Val::Px(18.0), Val::Px(10.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(7.0),
+                    border: UiRect::all(Val::Px(1.8)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
                     ..default()
                 },
                 BackgroundColor(bg_col),
                 BorderColor::all(border_col),
             ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new(text_msg),
-                    TextFont {
-                        font_size: FontSize::Px(13.0),
+            .with_children(|banner| {
+                // ردیف بالا: نقطه چشمک‌زن + برچسب وضعیت قرمز + متن اصلی
+                banner
+                    .spawn(Node {
+                        width: Val::Percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        column_gap: Val::Px(10.0),
                         ..default()
-                    },
-                    TextColor(Color::srgb(0.96, 0.98, 1.0)),
-                ));
+                    })
+                    .with_children(|row| {
+                        if show_loader {
+                            row.spawn((
+                                CoordinatorPulseDot,
+                                Node {
+                                    width: Val::Px(10.0),
+                                    height: Val::Px(10.0),
+                                    border_radius: BorderRadius::MAX,
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(1.0, 0.42, 0.38)),
+                            ));
+                        }
+                        row.spawn((
+                            Node {
+                                padding: UiRect::axes(Val::Px(8.0), Val::Px(3.0)),
+                                border_radius: BorderRadius::all(Val::Px(3.0)),
+                                ..default()
+                            },
+                            BackgroundColor(badge_bg),
+                        ))
+                        .with_children(|bdg| {
+                            bdg.spawn((
+                                Text::new(badge_txt),
+                                TextFont {
+                                    font_size: FontSize::Px(11.0),
+                                    ..default()
+                                },
+                                TextColor(Color::WHITE),
+                            ));
+                        });
+                        row.spawn((
+                            Text::new(headline_msg),
+                            TextFont {
+                                font_size: FontSize::Px(13.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(1.0, 0.94, 0.94)),
+                        ));
+                    });
+
+                // ردیف پایین (در حالت Coordinator Updating): لودینگ مفهومی با نوار اسکنر متحرک
+                if show_loader {
+                    banner
+                        .spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(10.0),
+                            ..default()
+                        })
+                        .with_children(|lrow| {
+                            lrow.spawn((
+                                CoordinatorLoadingText,
+                                Text::new("SYNCING WITH GAME COORDINATOR..."),
+                                TextFont {
+                                    font_size: FontSize::Px(10.5),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(1.0, 0.78, 0.76)),
+                            ));
+                            lrow.spawn((
+                                Node {
+                                    flex_grow: 1.0,
+                                    height: Val::Px(6.0),
+                                    overflow: Overflow::clip(),
+                                    border_radius: BorderRadius::all(Val::Px(3.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.16, 0.02, 0.03, 0.90)),
+                            ))
+                            .with_children(|track| {
+                                track.spawn((
+                                    CoordinatorScannerFill,
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        left: Val::Percent(0.0),
+                                        top: Val::Px(0.0),
+                                        width: Val::Percent(28.0),
+                                        height: Val::Percent(100.0),
+                                        border_radius: BorderRadius::all(Val::Px(3.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgb(1.0, 0.38, 0.34)),
+                                ));
+                            });
+                        });
+                }
             });
     }
 

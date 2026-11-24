@@ -7,10 +7,13 @@ use crate::{
 };
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 // =============================================================================
-// مدل‌های داده و اجرای دستورات Demo Hero (چند-هیرویی با کنترل کامل هر اسلات)
+// مدل‌های داده و اجرای دستورات Demo Hero (چند-هیرویی با کنترل کامل، گلد بی‌نهایت و حفظ دستورات)
 // =============================================================================
+
+pub const DEMO_INFINITE_GOLD: u32 = 99_999;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DummyBehavior {
@@ -34,17 +37,37 @@ pub enum DemoCommand {
     MaxLevel,
     AddGold { amount: u32 },
     RefreshHero,
+    RefreshCooldownsOnly,
+    RefreshHealthOnly,
     SetFreeCooldowns(bool),
     /// تغییر هیروی اسلاتی که الان در کنترل بازیکن است
     SwitchOwnHero { hero_id: String },
     /// اسپاون یک هیروی جدید در تیم دلخواه (Dawn یا Dusk) تا سقف ۱۰ هیرو (۵v۵)
     SpawnHero { team: TeamId, hero_id: String },
+    /// اسپاون یک هیروی Dummy دشمن درست روبه‌روی هیروی تحت کنترل
+    SpawnDummy { hero_id: String },
     /// انتقال کامل کنترل بازیکن (حرکت، تیراندازی، شاپ، دوربین و HUD) به اسلات مشخص‌شده
     ControlSlot { slot_index: usize },
     /// جابه‌جایی چرخشی کنترل به هیروی بعدی در زمین
     CycleControlSlot,
+    /// حذف هیروی تحت کنترل (در صورتی که اسلات ۰ نباشد)
+    RemoveControlledHero,
     /// حذف هیروهای اضافی و بازگشت به حالت پایه ۱v۱
     RemoveExtraHeroes,
+    /// بازنشانی کامل هیروی تحت کنترل (لول ۱، بدون آیتم، جان و مهمات کامل)
+    ResetControlledHero,
+    /// فعال/غیرفعال‌سازی آسیب‌ناپذیری (Invulnerable) برای هیروی تحت کنترل
+    ToggleInvulnerable,
+    /// جابه‌جایی تیم هیروی تحت کنترل (Dawn <-> Dusk)
+    SwapControlledTeam,
+    /// ثبت یا لغو دستور حرکت پایدار برای هر اسلات (با تعویض کنترل لغو نمی‌شود)
+    SetSlotMoveTarget { slot_index: usize, target: Option<Vec3> },
+    /// فعال/غیرفعال‌سازی اسپاون سربازان لاین
+    SetCreepsEnabled(bool),
+    /// فعال/غیرفعال‌سازی تاورها
+    SetTowersEnabled(bool),
+    /// توقف موقت / ادامه شبیه‌سازی دمو
+    SetPaused(bool),
     /// احضار همه هیروهای غیرکنترلی کنار هیروی فعلی
     RespawnDummiesNearPlayer,
     SetDummyBehavior(DummyBehavior),
@@ -65,6 +88,11 @@ pub struct DemoSharedFlags {
     pub free_cooldowns: bool,
     pub dummy_behavior: DummyBehavior,
     pub controlled_slot: usize,
+    pub paused: bool,
+    pub creeps_enabled: bool,
+    pub towers_enabled: bool,
+    pub slot_invulnerable: HashSet<usize>,
+    pub slot_move_targets: HashMap<usize, Vec3>,
 }
 
 impl Default for DemoSharedFlags {
@@ -73,6 +101,11 @@ impl Default for DemoSharedFlags {
             free_cooldowns: false,
             dummy_behavior: DummyBehavior::Idle,
             controlled_slot: 0,
+            paused: false,
+            creeps_enabled: true,
+            towers_enabled: true,
+            slot_invulnerable: HashSet::new(),
+            slot_move_targets: HashMap::new(),
         }
     }
 }
@@ -89,8 +122,29 @@ pub fn find_canyon_water_point(config: &GameConfig) -> Vec3 {
 pub fn step_demo_dummy_ai_and_rules(
     config: &GameConfig,
     world: &mut AuthoritativeWorldState,
-    flags: &DemoSharedFlags,
+    flags: &mut DemoSharedFlags,
 ) {
+    // گلد بی‌نهایت برای تمام هیروها در حالت Demo Hero
+    for p in &mut world.players {
+        if p.hero_gold < DEMO_INFINITE_GOLD {
+            p.hero_gold = DEMO_INFINITE_GOLD;
+        }
+    }
+
+    // اعمال آسیب‌ناپذیری (INVULN) روی اسلات‌های انتخاب‌شده
+    for &inv_slot in &flags.slot_invulnerable {
+        if let Some(p) = world.players.get_mut(inv_slot) {
+            p.is_dead = false;
+            p.respawn_remaining = 0.0;
+            p.hero_hp = p.hero_max_hp;
+        }
+    }
+
+    // اگر سربازان غیرفعال باشند، زمان موج بعدی را عقب بینداز
+    if !flags.creeps_enabled {
+        world.next_wave_time_secs = world.match_elapsed_secs + 9999.0;
+    }
+
     let ctrl = flags.controlled_slot.min(world.players.len().saturating_sub(1));
 
     if flags.free_cooldowns {
@@ -117,6 +171,7 @@ pub fn step_demo_dummy_ai_and_rules(
     let ctrl_team = world.players[ctrl].hero_team;
     let water_target = find_canyon_water_point(config);
 
+    let mut arrived_slots: Vec<usize> = Vec::new();
     let total_players = world.players.len();
     for slot_idx in 0..total_players {
         if slot_idx == ctrl {
@@ -150,47 +205,68 @@ pub fn step_demo_dummy_ai_and_rules(
             client_muzzle_world_pos: None,
         };
 
-        match flags.dummy_behavior {
-            DummyBehavior::Idle => {}
-            DummyBehavior::AttackPlayer => {
-                // فقط هیروهای تیم دشمن به هیروی تحت کنترل حمله می‌کنند
-                if !ctrl_dead && d_team != ctrl_team {
-                    let target_pt = ctrl_pos + Vec3::Y * 0.9;
-                    let ray_origin = d_pos + Vec3::Y * 1.2;
-                    let to_ctrl = target_pt - ray_origin;
-                    let dist = to_ctrl.length();
-                    if dist > 0.05 {
-                        cmd.aim_ray_origin = ray_origin;
-                        cmd.aim_ray_dir = to_ctrl / dist;
-                        cmd.has_aim_ray = true;
-                    }
-                    if dist <= max_r * 0.95 {
-                        cmd.fire_held = true;
-                        cmd.fire_just_pressed = world.tick % 6 == 0;
-                    } else {
-                        let flat =
-                            Vec3::new(ctrl_pos.x - d_pos.x, 0.0, ctrl_pos.z - d_pos.z)
+        // اولویت ۱: اگر بازیکن قبلاً به این هیرو دستور حرکت (کلیک روی زمین/مینی‌مپ) داده، تا رسیدن به مقصد ادامه دهد
+        let mut executing_player_order = false;
+        if let Some(&move_target) = flags.slot_move_targets.get(&slot_idx) {
+            let flat = Vec3::new(move_target.x - d_pos.x, 0.0, move_target.z - d_pos.z);
+            if flat.length() <= 0.55 {
+                arrived_slots.push(slot_idx);
+            } else {
+                let dir = flat.normalize_or_zero();
+                cmd.move_input = dir;
+                cmd.aim_ray_origin = d_pos + Vec3::Y * 1.2;
+                cmd.aim_ray_dir = dir;
+                cmd.has_aim_ray = true;
+                executing_player_order = true;
+            }
+        }
+
+        if !executing_player_order {
+            match flags.dummy_behavior {
+                DummyBehavior::Idle => {}
+                DummyBehavior::AttackPlayer => {
+                    // فقط هیروهای تیم دشمن به هیروی تحت کنترل حمله می‌کنند
+                    if !ctrl_dead && d_team != ctrl_team {
+                        let target_pt = ctrl_pos + Vec3::Y * 0.9;
+                        let ray_origin = d_pos + Vec3::Y * 1.2;
+                        let to_ctrl = target_pt - ray_origin;
+                        let dist = to_ctrl.length();
+                        if dist > 0.05 {
+                            cmd.aim_ray_origin = ray_origin;
+                            cmd.aim_ray_dir = to_ctrl / dist;
+                            cmd.has_aim_ray = true;
+                        }
+                        if dist <= max_r * 0.95 {
+                            cmd.fire_held = true;
+                            cmd.fire_just_pressed = world.tick % 6 == 0;
+                        } else {
+                            let flat = Vec3::new(ctrl_pos.x - d_pos.x, 0.0, ctrl_pos.z - d_pos.z)
                                 .normalize_or_zero();
-                        cmd.move_input = flat;
+                            cmd.move_input = flat;
+                        }
                     }
                 }
-            }
-            DummyBehavior::SwimInWater => {
-                if d_team != ctrl_team {
-                    let flat =
-                        Vec3::new(water_target.x - d_pos.x, 0.0, water_target.z - d_pos.z);
-                    if flat.length() > 1.8 {
-                        let dir = flat.normalize_or_zero();
-                        cmd.move_input = dir;
-                        cmd.aim_ray_origin = d_pos + Vec3::Y * 1.2;
-                        cmd.aim_ray_dir = dir;
-                        cmd.has_aim_ray = true;
+                DummyBehavior::SwimInWater => {
+                    if d_team != ctrl_team {
+                        let flat =
+                            Vec3::new(water_target.x - d_pos.x, 0.0, water_target.z - d_pos.z);
+                        if flat.length() > 1.8 {
+                            let dir = flat.normalize_or_zero();
+                            cmd.move_input = dir;
+                            cmd.aim_ray_origin = d_pos + Vec3::Y * 1.2;
+                            cmd.aim_ray_dir = dir;
+                            cmd.has_aim_ray = true;
+                        }
                     }
                 }
             }
         }
 
         world.set_slot_input(slot_idx, cmd);
+    }
+
+    for s in arrived_slots {
+        flags.slot_move_targets.remove(&s);
     }
 }
 
@@ -267,8 +343,8 @@ pub fn execute_demo_command(
                 let max_lv = config.combat.xp_thresholds_per_level.len().min(25) as u32;
                 let target = (pc.hero_level + levels).min(max_lv);
                 while pc.hero_level < target {
-                    let idx =
-                        (pc.hero_level as usize).min(config.combat.xp_thresholds_per_level.len() - 1);
+                    let idx = (pc.hero_level as usize)
+                        .min(config.combat.xp_thresholds_per_level.len() - 1);
                     let threshold = config.combat.xp_thresholds_per_level[idx];
                     let xp_needed = threshold.saturating_sub(pc.hero_xp).max(1);
                     grant_xp_to_player_slot(
@@ -285,8 +361,8 @@ pub fn execute_demo_command(
             if let Some(pc) = world.players.get_mut(ctrl) {
                 let max_lv = config.combat.xp_thresholds_per_level.len().min(25) as u32;
                 while pc.hero_level < max_lv {
-                    let idx =
-                        (pc.hero_level as usize).min(config.combat.xp_thresholds_per_level.len() - 1);
+                    let idx = (pc.hero_level as usize)
+                        .min(config.combat.xp_thresholds_per_level.len() - 1);
                     let threshold = config.combat.xp_thresholds_per_level[idx];
                     let xp_needed = threshold.saturating_sub(pc.hero_xp).max(1);
                     grant_xp_to_player_slot(
@@ -301,7 +377,7 @@ pub fn execute_demo_command(
         }
         DemoCommand::AddGold { amount } => {
             if let Some(pc) = world.players.get_mut(ctrl) {
-                pc.hero_gold = pc.hero_gold.saturating_add(amount);
+                pc.hero_gold = pc.hero_gold.saturating_add(amount).max(DEMO_INFINITE_GOLD);
             }
         }
         DemoCommand::RefreshHero => {
@@ -327,6 +403,35 @@ pub fn execute_demo_command(
                 pc.grenade_recharge_remaining = 0.0;
                 pc.beam_charge = pc.hero_weapon.beam_max_charge;
                 pc.ammo_in_mag = pc.hero_weapon.magazine_size;
+            }
+        }
+        DemoCommand::RefreshCooldownsOnly => {
+            for pc in &mut world.players {
+                pc.teleport_cooldown_remaining = 0.0;
+                pc.shadow_blade_cooldown_remaining = 0.0;
+                pc.reflect_armor_cooldown_remaining = 0.0;
+                pc.bullet_immunity_cooldown_remaining = 0.0;
+                pc.null_pulse_cooldown_remaining = 0.0;
+                pc.sonar_reveal_cooldown_remaining = 0.0;
+                pc.kinetic_dash_cooldown_remaining = 0.0;
+                pc.grenade_charges = pc.hero_grenade.max_charges;
+                pc.grenade_recharge_remaining = 0.0;
+                pc.beam_charge = pc.hero_weapon.beam_max_charge;
+                pc.ammo_in_mag = pc.hero_weapon.magazine_size;
+            }
+        }
+        DemoCommand::RefreshHealthOnly => {
+            for pc in &mut world.players {
+                pc.is_dead = false;
+                pc.respawn_remaining = 0.0;
+                pc.hero_hp = pc.hero_max_hp;
+                pc.hero_stamina = pc.hero_max_stamina;
+                pc.cryo_debuff_remaining = 0.0;
+                pc.cryo_slow_ratio = 0.0;
+                pc.cryo_heal_reduction_ratio = 0.0;
+                pc.null_mute_remaining = 0.0;
+                pc.flame_armor_debuff_remaining = 0.0;
+                pc.electric_fire_rate_slow_remaining = 0.0;
             }
         }
         DemoCommand::SetFreeCooldowns(enabled) => {
@@ -375,7 +480,56 @@ pub fn execute_demo_command(
             match_state.dirty = true;
             world.spawn_single_player_slot(config, &lp, spawn_pos, commands);
             if let Some(new_p) = world.players.get_mut(new_slot) {
-                new_p.hero_gold = 10_000;
+                new_p.hero_gold = DEMO_INFINITE_GOLD;
+                new_p.is_disconnected = false;
+            }
+        }
+        DemoCommand::SpawnDummy { hero_id } => {
+            if world.players.len() >= 10 {
+                return;
+            }
+            let valid_hero_id = if config.heroes.iter().any(|h| h.id == hero_id) {
+                hero_id
+            } else {
+                config.heroes[0].id.clone()
+            };
+            let new_slot = world.players.len();
+            let base_pos = world
+                .players
+                .get(ctrl)
+                .map(|p| p.soldier_pos)
+                .unwrap_or(Vec3::new(0.0, 0.2, 0.0));
+            let fwd = world
+                .players
+                .get(ctrl)
+                .map(|p| Vec3::new(p.aim_world_dir.x, 0.0, p.aim_world_dir.z).normalize_or_zero())
+                .unwrap_or(Vec3::X);
+            let dir = if fwd.length_squared() > 0.01 {
+                fwd
+            } else {
+                Vec3::X
+            };
+            let spawn_pos = base_pos + dir * 8.5;
+            let enemy_team = if world.players[ctrl].hero_team == TeamId::Dawn {
+                TeamId::Dusk
+            } else {
+                TeamId::Dawn
+            };
+            let lp = LobbyPlayerInfo {
+                slot_index: new_slot,
+                client_id: None,
+                user_id: Some(format!("demo_dummy_{}", new_slot)),
+                team: enemy_team,
+                connected: true,
+                selected_hero_id: Some(valid_hero_id),
+                map_loaded: true,
+            };
+            match_state.players.push(lp.clone());
+            match_state.required_players = match_state.players.len();
+            match_state.dirty = true;
+            world.spawn_single_player_slot(config, &lp, spawn_pos, commands);
+            if let Some(new_p) = world.players.get_mut(new_slot) {
+                new_p.hero_gold = DEMO_INFINITE_GOLD;
                 new_p.is_disconnected = false;
             }
         }
@@ -391,8 +545,43 @@ pub fn execute_demo_command(
                 match_state.dirty = true;
             }
         }
+        DemoCommand::RemoveControlledHero => {
+            // پاک‌سازی دقیق فیزیک در demo_client.rs انجام می‌شود؛ اینجا فقط اگر اسلات > 0 بود حذف می‌کنیم
+            if ctrl > 0 && ctrl < world.players.len() {
+                world.players.remove(ctrl);
+                if ctrl < match_state.players.len() {
+                    match_state.players.remove(ctrl);
+                }
+                for (idx, lp) in match_state.players.iter_mut().enumerate() {
+                    lp.slot_index = idx;
+                }
+                match_state.required_players = match_state.players.len();
+                match_state.dirty = true;
+
+                // بازنگاشت کلیدهای slot_invulnerable و slot_move_targets بعد از حذف اسلات میانی
+                let mut new_inv = HashSet::new();
+                for &s in &flags.slot_invulnerable {
+                    if s < ctrl {
+                        new_inv.insert(s);
+                    } else if s > ctrl {
+                        new_inv.insert(s - 1);
+                    }
+                }
+                flags.slot_invulnerable = new_inv;
+
+                let mut new_targets = HashMap::new();
+                for (&s, &pos) in &flags.slot_move_targets {
+                    if s < ctrl {
+                        new_targets.insert(s, pos);
+                    } else if s > ctrl {
+                        new_targets.insert(s - 1, pos);
+                    }
+                }
+                flags.slot_move_targets = new_targets;
+                flags.controlled_slot = 0;
+            }
+        }
         DemoCommand::RemoveExtraHeroes => {
-            // کنترل را به اسلات ۰ برگردان؛ پاک‌سازی فیزیک در demo_client.rs انجام می‌شود
             flags.controlled_slot = 0;
             if world.players.len() > 2 {
                 world.players.truncate(2);
@@ -400,6 +589,99 @@ pub fn execute_demo_command(
                 match_state.required_players = match_state.players.len();
                 match_state.dirty = true;
             }
+            flags.slot_invulnerable.retain(|&s| s < 2);
+            flags.slot_move_targets.retain(|&s, _| s < 2);
+        }
+        DemoCommand::ResetControlledHero => {
+            if let Some(pc) = world.players.get_mut(ctrl) {
+                pc.hero_level = 1;
+                pc.hero_xp = 0;
+                pc.inventory.clear();
+                pc.stash.clear();
+                pc.hero_gold = DEMO_INFINITE_GOLD;
+                pc.is_dead = false;
+                pc.respawn_remaining = 0.0;
+                pc.soldier_pos = pc.spawn_pos;
+                pc.traversal.is_active = false;
+                pc.wall_climb_mountain_index = None;
+                pc.teleport_cooldown_remaining = 0.0;
+                pc.shadow_blade_cooldown_remaining = 0.0;
+                pc.reflect_armor_cooldown_remaining = 0.0;
+                pc.bullet_immunity_cooldown_remaining = 0.0;
+                pc.null_pulse_cooldown_remaining = 0.0;
+                pc.sonar_reveal_cooldown_remaining = 0.0;
+                pc.kinetic_dash_cooldown_remaining = 0.0;
+                pc.invisibility_remaining = 0.0;
+                pc.reflect_armor_remaining = 0.0;
+                pc.bullet_immunity_remaining = 0.0;
+                pc.cryo_debuff_remaining = 0.0;
+                pc.null_mute_remaining = 0.0;
+                recompute_player_slot_stats(pc, config, items_cfg);
+                pc.hero_hp = pc.hero_max_hp;
+                pc.hero_stamina = pc.hero_max_stamina;
+                pc.beam_charge = pc.hero_weapon.beam_max_charge;
+                pc.ammo_in_mag = pc.hero_weapon.magazine_size;
+            }
+            flags.slot_move_targets.remove(&ctrl);
+            flags.slot_invulnerable.remove(&ctrl);
+        }
+        DemoCommand::ToggleInvulnerable => {
+            if flags.slot_invulnerable.contains(&ctrl) {
+                flags.slot_invulnerable.remove(&ctrl);
+            } else {
+                flags.slot_invulnerable.insert(ctrl);
+                if let Some(pc) = world.players.get_mut(ctrl) {
+                    pc.is_dead = false;
+                    pc.respawn_remaining = 0.0;
+                    pc.hero_hp = pc.hero_max_hp;
+                }
+            }
+        }
+        DemoCommand::SwapControlledTeam => {
+            if let Some(pc) = world.players.get_mut(ctrl) {
+                let new_team = if pc.hero_team == TeamId::Dawn {
+                    TeamId::Dusk
+                } else {
+                    TeamId::Dawn
+                };
+                pc.hero_team = new_team;
+                if let Some(lp) = match_state.players.get_mut(ctrl) {
+                    lp.team = new_team;
+                }
+                match_state.dirty = true;
+            }
+        }
+        DemoCommand::SetSlotMoveTarget { slot_index, target } => {
+            if let Some(pos) = target {
+                flags.slot_move_targets.insert(slot_index, pos);
+            } else {
+                flags.slot_move_targets.remove(&slot_index);
+            }
+        }
+        DemoCommand::SetCreepsEnabled(enabled) => {
+            flags.creeps_enabled = enabled;
+            if enabled {
+                world.next_wave_time_secs = world.match_elapsed_secs;
+            } else {
+                world.creeps.clear();
+                world.next_wave_time_secs = world.match_elapsed_secs + 9999.0;
+            }
+        }
+        DemoCommand::SetTowersEnabled(enabled) => {
+            flags.towers_enabled = enabled;
+            for t in &mut world.turrets {
+                if enabled {
+                    t.hp = t.max_hp;
+                    t.is_dead = false;
+                    t.fire_cooldown = 0.0;
+                } else {
+                    t.hp = 0.0;
+                    t.is_dead = true;
+                }
+            }
+        }
+        DemoCommand::SetPaused(paused) => {
+            flags.paused = paused;
         }
         DemoCommand::RespawnDummiesNearPlayer => {
             if world.players.len() < 2 {
@@ -438,6 +720,7 @@ pub fn execute_demo_command(
                 d.cryo_debuff_remaining = 0.0;
                 d.null_mute_remaining = 0.0;
                 d.sonar_revealed_remaining = 0.0;
+                flags.slot_move_targets.remove(&i);
                 idx_offset += 1;
             }
         }
@@ -499,6 +782,10 @@ pub fn execute_demo_command(
             world.current_weather = w;
             world.weather_remaining_secs = 9999.0;
             world.env_stats_initialized = false;
+            if w == WeatherKind::Rainy {
+                world.lightning_cooldown_secs =
+                    config.weather.lightning_min_interval_secs.min(4.0);
+            }
         }
         DemoCommand::SetNightTime(want_night) => {
             let phase_dur = config.day_night.phase_duration_secs.max(1.0);
@@ -513,12 +800,14 @@ pub fn execute_demo_command(
             world.demo_reveal_full_map = reveal;
         }
         DemoCommand::SpawnCreepWave => {
+            flags.creeps_enabled = true;
             world.next_wave_time_secs = world.match_elapsed_secs;
         }
         DemoCommand::ClearCreeps => {
             world.creeps.clear();
         }
         DemoCommand::RespawnAllTurrets => {
+            flags.towers_enabled = true;
             for t in &mut world.turrets {
                 t.hp = t.max_hp;
                 t.is_dead = false;
@@ -545,6 +834,7 @@ pub fn execute_demo_command(
                 pc.traversal.is_active = false;
                 pc.wall_climb_mountain_index = None;
             }
+            flags.slot_move_targets.remove(&ctrl);
         }
     }
 }

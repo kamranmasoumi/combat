@@ -2830,6 +2830,23 @@ pub enum GameplayFxEvent {
         radius: f32,
         color_rgb: (f32, f32, f32),
     },
+    DamageNumber {
+        pos: Vec3,
+        amount: f32,
+        is_crit: bool,
+    },
+    EvadeMiss {
+        pos: Vec3,
+    },
+    LifestealHeal {
+        slot_index: usize,
+        pos: Vec3,
+        amount: f32,
+    },
+    ReflectHitPulse {
+        slot_index: usize,
+        pos: Vec3,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -3521,6 +3538,9 @@ pub struct HeroSnapshot {
     pub invisibility_remaining: f32,
     pub is_reflect_armor_active: bool,
     pub is_bullet_immune: bool,
+    pub is_cryo_debuffed: bool,
+    pub is_null_muted: bool,
+    pub is_sonar_revealed: bool,
     pub active_buffs: Vec<ActiveBuffSnapshot>,
 }
 
@@ -3632,6 +3652,11 @@ pub struct RemotePlayerSnapshot {
     pub inventory: Vec<InventoryItemState>,
     pub tp_slot: Option<InventoryItemState>,
     pub is_invisible: bool,
+    pub is_reflect_armor_active: bool,
+    pub is_bullet_immune: bool,
+    pub is_cryo_debuffed: bool,
+    pub is_null_muted: bool,
+    pub is_sonar_revealed: bool,
     pub is_visible: bool,
 }
 
@@ -5657,6 +5682,8 @@ pub struct PhysicsGrenade {
 pub struct PhysicsBullet {
     pub id: u64,
     pub owner_slot: Option<usize>,
+    pub owner_creep_id: Option<u64>,
+    pub owner_turret_index: Option<usize>,
     pub owner_team: TeamId,
     pub vfx_source: BulletVfxSource,
     pub velocity: Vec3,
@@ -7140,6 +7167,7 @@ pub struct PlayerSlotState {
     pub null_pulse_cooldown_remaining: f32,
     pub sonar_reveal_cooldown_remaining: f32,
     pub kinetic_dash_cooldown_remaining: f32,
+    pub has_reflect_armor_passive: bool,
     pub reflect_armor_remaining: f32,
     pub reflect_armor_total_secs: f32,
     pub bullet_immunity_remaining: f32,
@@ -7268,6 +7296,7 @@ pub struct AuthoritativeWorldState {
     pub null_pulse_cooldown_remaining: f32,
     pub sonar_reveal_cooldown_remaining: f32,
     pub kinetic_dash_cooldown_remaining: f32,
+    pub has_reflect_armor_passive: bool,
     pub reflect_armor_remaining: f32,
     pub reflect_armor_total_secs: f32,
     pub bullet_immunity_remaining: f32,
@@ -7484,6 +7513,7 @@ impl AuthoritativeWorldState {
             null_pulse_cooldown_remaining: 0.0,
             sonar_reveal_cooldown_remaining: 0.0,
             kinetic_dash_cooldown_remaining: 0.0,
+            has_reflect_armor_passive: false,
             reflect_armor_remaining: 0.0,
             reflect_armor_total_secs: 0.0,
             bullet_immunity_remaining: 0.0,
@@ -7740,6 +7770,7 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.null_pulse_cooldown_remaining, &mut p.null_pulse_cooldown_remaining);
         std::mem::swap(&mut self.sonar_reveal_cooldown_remaining, &mut p.sonar_reveal_cooldown_remaining);
         std::mem::swap(&mut self.kinetic_dash_cooldown_remaining, &mut p.kinetic_dash_cooldown_remaining);
+        std::mem::swap(&mut self.has_reflect_armor_passive, &mut p.has_reflect_armor_passive);
         std::mem::swap(&mut self.reflect_armor_remaining, &mut p.reflect_armor_remaining);
         std::mem::swap(&mut self.reflect_armor_total_secs, &mut p.reflect_armor_total_secs);
         std::mem::swap(&mut self.bullet_immunity_remaining, &mut p.bullet_immunity_remaining);
@@ -8248,6 +8279,7 @@ impl AuthoritativeWorldState {
                 null_pulse_cooldown_remaining: 0.0,
                 sonar_reveal_cooldown_remaining: 0.0,
                 kinetic_dash_cooldown_remaining: 0.0,
+                has_reflect_armor_passive: false,
                 reflect_armor_remaining: 0.0,
                 reflect_armor_total_secs: 0.0,
                 bullet_immunity_remaining: 0.0,
@@ -8440,6 +8472,7 @@ impl AuthoritativeWorldState {
                 null_pulse_cooldown_remaining: 0.0,
                 sonar_reveal_cooldown_remaining: 0.0,
                 kinetic_dash_cooldown_remaining: 0.0,
+                has_reflect_armor_passive: false,
                 reflect_armor_remaining: 0.0,
                 reflect_armor_total_secs: 0.0,
                 bullet_immunity_remaining: 0.0,
@@ -8802,6 +8835,11 @@ impl AuthoritativeWorldState {
                 inventory: p.inventory.clone(),
                 tp_slot: p.tp_slot.clone(),
                 is_invisible: p.invisibility_remaining > 0.0,
+                is_reflect_armor_active: p.reflect_armor_remaining > 0.0,
+                is_bullet_immune: p.bullet_immunity_remaining > 0.0,
+                is_cryo_debuffed: p.cryo_debuff_remaining > 0.0,
+                is_null_muted: p.null_mute_remaining > 0.0,
+                is_sonar_revealed: p.sonar_revealed_remaining > 0.0,
                 is_visible: true,
             });
         }
@@ -9034,8 +9072,12 @@ impl AuthoritativeWorldState {
                     is_ally || fow.is_world_point_visible(config, pos.x, pos.z)
                 }
                 GameplayFxEvent::CombatPopup { pos, .. }
-                | GameplayFxEvent::TacticalPulse { pos, .. } => {
-                    fow.is_world_point_visible(config, pos.x, pos.z)
+                | GameplayFxEvent::TacticalPulse { pos, .. }
+                | GameplayFxEvent::DamageNumber { pos, .. }
+                | GameplayFxEvent::EvadeMiss { pos }
+                | GameplayFxEvent::LifestealHeal { pos, .. }
+                | GameplayFxEvent::ReflectHitPulse { pos, .. } => {
+                    self.demo_reveal_full_map || fow.is_world_point_visible(config, pos.x, pos.z)
                 }
             };
             if keep {
@@ -9255,6 +9297,9 @@ impl AuthoritativeWorldState {
                 invisibility_remaining: self.invisibility_remaining.max(0.0),
                 is_reflect_armor_active: self.reflect_armor_remaining > 0.0,
                 is_bullet_immune: self.bullet_immunity_remaining > 0.0,
+                is_cryo_debuffed: self.cryo_debuff_remaining > 0.0,
+                is_null_muted: self.null_mute_remaining > 0.0,
+                is_sonar_revealed: self.sonar_revealed_remaining > 0.0,
                 active_buffs: {
                     let mut buffs = Vec::new();
                     if let Some(ref tp) = self.active_teleport {
@@ -9311,7 +9356,7 @@ impl AuthoritativeWorldState {
                         buffs.push(ActiveBuffSnapshot {
                             id: "reflect_armor".to_string(),
                             item_id: items_cfg.reflect_armor.item_id.clone(),
-                            label: format!("MIRROR {:.0}%", items_cfg.reflect_armor.reflect_damage_ratio * 100.0),
+                            label: format!("MIRROR {:.0}%", items_cfg.reflect_armor.active_damage_ratio * 100.0),
                             remaining_secs: self.reflect_armor_remaining.max(0.0),
                             total_secs: self.reflect_armor_total_secs.max(0.01),
                             color_rgb: items_cfg.reflect_armor.buff_bar_color_rgb,
@@ -12524,6 +12569,8 @@ fn step_shooting_and_grenade_spawn(
                 PhysicsBullet {
                     id,
                     owner_slot: Some(world.active_slot),
+                    owner_creep_id: None,
+                    owner_turret_index: None,
                     owner_team: world.hero_team,
                     vfx_source: BulletVfxSource::Hero {
                         hero_id: world.hero_id.clone(),
@@ -12568,19 +12615,23 @@ pub fn apply_combat_damage_to_hero(
     world: &mut AuthoritativeWorldState,
     victim_idx: usize,
     attacker_slot: Option<usize>,
+    attacker_creep_id: Option<u64>,
+    attacker_turret_index: Option<usize>,
     mut raw_pre_armor_dmg: f32,
     min_hit_dmg: f32,
     is_evadable: bool,
     is_continuous_tick: bool,
+    is_shotgun_pellet: bool,
     can_apply_on_hit: bool,
     impact_pos: Vec3,
     config: &GameConfig,
     items_cfg: &ItemsConfig,
-) -> (f32, bool) {
+) -> (f32, bool, bool) {
     if victim_idx >= world.players.len() || world.players[victim_idx].is_dead {
-        return (0.0, false);
+        return (0.0, false, false);
     }
     let ce = &items_cfg.combat_effects;
+    let ra = &items_cfg.reflect_armor;
 
     // 1. بررسی مصونیت کامل از تیر/اشعه/انفجار (Quantum Phase Shield)
     if world.players[victim_idx].bullet_immunity_remaining > 0.0 {
@@ -12592,12 +12643,13 @@ pub fn apply_combat_damage_to_hero(
                 color_rgb: ce.immune_popup_color_rgb,
             });
         }
-        return (0.0, false);
+        return (0.0, false, false);
     }
 
-    let attacker_idx = attacker_slot.and_then(|s| world.players.iter().position(|p| p.slot_index == s));
+    let attacker_idx =
+        attacker_slot.and_then(|s| world.players.iter().position(|p| p.slot_index == s));
 
-    // 2. بررسی Evasion در برابر True Strike (فقط برای گلوله‌ها و تیغه‌های پرتابی؛ Beam و انفجار از Evasion رد می‌شوند)
+    // 2. بررسی Evasion در برابر True Strike -> نمایش نوشته مینیمال سفید `miss`
     if is_evadable {
         let evasion = world.players[victim_idx].hero_evasion_chance;
         if evasion > 0.0 && world.next_rand() < evasion {
@@ -12607,34 +12659,25 @@ pub fn apply_combat_damage_to_hero(
             if true_strike > 0.0 && world.next_rand() < true_strike {
                 raw_pre_armor_dmg += ce.true_strike_bonus_damage;
             } else {
-                if world.players[victim_idx].popup_throttle_remaining <= 0.0 {
-                    world.players[victim_idx].popup_throttle_remaining = ce.popup_throttle_secs * 0.5;
-                    world.pending_fx.push(GameplayFxEvent::CombatPopup {
-                        pos: impact_pos + Vec3::Y * 1.35,
-                        text: "EVADE".to_string(),
-                        color_rgb: ce.evade_popup_color_rgb,
-                    });
-                }
-                return (0.0, false);
+                world.pending_fx.push(GameplayFxEvent::EvadeMiss {
+                    pos: impact_pos + Vec3::Y * 1.35,
+                });
+                return (0.0, false, false);
             }
         }
     }
 
     // 3. ضربه بحرانی (Critical Strike)
+    let mut is_crit = false;
     if let Some(ai) = attacker_idx {
         let crit_chance = world.players[ai].hero_crit_chance;
         let crit_mult = world.players[ai].hero_crit_multiplier;
         if crit_chance > 0.0 && crit_mult > 1.0 {
             if is_continuous_tick {
-                // برای Beamها: مقیاس‌بندی دقیق امید ریاضی DPS بدون اسپم 60Hz پاپ‌آپ
                 raw_pre_armor_dmg *= 1.0 + crit_chance * (crit_mult - 1.0);
             } else if world.next_rand() < crit_chance {
                 raw_pre_armor_dmg *= crit_mult;
-                world.pending_fx.push(GameplayFxEvent::CombatPopup {
-                    pos: impact_pos + Vec3::Y * 1.6,
-                    text: "CRIT!".to_string(),
-                    color_rgb: ce.crit_popup_color_rgb,
-                });
+                is_crit = true;
             }
         }
     }
@@ -12650,6 +12693,24 @@ pub fn apply_combat_damage_to_hero(
 
     world.players[victim_idx].hero_hp = (world.players[victim_idx].hero_hp - eff_dmg).max(0.0);
     record_hero_damage_on_victim(world, victim_idx, attacker_slot, config);
+
+    // نمایش عدد جامع میزان دمیج (سفید ریز برای عادی، قرمز برجسته برای Crit)
+    if !is_continuous_tick {
+        if eff_dmg >= 0.5 {
+            world.pending_fx.push(GameplayFxEvent::DamageNumber {
+                pos: impact_pos + Vec3::Y * 1.45,
+                amount: eff_dmg,
+                is_crit,
+            });
+        }
+    } else if world.tick % 16 == 0 && eff_dmg > 0.01 {
+        // برای تیک ۶۰ هرتز اشعه/سم، هر ~0.26 ثانیه مجموع تقریبی آن بازه نمایش داده می‌شود
+        world.pending_fx.push(GameplayFxEvent::DamageNumber {
+            pos: impact_pos + Vec3::Y * 1.45,
+            amount: (eff_dmg * 16.0).max(1.0),
+            is_crit: false,
+        });
+    }
 
     // 5. اعمال دیباف Cryo (کندشدن + کاهش درمان با بونوس برف یا آب)
     if can_apply_on_hit {
@@ -12680,50 +12741,191 @@ pub fn apply_combat_damage_to_hero(
         }
     }
 
-    // 6. مکش سلامتی (Lifesteal) برای مهاجم با اعمال Anti-Heal حریف
-    if let Some(ai) = attacker_idx {
-        if !world.players[ai].is_dead && ai != victim_idx {
-            let ls = world.players[ai].hero_lifesteal_ratio;
-            if ls > 0.0 {
-                let heal_mult = if world.players[ai].cryo_debuff_remaining > 0.0 {
-                    (1.0 - world.players[ai].cryo_heal_reduction_ratio).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                let heal = eff_dmg * ls * heal_mult;
-                world.players[ai].hero_hp =
-                    (world.players[ai].hero_hp + heal).min(world.players[ai].hero_max_hp);
+    // 6. مکش سلامتی (Lifesteal) روی هیروها با کنترل کانفیگی + افکت سبز
+    if ce.lifesteal_applies_to_heroes {
+        if let Some(ai) = attacker_idx {
+            if !world.players[ai].is_dead && ai != victim_idx {
+                let ls = world.players[ai].hero_lifesteal_ratio;
+                if ls > 0.0 {
+                    let heal_mult = if world.players[ai].cryo_debuff_remaining > 0.0 {
+                        (1.0 - world.players[ai].cryo_heal_reduction_ratio).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let heal = eff_dmg * ls * heal_mult;
+                    if heal > 0.0 {
+                        let prev_hp = world.players[ai].hero_hp;
+                        world.players[ai].hero_hp =
+                            (prev_hp + heal).min(world.players[ai].hero_max_hp);
+                        let actual_heal = world.players[ai].hero_hp - prev_hp;
+                        if actual_heal >= ce.lifesteal_heal_fx_min_amount
+                            || (is_continuous_tick && actual_heal > 0.05 && world.tick % 18 == 0)
+                        {
+                            let apos = world.players[ai].soldier_pos;
+                            let aslot = world.players[ai].slot_index;
+                            world.pending_fx.push(GameplayFxEvent::LifestealHeal {
+                                slot_index: aslot,
+                                pos: apos,
+                                amount: actual_heal,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
 
-    // 7. بازتاب آسیب (Aegis Mirror Harness / ReflectArmor) با محافظ ضد حلقه بی‌نهایت
-    if world.players[victim_idx].reflect_armor_remaining > 0.0 {
-        if let Some(ai) = attacker_idx {
-            if ai != victim_idx
-                && !world.players[ai].is_dead
-                && world.players[ai].bullet_immunity_remaining <= 0.0
-            {
-                let victim_slot = world.players[victim_idx].slot_index;
-                let reflected_dmg = eff_dmg * items_cfg.reflect_armor.reflect_damage_ratio;
-                world.players[ai].hero_hp = (world.players[ai].hero_hp - reflected_dmg).max(0.0);
-                record_hero_damage_on_victim(world, ai, Some(victim_slot), config);
-                if world.players[ai].popup_throttle_remaining <= 0.0 {
-                    world.players[ai].popup_throttle_remaining = ce.popup_throttle_secs;
-                    let apos = world.players[ai].soldier_pos;
-                    world.pending_fx.push(GameplayFxEvent::CombatPopup {
-                        pos: apos + Vec3::Y * 1.9,
-                        text: "REFLECT".to_string(),
-                        color_rgb: ce.reflect_popup_color_rgb,
-                    });
-                }
-                if world.players[ai].hero_hp <= 0.0 && !world.players[ai].is_dead {
-                    world.swap_slot_in(ai);
-                    trigger_random_death(world, config);
-                    world.swap_slot_in(ai);
-                    award_hero_kill_rewards(world, ai, Some(victim_slot), config, items_cfg);
+    // 7. بازتاب آسیب (Aegis Mirror Harness): هر دو حالت Passive و Active بر اساس دمیج خام قبل از Armor قربانی
+    //    فرمول Passive: flat + raw_pre_armor_dmg * passive_ratio  (سپس کاهش توسط Armor مهاجم)
+    //    فرمول Active : flat + raw_pre_armor_dmg * active_ratio   (سپس کاهش توسط Armor مهاجم)
+    let is_reflect_active = world.players[victim_idx].reflect_armor_remaining > 0.0;
+    let has_reflect_passive = world.players[victim_idx].has_reflect_armor_passive;
+    if is_reflect_active || has_reflect_passive {
+        let victim_slot = world.players[victim_idx].slot_index;
+        let victim_pos = world.players[victim_idx].soldier_pos;
+        let (base_flat, reflect_ratio) = if is_reflect_active {
+            (ra.active_flat_damage, ra.active_damage_ratio)
+        } else {
+            (ra.passive_flat_damage, ra.passive_damage_ratio)
+        };
+        // جلوگیری از اکسپلویت دمیج ثابت روی Beamهای ۶۰ هرتز و شات‌گان چندساچمه‌ای
+        let flat_component = if is_continuous_tick {
+            base_flat / (config.network.server_tick_rate_hz.max(1.0) as f32)
+        } else if is_shotgun_pellet {
+            base_flat * ra.shotgun_flat_reflect_scale
+        } else {
+            base_flat
+        };
+        let raw_return_dmg = flat_component + raw_pre_armor_dmg * reflect_ratio;
+        let mut reflected_any = false;
+
+        // 7a. بازتاب روی هیروها (کاهش‌یافته توسط Armor خود مهاجم)
+        if ra.reflect_applies_to_heroes && raw_return_dmg > 0.0 {
+            if let Some(ai) = attacker_idx {
+                if ai != victim_idx
+                    && !world.players[ai].is_dead
+                    && world.players[ai].bullet_immunity_remaining <= 0.0
+                {
+                    let attacker_armor = world.players[ai].hero_armor
+                        - if world.players[ai].flame_armor_debuff_remaining > 0.0 {
+                            world.players[ai].flame_armor_debuff_amount
+                        } else {
+                            0.0
+                        };
+                    let reflected_dmg = raw_return_dmg * dota2_armor_multiplier(attacker_armor);
+                    world.players[ai].hero_hp = (world.players[ai].hero_hp - reflected_dmg).max(0.0);
+                    record_hero_damage_on_victim(world, ai, Some(victim_slot), config);
+                    reflected_any = true;
+                    if !is_continuous_tick || world.tick % 16 == 0 {
+                        let apos = world.players[ai].soldier_pos;
+                        let show_dmg = if is_continuous_tick {
+                            (reflected_dmg * 16.0).max(1.0)
+                        } else {
+                            reflected_dmg
+                        };
+                        if show_dmg >= 0.5 {
+                            world.pending_fx.push(GameplayFxEvent::DamageNumber {
+                                pos: apos + Vec3::Y * 1.5,
+                                amount: show_dmg,
+                                is_crit: false,
+                            });
+                        }
+                    }
+                    if world.players[ai].hero_hp <= 0.0 && !world.players[ai].is_dead {
+                        world.swap_slot_in(ai);
+                        trigger_random_death(world, config);
+                        world.swap_slot_in(ai);
+                        award_hero_kill_rewards(world, ai, Some(victim_slot), config, items_cfg);
+                    }
                 }
             }
+        }
+
+        // 7b. بازتاب روی سربازان لاین و کمپ‌های جنگل (کانفیگی + کاهش توسط Armor سرباز)
+        if ra.reflect_applies_to_creeps && raw_return_dmg > 0.0 {
+            if let Some(cid) = attacker_creep_id {
+                if let Some(c_idx) = world.creeps.iter().position(|c| c.id == cid && !c.is_dead) {
+                    let c_stats = resolve_creep_stats(config, world.creeps[c_idx].creep_type_id.as_deref());
+                    let (_, _, armor_bonus, _, _) = lane_creep_buffs(
+                        config,
+                        &world.barracks,
+                        world.creeps[c_idx].team,
+                        world.creeps[c_idx].lane,
+                        world.creeps[c_idx].camp_index.is_none(),
+                    );
+                    let (_, time_armor_bonus, _, _) = lane_creep_time_scaling(
+                        config,
+                        world.match_elapsed_secs,
+                        world.creeps[c_idx].camp_index.is_none(),
+                    );
+                    let creep_armor = c_stats.armor + time_armor_bonus + armor_bonus;
+                    let reflected_dmg = raw_return_dmg
+                        * ra.reflect_creep_damage_ratio
+                        * dota2_armor_multiplier(creep_armor);
+                    world.creeps[c_idx].hp = (world.creeps[c_idx].hp - reflected_dmg).max(0.0);
+                    let cpos = world.creeps[c_idx].pos;
+                    reflected_any = true;
+                    if reflected_dmg >= 0.5 {
+                        world.pending_fx.push(GameplayFxEvent::DamageNumber {
+                            pos: cpos + Vec3::Y * 1.2,
+                            amount: reflected_dmg,
+                            is_crit: false,
+                        });
+                    }
+                    if world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead {
+                        world.creeps[c_idx].is_dead = true;
+                        world.creeps[c_idx].anim_state = CreepAnimState::Die;
+                        world.creeps[c_idx].despawn_timer = c_stats.die_despawn_delay_secs;
+                        let gold_bounty = lane_creep_gold_bounty(
+                            config,
+                            world.match_elapsed_secs,
+                            world.creeps[c_idx].camp_index.is_none(),
+                            c_stats.gold_bounty,
+                        );
+                        world.players[victim_idx].last_hits += 1;
+                        world.players[victim_idx].hero_gold =
+                            world.players[victim_idx].hero_gold.saturating_add(gold_bounty);
+                        world.pending_private_fx.push((
+                            victim_slot,
+                            GameplayFxEvent::LastHitGold {
+                                pos: cpos,
+                                gold: gold_bounty,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 7c. بازتاب روی تاورها (کانفیگی + کاهش توسط Armor تاور)
+        if ra.reflect_applies_to_turrets && raw_return_dmg > 0.0 {
+            if let Some(t_idx) = attacker_turret_index {
+                if let Some(tur) = world.turrets.get_mut(t_idx) {
+                    if !tur.is_dead && !tur.is_invulnerable {
+                        let reflected_dmg = raw_return_dmg
+                            * ra.reflect_turret_damage_ratio
+                            * dota2_armor_multiplier(tur.armor);
+                        tur.hp = (tur.hp - reflected_dmg).max(0.0);
+                        let tpos = tur.pos;
+                        reflected_any = true;
+                        if reflected_dmg >= 0.5 {
+                            world.pending_fx.push(GameplayFxEvent::DamageNumber {
+                                pos: tpos + Vec3::Y * 3.0,
+                                amount: reflected_dmg,
+                                is_crit: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // پمپاژ لحظه‌ای شیلد مغناطیسی در کلاینت (فقط هنگام فعال بودن شیلد Active)
+        if is_reflect_active && reflected_any && (!is_continuous_tick || world.tick % 10 == 0) {
+            world.pending_fx.push(GameplayFxEvent::ReflectHitPulse {
+                slot_index: victim_slot,
+                pos: victim_pos,
+            });
         }
     }
 
@@ -12736,7 +12938,144 @@ pub fn apply_combat_damage_to_hero(
         award_hero_kill_rewards(world, victim_idx, attacker_slot, config, items_cfg);
     }
 
-    (eff_dmg, victim_killed)
+    (eff_dmg, victim_killed, is_crit)
+}
+
+/// اعمال ضربه بحرانی، مکش سلامتی روی سربازها/کمپ‌ها (کانفیگی) و عدد دمیج جامع روی کریپ‌ها
+fn apply_creep_combat_effects(
+    world: &mut AuthoritativeWorldState,
+    attacker_slot: Option<usize>,
+    is_enemy_creep: bool,
+    mut raw_pre_armor_dmg: f32,
+    armor_mult: f32,
+    min_dmg: f32,
+    is_continuous_tick: bool,
+    creep_pos: Vec3,
+    items_cfg: &ItemsConfig,
+) -> (f32, bool) {
+    let ce = &items_cfg.combat_effects;
+    let attacker_idx =
+        attacker_slot.and_then(|s| world.players.iter().position(|p| p.slot_index == s));
+
+    let mut is_crit = false;
+    if is_enemy_creep {
+        if let Some(ai) = attacker_idx {
+            let crit_chance = world.players[ai].hero_crit_chance;
+            let crit_mult = world.players[ai].hero_crit_multiplier;
+            if crit_chance > 0.0 && crit_mult > 1.0 {
+                if is_continuous_tick {
+                    raw_pre_armor_dmg *= 1.0 + crit_chance * (crit_mult - 1.0);
+                } else if world.next_rand() < crit_chance {
+                    raw_pre_armor_dmg *= crit_mult;
+                    is_crit = true;
+                }
+            }
+        }
+    }
+
+    let eff_dmg = (raw_pre_armor_dmg * armor_mult).max(min_dmg);
+
+    if !is_continuous_tick {
+        if eff_dmg >= 0.5 {
+            world.pending_fx.push(GameplayFxEvent::DamageNumber {
+                pos: creep_pos + Vec3::Y * 1.25,
+                amount: eff_dmg,
+                is_crit,
+            });
+        }
+    } else if world.tick % 16 == 0 && eff_dmg > 0.01 {
+        world.pending_fx.push(GameplayFxEvent::DamageNumber {
+            pos: creep_pos + Vec3::Y * 1.25,
+            amount: (eff_dmg * 16.0).max(1.0),
+            is_crit: false,
+        });
+    }
+
+    // مکش سلامتی روی سربازان لاین و کمپ‌های جنگل (کانفیگی)
+    if is_enemy_creep && ce.lifesteal_applies_to_creeps {
+        if let Some(ai) = attacker_idx {
+            if !world.players[ai].is_dead {
+                let ls = world.players[ai].hero_lifesteal_ratio * ce.lifesteal_creep_ratio_mult;
+                if ls > 0.0 {
+                    let heal_mult = if world.players[ai].cryo_debuff_remaining > 0.0 {
+                        (1.0 - world.players[ai].cryo_heal_reduction_ratio).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let heal = eff_dmg * ls * heal_mult;
+                    if heal > 0.0 {
+                        let prev_hp = world.players[ai].hero_hp;
+                        world.players[ai].hero_hp =
+                            (prev_hp + heal).min(world.players[ai].hero_max_hp);
+                        let actual_heal = world.players[ai].hero_hp - prev_hp;
+                        if actual_heal >= ce.lifesteal_heal_fx_min_amount
+                            || (is_continuous_tick && actual_heal > 0.05 && world.tick % 18 == 0)
+                        {
+                            let apos = world.players[ai].soldier_pos;
+                            let aslot = world.players[ai].slot_index;
+                            world.pending_fx.push(GameplayFxEvent::LifestealHeal {
+                                slot_index: aslot,
+                                pos: apos,
+                                amount: actual_heal,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (eff_dmg, is_crit)
+}
+
+/// نمایش عدد دمیج سفید روی ساختمان‌ها (تاور، باراکس، انشنت) + مکش سلامتی اختیاری بر اساس کانفیگ
+fn apply_building_damage_effects(
+    world: &mut AuthoritativeWorldState,
+    owner_slot: Option<usize>,
+    eff_dmg: f32,
+    building_pos: Vec3,
+    items_cfg: &ItemsConfig,
+) {
+    if eff_dmg >= 0.5 {
+        world.pending_fx.push(GameplayFxEvent::DamageNumber {
+            pos: building_pos,
+            amount: eff_dmg,
+            is_crit: false,
+        });
+    } else if eff_dmg > 0.01 && world.tick % 16 == 0 {
+        world.pending_fx.push(GameplayFxEvent::DamageNumber {
+            pos: building_pos,
+            amount: (eff_dmg * 16.0).max(1.0),
+            is_crit: false,
+        });
+    }
+    let ce = &items_cfg.combat_effects;
+    if ce.lifesteal_applies_to_buildings {
+        if let Some(ai) = owner_slot.and_then(|s| world.players.iter().position(|p| p.slot_index == s)) {
+            if !world.players[ai].is_dead && world.players[ai].hero_lifesteal_ratio > 0.0 {
+                let heal_mult = if world.players[ai].cryo_debuff_remaining > 0.0 {
+                    (1.0 - world.players[ai].cryo_heal_reduction_ratio).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                let heal = eff_dmg * world.players[ai].hero_lifesteal_ratio * heal_mult;
+                if heal > 0.0 {
+                    let prev_hp = world.players[ai].hero_hp;
+                    world.players[ai].hero_hp = (prev_hp + heal).min(world.players[ai].hero_max_hp);
+                    let actual_heal = world.players[ai].hero_hp - prev_hp;
+                    if actual_heal >= ce.lifesteal_heal_fx_min_amount {
+                        let apos = world.players[ai].soldier_pos;
+                        let aslot = world.players[ai].slot_index;
+                        world.pending_fx.push(GameplayFxEvent::LifestealHeal {
+                            slot_index: aslot,
+                            pos: apos,
+                            amount: actual_heal,
+                        });
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn apply_damage_to_turret(
@@ -12759,7 +13098,9 @@ fn apply_damage_to_turret(
     }
     let dmg_mult = dota2_armor_multiplier(world.turrets[tur_idx].armor);
     let eff_dmg = (raw_dmg * dmg_mult).max(min_dmg);
+    let t_pos = world.turrets[tur_idx].pos + Vec3::Y * 3.2;
     world.turrets[tur_idx].hp = (world.turrets[tur_idx].hp - eff_dmg).max(0.0);
+    apply_building_damage_effects(world, owner_slot, eff_dmg, t_pos, items_cfg);
     if world.turrets[tur_idx].hp <= 0.0 && !world.turrets[tur_idx].is_dead {
         world.turrets[tur_idx].is_dead = true;
         world.turrets[tur_idx].aim_target_pos = None;
@@ -12836,7 +13177,9 @@ fn apply_damage_to_barracks(
     }
     let dmg_mult = dota2_armor_multiplier(world.barracks[bar_idx].armor);
     let eff_dmg = (raw_dmg * dmg_mult).max(min_dmg);
+    let b_pos = world.barracks[bar_idx].pos + Vec3::Y * 2.4;
     world.barracks[bar_idx].hp = (world.barracks[bar_idx].hp - eff_dmg).max(0.0);
+    apply_building_damage_effects(world, owner_slot, eff_dmg, b_pos, items_cfg);
     if world.barracks[bar_idx].hp <= 0.0 && !world.barracks[bar_idx].is_dead {
         world.barracks[bar_idx].is_dead = true;
         if let Some(ent) = bar_entity {
@@ -12918,7 +13261,9 @@ fn apply_damage_to_ancient(
     }
     let dmg_mult = dota2_armor_multiplier(world.ancients[anc_idx].armor);
     let eff_dmg = (raw_dmg * dmg_mult).max(min_dmg);
+    let a_pos = world.ancients[anc_idx].pos + Vec3::Y * 3.4;
     world.ancients[anc_idx].hp = (world.ancients[anc_idx].hp - eff_dmg).max(0.0);
+    apply_building_damage_effects(world, None, eff_dmg, a_pos, items_cfg);
     if world.ancients[anc_idx].hp <= 0.0 && !world.ancients[anc_idx].is_dead {
         world.ancients[anc_idx].is_dead = true;
         if let Some(ent) = anc_entity {
@@ -13000,8 +13345,11 @@ fn apply_aoe_explosion(
                 world,
                 p_idx,
                 owner_slot,
+                None,
+                None,
                 dmg,
                 1.0,
+                false,
                 false,
                 false,
                 true,
@@ -13032,7 +13380,17 @@ fn apply_aoe_explosion(
                 world.match_elapsed_secs,
                 world.creeps[c_idx].camp_index.is_none(),
             );
-            let eff_dmg = (dmg * dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus)).max(1.0);
+            let (eff_dmg, _) = apply_creep_combat_effects(
+                world,
+                owner_slot,
+                true,
+                dmg,
+                dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus),
+                1.0,
+                false,
+                c_pos,
+                items_cfg,
+            );
             world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
             if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
                 for c in &mut world.creeps {
@@ -13583,19 +13941,43 @@ fn shared_authoritative_react_system(
                 }
                 _ => items_cfg.stat_limits.min_weapon_damage,
             };
-            let (_, enemy_killed) = apply_combat_damage_to_hero(
+            let is_shotgun_pellet = matches!(
+                &bullet.vfx_source,
+                BulletVfxSource::Hero { weapon_kind: WeaponKind::Shotgun, .. }
+            );
+            let (dealt_dmg, enemy_killed, was_crit) = apply_combat_damage_to_hero(
                 &mut world,
                 enemy_idx,
                 bullet.owner_slot,
+                bullet.owner_creep_id,
+                bullet.owner_turret_index,
                 bullet.damage,
                 min_hit_dmg,
                 true,
                 false,
+                is_shotgun_pellet,
                 true,
                 impact_pos,
                 &config,
                 &items_cfg,
             );
+            if was_crit && dealt_dmg > 0.0 {
+                let extra = items_cfg.combat_effects.crit_blood_extra_bursts;
+                for _ in 0..extra {
+                    let jx = (world.next_rand() - 0.5) * 0.4;
+                    let jy = (world.next_rand() - 0.5) * 0.3;
+                    let jz = (world.next_rand() - 0.5) * 0.4;
+                    world.pending_fx.push(GameplayFxEvent::BulletImpact {
+                        impact_pos: impact_pos + Vec3::new(jx, jy, jz),
+                        bullet_dir: step_dir,
+                        surface: ImpactSurface::Character,
+                        target_destroyed: true,
+                        trauma_add: config.combat.shot_fire_trauma_add,
+                        trauma_max: config.combat.shot_fire_trauma_max,
+                        vfx_source: bullet.vfx_source.clone(),
+                    });
+                }
+            }
 
             world.pending_fx.push(GameplayFxEvent::BulletTrailSegment {
                 start: old_pos,
@@ -13830,7 +14212,19 @@ fn shared_authoritative_react_system(
                 }
                 _ => items_cfg.stat_limits.min_weapon_damage,
             };
-            let effective_dmg = (bullet.damage * dmg_mult).max(min_hit_dmg);
+            let is_enemy_c = bullet.owner_team != world.creeps[c_idx].team;
+            let c_hit_pos = world.creeps[c_idx].pos;
+            let (effective_dmg, _) = apply_creep_combat_effects(
+                &mut world,
+                bullet.owner_slot,
+                is_enemy_c,
+                bullet.damage,
+                dmg_mult,
+                min_hit_dmg,
+                false,
+                c_hit_pos,
+                &items_cfg,
+            );
             world.creeps[c_idx].hp = (world.creeps[c_idx].hp - effective_dmg).max(0.0);
             if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
                 for c in &mut world.creeps {
@@ -14447,10 +14841,13 @@ fn shared_authoritative_react_system(
                 &mut world,
                 enemy_idx,
                 Some(owner_slot),
+                None,
+                None,
                 tick_dmg,
                 0.0,
                 false,
                 true,
+                false,
                 true,
                 end_pos,
                 &config,
@@ -14482,7 +14879,19 @@ fn shared_authoritative_react_system(
             let c_stats = resolve_creep_stats(&config, world.creeps[c_idx].creep_type_id.as_deref());
             let (_, _, armor_bonus, _, _) = lane_creep_buffs(&config, &world.barracks, world.creeps[c_idx].team, world.creeps[c_idx].lane, world.creeps[c_idx].camp_index.is_none());
             let (_, time_armor_bonus, _, _) = lane_creep_time_scaling(&config, world.match_elapsed_secs, world.creeps[c_idx].camp_index.is_none());
-            let eff_dmg = tick_dmg * dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus);
+            let is_enemy_c = owner_team != world.creeps[c_idx].team;
+            let c_hit_pos = world.creeps[c_idx].pos;
+            let (eff_dmg, _) = apply_creep_combat_effects(
+                &mut world,
+                Some(owner_slot),
+                is_enemy_c,
+                tick_dmg,
+                dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus),
+                0.0,
+                true,
+                c_hit_pos,
+                &items_cfg,
+            );
             world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
             if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
                 for c in &mut world.creeps {
@@ -14706,10 +15115,13 @@ fn shared_authoritative_react_system(
                     &mut world,
                     p_idx,
                     pool.owner_slot,
+                    None,
+                    None,
                     tick_dmg,
                     0.0,
                     false,
                     true,
+                    false,
                     false,
                     h_pos + Vec3::Y * 0.9,
                     &config,
@@ -14738,7 +15150,17 @@ fn shared_authoritative_react_system(
                     world.match_elapsed_secs,
                     world.creeps[c_idx].camp_index.is_none(),
                 );
-                let eff_dmg = tick_dmg * dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus);
+                let (eff_dmg, _) = apply_creep_combat_effects(
+                    &mut world,
+                    pool.owner_slot,
+                    true,
+                    tick_dmg,
+                    dota2_armor_multiplier(c_stats.armor + time_armor_bonus + armor_bonus),
+                    0.0,
+                    true,
+                    c_pos,
+                    &items_cfg,
+                );
                 world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
                 if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
                     for c in &mut world.creeps {
@@ -15961,6 +16383,8 @@ fn step_lane_creeps_system(
                         PhysicsBullet {
                             id: b_id,
                             owner_slot: None,
+                            owner_creep_id: Some(world.creeps[idx].id),
+                            owner_turret_index: None,
                             owner_team: my_team,
                             vfx_source: BulletVfxSource::Creep,
                             velocity: shot_dir * c_stats.projectile_speed,
@@ -16701,6 +17125,8 @@ fn step_turrets_system(
                     PhysicsBullet {
                         id: b_id,
                         owner_slot: None,
+                        owner_creep_id: None,
+                        owner_turret_index: Some(idx),
                         owner_team: my_team,
                         vfx_source: BulletVfxSource::Turret,
                         velocity: shot_dir * t_def.projectile_speed,
@@ -16767,6 +17193,8 @@ fn step_turrets_system(
                         PhysicsBullet {
                             id: b_id,
                             owner_slot: None,
+                            owner_creep_id: None,
+                            owner_turret_index: None,
                             owner_team: ftn.team,
                             vfx_source: BulletVfxSource::Turret,
                             velocity: shot_dir * ftn.projectile_speed,

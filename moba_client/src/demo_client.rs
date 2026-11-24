@@ -8,9 +8,9 @@ use bevy::ui_widgets::Button as UiButton;
 use moba_shared::{
     create_shared_renet_server, execute_demo_command, step_couriers_system,
     step_demo_dummy_ai_and_rules, step_shadow_blade_system, step_teleports_system,
-    step_weather_and_environment_system, try_activate_item_ability, try_activate_shadow_blade,
-    try_buy_cart, try_buy_item, try_buy_recipe, try_cancel_teleport, try_courier_deliver,
-    try_courier_move_to, try_courier_return_to_fountain, try_cycle_item_mode,
+    step_weather_and_environment_system, team_fountain_pos, try_activate_item_ability,
+    try_activate_shadow_blade, try_buy_cart, try_buy_item, try_buy_recipe, try_cancel_teleport,
+    try_courier_deliver, try_courier_move_to, try_courier_return_to_fountain, try_cycle_item_mode,
     try_move_courier_item_to_stash, try_move_hero_item_to_stash, try_move_stash_item_to_courier,
     try_move_stash_item_to_hero, try_sell_courier_item, try_sell_item, try_sell_stash_item,
     try_start_teleport, try_swap_courier_slots, try_swap_inventory_slots, try_swap_stash_slots,
@@ -20,10 +20,11 @@ use moba_shared::{
     DemoTeleportPreset, DummyBehavior, GameConfig, GameplayFxEvent, ItemsConfig, LobbyPlayerInfo,
     MatchPhase, MobaPhysicsSet, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
     ServerLobbyPacket, ServerMatchMessage, TeamId, WeatherKind, CHANNEL_RELIABLE_FX,
-    CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
+    CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE, DEMO_INFINITE_GOLD,
 };
 use renet::{ClientId, RenetServer, ServerEvent};
 use renet_netcode::NetcodeServerTransport;
+use std::collections::{HashMap, HashSet};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 // =============================================================================
-// سرور لوکال تعبیه‌شده Demo Hero (پشتیبانی کامل از چند هیرو در هر دو تیم و سوئیچ کنترل کامل)
+// سرور لوکال تعبیه‌شده Demo Hero (گلد بی‌نهایت، خرید از هرجا، آب‌وهوای فوری و حفظ دستورات)
 // =============================================================================
 
 pub struct EmbeddedDemoServerHandle {
@@ -73,6 +74,35 @@ struct DemoServerRuntime {
     serialize_buf: Vec<u8>,
 }
 
+fn demo_server_not_paused(demo: Res<DemoServerRuntime>) -> bool {
+    !demo.flags.paused
+}
+
+/// اجرای تراکنش شاپ در حالت Demo Hero به طوری که خرید/فروش از هر نقطه نقشه مستقیماً به اینونتوری هیرو اعمال شود
+fn with_demo_fountain_access<F>(
+    world: &mut AuthoritativeWorldState,
+    slot_index: usize,
+    config: &GameConfig,
+    f: F,
+) where
+    F: FnOnce(&mut AuthoritativeWorldState),
+{
+    let saved_pos = world.players.get(slot_index).map(|p| (p.soldier_pos, p.hero_team));
+    if let Some((_, team)) = saved_pos {
+        if let Some(fountain_pos) = team_fountain_pos(config, team) {
+            if let Some(p) = world.players.get_mut(slot_index) {
+                p.soldier_pos = fountain_pos;
+            }
+        }
+    }
+    f(world);
+    if let Some((orig_pos, _)) = saved_pos {
+        if let Some(p) = world.players.get_mut(slot_index) {
+            p.soldier_pos = orig_pos;
+        }
+    }
+}
+
 fn spawn_embedded_demo_server(
     mut config: GameConfig,
     items_config: ItemsConfig,
@@ -86,6 +116,8 @@ fn spawn_embedded_demo_server(
     config.network.server_bind_addr = addr.clone();
     config.network.server_public_addr = addr.clone();
     config.network.max_clients = 2;
+    // اجازه تغییر فوری آب‌وهوا در Demo Hero از ثانیه صفر (بدون نیاز به انتظار تا دقیقه ۱۵)
+    config.weather.weather_cycle_start_secs = 0.0;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop_flag);
@@ -168,23 +200,38 @@ fn run_embedded_demo_server_loop(
         .insert_resource(DemoServerNetwork { server, transport })
         .insert_resource(DemoServerStopFlag(stop_flag))
         .init_resource::<DemoServerRuntime>()
+        .configure_sets(
+            FixedUpdate,
+            (
+                MobaPhysicsSet::Drive,
+                MobaPhysicsSet::Simulate,
+                MobaPhysicsSet::React,
+            )
+                .run_if(demo_server_not_paused),
+        )
         .add_systems(
             FixedUpdate,
             (
                 demo_server_init_and_receive_system.before(MobaPhysicsSet::Drive),
-                demo_server_ai_tick_system.before(MobaPhysicsSet::Drive),
+                demo_server_ai_tick_system
+                    .before(MobaPhysicsSet::Drive)
+                    .run_if(demo_server_not_paused),
                 step_couriers_system
                     .after(MobaPhysicsSet::Drive)
-                    .before(demo_server_send_snapshot_system),
+                    .before(demo_server_send_snapshot_system)
+                    .run_if(demo_server_not_paused),
                 step_teleports_system
                     .after(MobaPhysicsSet::Drive)
-                    .before(demo_server_send_snapshot_system),
+                    .before(demo_server_send_snapshot_system)
+                    .run_if(demo_server_not_paused),
                 step_shadow_blade_system
                     .after(MobaPhysicsSet::Drive)
-                    .before(demo_server_send_snapshot_system),
+                    .before(demo_server_send_snapshot_system)
+                    .run_if(demo_server_not_paused),
                 step_weather_and_environment_system
                     .after(MobaPhysicsSet::Drive)
-                    .before(demo_server_send_snapshot_system),
+                    .before(demo_server_send_snapshot_system)
+                    .run_if(demo_server_not_paused),
                 demo_server_send_snapshot_system.after(MobaPhysicsSet::React),
             ),
         )
@@ -204,7 +251,7 @@ fn demo_server_init_and_receive_system(
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
     mut demo: ResMut<DemoServerRuntime>,
-    existing_soldiers: Query<(Entity, &PhysicsSoldier)>,
+    mut existing_soldiers: Query<(Entity, &mut PhysicsSoldier)>,
 ) {
     if stop_flag.0.load(Ordering::SeqCst) {
         app_exit.write(AppExit::Success);
@@ -215,9 +262,12 @@ fn demo_server_init_and_receive_system(
         demo.initialized = true;
         let old_ents: Vec<Entity> = existing_soldiers.iter().map(|(e, _)| e).collect();
         world.init_multiplayer_players(&config, &match_state, &mut commands, &old_ents);
+        // شروع دمو با هوای صاف و ثابت تا زمان تغییر دستی توسط بازیکن
+        world.current_weather = WeatherKind::Clear;
+        world.weather_remaining_secs = 9999.0;
         if world.players.len() >= 2 {
-            world.players[0].hero_gold = 10_000;
-            world.players[1].hero_gold = 10_000;
+            world.players[0].hero_gold = DEMO_INFINITE_GOLD;
+            world.players[1].hero_gold = DEMO_INFINITE_GOLD;
             let mid_pos = Vec3::new(-6.0, 0.2, 0.0);
             let dummy_pos = Vec3::new(8.0, 0.2, 0.0);
             world.players[0].soldier_pos = mid_pos;
@@ -294,6 +344,12 @@ fn demo_server_init_and_receive_system(
             match msg {
                 ClientLobbyMessage::DemoCommand(cmd) => {
                     let is_remove_extra = matches!(cmd, DemoCommand::RemoveExtraHeroes);
+                    let is_remove_ctrl = matches!(cmd, DemoCommand::RemoveControlledHero);
+                    let removed_slot = if is_remove_ctrl && ctrl > 0 {
+                        Some(ctrl)
+                    } else {
+                        None
+                    };
                     execute_demo_command(
                         cmd,
                         &mut world,
@@ -309,19 +365,35 @@ fn demo_server_init_and_receive_system(
                                 commands.entity(ent).despawn();
                             }
                         }
+                    } else if let Some(rem) = removed_slot {
+                        for (ent, mut ps) in &mut existing_soldiers {
+                            if ps.slot_index == rem {
+                                commands.entity(ent).despawn();
+                            } else if ps.slot_index > rem {
+                                ps.slot_index -= 1;
+                            }
+                        }
                     }
                 }
                 ClientLobbyMessage::BuyItem { item_id } => {
-                    try_buy_item(&mut world, ctrl, &item_id, &config, &items_config);
+                    with_demo_fountain_access(&mut world, ctrl, &config, |w| {
+                        try_buy_item(w, ctrl, &item_id, &config, &items_config);
+                    });
                 }
                 ClientLobbyMessage::BuyRecipe { item_id } => {
-                    try_buy_recipe(&mut world, ctrl, &item_id, &config, &items_config);
+                    with_demo_fountain_access(&mut world, ctrl, &config, |w| {
+                        try_buy_recipe(w, ctrl, &item_id, &config, &items_config);
+                    });
                 }
                 ClientLobbyMessage::BuyCart { item_ids } => {
-                    try_buy_cart(&mut world, ctrl, &item_ids, &config, &items_config);
+                    with_demo_fountain_access(&mut world, ctrl, &config, |w| {
+                        try_buy_cart(w, ctrl, &item_ids, &config, &items_config);
+                    });
                 }
                 ClientLobbyMessage::SellItem { inv_index } => {
-                    try_sell_item(&mut world, ctrl, inv_index, &config, &items_config);
+                    with_demo_fountain_access(&mut world, ctrl, &config, |w| {
+                        try_sell_item(w, ctrl, inv_index, &config, &items_config);
+                    });
                 }
                 ClientLobbyMessage::CycleItemMode { inv_index } => {
                     try_cycle_item_mode(&mut world, ctrl, inv_index, &config, &items_config);
@@ -375,13 +447,9 @@ fn demo_server_init_and_receive_system(
                     );
                 }
                 ClientLobbyMessage::MoveStashItemToHero { stash_slot } => {
-                    try_move_stash_item_to_hero(
-                        &mut world,
-                        ctrl,
-                        stash_slot,
-                        &config,
-                        &items_config,
-                    );
+                    with_demo_fountain_access(&mut world, ctrl, &config, |w| {
+                        try_move_stash_item_to_hero(w, ctrl, stash_slot, &config, &items_config);
+                    });
                 }
                 ClientLobbyMessage::MoveCourierItemToStash { courier_slot } => {
                     try_move_courier_item_to_stash(
@@ -405,7 +473,9 @@ fn demo_server_init_and_receive_system(
                     try_sell_stash_item(&mut world, ctrl, stash_slot, &items_config);
                 }
                 ClientLobbyMessage::TakeAllStashToHero => {
-                    try_take_all_stash_to_hero(&mut world, ctrl, &config, &items_config);
+                    with_demo_fountain_access(&mut world, ctrl, &config, |w| {
+                        try_take_all_stash_to_hero(w, ctrl, &config, &items_config);
+                    });
                 }
                 ClientLobbyMessage::StartTeleport {
                     inv_index,
@@ -446,7 +516,9 @@ fn demo_server_init_and_receive_system(
         .receive_message(client_id, CHANNEL_UNRELIABLE_STATE)
     {
         if let Ok(cmd) = bincode::deserialize::<ClientInputCommand>(&bytes) {
-            world.set_slot_input(ctrl, cmd);
+            if !demo.flags.paused {
+                world.set_slot_input(ctrl, cmd);
+            }
         }
     }
 }
@@ -454,9 +526,9 @@ fn demo_server_init_and_receive_system(
 fn demo_server_ai_tick_system(
     config: Res<GameConfig>,
     mut world: ResMut<AuthoritativeWorldState>,
-    demo: Res<DemoServerRuntime>,
+    mut demo: ResMut<DemoServerRuntime>,
 ) {
-    step_demo_dummy_ai_and_rules(&config, &mut world, &demo.flags);
+    step_demo_dummy_ai_and_rules(&config, &mut world, &mut demo.flags);
 }
 
 fn demo_server_send_snapshot_system(
@@ -519,7 +591,7 @@ fn demo_server_send_snapshot_system(
 }
 
 // =============================================================================
-// منابع و رابط کاربری مستقل Demo Hero در کلاینت
+// منابع و رابط کاربری مدرن Demo Hero (بزرگ، خوانا، وسط‌چین عمودی سمت چپ مشابه Dota 2)
 // =============================================================================
 
 #[derive(Resource, Default)]
@@ -537,15 +609,23 @@ pub struct ActiveDemoSession {
     pub handle: Option<EmbeddedDemoServerHandle>,
     pub is_active: bool,
     pub panel_open: bool,
+    pub is_pointer_over_panel: bool,
+    pub spawn_dropdown_open: bool,
+    pub global_more_open: bool,
     pub free_cooldowns: bool,
+    pub creeps_enabled: bool,
+    pub towers_enabled: bool,
     pub reveal_full_map: bool,
     pub is_night: bool,
+    pub paused: bool,
     pub weather: WeatherKind,
     pub dummy_behavior: DummyBehavior,
     pub controlled_slot: usize,
     pub slots: Vec<DemoSlotEntry>,
+    pub invulnerable_slots: HashSet<usize>,
+    pub slot_move_targets: HashMap<usize, Vec3>,
+    pub pending_hero_move_target_sync: Option<Option<Vec3>>,
     pub spawn_hero_idx: usize,
-    pub dummy_item_idx: usize,
     pub ui_dirty: bool,
 }
 
@@ -555,64 +635,91 @@ impl Default for ActiveDemoSession {
             handle: None,
             is_active: false,
             panel_open: true,
+            is_pointer_over_panel: false,
+            spawn_dropdown_open: false,
+            global_more_open: false,
             free_cooldowns: false,
+            creeps_enabled: true,
+            towers_enabled: true,
             reveal_full_map: false,
             is_night: false,
+            paused: false,
             weather: WeatherKind::Clear,
             dummy_behavior: DummyBehavior::Idle,
             controlled_slot: 0,
             slots: Vec::new(),
+            invulnerable_slots: HashSet::new(),
+            slot_move_targets: HashMap::new(),
+            pending_hero_move_target_sync: None,
             spawn_hero_idx: 0,
-            dummy_item_idx: 0,
             ui_dirty: true,
         }
+    }
+}
+
+impl ActiveDemoSession {
+    /// انتقال کنترل به اسلات دلخواه با حفظ دستور حرکت هیروی قبلی و بازیابی دستور حرکت هیروی جدید
+    pub fn switch_control_to_slot(
+        &mut self,
+        target_slot: usize,
+        outgoing: &mut ShopOutgoingQueue,
+    ) -> bool {
+        if !self.is_active || target_slot >= self.slots.len() || target_slot == self.controlled_slot
+        {
+            return false;
+        }
+        self.controlled_slot = target_slot;
+        self.pending_hero_move_target_sync =
+            Some(self.slot_move_targets.get(&target_slot).copied());
+        self.ui_dirty = true;
+        outgoing
+            .0
+            .push(ClientLobbyMessage::DemoCommand(DemoCommand::ControlSlot {
+                slot_index: target_slot,
+            }));
+        true
     }
 }
 
 #[derive(Component)]
 struct DemoPanelRoot;
 
+#[derive(Component)]
+struct DemoPanelInteractiveArea;
+
 #[derive(Component, Clone)]
 enum DemoBtnAction {
     TogglePanel,
-    ControlSlot(usize),
+    ToggleSpawnDropdown,
+    SelectSpawnHero(usize),
+    ToggleGlobalMore,
     CycleControlSlot,
-    NextSpawnHero,
     SpawnHero(TeamId),
-    RemoveExtraHeroes,
+    SpawnDummy,
     ChangeControlledHero,
     LevelUp,
     MaxLevel,
-    AddGold,
+    ToggleInvulnerable,
     RefreshHero,
+    SwapControlledTeam,
+    ResetControlledHero,
+    RemoveControlledHero,
     ToggleFreeCooldowns,
+    ToggleCreeps,
+    ToggleTowers,
+    ToggleDayNight,
+    RefreshCooldownsOnly,
+    RefreshHealthOnly,
+    SetWeather(WeatherKind),
+    ToggleRevealMap,
     RespawnDummiesNearPlayer,
     CycleDummyBehavior,
-    NextDummyItem,
-    GiveOtherHeroesSelectedItem,
-    ForceOtherHeroesUseSlot0,
-    ClearOtherHeroesItems,
-    SetWeather(WeatherKind),
-    ToggleDayNight,
-    ToggleRevealMap,
     SpawnCreepWave,
-    ClearCreeps,
     RespawnAllTurrets,
     Teleport(DemoTeleportPreset),
+    TogglePause,
+    QuitDemo,
 }
-
-const DEMO_TEST_ITEMS: &[(&str, &str)] = &[
-    ("shadow_blade", "Shadow Blade"),
-    ("quantum_phase_shield", "Phase Shield"),
-    ("aegis_mirror_harness", "Mirror Harness"),
-    ("mirage_phase_cloak", "Mirage Cloak"),
-    ("ballistic_truelock", "True-Lock Core"),
-    ("cryo_stasis_injector", "Cryo Injector"),
-    ("valkyrie_crit_capacitor", "Crit Capacitor"),
-    ("null_vector_disruptor", "Null Disruptor"),
-    ("deep_scan_sonar", "Sonar Array"),
-    ("vector_thruster_pack", "Thruster Pack"),
-];
 
 pub struct DemoHeroClientPlugin;
 
@@ -674,9 +781,15 @@ fn launch_embedded_demo_system(
         handle: Some(handle),
         is_active: true,
         panel_open: true,
+        is_pointer_over_panel: false,
+        spawn_dropdown_open: false,
+        global_more_open: false,
         free_cooldowns: false,
+        creeps_enabled: true,
+        towers_enabled: true,
         reveal_full_map: false,
         is_night: false,
+        paused: false,
         weather: WeatherKind::Clear,
         dummy_behavior: DummyBehavior::Idle,
         controlled_slot: 0,
@@ -692,8 +805,10 @@ fn launch_embedded_demo_system(
                 hero_name: dummy_name,
             },
         ],
-        spawn_hero_idx: dummy_idx,
-        dummy_item_idx: 0,
+        invulnerable_slots: HashSet::new(),
+        slot_move_targets: HashMap::new(),
+        pending_hero_move_target_sync: None,
+        spawn_hero_idx: own_idx,
         ui_dirty: true,
     };
 
@@ -724,18 +839,26 @@ fn cleanup_demo_session_system(
         h.stop();
     }
     session.is_active = false;
+    session.is_pointer_over_panel = false;
+    session.slot_move_targets.clear();
+    session.invulnerable_slots.clear();
+    session.pending_hero_move_target_sync = None;
     session.ui_dirty = true;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn demo_panel_hotkey_and_click_system(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     config: Res<GameConfig>,
     mut session: ResMut<ActiveDemoSession>,
     mut outgoing: ResMut<ShopOutgoingQueue>,
+    mut next_screen: ResMut<NextState<AppScreenState>>,
+    panel_area_q: Query<&Hovered, (With<DemoPanelInteractiveArea>, Without<UiButton>)>,
     mut btn_q: Query<(&Hovered, &DemoBtnAction, &mut BorderColor), With<UiButton>>,
 ) {
     if !session.is_active {
+        session.is_pointer_over_panel = false;
         return;
     }
 
@@ -745,25 +868,27 @@ fn demo_panel_hotkey_and_click_system(
     }
 
     if keys.just_pressed(KeyCode::F7) && !session.slots.is_empty() {
-        session.controlled_slot = (session.controlled_slot + 1) % session.slots.len();
-        session.ui_dirty = true;
-        outgoing
-            .0
-            .push(ClientLobbyMessage::DemoCommand(DemoCommand::CycleControlSlot));
+        let next_slot = (session.controlled_slot + 1) % session.slots.len();
+        session.switch_control_to_slot(next_slot, &mut outgoing);
     }
 
     let clicked = mouse.just_pressed(MouseButton::Left);
     let mut triggered: Option<DemoBtnAction> = None;
+    let mut any_btn_hovered = false;
     for (hovered, action, mut border) in &mut btn_q {
         if hovered.get() {
-            *border = BorderColor::all(Color::srgb(0.98, 0.84, 0.34));
+            any_btn_hovered = true;
+            *border = BorderColor::all(Color::srgba(0.76, 0.84, 0.94, 0.92));
             if clicked && triggered.is_none() {
                 triggered = Some(action.clone());
             }
         } else {
-            *border = BorderColor::all(Color::srgba(0.28, 0.72, 0.72, 0.65));
+            *border = BorderColor::all(Color::srgba(0.28, 0.33, 0.40, 0.72));
         }
     }
+
+    session.is_pointer_over_panel =
+        any_btn_hovered || panel_area_q.iter().any(|h| h.get());
 
     let Some(act) = triggered else {
         return;
@@ -774,28 +899,25 @@ fn demo_panel_hotkey_and_click_system(
             session.panel_open = !session.panel_open;
             session.ui_dirty = true;
         }
-        DemoBtnAction::ControlSlot(slot_index) => {
-            if slot_index < session.slots.len() {
-                session.controlled_slot = slot_index;
+        DemoBtnAction::ToggleSpawnDropdown => {
+            session.spawn_dropdown_open = !session.spawn_dropdown_open;
+            session.ui_dirty = true;
+        }
+        DemoBtnAction::SelectSpawnHero(idx) => {
+            if idx < config.heroes.len() {
+                session.spawn_hero_idx = idx;
+                session.spawn_dropdown_open = false;
                 session.ui_dirty = true;
-                outgoing.0.push(ClientLobbyMessage::DemoCommand(
-                    DemoCommand::ControlSlot { slot_index },
-                ));
             }
+        }
+        DemoBtnAction::ToggleGlobalMore => {
+            session.global_more_open = !session.global_more_open;
+            session.ui_dirty = true;
         }
         DemoBtnAction::CycleControlSlot => {
             if !session.slots.is_empty() {
-                session.controlled_slot = (session.controlled_slot + 1) % session.slots.len();
-                session.ui_dirty = true;
-                outgoing
-                    .0
-                    .push(ClientLobbyMessage::DemoCommand(DemoCommand::CycleControlSlot));
-            }
-        }
-        DemoBtnAction::NextSpawnHero => {
-            if !config.heroes.is_empty() {
-                session.spawn_hero_idx = (session.spawn_hero_idx + 1) % config.heroes.len();
-                session.ui_dirty = true;
+                let next_slot = (session.controlled_slot + 1) % session.slots.len();
+                session.switch_control_to_slot(next_slot, &mut outgoing);
             }
         }
         DemoBtnAction::SpawnHero(team) => {
@@ -816,15 +938,32 @@ fn demo_panel_hotkey_and_click_system(
                 ));
             }
         }
-        DemoBtnAction::RemoveExtraHeroes => {
-            session.controlled_slot = 0;
-            if session.slots.len() > 2 {
-                session.slots.truncate(2);
+        DemoBtnAction::SpawnDummy => {
+            if session.slots.len() < 10 && !config.heroes.is_empty() {
+                let h = &config.heroes[session.spawn_hero_idx % config.heroes.len()];
+                let ctrl_team = session
+                    .slots
+                    .get(session.controlled_slot)
+                    .map(|s| s.team)
+                    .unwrap_or(TeamId::Dawn);
+                let enemy_team = if ctrl_team == TeamId::Dawn {
+                    TeamId::Dusk
+                } else {
+                    TeamId::Dawn
+                };
+                let new_slot = session.slots.len();
+                session.slots.push(DemoSlotEntry {
+                    slot_index: new_slot,
+                    team: enemy_team,
+                    hero_name: h.display_name.clone(),
+                });
+                session.ui_dirty = true;
+                outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                    DemoCommand::SpawnDummy {
+                        hero_id: h.id.clone(),
+                    },
+                ));
             }
-            session.ui_dirty = true;
-            outgoing.0.push(ClientLobbyMessage::DemoCommand(
-                DemoCommand::RemoveExtraHeroes,
-            ));
         }
         DemoBtnAction::ChangeControlledHero => {
             if !config.heroes.is_empty() {
@@ -853,28 +992,149 @@ fn demo_panel_hotkey_and_click_system(
                 .0
                 .push(ClientLobbyMessage::DemoCommand(DemoCommand::MaxLevel));
         }
-        DemoBtnAction::AddGold => {
-            outgoing
-                .0
-                .push(ClientLobbyMessage::DemoCommand(DemoCommand::AddGold {
-                    amount: 10_000,
-                }));
+        DemoBtnAction::ToggleInvulnerable => {
+            let ctrl = session.controlled_slot;
+            if session.invulnerable_slots.contains(&ctrl) {
+                session.invulnerable_slots.remove(&ctrl);
+            } else {
+                session.invulnerable_slots.insert(ctrl);
+            }
+            session.ui_dirty = true;
+            outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                DemoCommand::ToggleInvulnerable,
+            ));
         }
         DemoBtnAction::RefreshHero => {
             outgoing
                 .0
                 .push(ClientLobbyMessage::DemoCommand(DemoCommand::RefreshHero));
         }
+        DemoBtnAction::SwapControlledTeam => {
+            let ctrl = session.controlled_slot;
+            if let Some(entry) = session.slots.get_mut(ctrl) {
+                entry.team = if entry.team == TeamId::Dawn {
+                    TeamId::Dusk
+                } else {
+                    TeamId::Dawn
+                };
+            }
+            session.ui_dirty = true;
+            outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                DemoCommand::SwapControlledTeam,
+            ));
+        }
+        DemoBtnAction::ResetControlledHero => {
+            let ctrl = session.controlled_slot;
+            session.invulnerable_slots.remove(&ctrl);
+            session.slot_move_targets.remove(&ctrl);
+            session.pending_hero_move_target_sync = Some(None);
+            session.ui_dirty = true;
+            outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                DemoCommand::ResetControlledHero,
+            ));
+        }
+        DemoBtnAction::RemoveControlledHero => {
+            let ctrl = session.controlled_slot;
+            if ctrl > 0 && ctrl < session.slots.len() {
+                session.slots.remove(ctrl);
+                for (i, s) in session.slots.iter_mut().enumerate() {
+                    s.slot_index = i;
+                }
+                let mut new_inv = HashSet::new();
+                for &s in &session.invulnerable_slots {
+                    if s < ctrl {
+                        new_inv.insert(s);
+                    } else if s > ctrl {
+                        new_inv.insert(s - 1);
+                    }
+                }
+                session.invulnerable_slots = new_inv;
+                let mut new_targets = HashMap::new();
+                for (&s, &pos) in &session.slot_move_targets {
+                    if s < ctrl {
+                        new_targets.insert(s, pos);
+                    } else if s > ctrl {
+                        new_targets.insert(s - 1, pos);
+                    }
+                }
+                session.slot_move_targets = new_targets;
+                session.controlled_slot = 0;
+                session.pending_hero_move_target_sync =
+                    Some(session.slot_move_targets.get(&0).copied());
+                session.ui_dirty = true;
+                outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                    DemoCommand::RemoveControlledHero,
+                ));
+            } else if session.slots.len() > 2 {
+                session.controlled_slot = 0;
+                session.slots.truncate(2);
+                session.invulnerable_slots.retain(|&s| s < 2);
+                session.slot_move_targets.retain(|&s, _| s < 2);
+                session.pending_hero_move_target_sync =
+                    Some(session.slot_move_targets.get(&0).copied());
+                session.ui_dirty = true;
+                outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                    DemoCommand::RemoveExtraHeroes,
+                ));
+            }
+        }
         DemoBtnAction::ToggleFreeCooldowns => {
             session.free_cooldowns = !session.free_cooldowns;
             session.ui_dirty = true;
+            outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                DemoCommand::SetFreeCooldowns(session.free_cooldowns),
+            ));
+        }
+        DemoBtnAction::ToggleCreeps => {
+            session.creeps_enabled = !session.creeps_enabled;
+            session.ui_dirty = true;
+            outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                DemoCommand::SetCreepsEnabled(session.creeps_enabled),
+            ));
+        }
+        DemoBtnAction::ToggleTowers => {
+            session.towers_enabled = !session.towers_enabled;
+            session.ui_dirty = true;
+            outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                DemoCommand::SetTowersEnabled(session.towers_enabled),
+            ));
+        }
+        DemoBtnAction::ToggleDayNight => {
+            session.is_night = !session.is_night;
+            session.ui_dirty = true;
             outgoing
                 .0
-                .push(ClientLobbyMessage::DemoCommand(DemoCommand::SetFreeCooldowns(
-                    session.free_cooldowns,
+                .push(ClientLobbyMessage::DemoCommand(DemoCommand::SetNightTime(
+                    session.is_night,
                 )));
         }
+        DemoBtnAction::RefreshCooldownsOnly => {
+            outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                DemoCommand::RefreshCooldownsOnly,
+            ));
+        }
+        DemoBtnAction::RefreshHealthOnly => {
+            outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                DemoCommand::RefreshHealthOnly,
+            ));
+        }
+        DemoBtnAction::SetWeather(w) => {
+            session.weather = w;
+            session.ui_dirty = true;
+            outgoing
+                .0
+                .push(ClientLobbyMessage::DemoCommand(DemoCommand::SetWeather(w)));
+        }
+        DemoBtnAction::ToggleRevealMap => {
+            session.reveal_full_map = !session.reveal_full_map;
+            session.ui_dirty = true;
+            outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                DemoCommand::SetRevealFullMap(session.reveal_full_map),
+            ));
+        }
         DemoBtnAction::RespawnDummiesNearPlayer => {
+            let ctrl = session.controlled_slot;
+            session.slot_move_targets.retain(|&s, _| s == ctrl);
             outgoing.0.push(ClientLobbyMessage::DemoCommand(
                 DemoCommand::RespawnDummiesNearPlayer,
             ));
@@ -890,75 +1150,61 @@ fn demo_panel_hotkey_and_click_system(
                 DemoCommand::SetDummyBehavior(session.dummy_behavior),
             ));
         }
-        DemoBtnAction::NextDummyItem => {
-            session.dummy_item_idx = (session.dummy_item_idx + 1) % DEMO_TEST_ITEMS.len();
-            session.ui_dirty = true;
-        }
-        DemoBtnAction::GiveOtherHeroesSelectedItem => {
-            let (item_id, _) = DEMO_TEST_ITEMS[session.dummy_item_idx % DEMO_TEST_ITEMS.len()];
-            outgoing.0.push(ClientLobbyMessage::DemoCommand(
-                DemoCommand::GiveOtherHeroesItem {
-                    item_id: item_id.to_string(),
-                },
-            ));
-        }
-        DemoBtnAction::ForceOtherHeroesUseSlot0 => {
-            outgoing.0.push(ClientLobbyMessage::DemoCommand(
-                DemoCommand::ForceOtherHeroesActivateItem { inv_index: 0 },
-            ));
-        }
-        DemoBtnAction::ClearOtherHeroesItems => {
-            outgoing.0.push(ClientLobbyMessage::DemoCommand(
-                DemoCommand::ClearOtherHeroesItems,
-            ));
-        }
-        DemoBtnAction::SetWeather(w) => {
-            session.weather = w;
-            session.ui_dirty = true;
-            outgoing
-                .0
-                .push(ClientLobbyMessage::DemoCommand(DemoCommand::SetWeather(w)));
-        }
-        DemoBtnAction::ToggleDayNight => {
-            session.is_night = !session.is_night;
-            session.ui_dirty = true;
-            outgoing
-                .0
-                .push(ClientLobbyMessage::DemoCommand(DemoCommand::SetNightTime(
-                    session.is_night,
-                )));
-        }
-        DemoBtnAction::ToggleRevealMap => {
-            session.reveal_full_map = !session.reveal_full_map;
-            session.ui_dirty = true;
-            outgoing.0.push(ClientLobbyMessage::DemoCommand(
-                DemoCommand::SetRevealFullMap(session.reveal_full_map),
-            ));
-        }
         DemoBtnAction::SpawnCreepWave => {
+            session.creeps_enabled = true;
+            session.ui_dirty = true;
             outgoing
                 .0
                 .push(ClientLobbyMessage::DemoCommand(DemoCommand::SpawnCreepWave));
         }
-        DemoBtnAction::ClearCreeps => {
-            outgoing
-                .0
-                .push(ClientLobbyMessage::DemoCommand(DemoCommand::ClearCreeps));
-        }
         DemoBtnAction::RespawnAllTurrets => {
+            session.towers_enabled = true;
+            session.ui_dirty = true;
             outgoing.0.push(ClientLobbyMessage::DemoCommand(
                 DemoCommand::RespawnAllTurrets,
             ));
         }
         DemoBtnAction::Teleport(preset) => {
+            let ctrl = session.controlled_slot;
+            session.slot_move_targets.remove(&ctrl);
+            session.pending_hero_move_target_sync = Some(None);
             outgoing
                 .0
                 .push(ClientLobbyMessage::DemoCommand(DemoCommand::TeleportSelf(
                     preset,
                 )));
         }
+        DemoBtnAction::TogglePause => {
+            session.paused = !session.paused;
+            session.ui_dirty = true;
+            outgoing
+                .0
+                .push(ClientLobbyMessage::DemoCommand(DemoCommand::SetPaused(
+                    session.paused,
+                )));
+        }
+        DemoBtnAction::QuitDemo => {
+            next_screen.set(AppScreenState::PreGame);
+        }
     }
 }
+
+// =============================================================================
+// رنگ‌ها و المان‌های رابط کاربری بزرگ و خوانا مشابه Dota 2 Demo Hero
+// =============================================================================
+
+const COL_PANEL_BG: Color = Color::srgba(0.095, 0.112, 0.135, 0.95);
+const COL_PANEL_BORDER: Color = Color::srgba(0.24, 0.28, 0.34, 0.92);
+const COL_DIVIDER: Color = Color::srgba(0.24, 0.28, 0.34, 0.55);
+const COL_BTN_SLATE: Color = Color::srgb(0.24, 0.28, 0.33);
+const COL_BTN_DARK: Color = Color::srgb(0.14, 0.17, 0.21);
+const COL_BTN_ACTIVE: Color = Color::srgb(0.16, 0.42, 0.52);
+const COL_BTN_ALLY: Color = Color::srgb(0.22, 0.46, 0.24);
+const COL_BTN_ENEMY: Color = Color::srgb(0.55, 0.17, 0.17);
+const COL_BTN_QUIT: Color = Color::srgb(0.84, 0.30, 0.24);
+const COL_BTN_PAUSE_ON: Color = Color::srgb(0.62, 0.44, 0.12);
+const COL_TEXT_HEADER: Color = Color::srgb(0.95, 0.97, 0.99);
+const COL_TEXT_SUB: Color = Color::srgb(0.78, 0.83, 0.89);
 
 fn rebuild_demo_panel_ui_system(
     mut commands: Commands,
@@ -981,297 +1227,683 @@ fn rebuild_demo_panel_ui_system(
     let spawn_hero_name = config
         .heroes
         .get(session.spawn_hero_idx)
-        .map(|h| h.display_name.as_str())
-        .unwrap_or("Hero");
-    let (_, dummy_item_label) = DEMO_TEST_ITEMS[session.dummy_item_idx % DEMO_TEST_ITEMS.len()];
-    let ai_label = match session.dummy_behavior {
+        .map(|h| h.display_name.to_uppercase())
+        .unwrap_or_else(|| "HERO".to_string());
+    let ai_short = match session.dummy_behavior {
         DummyBehavior::Idle => "AI: IDLE",
-        DummyBehavior::AttackPlayer => "AI: ATTACK ME",
-        DummyBehavior::SwimInWater => "AI: SWIM WATER",
+        DummyBehavior::AttackPlayer => "AI: ATK",
+        DummyBehavior::SwimInWater => "AI: SWIM",
     };
+    let ctrl_invuln = session.invulnerable_slots.contains(&session.controlled_slot);
+    let ctrl_badge = session
+        .slots
+        .get(session.controlled_slot)
+        .map(|s| {
+            let tag = if s.team == TeamId::Dawn { "ALLY" } else { "ENEMY" };
+            let short: String = s.hero_name.chars().take(9).collect();
+            format!("P{} {} • {}", s.slot_index, tag, short)
+        })
+        .unwrap_or_else(|| "P0 ALLY".to_string());
+    let ctrl_team_is_dawn = session
+        .slots
+        .get(session.controlled_slot)
+        .map(|s| s.team == TeamId::Dawn)
+        .unwrap_or(true);
 
+    // کانتینر تمام‌ارتفاع سمت چپ (Pickable::IGNORE) برای وسط‌چین عمودی دقیق پنل
     commands
         .spawn((
             DemoPanelRoot,
+            Pickable::IGNORE,
             GlobalZIndex(220),
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(64.0),
-                left: Val::Px(12.0),
-                width: Val::Px(if session.panel_open { 260.0 } else { 148.0 }),
-                padding: UiRect::all(Val::Px(8.0)),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(5.0),
-                border: UiRect::all(Val::Px(1.5)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
+                top: Val::Px(0.0),
+                bottom: Val::Px(0.0),
+                left: Val::Px(0.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.02, 0.07, 0.09, 0.92)),
-            BorderColor::all(Color::srgb(0.26, 0.88, 0.78)),
         ))
-        .with_children(|root| {
-            spawn_demo_btn(
-                root,
-                if session.panel_open {
-                    "DEMO CONTROLS [F8] -"
-                } else {
-                    "DEMO [F8] +"
-                },
-                DemoBtnAction::TogglePanel,
-                Color::srgb(0.08, 0.30, 0.28),
-                true,
-            );
-
-            if !session.panel_open {
-                return;
-            }
-
-            // بخش ۱: انتخاب و کنترل مستقیم تک‌تک هیروهای حاضر در زمین
-            spawn_section_label(
-                root,
-                &format!("CONTROL HERO [F7] ({}/10)", session.slots.len()),
-            );
-            spawn_demo_btn(
-                root,
-                "SWITCH CONTROL TO NEXT [F7]",
-                DemoBtnAction::CycleControlSlot,
-                Color::srgb(0.36, 0.26, 0.06),
-                true,
-            );
-            root.spawn(Node {
-                width: Val::Percent(100.0),
-                flex_direction: FlexDirection::Row,
-                flex_wrap: FlexWrap::Wrap,
-                column_gap: Val::Px(4.0),
-                row_gap: Val::Px(4.0),
-                ..default()
-            })
-            .with_children(|grid| {
-                for entry in &session.slots {
-                    let is_ctrl = entry.slot_index == session.controlled_slot;
-                    let team_tag = if entry.team == TeamId::Dawn { "A" } else { "E" };
-                    let short_name: String = entry.hero_name.chars().take(7).collect();
-                    let lbl = format!("#{} {} {}", entry.slot_index, team_tag, short_name);
-                    let bg = if is_ctrl {
-                        Color::srgb(0.14, 0.48, 0.30)
-                    } else if entry.team == TeamId::Dawn {
-                        Color::srgb(0.06, 0.20, 0.28)
-                    } else {
-                        Color::srgb(0.30, 0.10, 0.12)
-                    };
-                    grid.spawn((
-                        UiButton,
+        .with_children(|outer| {
+            // بدنه اصلی پنل (در صورت باز بودن)
+            if session.panel_open {
+                outer
+                    .spawn((
+                        DemoPanelInteractiveArea,
                         Hovered::default(),
                         Node {
-                            width: Val::Px(118.0),
-                            height: Val::Px(22.0),
-                            padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
-                            justify_content: JustifyContent::Center,
-                            align_items: AlignItems::Center,
-                            border: UiRect::all(Val::Px(if is_ctrl { 1.5 } else { 1.0 })),
-                            border_radius: BorderRadius::all(Val::Px(4.0)),
+                            width: Val::Px(322.0),
+                            padding: UiRect::all(Val::Px(14.0)),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(9.0),
+                            border: UiRect::new(
+                                Val::Px(0.0),
+                                Val::Px(1.5),
+                                Val::Px(1.5),
+                                Val::Px(1.5),
+                            ),
+                            border_radius: BorderRadius::all(Val::Px(5.0)),
                             ..default()
                         },
-                        BackgroundColor(bg),
-                        BorderColor::all(if is_ctrl {
-                            Color::srgb(0.98, 0.86, 0.34)
-                        } else {
-                            Color::srgba(0.28, 0.72, 0.72, 0.65)
-                        }),
-                        DemoBtnAction::ControlSlot(entry.slot_index),
+                        BackgroundColor(COL_PANEL_BG),
+                        BorderColor::all(COL_PANEL_BORDER),
                     ))
-                    .with_children(|b| {
-                        b.spawn((
-                            Text::new(lbl),
+                    .with_children(|root| {
+                        // =====================================================
+                        // ۱. بخش SPAWN (مشابه Dota 2، بدون بخش اضافی دادن آیتم)
+                        // =====================================================
+                        root.spawn((
+                            Text::new("SPAWN"),
                             TextFont {
-                                font_size: FontSize::Px(9.5),
+                                font_size: FontSize::Px(14.5),
                                 ..default()
                             },
-                            TextColor(Color::WHITE),
+                            TextColor(COL_TEXT_HEADER),
                         ));
+
+                        // باکس انتخاب هیرو (Dropdown بزرگ و خوانا)
+                        root.spawn((
+                            UiButton,
+                            Hovered::default(),
+                            Node {
+                                width: Val::Percent(100.0),
+                                height: Val::Px(40.0),
+                                padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                                flex_direction: FlexDirection::Row,
+                                justify_content: JustifyContent::SpaceBetween,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(1.0)),
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.06, 0.08, 0.10)),
+                            BorderColor::all(Color::srgba(0.28, 0.33, 0.40, 0.85)),
+                            DemoBtnAction::ToggleSpawnDropdown,
+                        ))
+                        .with_children(|box_el| {
+                            box_el.spawn((
+                                Text::new(spawn_hero_name),
+                                TextFont {
+                                    font_size: FontSize::Px(14.5),
+                                    ..default()
+                                },
+                                TextColor(COL_TEXT_HEADER),
+                            ));
+                            box_el.spawn((
+                                Text::new(if session.spawn_dropdown_open { "^" } else { "v" }),
+                                TextFont {
+                                    font_size: FontSize::Px(13.5),
+                                    ..default()
+                                },
+                                TextColor(COL_TEXT_SUB),
+                            ));
+                        });
+
+                        // لیست بازشونده انتخاب سریع هیرو
+                        if session.spawn_dropdown_open {
+                            root.spawn((
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: Val::Px(3.0),
+                                    padding: UiRect::all(Val::Px(5.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.05, 0.07, 0.09)),
+                                BorderColor::all(COL_PANEL_BORDER),
+                            ))
+                            .with_children(|dd| {
+                                for (idx, h) in config.heroes.iter().enumerate() {
+                                    let is_sel = idx == session.spawn_hero_idx;
+                                    spawn_dota_btn(
+                                        dd,
+                                        &h.display_name.to_uppercase(),
+                                        DemoBtnAction::SelectSpawnHero(idx),
+                                        if is_sel { COL_BTN_ACTIVE } else { COL_BTN_DARK },
+                                        true,
+                                        30.0,
+                                        12.5,
+                                    );
+                                }
+                            });
+                        }
+
+                        // دکمه تمام‌عرض CHANGE MY HERO
+                        spawn_dota_btn(
+                            root,
+                            "CHANGE MY HERO",
+                            DemoBtnAction::ChangeControlledHero,
+                            COL_BTN_SLATE,
+                            true,
+                            36.0,
+                            13.0,
+                        );
+
+                        // ردیف سه‌تایی +ALLY | +ENEMY | +DUMMY
+                        spawn_row_3(
+                            root,
+                            ("+ALLY", DemoBtnAction::SpawnHero(TeamId::Dawn), COL_BTN_ALLY),
+                            ("+ENEMY", DemoBtnAction::SpawnHero(TeamId::Dusk), COL_BTN_ENEMY),
+                            ("+DUMMY", DemoBtnAction::SpawnDummy, COL_BTN_SLATE),
+                            35.0,
+                            12.5,
+                        );
+
+                        spawn_divider(root);
+
+                        // =====================================================
+                        // ۲. بخش UNITS (گرید ۲ + ۳ + ۳ مشابه Dota 2)
+                        // =====================================================
+                        root.spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::SpaceBetween,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        })
+                        .with_children(|hdr| {
+                            hdr.spawn((
+                                Text::new("UNITS"),
+                                TextFont {
+                                    font_size: FontSize::Px(14.5),
+                                    ..default()
+                                },
+                                TextColor(COL_TEXT_HEADER),
+                            ));
+                            hdr.spawn((
+                                UiButton,
+                                Hovered::default(),
+                                Node {
+                                    height: Val::Px(24.0),
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                                    justify_content: JustifyContent::Center,
+                                    align_items: AlignItems::Center,
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(if ctrl_team_is_dawn {
+                                    Color::srgba(0.14, 0.34, 0.20, 0.92)
+                                } else {
+                                    Color::srgba(0.42, 0.14, 0.16, 0.92)
+                                }),
+                                BorderColor::all(Color::srgba(0.40, 0.48, 0.56, 0.78)),
+                                DemoBtnAction::CycleControlSlot,
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new(ctrl_badge),
+                                    TextFont {
+                                        font_size: FontSize::Px(11.0),
+                                        ..default()
+                                    },
+                                    TextColor(COL_TEXT_HEADER),
+                                ));
+                            });
+                        });
+
+                        spawn_row_2(
+                            root,
+                            ("LVL UP", DemoBtnAction::LevelUp, COL_BTN_SLATE),
+                            ("LVL MAX", DemoBtnAction::MaxLevel, COL_BTN_SLATE),
+                            34.0,
+                            12.5,
+                        );
+                        spawn_row_3(
+                            root,
+                            (
+                                "INVULN",
+                                DemoBtnAction::ToggleInvulnerable,
+                                if ctrl_invuln { COL_BTN_ACTIVE } else { COL_BTN_SLATE },
+                            ),
+                            ("REFRESH", DemoBtnAction::RefreshHero, COL_BTN_SLATE),
+                            (ai_short, DemoBtnAction::CycleDummyBehavior, COL_BTN_SLATE),
+                            34.0,
+                            12.0,
+                        );
+                        spawn_row_3(
+                            root,
+                            ("SWAP TEAM", DemoBtnAction::SwapControlledTeam, COL_BTN_SLATE),
+                            ("RESET", DemoBtnAction::ResetControlledHero, COL_BTN_SLATE),
+                            ("REMOVE", DemoBtnAction::RemoveControlledHero, COL_BTN_SLATE),
+                            34.0,
+                            11.5,
+                        );
+
+                        spawn_divider(root);
+
+                        // =====================================================
+                        // ۳. بخش GLOBAL (چک‌باکس‌های ۲×۲ + REFRESH + آب‌وهوا + MORE)
+                        // =====================================================
+                        spawn_section_header_with_more(
+                            root,
+                            "GLOBAL",
+                            if session.global_more_open {
+                                "LESS ^"
+                            } else {
+                                "MORE >"
+                            },
+                            DemoBtnAction::ToggleGlobalMore,
+                        );
+
+                        root.spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(8.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            spawn_dota_checkbox(
+                                row,
+                                "Free Spells",
+                                session.free_cooldowns,
+                                DemoBtnAction::ToggleFreeCooldowns,
+                            );
+                            spawn_dota_checkbox(
+                                row,
+                                "Creeps",
+                                session.creeps_enabled,
+                                DemoBtnAction::ToggleCreeps,
+                            );
+                        });
+                        root.spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(8.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            spawn_dota_checkbox(
+                                row,
+                                "Towers",
+                                session.towers_enabled,
+                                DemoBtnAction::ToggleTowers,
+                            );
+                            spawn_dota_checkbox(
+                                row,
+                                "Night Time",
+                                session.is_night,
+                                DemoBtnAction::ToggleDayNight,
+                            );
+                        });
+
+                        // ردیف REFRESH: COOLDOWNS | HEALTH
+                        root.spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(6.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            row.spawn((
+                                Text::new("REFRESH:"),
+                                TextFont {
+                                    font_size: FontSize::Px(12.0),
+                                    ..default()
+                                },
+                                TextColor(COL_TEXT_SUB),
+                            ));
+                            spawn_dota_btn(
+                                row,
+                                "COOLDOWNS",
+                                DemoBtnAction::RefreshCooldownsOnly,
+                                COL_BTN_SLATE,
+                                false,
+                                32.0,
+                                11.5,
+                            );
+                            spawn_dota_btn(
+                                row,
+                                "HEALTH",
+                                DemoBtnAction::RefreshHealthOnly,
+                                COL_BTN_SLATE,
+                                false,
+                                32.0,
+                                11.5,
+                            );
+                        });
+
+                        // ردیف اختصاصی تغییر فوری آب‌وهوا (CLEAR | RAIN | SNOW)
+                        root.spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(5.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            row.spawn((
+                                Text::new("WEATHER:"),
+                                TextFont {
+                                    font_size: FontSize::Px(12.0),
+                                    ..default()
+                                },
+                                TextColor(COL_TEXT_SUB),
+                            ));
+                            for (lbl, w) in [
+                                ("CLEAR", WeatherKind::Clear),
+                                ("RAIN", WeatherKind::Rainy),
+                                ("SNOW", WeatherKind::Snowy),
+                            ] {
+                                let active = session.weather == w;
+                                spawn_dota_btn(
+                                    row,
+                                    lbl,
+                                    DemoBtnAction::SetWeather(w),
+                                    if active { COL_BTN_ACTIVE } else { COL_BTN_DARK },
+                                    false,
+                                    32.0,
+                                    11.5,
+                                );
+                            }
+                        });
+
+                        // کشوی اختیاری MORE برای تلپورت سریع، FoW، احضار هیروها و کنترل موج/تاور
+                        if session.global_more_open {
+                            root.spawn((
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    padding: UiRect::all(Val::Px(8.0)),
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: Val::Px(6.0),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.06, 0.08, 0.10, 0.90)),
+                                BorderColor::all(COL_DIVIDER),
+                            ))
+                            .with_children(|more| {
+                                spawn_dota_btn(
+                                    more,
+                                    "BRING OTHER HEROES HERE",
+                                    DemoBtnAction::RespawnDummiesNearPlayer,
+                                    COL_BTN_DARK,
+                                    true,
+                                    30.0,
+                                    11.5,
+                                );
+                                spawn_row_2(
+                                    more,
+                                    (
+                                        if session.reveal_full_map {
+                                            "FOW: REVEALED"
+                                        } else {
+                                            "FOW: NORMAL"
+                                        },
+                                        DemoBtnAction::ToggleRevealMap,
+                                        if session.reveal_full_map {
+                                            COL_BTN_ACTIVE
+                                        } else {
+                                            COL_BTN_DARK
+                                        },
+                                    ),
+                                    ("SPAWN WAVE", DemoBtnAction::SpawnCreepWave, COL_BTN_DARK),
+                                    30.0,
+                                    11.5,
+                                );
+                                spawn_dota_btn(
+                                    more,
+                                    "RESPAWN ALL TURRETS",
+                                    DemoBtnAction::RespawnAllTurrets,
+                                    COL_BTN_DARK,
+                                    true,
+                                    30.0,
+                                    11.5,
+                                );
+                                spawn_row_2(
+                                    more,
+                                    ("TP: MID", DemoBtnAction::Teleport(DemoTeleportPreset::MidLane), COL_BTN_DARK),
+                                    ("TP: WATER", DemoBtnAction::Teleport(DemoTeleportPreset::CanyonWater), COL_BTN_DARK),
+                                    30.0,
+                                    11.5,
+                                );
+                                spawn_row_2(
+                                    more,
+                                    ("TP: ROSHAN", DemoBtnAction::Teleport(DemoTeleportPreset::RoshanPit), COL_BTN_DARK),
+                                    ("TP: ENEMY T1", DemoBtnAction::Teleport(DemoTeleportPreset::EnemyTower), COL_BTN_DARK),
+                                    30.0,
+                                    11.5,
+                                );
+                            });
+                        }
+
+                        spawn_divider(root);
+
+                        // =====================================================
+                        // ۴. نوار پایینی PAUSE | QUIT (مشابه Dota 2)
+                        // =====================================================
+                        spawn_row_2(
+                            root,
+                            (
+                                if session.paused { "RESUME" } else { "PAUSE" },
+                                DemoBtnAction::TogglePause,
+                                if session.paused {
+                                    COL_BTN_PAUSE_ON
+                                } else {
+                                    COL_BTN_SLATE
+                                },
+                            ),
+                            ("QUIT", DemoBtnAction::QuitDemo, COL_BTN_QUIT),
+                            38.0,
+                            13.5,
+                        );
                     });
-                }
-            });
+            }
 
-            // بخش ۲: اسپاون هیروهای جدید در هر دو تیم و تعویض هیروی فعلی
-            spawn_section_label(root, "SPAWN & CHANGE HERO");
-            spawn_demo_btn(
-                root,
-                &format!("SELECT: {}  >", spawn_hero_name),
-                DemoBtnAction::NextSpawnHero,
-                Color::srgb(0.08, 0.20, 0.28),
-                true,
-            );
-            spawn_btn_row(
-                root,
-                ("+ SPAWN ALLY", DemoBtnAction::SpawnHero(TeamId::Dawn), Color::srgb(0.07, 0.32, 0.26)),
-                ("+ SPAWN ENEMY", DemoBtnAction::SpawnHero(TeamId::Dusk), Color::srgb(0.36, 0.12, 0.14)),
-            );
-            spawn_btn_row(
-                root,
-                ("CHANGE MY HERO", DemoBtnAction::ChangeControlledHero, Color::srgb(0.14, 0.24, 0.34)),
-                ("RESET 1v1", DemoBtnAction::RemoveExtraHeroes, Color::srgb(0.26, 0.12, 0.14)),
-            );
-
-            // بخش ۳: ارتقا و وضعیت هیروی تحت کنترل
-            spawn_section_label(root, "ACTIVE HERO STATS");
-            spawn_btn_row(
-                root,
-                ("+1 LVL", DemoBtnAction::LevelUp, Color::srgb(0.07, 0.22, 0.26)),
-                ("MAX LVL", DemoBtnAction::MaxLevel, Color::srgb(0.07, 0.22, 0.26)),
-            );
-            spawn_btn_row(
-                root,
-                ("+10K GOLD", DemoBtnAction::AddGold, Color::srgb(0.36, 0.26, 0.06)),
-                ("REFRESH", DemoBtnAction::RefreshHero, Color::srgb(0.08, 0.34, 0.22)),
-            );
-            spawn_demo_btn(
-                root,
-                if session.free_cooldowns {
-                    "FREE COOLDOWNS: ON"
-                } else {
-                    "FREE COOLDOWNS: OFF"
-                },
-                DemoBtnAction::ToggleFreeCooldowns,
-                if session.free_cooldowns {
-                    Color::srgb(0.10, 0.44, 0.28)
-                } else {
-                    Color::srgb(0.06, 0.16, 0.20)
-                },
-                true,
-            );
-
-            // بخش ۴: کنترل رفتار و آیتم سایر هیروها
-            spawn_section_label(root, "OTHER HEROES (AI & ITEMS)");
-            spawn_btn_row(
-                root,
-                ("BRING HERE", DemoBtnAction::RespawnDummiesNearPlayer, Color::srgb(0.28, 0.14, 0.14)),
-                (ai_label, DemoBtnAction::CycleDummyBehavior, Color::srgb(0.34, 0.18, 0.10)),
-            );
-            spawn_demo_btn(
-                root,
-                &format!("ITEM: {}  >", dummy_item_label),
-                DemoBtnAction::NextDummyItem,
-                Color::srgb(0.12, 0.16, 0.24),
-                true,
-            );
-            spawn_btn_row(
-                root,
-                ("GIVE ALL", DemoBtnAction::GiveOtherHeroesSelectedItem, Color::srgb(0.10, 0.32, 0.26)),
-                ("USE SLOT 1", DemoBtnAction::ForceOtherHeroesUseSlot0, Color::srgb(0.42, 0.22, 0.08)),
-            );
-            spawn_demo_btn(
-                root,
-                "CLEAR OTHER ITEMS",
-                DemoBtnAction::ClearOtherHeroesItems,
-                Color::srgb(0.24, 0.10, 0.12),
-                true,
-            );
-
-            // بخش ۵: محیط، آب‌وهوا، شب‌وروز و نقشه
-            spawn_section_label(root, "ENVIRONMENT & MAP");
-            root.spawn(Node {
-                width: Val::Percent(100.0),
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(4.0),
-                ..default()
-            })
-            .with_children(|row| {
-                for (lbl, w) in [
-                    ("CLEAR", WeatherKind::Clear),
-                    ("RAIN", WeatherKind::Rainy),
-                    ("SNOW", WeatherKind::Snowy),
-                ] {
-                    let active = session.weather == w;
-                    spawn_demo_btn(
-                        row,
-                        lbl,
-                        DemoBtnAction::SetWeather(w),
-                        if active {
-                            Color::srgb(0.12, 0.42, 0.38)
-                        } else {
-                            Color::srgb(0.05, 0.14, 0.18)
+            // زبانه جمع‌شونده سمت راست پنل (< / >)
+            outer
+                .spawn((
+                    UiButton,
+                    Hovered::default(),
+                    Node {
+                        width: Val::Px(28.0),
+                        height: Val::Px(104.0),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::new(
+                            Val::Px(0.0),
+                            Val::Px(1.5),
+                            Val::Px(1.5),
+                            Val::Px(1.5),
+                        ),
+                        border_radius: BorderRadius::all(Val::Px(5.0)),
+                        ..default()
+                    },
+                    BackgroundColor(COL_PANEL_BG),
+                    BorderColor::all(COL_PANEL_BORDER),
+                    DemoBtnAction::TogglePanel,
+                ))
+                .with_children(|tab| {
+                    tab.spawn((
+                        Text::new(if session.panel_open { "<" } else { ">" }),
+                        TextFont {
+                            font_size: FontSize::Px(18.0),
+                            ..default()
                         },
-                        false,
-                    );
-                }
-            });
-            spawn_btn_row(
-                root,
-                (
-                    if session.is_night { "TIME: NIGHT" } else { "TIME: DAY" },
-                    DemoBtnAction::ToggleDayNight,
-                    Color::srgb(0.10, 0.20, 0.34),
-                ),
-                (
-                    if session.reveal_full_map { "FOW: OFF" } else { "FOW: ON" },
-                    DemoBtnAction::ToggleRevealMap,
-                    Color::srgb(0.16, 0.22, 0.30),
-                ),
-            );
-            spawn_btn_row(
-                root,
-                ("SPAWN CREEPS", DemoBtnAction::SpawnCreepWave, Color::srgb(0.08, 0.26, 0.22)),
-                ("CLEAR CREEPS", DemoBtnAction::ClearCreeps, Color::srgb(0.22, 0.14, 0.14)),
-            );
-            spawn_demo_btn(
-                root,
-                "RESPAWN ALL TURRETS",
-                DemoBtnAction::RespawnAllTurrets,
-                Color::srgb(0.12, 0.24, 0.28),
-                true,
-            );
-
-            // بخش ۶: تلپورت سریع
-            spawn_section_label(root, "QUICK TELEPORT");
-            spawn_btn_row(
-                root,
-                ("MID LANE", DemoBtnAction::Teleport(DemoTeleportPreset::MidLane), Color::srgb(0.08, 0.20, 0.24)),
-                ("WATER", DemoBtnAction::Teleport(DemoTeleportPreset::CanyonWater), Color::srgb(0.06, 0.26, 0.34)),
-            );
-            spawn_btn_row(
-                root,
-                ("ROSHAN PIT", DemoBtnAction::Teleport(DemoTeleportPreset::RoshanPit), Color::srgb(0.20, 0.14, 0.26)),
-                ("ENEMY T1", DemoBtnAction::Teleport(DemoTeleportPreset::EnemyTower), Color::srgb(0.28, 0.14, 0.14)),
-            );
+                        TextColor(COL_TEXT_HEADER),
+                    ));
+                });
         });
 }
 
-fn spawn_section_label(parent: &mut ChildSpawnerCommands, title: &str) {
+fn spawn_divider(parent: &mut ChildSpawnerCommands) {
     parent.spawn((
-        Text::new(title),
-        TextFont {
-            font_size: FontSize::Px(9.5),
+        Node {
+            width: Val::Percent(100.0),
+            height: Val::Px(1.0),
+            margin: UiRect::vertical(Val::Px(2.0)),
             ..default()
         },
-        TextColor(Color::srgb(0.96, 0.84, 0.38)),
+        BackgroundColor(COL_DIVIDER),
     ));
 }
 
-fn spawn_btn_row(
+fn spawn_section_header_with_more(
     parent: &mut ChildSpawnerCommands,
-    left: (&str, DemoBtnAction, Color),
-    right: (&str, DemoBtnAction, Color),
+    title: &str,
+    more_label: &str,
+    more_action: DemoBtnAction,
 ) {
     parent
         .spawn(Node {
             width: Val::Percent(100.0),
             flex_direction: FlexDirection::Row,
-            column_gap: Val::Px(4.0),
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
             ..default()
         })
         .with_children(|row| {
-            spawn_demo_btn(row, left.0, left.1, left.2, false);
-            spawn_demo_btn(row, right.0, right.1, right.2, false);
+            row.spawn((
+                Text::new(title),
+                TextFont {
+                    font_size: FontSize::Px(14.5),
+                    ..default()
+                },
+                TextColor(COL_TEXT_HEADER),
+            ));
+            row.spawn((
+                UiButton,
+                Hovered::default(),
+                Node {
+                    height: Val::Px(25.0),
+                    padding: UiRect::axes(Val::Px(9.0), Val::Px(2.0)),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(Val::Px(1.0)),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(COL_BTN_DARK),
+                BorderColor::all(Color::srgba(0.28, 0.33, 0.40, 0.72)),
+                more_action,
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new(more_label),
+                    TextFont {
+                        font_size: FontSize::Px(11.5),
+                        ..default()
+                    },
+                    TextColor(COL_TEXT_SUB),
+                ));
+            });
         });
 }
 
-fn spawn_demo_btn(
+fn spawn_dota_checkbox(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    checked: bool,
+    action: DemoBtnAction,
+) {
+    parent
+        .spawn((
+            UiButton,
+            Hovered::default(),
+            Node {
+                flex_grow: 1.0,
+                flex_basis: Val::Px(0.0),
+                height: Val::Px(28.0),
+                padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0)),
+            BorderColor::all(Color::srgba(0.28, 0.33, 0.40, 0.0)),
+            action,
+        ))
+        .with_children(|row| {
+            row.spawn((
+                Node {
+                    width: Val::Px(18.0),
+                    height: Val::Px(18.0),
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(3.0)),
+                    ..default()
+                },
+                BackgroundColor(if checked {
+                    Color::srgb(0.76, 0.93, 0.98)
+                } else {
+                    Color::srgb(0.05, 0.06, 0.08)
+                }),
+                BorderColor::all(if checked {
+                    Color::srgb(0.45, 0.62, 0.92)
+                } else {
+                    Color::srgb(0.32, 0.36, 0.42)
+                }),
+            ));
+            row.spawn((
+                Text::new(label),
+                TextFont {
+                    font_size: FontSize::Px(13.5),
+                    ..default()
+                },
+                TextColor(COL_TEXT_SUB),
+            ));
+        });
+}
+
+fn spawn_row_2(
+    parent: &mut ChildSpawnerCommands,
+    left: (&str, DemoBtnAction, Color),
+    right: (&str, DemoBtnAction, Color),
+    height: f32,
+    font_px: f32,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(6.0),
+            ..default()
+        })
+        .with_children(|row| {
+            spawn_dota_btn(row, left.0, left.1, left.2, false, height, font_px);
+            spawn_dota_btn(row, right.0, right.1, right.2, false, height, font_px);
+        });
+}
+
+fn spawn_row_3(
+    parent: &mut ChildSpawnerCommands,
+    a: (&str, DemoBtnAction, Color),
+    b: (&str, DemoBtnAction, Color),
+    c: (&str, DemoBtnAction, Color),
+    height: f32,
+    font_px: f32,
+) {
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_direction: FlexDirection::Row,
+            column_gap: Val::Px(6.0),
+            ..default()
+        })
+        .with_children(|row| {
+            spawn_dota_btn(row, a.0, a.1, a.2, false, height, font_px);
+            spawn_dota_btn(row, b.0, b.1, b.2, false, height, font_px);
+            spawn_dota_btn(row, c.0, c.1, c.2, false, height, font_px);
+        });
+}
+
+fn spawn_dota_btn(
     parent: &mut ChildSpawnerCommands,
     label: &str,
     action: DemoBtnAction,
     bg: Color,
     full_width: bool,
+    height: f32,
+    font_px: f32,
 ) {
     parent
         .spawn((
@@ -1284,8 +1916,9 @@ fn spawn_demo_btn(
                     Val::Auto
                 },
                 flex_grow: if full_width { 0.0 } else { 1.0 },
-                height: Val::Px(22.0),
-                padding: UiRect::axes(Val::Px(5.0), Val::Px(2.0)),
+                flex_basis: if full_width { Val::Auto } else { Val::Px(0.0) },
+                height: Val::Px(height),
+                padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border: UiRect::all(Val::Px(1.0)),
@@ -1293,17 +1926,17 @@ fn spawn_demo_btn(
                 ..default()
             },
             BackgroundColor(bg),
-            BorderColor::all(Color::srgba(0.28, 0.72, 0.72, 0.65)),
+            BorderColor::all(Color::srgba(0.28, 0.33, 0.40, 0.72)),
             action,
         ))
         .with_children(|b| {
             b.spawn((
                 Text::new(label),
                 TextFont {
-                    font_size: FontSize::Px(10.0),
+                    font_size: FontSize::Px(font_px),
                     ..default()
                 },
-                TextColor(Color::srgb(0.94, 0.98, 0.98)),
+                TextColor(COL_TEXT_HEADER),
             ));
         });
 }

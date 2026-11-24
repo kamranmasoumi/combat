@@ -223,6 +223,9 @@ fn main() {
             invisibility_remaining: 0.0,
             is_reflect_armor_active: false,
             is_bullet_immune: false,
+            is_cryo_debuffed: false,
+            is_null_muted: false,
+            is_sonar_revealed: false,
             active_buffs: Vec::new(),
         }
     };
@@ -450,7 +453,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, update_inventory_world_drop_target_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system, teleport_preview_and_input_system.before(minimap_interaction_system), sync_active_teleports_visual_system, sync_invisibility_visual_system)
+            (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, update_inventory_world_drop_target_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system, teleport_preview_and_input_system.before(minimap_interaction_system), sync_active_teleports_visual_system, sync_invisibility_visual_system, sync_tactical_aura_snapshots_system)
                 .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
@@ -4192,6 +4195,8 @@ struct SampleInputExtraParams<'w, 's> {
     drag_bridge: ResMut<'w, InventoryDragDropBridge>,
     hero_hud_rel_q: Query<'w, 's, &'static RelativeCursorPosition, With<HeroHudRoot>>,
     soldier_root_query: Query<'w, 's, &'static GlobalTransform, With<SoldierMarker>>,
+    demo_session: ResMut<'w, demo_client::ActiveDemoSession>,
+    outgoing: ResMut<'w, ShopOutgoingQueue>,
 }
 
 fn client_sample_input_system(
@@ -4246,6 +4251,10 @@ fn client_sample_input_system(
     if keyboard.pressed(KeyCode::KeyD) {
         move_vec.x += 1.0;
     }
+    if let Some(synced_target) = ex.demo_session.pending_hero_move_target_sync.take() {
+        ex.hero_move_target.0 = synced_target;
+    }
+    let had_move_target = ex.hero_move_target.0.is_some();
     if ex.drag_bridge.clear_hero_move_target {
         ex.hero_move_target.0 = None;
         ex.drag_bridge.clear_hero_move_target = false;
@@ -4264,6 +4273,18 @@ fn client_sample_input_system(
         } else {
             move_vec = delta.normalize();
         }
+    }
+    if had_move_target && ex.hero_move_target.0.is_none() && ex.demo_session.is_active {
+        let ctrl = ex.demo_session.controlled_slot;
+        ex.demo_session.slot_move_targets.remove(&ctrl);
+        ex.outgoing
+            .0
+            .push(ClientLobbyMessage::DemoCommand(
+                moba_shared::DemoCommand::SetSlotMoveTarget {
+                    slot_index: ctrl,
+                    target: None,
+                },
+            ));
     }
 
     let mut aim_ray_origin = Vec3::ZERO;
@@ -4304,7 +4325,8 @@ fn client_sample_input_system(
         || shop_ui.is_dragging_item
         || shop_ui.suppress_world_click_this_frame
         || camera_control.is_pointer_over_minimap
-        || camera_control.is_dragging_minimap;
+        || camera_control.is_dragging_minimap
+        || ex.demo_session.is_pointer_over_panel;
 
     let alt_held = keyboard.pressed(KeyCode::AltLeft) || keyboard.pressed(KeyCode::AltRight);
     let hero_action_taken = wasd_pressed
@@ -4416,6 +4438,7 @@ struct TurretFxResources<'w, 's> {
     materials: ResMut<'w, Assets<StandardMaterial>>,
     audio_q: ResMut<'w, AudioEventQueue>,
     vfx_q: ResMut<'w, VfxEventQueue>,
+    aura_sync: ResMut<'w, vfx_client::TacticalAuraSyncState>,
     turret_gun_q: Query<'w, 's, &'static mut TurretGunBone>,
     turret_muzzle_q: Query<'w, 's, (&'static TurretMuzzlePoint, &'static GlobalTransform)>,
     next_screen: ResMut<'w, NextState<AppScreenState>>,
@@ -4786,6 +4809,7 @@ fn client_receive_snapshot_and_sync_system(
             &fx_res.turret_muzzle_q,
             fx_live_muzzle,
             fx,
+            &mut fx_res.aura_sync,
         );
     }
 
@@ -4842,6 +4866,7 @@ fn spawn_fx_from_server_event(
     turret_muzzle_q: &Query<(&TurretMuzzlePoint, &GlobalTransform)>,
     live_muzzle_opt: Option<Vec3>,
     event: GameplayFxEvent,
+    aura_sync: &mut vfx_client::TacticalAuraSyncState,
 ) {
     match event {
         GameplayFxEvent::ShotFired {
@@ -5241,25 +5266,92 @@ fn spawn_fx_from_server_event(
             color_rgb,
         } => {
             audio_q.0.push(ClientAudioEvent::ShadowBladeActivate { pos });
-            let ring_count = 16_usize;
-            for i in 0..ring_count {
-                let angle = (i as f32) * (std::f32::consts::TAU / ring_count as f32);
-                let spd = (radius * 1.45).clamp(4.0, 32.0);
-                let vel = Vec3::new(angle.cos() * spd, 0.8, angle.sin() * spd);
-                commands.spawn((
-                    Mesh3d(shared_fx.coin_mesh.clone()),
-                    MeshMaterial3d(shared_fx.coin_mat.clone()),
-                    particle_physics_bundle(
-                        config,
-                        pos + Vec3::new(angle.cos() * 0.4, 0.35, angle.sin() * 0.4),
-                        vel,
-                        0.45,
-                        false,
-                    ),
-                    NotShadowCaster,
-                ));
-            }
-            let _ = color_rgb;
+            aura_sync.pending_tactical_pulses.push((pos, radius, color_rgb));
+        }
+        GameplayFxEvent::DamageNumber {
+            pos,
+            amount,
+            is_crit,
+        } => {
+            let jitter_x = (render_state.next_fx_rand() - 0.5) * 0.45;
+            let jitter_z = (render_state.next_fx_rand() - 0.5) * 0.45;
+            let label = if is_crit {
+                format!("{:.0}!", amount.round())
+            } else {
+                format!("{:.0}", amount.round())
+            };
+            let (font_sz, text_col) = if is_crit {
+                (16.0, Color::srgb(1.0, 0.16, 0.14))
+            } else {
+                (11.5, Color::srgba(0.96, 0.97, 1.0, 0.92))
+            };
+            commands
+                .spawn((
+                    FloatingWorldPopup {
+                        world_pos: pos + Vec3::new(jitter_x, 0.15, jitter_z),
+                        timer: Timer::from_seconds(
+                            if is_crit { 0.85 } else { 0.58 },
+                            TimerMode::Once,
+                        ),
+                    },
+                    Pickable::IGNORE,
+                    GlobalZIndex(if is_crit { 190 } else { 175 }),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::NONE),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        Text::new(label),
+                        TextFont {
+                            font_size: FontSize::Px(font_sz),
+                            ..default()
+                        },
+                        TextColor(text_col),
+                    ));
+                });
+        }
+        GameplayFxEvent::EvadeMiss { pos } => {
+            commands
+                .spawn((
+                    FloatingWorldPopup {
+                        world_pos: pos,
+                        timer: Timer::from_seconds(0.62, TimerMode::Once),
+                    },
+                    Pickable::IGNORE,
+                    GlobalZIndex(180),
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px(0.0),
+                        top: px(0.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::NONE),
+                ))
+                .with_children(|p| {
+                    p.spawn((
+                        Text::new("miss"),
+                        TextFont {
+                            font_size: FontSize::Px(11.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgba(0.95, 0.97, 1.0, 0.90)),
+                    ));
+                });
+        }
+        GameplayFxEvent::LifestealHeal {
+            slot_index: _,
+            pos,
+            amount: _,
+        } => {
+            aura_sync.pending_lifesteal_heals.push(pos);
+        }
+        GameplayFxEvent::ReflectHitPulse { slot_index, pos: _ } => {
+            aura_sync.pending_reflect_pulses.push(slot_index);
         }
     }
 }
@@ -5702,6 +5794,7 @@ fn cursor_reticle_system(
     shake: Res<CameraShake>,
     shop_ui: Res<ShopUiState>,
     settings_ui: Res<SettingsUiState>,
+    demo_session: Res<demo_client::ActiveDemoSession>,
     mut window_query: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
     mut root_query: Query<(&mut ReticleRoot, &mut Node, &mut Visibility)>,
     mut outer_query: Query<
@@ -5752,7 +5845,8 @@ fn cursor_reticle_system(
         || settings_ui.is_open
         || shop_ui.pending_sell_slot.is_some()
         || shop_ui.is_pointer_over_hud_ui
-        || shop_ui.is_dragging_item;
+        || shop_ui.is_dragging_item
+        || demo_session.is_pointer_over_panel;
 
     if config.cursor_reticle.hide_os_cursor_in_game {
         if cursor_options.visible != ui_cursor_needed {
@@ -6543,7 +6637,7 @@ fn minimap_interaction_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     window_query: Query<&Window, With<PrimaryWindow>>,
-    _render_state: Res<ClientRenderState>,
+    mut demo_session: ResMut<demo_client::ActiveDemoSession>,
     courier_ctrl: Res<CourierControlState>,
     mut inspected: ResMut<InspectedUnit>,
     mut hero_move_target: ResMut<HeroClickMoveTarget>,
@@ -6620,6 +6714,16 @@ fn minimap_interaction_system(
         } else {
             *inspected = InspectedUnit::OwnHero;
             hero_move_target.0 = Some(target_pos);
+            if demo_session.is_active {
+                let ctrl = demo_session.controlled_slot;
+                demo_session.slot_move_targets.insert(ctrl, target_pos);
+                outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                    moba_shared::DemoCommand::SetSlotMoveTarget {
+                        slot_index: ctrl,
+                        target: Some(target_pos),
+                    },
+                ));
+            }
         }
     }
 }
@@ -16042,6 +16146,7 @@ struct RightClickBoxInputParams<'w, 's> {
     window_q: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     cam_q: Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<MobaCamera>>,
     map_obj_q: Query<'w, 's, &'static MapObjectId>,
+    demo_session: ResMut<'w, demo_client::ActiveDemoSession>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16073,7 +16178,8 @@ fn courier_manual_move_input_system(
         || guards.settings_ui.is_open
         || guards.chat_state.is_open
         || guards.camera_control.is_pointer_over_minimap
-        || guards.camera_control.is_dragging_minimap;
+        || guards.camera_control.is_dragging_minimap
+        || rbox.demo_session.is_pointer_over_panel;
 
     // ساخت تنبل (Lazy) کادر مستطیلی آبی انتخاب مشابه ویندوز و Dota 2
     if box_ui_q.is_empty() && match_flow.is_in_game() {
@@ -16194,6 +16300,24 @@ fn courier_manual_move_input_system(
             guards.render_state.soldier_pos,
             my_slot,
         ) {
+            if rbox.demo_session.is_active {
+                if let InspectedUnit::RemoteHero(target_slot) = best_unit {
+                    if let Some(cur_t) = hero_move_target.0 {
+                        let old_ctrl = rbox.demo_session.controlled_slot;
+                        rbox.demo_session.slot_move_targets.insert(old_ctrl, cur_t);
+                    }
+                    if rbox.demo_session.switch_control_to_slot(target_slot, &mut outgoing) {
+                        hero_move_target.0 = rbox
+                            .demo_session
+                            .pending_hero_move_target_sync
+                            .take()
+                            .flatten();
+                        courier_ctrl.selected = false;
+                        *inspected = InspectedUnit::OwnHero;
+                        return;
+                    }
+                }
+            }
             courier_ctrl.selected = best_unit == InspectedUnit::OwnCourier;
             *inspected = best_unit;
         }
@@ -16222,6 +16346,21 @@ fn courier_manual_move_input_system(
     if !courier_ctrl.selected {
         for rp in &q.latest_remotes.0 {
             if rp.is_visible && ray_point_distance(ray.origin, ray_dir, rp.pos + Vec3::Y * 1.0).0 <= 1.25 {
+                if rbox.demo_session.is_active {
+                    if let Some(cur_t) = hero_move_target.0 {
+                        let old_ctrl = rbox.demo_session.controlled_slot;
+                        rbox.demo_session.slot_move_targets.insert(old_ctrl, cur_t);
+                    }
+                    if rbox.demo_session.switch_control_to_slot(rp.slot_index, &mut outgoing) {
+                        hero_move_target.0 = rbox
+                            .demo_session
+                            .pending_hero_move_target_sync
+                            .take()
+                            .flatten();
+                        *inspected = InspectedUnit::OwnHero;
+                        return;
+                    }
+                }
                 *inspected = InspectedUnit::RemoteHero(rp.slot_index);
                 return;
             }
@@ -16309,6 +16448,16 @@ fn courier_manual_move_input_system(
         } else {
             *inspected = InspectedUnit::OwnHero;
             hero_move_target.0 = Some(hit_world);
+            if rbox.demo_session.is_active {
+                let ctrl = rbox.demo_session.controlled_slot;
+                rbox.demo_session.slot_move_targets.insert(ctrl, hit_world);
+                outgoing.0.push(ClientLobbyMessage::DemoCommand(
+                    moba_shared::DemoCommand::SetSlotMoveTarget {
+                        slot_index: ctrl,
+                        target: Some(hit_world),
+                    },
+                ));
+            }
         }
     }
 }
@@ -18224,5 +18373,44 @@ fn gpu_startup_guard_system(mut guard: ResMut<GpuStartupGuard>) {
             GpuBackendChoice::EnvOverride => {}
         }
         guard.committed = true;
+    }
+}
+fn sync_tactical_aura_snapshots_system(
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    hero_hud: Res<LatestHeroSnapshot>,
+    remote_players: Res<LatestRemotePlayers>,
+    mut aura_sync: ResMut<vfx_client::TacticalAuraSyncState>,
+) {
+    aura_sync.heroes.clear();
+    if !match_flow.is_in_game() {
+        return;
+    }
+    if let Some(my_slot) = match_flow.your_slot {
+        aura_sync.heroes.push(vfx_client::HeroTacticalAuraSnapshot {
+            slot_index: my_slot,
+            pos: render_state.soldier_pos,
+            is_dead: render_state.is_dead,
+            is_reflect_armor_active: hero_hud.0.is_reflect_armor_active,
+            is_bullet_immune: hero_hud.0.is_bullet_immune,
+            is_cryo_debuffed: hero_hud.0.is_cryo_debuffed,
+            is_null_muted: hero_hud.0.is_null_muted,
+            is_sonar_revealed: hero_hud.0.is_sonar_revealed,
+        });
+    }
+    for rp in &remote_players.0 {
+        if !rp.is_visible {
+            continue;
+        }
+        aura_sync.heroes.push(vfx_client::HeroTacticalAuraSnapshot {
+            slot_index: rp.slot_index,
+            pos: rp.pos,
+            is_dead: rp.is_dead,
+            is_reflect_armor_active: rp.is_reflect_armor_active,
+            is_bullet_immune: rp.is_bullet_immune,
+            is_cryo_debuffed: rp.is_cryo_debuffed,
+            is_null_muted: rp.is_null_muted,
+            is_sonar_revealed: rp.is_sonar_revealed,
+        });
     }
 }

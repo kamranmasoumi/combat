@@ -777,7 +777,9 @@ impl Plugin for MobaVfxPlugin {
             .add_plugins(MaterialPlugin::<TeleportPortalMaterial>::default())
             .add_plugins(MaterialPlugin::<WeatherRainMaterial>::default())
             .add_plugins(MaterialPlugin::<WeatherSnowMaterial>::default())
+            .add_plugins(MaterialPlugin::<TacticalAuraMaterial>::default())
             .init_resource::<VfxEventQueue>()
+            .init_resource::<TacticalAuraSyncState>()
             .init_resource::<VfxMaterialPool>()
             .init_resource::<BulletVfxRegistry>()
             .init_resource::<WeatherVfxState>()
@@ -792,6 +794,7 @@ impl Plugin for MobaVfxPlugin {
                     process_vfx_events_system,
                     update_vfx_lifetimes_system,
                     update_weather_vfx_system,
+                    update_tactical_auras_vfx_system,
                 )
                     .chain(),
             );
@@ -2941,4 +2944,321 @@ fn safe_despawn(commands: &mut Commands, entity: Entity) {
             em.despawn();
         }
     });
+}
+// =============================================================================
+// سیستم افکت‌های سه‌بعدی WESL برای تمام آیتم‌های تاکتیکی (vfx_tactical_aura.wesl)
+// =============================================================================
+
+#[derive(ShaderType, Debug, Clone)]
+pub struct TacticalAuraUniforms {
+    pub primary_color: Vec4,
+    pub secondary_color: Vec4,
+    pub params: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct TacticalAuraMaterial {
+    #[uniform(0)]
+    pub uniforms: TacticalAuraUniforms,
+}
+
+impl Material for TacticalAuraMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/vfx_tactical_aura.wesl".into()
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Add
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HeroTacticalAuraSnapshot {
+    pub slot_index: usize,
+    pub pos: Vec3,
+    pub is_dead: bool,
+    pub is_reflect_armor_active: bool,
+    pub is_bullet_immune: bool,
+    pub is_cryo_debuffed: bool,
+    pub is_null_muted: bool,
+    pub is_sonar_revealed: bool,
+}
+
+#[derive(Resource, Default)]
+pub struct TacticalAuraSyncState {
+    pub heroes: Vec<HeroTacticalAuraSnapshot>,
+    pub pending_reflect_pulses: Vec<usize>,
+    pub pending_lifesteal_heals: Vec<Vec3>,
+    pub pending_tactical_pulses: Vec<(Vec3, f32, (f32, f32, f32))>,
+}
+
+#[derive(Component)]
+struct HeroPersistentAuraVfx {
+    slot_index: usize,
+    kind: u8, // 0=ReflectDome, 1=PhaseDome, 3=CryoRing, 4=NullRing, 5=SonarRing
+    hit_pulse: f32,
+}
+
+#[derive(Component)]
+struct TransientTacticalAuraVfx {
+    elapsed: f32,
+    duration: f32,
+    mode: f32,
+    start_scale: f32,
+    end_scale: f32,
+    rise_speed: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_tactical_auras_vfx_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut aura_mats: ResMut<Assets<TacticalAuraMaterial>>,
+    mut sync: ResMut<TacticalAuraSyncState>,
+    mut persistent_q: Query<
+        (
+            Entity,
+            &mut HeroPersistentAuraVfx,
+            &mut Transform,
+            &MeshMaterial3d<TacticalAuraMaterial>,
+        ),
+        Without<TransientTacticalAuraVfx>,
+    >,
+    mut transient_q: Query<
+        (
+            Entity,
+            &mut TransientTacticalAuraVfx,
+            &mut Transform,
+            &MeshMaterial3d<TacticalAuraMaterial>,
+        ),
+        Without<HeroPersistentAuraVfx>,
+    >,
+) {
+    let dt = time.delta_secs();
+    let t = time.elapsed_secs();
+
+    // ۱. اعمال پمپاژ لحظه‌ای شیلد مغناطیسی Aegis Mirror هنگام برخورد تیر
+    let reflect_pulses: Vec<usize> = sync.pending_reflect_pulses.drain(..).collect();
+    for (_, mut aura, _, _) in &mut persistent_q {
+        if aura.kind == 0 && reflect_pulses.contains(&aura.slot_index) {
+            aura.hit_pulse = 1.0;
+        }
+    }
+
+    // ۲. افکت سبز صعودی Lifesteal (مشابه Dota 2)
+    let heal_positions: Vec<Vec3> = sync.pending_lifesteal_heals.drain(..).collect();
+    for pos in heal_positions {
+        let mesh = meshes.add(Cylinder::new(0.68, 1.75));
+        let mat = aura_mats.add(TacticalAuraMaterial {
+            uniforms: TacticalAuraUniforms {
+                primary_color: Vec4::new(0.14, 0.96, 0.36, 1.0),
+                secondary_color: Vec4::new(0.68, 1.0, 0.72, 1.0),
+                params: Vec4::new(t, 1.0, 0.0, 2.0),
+            },
+        });
+        commands.spawn((
+            TransientTacticalAuraVfx {
+                elapsed: 0.0,
+                duration: 0.52,
+                mode: 2.0,
+                start_scale: 0.92,
+                end_scale: 1.18,
+                rise_speed: 0.75,
+            },
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::from_translation(pos + Vec3::Y * 0.95),
+            NotShadowCaster,
+        ));
+    }
+
+    // ۳. موج‌های انفجاری WESL برای NullPulse / SonarReveal / KineticDash
+    let pulse_events: Vec<(Vec3, f32, (f32, f32, f32))> =
+        sync.pending_tactical_pulses.drain(..).collect();
+    for (pos, radius, col) in pulse_events {
+        let mesh = meshes.add(Plane3d::default().mesh().size(2.0, 2.0));
+        let mat = aura_mats.add(TacticalAuraMaterial {
+            uniforms: TacticalAuraUniforms {
+                primary_color: Vec4::new(col.0, col.1, col.2, 1.0),
+                secondary_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
+                params: Vec4::new(t, 1.0, 0.0, 6.0),
+            },
+        });
+        commands.spawn((
+            TransientTacticalAuraVfx {
+                elapsed: 0.0,
+                duration: 0.58,
+                mode: 6.0,
+                start_scale: 0.8,
+                end_scale: radius.max(2.0),
+                rise_speed: 0.0,
+            },
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::from_translation(pos + Vec3::Y * 0.14),
+            NotShadowCaster,
+        ));
+    }
+
+    // ۴. همگام‌سازی شیلدها و حلقه‌های پایدار روی تمام هیروها (لوکال و ریموت)
+    let mut existing_keys: Vec<(usize, u8)> = Vec::new();
+    for (ent, mut aura, mut tf, mat_h) in &mut persistent_q {
+        let hero_opt = sync.heroes.iter().find(|h| h.slot_index == aura.slot_index);
+        let still_active = hero_opt.is_some_and(|h| {
+            !h.is_dead
+                && match aura.kind {
+                    0 => h.is_reflect_armor_active,
+                    1 => h.is_bullet_immune,
+                    3 => h.is_cryo_debuffed,
+                    4 => h.is_null_muted,
+                    5 => h.is_sonar_revealed,
+                    _ => false,
+                }
+        });
+        if !still_active {
+            safe_despawn(&mut commands, ent);
+            continue;
+        }
+        existing_keys.push((aura.slot_index, aura.kind));
+        let hpos = hero_opt.unwrap().pos;
+        aura.hit_pulse = (aura.hit_pulse - dt * 5.8).max(0.0);
+
+        match aura.kind {
+            0 => {
+                // شیلد مغناطیسی Aegis Mirror + پمپاژ لحظه‌ای هنگام برخورد تیر
+                let pump = 1.0 + aura.hit_pulse * 0.24;
+                tf.translation = hpos + Vec3::Y * 1.05;
+                tf.scale = Vec3::splat(pump);
+                tf.rotation = Quat::from_rotation_y(t * 1.4);
+            }
+            1 => {
+                // گنبد طلایی Quantum Phase Shield
+                tf.translation = hpos + Vec3::Y * 1.05;
+                tf.scale = Vec3::splat(1.0 + (t * 4.5).sin() * 0.025);
+                tf.rotation = Quat::from_rotation_y(-t * 1.1);
+            }
+            3 => {
+                tf.translation = hpos + Vec3::Y * 0.10;
+            }
+            4 => {
+                tf.translation = hpos + Vec3::Y * 1.15;
+            }
+            5 => {
+                tf.translation = hpos + Vec3::Y * 0.14;
+            }
+            _ => {}
+        }
+
+        if let Some(mut mat) = aura_mats.get_mut(&mat_h.0) {
+            mat.uniforms.params.x = t;
+            mat.uniforms.params.y = 1.0;
+            mat.uniforms.params.z = aura.hit_pulse;
+        }
+    }
+
+    for h in &sync.heroes {
+        if h.is_dead {
+            continue;
+        }
+        let specs: [(u8, bool, Vec4, Vec4, Vec3, bool); 5] = [
+            (
+                0,
+                h.is_reflect_armor_active,
+                Vec4::new(1.0, 0.44, 0.12, 1.0),
+                Vec4::new(1.0, 0.88, 0.48, 1.0),
+                Vec3::Y * 1.05,
+                true,
+            ),
+            (
+                1,
+                h.is_bullet_immune,
+                Vec4::new(1.0, 0.86, 0.24, 1.0),
+                Vec4::new(1.0, 0.99, 0.88, 1.0),
+                Vec3::Y * 1.05,
+                true,
+            ),
+            (
+                3,
+                h.is_cryo_debuffed,
+                Vec4::new(0.22, 0.84, 1.0, 1.0),
+                Vec4::new(0.82, 0.98, 1.0, 1.0),
+                Vec3::Y * 0.10,
+                false,
+            ),
+            (
+                4,
+                h.is_null_muted,
+                Vec4::new(0.96, 0.22, 0.88, 1.0),
+                Vec4::new(1.0, 0.72, 0.98, 1.0),
+                Vec3::Y * 1.15,
+                false,
+            ),
+            (
+                5,
+                h.is_sonar_revealed,
+                Vec4::new(1.0, 0.80, 0.20, 1.0),
+                Vec4::new(1.0, 0.96, 0.72, 1.0),
+                Vec3::Y * 0.14,
+                false,
+            ),
+        ];
+
+        for (kind, active, c1, c2, offset, is_sphere) in specs {
+            if !active || existing_keys.contains(&(h.slot_index, kind)) {
+                continue;
+            }
+            let mesh = if is_sphere {
+                let rad = if kind == 1 { 1.24 } else { 1.16 };
+                meshes.add(Sphere::new(rad).mesh().uv(24, 14))
+            } else {
+                meshes.add(Plane3d::default().mesh().size(2.15, 2.15))
+            };
+            let mat = aura_mats.add(TacticalAuraMaterial {
+                uniforms: TacticalAuraUniforms {
+                    primary_color: c1,
+                    secondary_color: c2,
+                    params: Vec4::new(t, 1.0, 0.0, kind as f32),
+                },
+            });
+            commands.spawn((
+                HeroPersistentAuraVfx {
+                    slot_index: h.slot_index,
+                    kind,
+                    hit_pulse: 0.0,
+                },
+                Mesh3d(mesh),
+                MeshMaterial3d(mat),
+                Transform::from_translation(h.pos + offset),
+                NotShadowCaster,
+            ));
+        }
+    }
+
+    // ۵. به‌روزرسانی عمر افکت‌های گذرا (لایف‌استیل سبز و موج‌های EMP/Sonar)
+    for (ent, mut tr, mut tf, mat_h) in &mut transient_q {
+        tr.elapsed += dt;
+        let frac = (tr.elapsed / tr.duration.max(0.01)).clamp(0.0, 1.0);
+        if frac >= 1.0 {
+            safe_despawn(&mut commands, ent);
+            continue;
+        }
+        let fade = 1.0 - frac;
+        let cur_scale = tr.start_scale + (tr.end_scale - tr.start_scale) * frac;
+        if tr.mode > 5.5 {
+            tf.scale = Vec3::new(cur_scale, 1.0, cur_scale);
+        } else {
+            tf.scale = Vec3::splat(cur_scale);
+            tf.translation.y += tr.rise_speed * dt;
+        }
+        if let Some(mut mat) = aura_mats.get_mut(&mat_h.0) {
+            mat.uniforms.params.x = t;
+            mat.uniforms.params.y = fade;
+        }
+    }
 }

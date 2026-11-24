@@ -457,6 +457,12 @@ pub struct CombatEffectsConfig {
     pub reflect_popup_color_rgb: (f32, f32, f32),
     pub purge_popup_color_rgb: (f32, f32, f32),
     pub sonar_popup_color_rgb: (f32, f32, f32),
+    pub lifesteal_applies_to_heroes: bool,
+    pub lifesteal_applies_to_creeps: bool,
+    pub lifesteal_applies_to_buildings: bool,
+    pub lifesteal_creep_ratio_mult: f32,
+    pub lifesteal_heal_fx_min_amount: f32,
+    pub crit_blood_extra_bursts: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -464,7 +470,16 @@ pub struct ReflectArmorConfig {
     pub item_id: String,
     pub duration_secs: f32,
     pub cooldown_secs: f32,
-    pub reflect_damage_ratio: f32,
+    pub passive_flat_damage: f32,
+    pub passive_damage_ratio: f32,
+    pub active_flat_damage: f32,
+    pub active_damage_ratio: f32,
+    pub shotgun_flat_reflect_scale: f32,
+    pub reflect_applies_to_heroes: bool,
+    pub reflect_applies_to_creeps: bool,
+    pub reflect_applies_to_turrets: bool,
+    pub reflect_creep_damage_ratio: f32,
+    pub reflect_turret_damage_ratio: f32,
     pub buff_bar_color_rgb: (f32, f32, f32),
 }
 
@@ -760,7 +775,9 @@ impl ItemsConfig {
         assert!(self.combat_effects.true_strike_bonus_damage >= 0.0, "true_strike_bonus_damage نامعتبر است");
         assert!(self.combat_effects.cryo_snow_or_water_duration_mult >= 1.0, "cryo_snow_or_water_duration_mult باید >= 1.0 باشد");
         assert!(self.combat_effects.popup_throttle_secs > 0.0, "popup_throttle_secs باید > 0 باشد");
-        assert!(self.reflect_armor.duration_secs > 0.0 && self.reflect_armor.cooldown_secs > 0.0 && self.reflect_armor.reflect_damage_ratio > 0.0, "reflect_armor نامعتبر است");
+        assert!(self.combat_effects.lifesteal_creep_ratio_mult >= 0.0 && self.combat_effects.lifesteal_creep_ratio_mult <= 2.0, "lifesteal_creep_ratio_mult نامعتبر است");
+        assert!(self.combat_effects.lifesteal_heal_fx_min_amount >= 0.0, "lifesteal_heal_fx_min_amount نامعتبر است");
+        assert!(self.reflect_armor.duration_secs > 0.0 && self.reflect_armor.cooldown_secs > 0.0 && self.reflect_armor.passive_flat_damage >= 0.0 && self.reflect_armor.passive_damage_ratio >= 0.0 && self.reflect_armor.active_flat_damage >= 0.0 && self.reflect_armor.active_damage_ratio > 0.0 && self.reflect_armor.shotgun_flat_reflect_scale > 0.0 && self.reflect_armor.reflect_creep_damage_ratio >= 0.0 && self.reflect_armor.reflect_turret_damage_ratio >= 0.0, "reflect_armor نامعتبر است");
         assert!(self.bullet_immunity.duration_secs > 0.0 && self.bullet_immunity.cooldown_secs > 0.0, "bullet_immunity نامعتبر است");
         assert!(self.null_pulse.radius > 0.0 && self.null_pulse.rain_or_water_radius_mult >= 1.0 && self.null_pulse.mute_duration_secs > 0.0 && self.null_pulse.cooldown_secs > 0.0, "null_pulse نامعتبر است");
         assert!(self.sonar_reveal.radius > 0.0 && self.sonar_reveal.reveal_duration_secs > 0.0 && self.sonar_reveal.cooldown_secs > 0.0, "sonar_reveal نامعتبر است");
@@ -1109,6 +1126,11 @@ pub fn recompute_player_slot_stats(
         .on_hit_heal_reduction_ratio
         .clamp(0.0, lim.max_on_hit_heal_reduction_ratio);
     p.hero_on_hit_debuff_duration_secs = total_mod.on_hit_debuff_duration_secs.max(0.0);
+    p.has_reflect_armor_passive = p.inventory.iter().any(|inv| {
+        items_cfg
+            .get_item(&inv.item_id)
+            .is_some_and(|d| d.active_ability == ItemActiveAbility::ReflectArmor)
+    });
 
     // به‌روزرسانی آنی سرعت نمایشی (حتی وقتی هیرو ایستاده است)
     let invis_mult = if p.invisibility_remaining > 0.0 {

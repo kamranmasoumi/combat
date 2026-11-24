@@ -7604,20 +7604,52 @@ fn optimize_tree_shadows_system(
     mut tree_query: Query<(Entity, &mut TreeVisualMarker), Without<MountainVisualMarker>>,
     mut mountain_query: Query<(Entity, &mut MountainVisualMarker), Without<TreeVisualMarker>>,
     children_query: Query<&Children>,
-    mesh_query: Query<(), With<Mesh3d>>,
+    mesh_query: Query<Option<&MeshMaterial3d<StandardMaterial>>, With<Mesh3d>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut tuned_tree_mats: Local<std::collections::HashSet<AssetId<StandardMaterial>>>,
 ) {
+    // درخت‌ها سایه واقعی می‌اندازند و متریال‌های glTF آن‌ها برای نورپردازی طبیعی شاخ‌وبرگ بهینه‌سازی می‌شوند
     for (tree_ent, mut marker) in &mut tree_query {
         if marker.shadows_optimized {
             continue;
         }
         let mut found_mesh = false;
-        if mesh_query.contains(tree_ent) {
-            commands.entity(tree_ent).insert(NotShadowCaster);
+        let mut tune_mat = |mat_opt: Option<&MeshMaterial3d<StandardMaterial>>| {
+            let Some(mat_h) = mat_opt else { return };
+            let mat_id = mat_h.0.id();
+            if !tuned_tree_mats.insert(mat_id) {
+                return;
+            }
+            if let Some(mut mat) = materials.get_mut(mat_id) {
+                // جلوگیری از بی‌روح شدن درخت در صورت وجود KHR_materials_unlit در فایل glb
+                mat.unlit = false;
+                mat.metallic = 0.0;
+                mat.perceptual_roughness = mat.perceptual_roughness.max(0.78);
+                mat.reflectance = mat.reflectance.min(0.24);
+                // تبدیل Blend برگ‌ها به Mask برای انداختن سایه تمیز و جلوگیری از خطای عمق
+                let is_foliage_alpha = matches!(
+                    mat.alpha_mode,
+                    AlphaMode::Blend | AlphaMode::Premultiplied | AlphaMode::Mask(_)
+                );
+                if is_foliage_alpha {
+                    mat.alpha_mode = AlphaMode::Mask(0.45);
+                    mat.double_sided = true;
+                    mat.cull_mode = None;
+                    // عبور نرم نور خورشید از میان برگ‌ها برای حس زنده و طبیعی
+                    mat.diffuse_transmission = mat.diffuse_transmission.max(0.18);
+                }
+            }
+        };
+
+        if let Ok(mat_opt) = mesh_query.get(tree_ent) {
+            commands.entity(tree_ent).remove::<NotShadowCaster>();
+            tune_mat(mat_opt);
             found_mesh = true;
         }
         for desc in children_query.iter_descendants(tree_ent) {
-            if mesh_query.contains(desc) {
-                commands.entity(desc).insert(NotShadowCaster);
+            if let Ok(mat_opt) = mesh_query.get(desc) {
+                commands.entity(desc).remove::<NotShadowCaster>();
+                tune_mat(mat_opt);
                 found_mesh = true;
             }
         }

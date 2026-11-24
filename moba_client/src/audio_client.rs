@@ -3,7 +3,6 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use moba_shared::{BulletVfxSource, GameConfig, ImpactSurface, ItemsConfig, ShotAudioSource, WeaponKind, WeatherKind};
 use std::collections::HashMap;
-use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AudioCategory {
@@ -235,9 +234,7 @@ impl AudioAssetCache {
         if let Some(cached) = self.0.get(path) {
             return cached.clone();
         }
-        let exists = Path::new("assets").join(path).is_file()
-            || Path::new("../../assets").join(path).is_file()
-            || Path::new(path).is_file();
+        let exists = crate::client_assets_dir().join(path).is_file();
         let handle = if exists {
             Some(asset_server.load(path.to_string()))
         } else {

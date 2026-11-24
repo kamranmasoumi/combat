@@ -12,7 +12,6 @@ use moba_shared::{
     parse_recipe_target, recipe_item_id, ActiveBuffSnapshot, ClientLobbyMessage, CourierOrder,
     GameConfig, InventoryItemState, ItemActiveAbility, ItemCategory, ItemDef, ItemsConfig,
 };
-use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShopCategoryFilter {

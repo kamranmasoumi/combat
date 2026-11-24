@@ -24,7 +24,9 @@ from django.db import transaction
 from django.utils import timezone
 
 from .models import (
+    ClientPatchRelease,
     Friendship,
+    GameCoordinatorConfig,
     GameMatchRoom,
     MatchParticipant,
     Player,
@@ -1426,15 +1428,21 @@ def _find_party_member_in_active_match(player_pks: List[int]) -> Optional[str]:
 class MatchmakingConsumer(AsyncWebsocketConsumer):
     """
     وب‌سوکت صف یافتن نبرد (Find Match):
-    ws://<host>/ws/matchmaking/?token=<access_token>
+    ws://<host>/ws/matchmaking/?token=<access_token>&client_build=<int>
     """
 
     player: Optional[Player] = None
+    client_build: Optional[int] = None
 
     async def connect(self) -> None:
         query_string = self.scope.get("query_string", b"").decode("utf-8")
         params = parse_qs(query_string)
         token_str = params.get("token", [""])[0].strip()
+        raw_build = params.get("client_build", [""])[0].strip()
+        try:
+            self.client_build = int(raw_build) if raw_build else None
+        except Exception:
+            self.client_build = None
 
         if not token_str:
             headers = dict(self.scope.get("headers", []))
@@ -1515,6 +1523,13 @@ class MatchmakingConsumer(AsyncWebsocketConsumer):
                 )
             )
             await self.close(code=4003)
+            return
+
+        # بررسی وضعیت Game Coordinator و نسخه کلاینت (پس از چک active_match تا بازی‌های فعال هیچ‌گاه مختل نشوند)
+        gate_err = await _check_coordinator_and_version_gate_async(self.client_build)
+        if gate_err is not None:
+            await self.send(text_data=json.dumps(gate_err))
+            await self.close(code=4004)
             return
 
         required = max(1, int(getattr(settings, "MATCHMAKING_PLAYERS_PER_MATCH", 2)))
@@ -2502,6 +2517,15 @@ class LobbyConsumer(AsyncWebsocketConsumer):
     async def _handle_start_match(self) -> None:
         assert self.player is not None
         if not self.current_lobby_id:
+            return
+        gate_err = await _check_coordinator_and_version_gate_async(None)
+        if gate_err is not None:
+            await self.send_json(
+                {
+                    "event": "error",
+                    "message": gate_err.get("message", "Game Coordinator is updating."),
+                }
+            )
             return
 
         async with _LOBBY_LOCK:
@@ -4095,6 +4119,17 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
 
     async def _handle_start_party_matchmaking(self) -> None:
         assert self.player is not None
+        gate_err = await _check_coordinator_and_version_gate_async(None)
+        if gate_err is not None:
+            await self.send_json(
+                {
+                    "event": "notification",
+                    "kind": "error",
+                    "title": "GAME COORDINATOR",
+                    "message": gate_err.get("message", "Game Coordinator is updating."),
+                }
+            )
+            return
         party_members_copy: List[PartyMember] = []
         party_id_copy: Optional[str] = None
         party_detail: Optional[dict] = None
@@ -4472,3 +4507,189 @@ class SocialPartyConsumer(AsyncWebsocketConsumer):
 
     async def match_found(self, event: dict) -> None:
         await self.send_json(event["payload"])
+
+
+# ============================================================================
+# سیستم Game Coordinator و پخش زنده پچ‌های کلاینت مشابه Dota 2 (/ws/coordinator/)
+# ============================================================================
+
+COORDINATOR_GROUP_NAME = "simorgh_coordinator_global"
+
+
+def serialize_patch_summary(patch: Optional[ClientPatchRelease], include_manifest: bool = False) -> Optional[dict]:
+    if not patch:
+        return None
+    data = {
+        "version": patch.version,
+        "build_number": patch.build_number,
+        "min_supported_build": patch.min_supported_build,
+        "title": patch.title,
+        "release_notes": patch.release_notes,
+        "base_download_url": patch.base_download_url,
+        "total_size_bytes": patch.total_size_bytes,
+        "file_count": len(patch.manifest_json) if isinstance(patch.manifest_json, list) else 0,
+        "is_mandatory": patch.is_mandatory,
+        "published_at": patch.published_at.isoformat() if patch.published_at else None,
+    }
+    if include_manifest:
+        data["files"] = patch.manifest_json if isinstance(patch.manifest_json, list) else []
+    return data
+
+
+def build_coordinator_status_payload(include_manifest: bool = False) -> dict:
+    coord = GameCoordinatorConfig.get_solo()
+    active_patch = (
+        ClientPatchRelease.objects.filter(is_active=True)
+        .order_by("-build_number")
+        .first()
+    )
+    default_msg = ""
+    if coord.mode == GameCoordinatorConfig.MODE_UPDATING:
+        default_msg = "Game Coordinator is updating — Matchmaking is paused. Active ranked matches are unaffected."
+    elif coord.mode == GameCoordinatorConfig.MODE_MAINTENANCE:
+        default_msg = "Game Coordinator is under maintenance — Matchmaking is temporarily disabled."
+    return {
+        "mode": coord.mode,
+        "block_matchmaking": bool(coord.block_matchmaking or coord.mode != GameCoordinatorConfig.MODE_ONLINE),
+        "banner_message": coord.banner_message or default_msg,
+        "updated_at": coord.updated_at.isoformat() if coord.updated_at else None,
+        "latest_patch": serialize_patch_summary(active_patch, include_manifest=include_manifest),
+    }
+
+
+@database_sync_to_async
+def _build_coordinator_status_payload_async(include_manifest: bool = False) -> dict:
+    return build_coordinator_status_payload(include_manifest=include_manifest)
+
+
+def check_coordinator_and_version_gate(client_build: Optional[int]) -> Optional[dict]:
+    """
+    بررسی اینکه آیا ورود به صف Matchmaking یا شروع لابی جدید مجاز است یا خیر.
+    توجه: بازیکنان حاضر در نبرد فعال (Reconnect) هیچ‌گاه توسط این گیت مسدود نمی‌شوند.
+    """
+    coord = GameCoordinatorConfig.get_solo()
+    if coord.mode != GameCoordinatorConfig.MODE_ONLINE or coord.block_matchmaking:
+        msg = coord.banner_message or (
+            "Game Coordinator is currently updating. New matches are paused until update completes."
+            if coord.mode == GameCoordinatorConfig.MODE_UPDATING
+            else "Game Coordinator is under maintenance. Please try again shortly."
+        )
+        return {
+            "event": "coordinator_blocked",
+            "mode": coord.mode,
+            "message": msg,
+        }
+
+    if client_build is not None:
+        active_patch = (
+            ClientPatchRelease.objects.filter(is_active=True)
+            .order_by("-build_number")
+            .first()
+        )
+        if active_patch and active_patch.is_mandatory and client_build < active_patch.min_supported_build:
+            return {
+                "event": "update_required",
+                "message": f"Client update required (v{active_patch.version}, build #{active_patch.build_number}). Please update before matchmaking.",
+                "latest_patch": serialize_patch_summary(active_patch, include_manifest=False),
+            }
+    return None
+
+
+@database_sync_to_async
+def _check_coordinator_and_version_gate_async(client_build: Optional[int]) -> Optional[dict]:
+    return check_coordinator_and_version_gate(client_build)
+
+
+async def evict_waiting_queue_for_coordinator_async(message: str, mode: str) -> int:
+    """
+    خارج‌سازی امن بازیکنانی که فقط در صف انتظار Matchmaking هستند (بدون هیچ جریمه و بدون تاثیر روی مچ‌های فعال)
+    """
+    evicted_channels: List[str] = []
+    async with _QUEUE_LOCK:
+        evicted_channels = [item.channel_name for item in _WAITING_QUEUE if item.channel_name]
+        _WAITING_QUEUE[:] = []
+
+    layer = get_channel_layer()
+    if layer is not None:
+        for ch in evicted_channels:
+            try:
+                await layer.send(
+                    ch,
+                    {
+                        "type": "queue.status",
+                        "payload": {
+                            "event": "coordinator_blocked",
+                            "mode": mode,
+                            "message": message,
+                        },
+                    },
+                )
+            except Exception:
+                pass
+    return len(evicted_channels)
+
+
+def broadcast_coordinator_state_sync(event_name: str = "coordinator_state") -> None:
+    """
+    پخش آنی وضعیت Game Coordinator یا انتشار پچ جدید برای تمام کلاینت‌های متصل به /ws/coordinator/
+    """
+    payload = build_coordinator_status_payload(include_manifest=False)
+    payload["event"] = event_name
+    layer = get_channel_layer()
+    if layer is None:
+        return
+    try:
+        async_to_sync(layer.group_send)(
+            COORDINATOR_GROUP_NAME,
+            {
+                "type": "coordinator.event",
+                "payload": payload,
+            },
+        )
+        if payload.get("block_matchmaking"):
+            async_to_sync(evict_waiting_queue_for_coordinator_async)(
+                payload.get("banner_message", "Game Coordinator is updating."),
+                payload.get("mode", "updating"),
+            )
+    except Exception as exc:
+        print(f"[COORDINATOR BROADCAST WARNING] {exc}", flush=True)
+
+
+class CoordinatorConsumer(AsyncWebsocketConsumer):
+    """
+    وب‌سوکت پایدار و سبک Game Coordinator (متصل در صفحه ورود، منو و حتی بی‌صدا در حین بازی):
+    ws://<host>/ws/coordinator/
+    """
+
+    async def connect(self) -> None:
+        await self.channel_layer.group_add(COORDINATOR_GROUP_NAME, self.channel_name)
+        await self.accept()
+        snapshot = await _build_coordinator_status_payload_async(include_manifest=False)
+        snapshot["event"] = "coordinator_snapshot"
+        await self.send(text_data=json.dumps(snapshot))
+
+    async def disconnect(self, close_code: int) -> None:
+        try:
+            await self.channel_layer.group_discard(COORDINATOR_GROUP_NAME, self.channel_name)
+        except Exception:
+            pass
+
+    async def receive(
+        self, text_data: Optional[str] = None, bytes_data: Optional[bytes] = None
+    ) -> None:
+        if not text_data:
+            return
+        try:
+            msg = json.loads(text_data)
+        except Exception:
+            return
+        action = str(msg.get("action", "")).strip()
+        if action == "ping":
+            await self.send(text_data=json.dumps({"event": "pong"}))
+        elif action == "refresh":
+            snapshot = await _build_coordinator_status_payload_async(include_manifest=False)
+            snapshot["event"] = "coordinator_snapshot"
+            await self.send(text_data=json.dumps(snapshot))
+
+    async def coordinator_event(self, event: dict) -> None:
+        await self.send(text_data=json.dumps(event["payload"]))

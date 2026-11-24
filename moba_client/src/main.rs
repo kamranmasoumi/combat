@@ -54,6 +54,7 @@ mod audio_client;
 mod backend_client;
 mod demo_client;
 mod pregame_ui;
+mod updater_client;
 mod vfx_client;
 use backend_client::BackendClient;
 use pregame_ui::{AppScreenState, PendingMatchConnection, PreGamePlugin, PreGameSessionState};
@@ -236,6 +237,10 @@ fn main() {
         .set_error_handler(bevy::ecs::error::warn)
         .add_plugins(
             DefaultPlugins
+                .set(AssetPlugin {
+                    file_path: client_assets_dir().to_string_lossy().into_owned(),
+                    ..default()
+                })
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: config.window.title.clone(),
@@ -270,6 +275,7 @@ fn main() {
         .insert_resource(backend_client)
         .add_plugins(PreGamePlugin)
         .add_plugins(demo_client::DemoHeroClientPlugin)
+        .add_plugins(updater_client::ClientUpdaterPlugin)
         .add_plugins(ShopPlugin)
         .add_plugins(MobaAudioPlugin)
         .add_plugins((
@@ -1105,11 +1111,25 @@ impl ClientRenderState {
 }
 
 /// بررسی وجود فایل مدل ۳بعدی `.glb` در پوشه `assets`؛ اگر فایل وجود داشته باشد به‌صورت خودکار جایگزین مش پیش‌فرض Bevy می‌شود
+/// مسیر یکتای دایرکتوری assets:
+/// - در حالت توسعه (cargo run -p moba_client): دقیقاً `moba_client/assets`
+/// - در نسخه عملیاتی (اجرای مستقیم exe): دقیقاً `assets` کنار فایل اجرایی
+pub fn client_assets_dir() -> std::path::PathBuf {
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        std::path::PathBuf::from(manifest_dir).join("assets")
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("assets")))
+            .unwrap_or_else(|| std::path::PathBuf::from("assets"))
+    }
+}
+
 fn custom_glb_exists(model_path: &str) -> bool {
     if model_path.trim().is_empty() {
         return false;
     }
-    Path::new("assets").join(model_path).is_file() || Path::new(model_path).is_file()
+    client_assets_dir().join(model_path).is_file()
 }
 
 fn model_transform_to_bevy(t: &ModelTransformConfig) -> Transform {
@@ -12505,7 +12525,7 @@ fn day_night_cycle_system(
             } else {
                 (&config.day_night.day_start_sound, config.day_night.day_start_volume)
             };
-            if Path::new("assets").join(sound_path).is_file() || Path::new(sound_path).is_file() {
+            if client_assets_dir().join(sound_path).is_file() {
                 commands.spawn((
                     AudioPlayer::new(asset_server.load(sound_path)),
                     PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(vol)),

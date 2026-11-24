@@ -14,14 +14,7 @@ from .consumers import (
     stop_game_server_service,
     store_ticket_in_redis,
 )
-from .models import (
-    GameMatchRoom,
-    MatchParticipant,
-    OtpVerification,
-    Player,
-    PlayerSessionToken,
-    compute_rank_tier_from_mmr,
-)
+from .models import *
 
 # عنوان‌های اختصاصی پنل مدیریت جنگو
 admin.site.site_header = "پنل مدیریت سرورهای سیمرغ (Simorgh MOBA Admin)"
@@ -674,3 +667,7 @@ class OtpVerificationAdmin(admin.ModelAdmin):
         self.message_user(
             request, f"{updated} کد OTP باطل شد.", messages.INFO
         )
+
+
+admin.site.register(GameCoordinatorConfig)
+admin.site.register(ClientPatchRelease)

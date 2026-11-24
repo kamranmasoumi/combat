@@ -354,3 +354,147 @@ class Friendship(models.Model):
 
     def __str__(self) -> str:
         return f"{self.requester.username} -> {self.addressee.username} [{self.status}]"
+
+
+class GameCoordinatorConfig(models.Model):
+    """
+    تنظیمات تک‌نمونه‌ای (Singleton) وضعیت Game Coordinator مشابه Dota 2:
+    - online: وضعیت عادی، یافتن نبرد و لابی باز است
+    - updating: در حال انتشار پچ جدید، یافتن نبرد و شروع لابی جدید مسدود می‌شود ولی بازی‌های فعال بدون اختلال ادامه می‌یابند
+    - maintenance: تعمیرات سرور، ورود به صف جدید مسدود است
+    """
+
+    MODE_ONLINE = "online"
+    MODE_UPDATING = "updating"
+    MODE_MAINTENANCE = "maintenance"
+
+    MODE_CHOICES = [
+        (MODE_ONLINE, "آنلاین — آماده نبرد (Online)"),
+        (MODE_UPDATING, "در حال بروزرسانی هماهنگ‌کننده (Game Coordinator Updating)"),
+        (MODE_MAINTENANCE, "در حال تعمیرات (Maintenance)"),
+    ]
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    mode = models.CharField(
+        "وضعیت Coordinator",
+        max_length=24,
+        choices=MODE_CHOICES,
+        default=MODE_ONLINE,
+        db_index=True,
+    )
+    banner_message = models.CharField(
+        "پیام بنر بالای منو",
+        max_length=240,
+        blank=True,
+        default="",
+    )
+    block_matchmaking = models.BooleanField(
+        "مسدودسازی Find Match و لابی جدید",
+        default=False,
+    )
+    updated_at = models.DateTimeField("آخرین تغییر", auto_now=True)
+
+    class Meta:
+        db_table = "moba_coordinator_state"
+        verbose_name = "وضعیت هماهنگ‌کننده بازی (Game Coordinator)"
+        verbose_name_plural = "۷. وضعیت Game Coordinator"
+
+    def __str__(self) -> str:
+        return f"Game Coordinator [{self.mode.upper()}] (Block MM: {self.block_matchmaking})"
+
+    @classmethod
+    def get_solo(cls) -> "GameCoordinatorConfig":
+        obj, _ = cls.objects.get_or_create(
+            pk=1,
+            defaults={
+                "mode": cls.MODE_ONLINE,
+                "banner_message": "",
+                "block_matchmaking": False,
+            },
+        )
+        return obj
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        if self.mode != self.MODE_ONLINE:
+            self.block_matchmaking = True
+        super().save(*args, **kwargs)
+
+
+class ClientPatchRelease(models.Model):
+    """
+    جدول مدیریت نسخه‌ها و پچ‌های کلاینت (moba_client.exe + assets/) با مانیفست تفاضلی SHA-256
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    version = models.CharField(
+        "نسخه پچ (مثلاً 0.4.2)",
+        max_length=32,
+        unique=True,
+        db_index=True,
+    )
+    build_number = models.PositiveIntegerField(
+        "شماره بیلد عددی (افزایشی)",
+        unique=True,
+        db_index=True,
+    )
+    min_supported_build = models.PositiveIntegerField(
+        "حداقل بیلد مجاز برای Find Match",
+        default=1,
+    )
+    title = models.CharField(
+        "عنوان پچ",
+        max_length=128,
+        default="Client Update",
+    )
+    release_notes = models.TextField(
+        "توضیحات تغییرات (Changelog)",
+        blank=True,
+        default="",
+    )
+    base_download_url = models.CharField(
+        "آدرس پایه دانلود فایل‌های پچ (مثلاً /media/patches/0.4.2/ یا URL کامل CDN)",
+        max_length=512,
+    )
+    manifest_json = models.JSONField(
+        "مانیفست فایل‌ها (لیست path, sha256, size)",
+        default=list,
+    )
+    total_size_bytes = models.BigIntegerField(
+        "حجم کل فایل‌های مانیفست (بایت)",
+        default=0,
+    )
+    is_mandatory = models.BooleanField(
+        "آپدیت اجباری (مسدودسازی Find Match برای نسخه‌های قدیمی)",
+        default=True,
+    )
+    is_active = models.BooleanField(
+        "نسخه فعال فعلی",
+        default=False,
+        db_index=True,
+    )
+    published_at = models.DateTimeField(
+        "زمان انتشار",
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField("زمان ایجاد رکورد", auto_now_add=True)
+
+    class Meta:
+        db_table = "moba_patch_releases"
+        verbose_name = "نسخه و پچ کلاینت (Patch Release)"
+        verbose_name_plural = "۸. نسخه‌ها و پچ‌های کلاینت (Client Patches)"
+        ordering = ["-build_number", "-created_at"]
+
+    def __str__(self) -> str:
+        tag = "ACTIVE" if self.is_active else "ARCHIVED"
+        return f"v{self.version} (build #{self.build_number}) [{tag}]"
+
+    def save(self, *args, **kwargs):
+        if self.is_active:
+            if self.published_at is None:
+                self.published_at = timezone.now()
+            ClientPatchRelease.objects.exclude(pk=self.pk).filter(is_active=True).update(
+                is_active=False
+            )
+        super().save(*args, **kwargs)

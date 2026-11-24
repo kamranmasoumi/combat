@@ -360,7 +360,7 @@ impl ItemIconCache {
         if let Some(cached) = self.0.get(icon_path) {
             return cached.clone();
         }
-        let exists = Path::new("assets").join(icon_path).is_file() || Path::new(icon_path).is_file();
+        let exists = crate::client_assets_dir().join(icon_path).is_file();
         let handle = if exists {
             Some(asset_server.load(icon_path.to_string()))
         } else {

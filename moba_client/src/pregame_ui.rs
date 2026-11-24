@@ -1681,6 +1681,7 @@ fn handle_pregame_buttons_system(
     mut backend: ResMut<BackendClient>,
     mut state: ResMut<PreGameSessionState>,
     mut pending_demo: ResMut<PendingDemoLaunch>,
+    updater: Option<Res<crate::updater_client::ClientUpdaterState>>,
     mut app_exit: MessageWriter<AppExit>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut btn_q: Query<
@@ -1695,6 +1696,9 @@ fn handle_pregame_buttons_system(
         With<UiButton>,
     >,
 ) {
+    if updater.as_ref().is_some_and(|u| u.is_pointer_over_overlay) {
+        return;
+    }
     let mut triggered: Option<PreGameBtnAction> = None;
     let clicked_this_frame = mouse.just_pressed(MouseButton::Left);
     for (ent, hovered, pressed, action, mut border, base_border) in &mut btn_q {
@@ -1874,6 +1878,19 @@ fn handle_pregame_buttons_system(
             state.ui_dirty = true;
         }
         PreGameBtnAction::StartFindMatch => {
+            if let Some(ref upd) = updater {
+                if upd.should_block_new_matchmaking() {
+                    let msg = if upd.is_mandatory_update_pending() {
+                        "A mandatory client patch is available. Please update before matchmaking."
+                    } else if !upd.banner_message.is_empty() {
+                        upd.banner_message.as_str()
+                    } else {
+                        "Game Coordinator is currently updating. Matchmaking is paused."
+                    };
+                    push_notification(&mut state, "error", "GAME COORDINATOR", msg, notif_dur);
+                    return;
+                }
+            }
             let Some(tok) = state.access_token.clone() else { return };
             if state.active_match.is_some() {
                 push_notification(

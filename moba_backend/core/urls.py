@@ -19,4 +19,9 @@ urlpatterns = [
     path("friends/request/", views.send_friend_request_view, name="friends_request"),
     path("friends/respond/", views.respond_friend_request_view, name="friends_respond"),
     path("friends/remove/", views.remove_friend_view, name="friends_remove"),
+    # Client Patch & Game Coordinator APIs
+    path("client/patch/latest/", views.latest_patch_view, name="client_patch_latest"),
+    path("client/patch/manifest/<str:version>/", views.patch_manifest_view, name="client_patch_manifest"),
+    path("client/coordinator/set/", views.set_coordinator_state_view, name="client_coordinator_set"),
+    path("client/patch/publish/", views.publish_patch_release_view, name="client_patch_publish"),
 ]

@@ -15,6 +15,8 @@ from django.views.decorators.http import require_GET, require_POST
 
 from .consumers import (
     abandon_active_matches_for_player,
+    broadcast_coordinator_state_sync,
+    build_coordinator_status_payload,
     build_friends_payload_for_player,
     get_player_presence_snapshot,
     push_social_event_to_user_sync,
@@ -22,10 +24,13 @@ from .consumers import (
     get_active_match_for_player,
     reconnect_active_match_for_player,
     record_match_result_from_server,
+    serialize_patch_summary,
     update_player_connection_state_from_server,
 )
 from .models import (
+    ClientPatchRelease,
     Friendship,
+    GameCoordinatorConfig,
     GameMatchRoom,
     MatchParticipant,
     OtpVerification,
@@ -839,6 +844,164 @@ def remove_friend_view(request: HttpRequest) -> JsonResponse:
             "removed": deleted_count > 0,
             "message": action_message,
             **build_friends_payload_for_player(player),
+        },
+        status=200,
+    )
+
+
+# ============================================================================
+# اندپوینت‌های مدیریت پچ کلاینت و Game Coordinator (مشابه Dota 2)
+# ============================================================================
+
+
+@require_GET
+def latest_patch_view(request: HttpRequest) -> JsonResponse:
+    """
+    GET /api/v1/client/patch/latest/?include_manifest=0
+    دریافت وضعیت فعلی Game Coordinator و اطلاعات آخرین پچ فعال کلاینت
+    """
+    include_manifest = request.GET.get("include_manifest", "0").strip() in ("1", "true", "yes")
+    payload = build_coordinator_status_payload(include_manifest=include_manifest)
+    return JsonResponse(payload, status=200)
+
+
+@require_GET
+def patch_manifest_view(request: HttpRequest, version: str) -> JsonResponse:
+    """
+    GET /api/v1/client/patch/manifest/<version>/
+    دریافت مانیفست کامل فایل‌ها (path, sha256, size) برای دانلود تفاضلی (Delta Update)
+    """
+    patch = ClientPatchRelease.objects.filter(version=version.strip()).first()
+    if not patch:
+        return JsonResponse({"error": f"Patch version '{version}' not found."}, status=404)
+    return JsonResponse(
+        serialize_patch_summary(patch, include_manifest=True),
+        status=200,
+    )
+
+
+@csrf_exempt
+@require_POST
+def set_coordinator_state_view(request: HttpRequest) -> JsonResponse:
+    """
+    POST /api/v1/client/coordinator/set/
+    تغییر آنی وضعیت Game Coordinator (online | updating | maintenance) توسط اسکریپت دیپلوی یا ادمین
+    """
+    if not _is_internal_webhook_authorized(request):
+        return JsonResponse({"error": "Forbidden internal endpoint."}, status=403)
+
+    data = _parse_json_body(request)
+    mode = str(data.get("mode", GameCoordinatorConfig.MODE_ONLINE)).strip().lower()
+    valid_modes = {
+        GameCoordinatorConfig.MODE_ONLINE,
+        GameCoordinatorConfig.MODE_UPDATING,
+        GameCoordinatorConfig.MODE_MAINTENANCE,
+    }
+    if mode not in valid_modes:
+        return JsonResponse({"error": f"Invalid mode: {mode}"}, status=400)
+
+    coord = GameCoordinatorConfig.get_solo()
+    coord.mode = mode
+    if "banner_message" in data:
+        coord.banner_message = str(data.get("banner_message", "")).strip()[:240]
+    if "block_matchmaking" in data and mode == GameCoordinatorConfig.MODE_ONLINE:
+        coord.block_matchmaking = bool(data.get("block_matchmaking"))
+    else:
+        coord.block_matchmaking = mode != GameCoordinatorConfig.MODE_ONLINE
+    coord.save()
+
+    broadcast_coordinator_state_sync(event_name="coordinator_state")
+    return JsonResponse(
+        {
+            "status": "ok",
+            **build_coordinator_status_payload(include_manifest=False),
+        },
+        status=200,
+    )
+
+
+@csrf_exempt
+@require_POST
+def publish_patch_release_view(request: HttpRequest) -> JsonResponse:
+    """
+    POST /api/v1/client/patch/publish/
+    ثبت و فعال‌سازی یک پچ جدید در دیتابیس و ارسال اعلان آنی patch_available روی وب‌سوکت /ws/coordinator/
+    """
+    if not _is_internal_webhook_authorized(request):
+        return JsonResponse({"error": "Forbidden internal endpoint."}, status=403)
+
+    data = _parse_json_body(request)
+    version = str(data.get("version", "")).strip()
+    if not version:
+        return JsonResponse({"error": "version is required."}, status=400)
+
+    try:
+        build_number = int(data.get("build_number", 0))
+    except Exception:
+        build_number = 0
+    if build_number <= 0:
+        return JsonResponse({"error": "build_number must be a positive integer."}, status=400)
+
+    min_supported_build = int(data.get("min_supported_build", build_number) or build_number)
+    title = str(data.get("title", f"Patch {version}")).strip()[:128]
+    release_notes = str(data.get("release_notes", "")).strip()
+    base_download_url = str(data.get("base_download_url", "")).strip()
+    if not base_download_url:
+        return JsonResponse({"error": "base_download_url is required."}, status=400)
+
+    files = data.get("files", [])
+    if not isinstance(files, list) or not files:
+        return JsonResponse({"error": "files manifest list is required."}, status=400)
+
+    total_size = 0
+    clean_files = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        p_str = str(item.get("path", "")).strip().replace("\\", "/")
+        sha = str(item.get("sha256", "")).strip().lower()
+        sz = int(item.get("size", 0) or 0)
+        if not p_str or len(sha) != 64:
+            continue
+        clean_files.append({"path": p_str, "sha256": sha, "size": sz})
+        total_size += sz
+
+    if not clean_files:
+        return JsonResponse({"error": "No valid file entries (path + 64-char sha256) in manifest."}, status=400)
+
+    is_mandatory = bool(data.get("is_mandatory", True))
+    activate_now = bool(data.get("activate", True))
+    set_online_after = bool(data.get("set_coordinator_online", True))
+
+    with transaction.atomic():
+        patch, _ = ClientPatchRelease.objects.update_or_create(
+            version=version,
+            defaults={
+                "build_number": build_number,
+                "min_supported_build": min_supported_build,
+                "title": title,
+                "release_notes": release_notes,
+                "base_download_url": base_download_url,
+                "manifest_json": clean_files,
+                "total_size_bytes": total_size,
+                "is_mandatory": is_mandatory,
+                "is_active": activate_now,
+                "published_at": timezone.now() if activate_now else None,
+            },
+        )
+        if set_online_after:
+            coord = GameCoordinatorConfig.get_solo()
+            coord.mode = GameCoordinatorConfig.MODE_ONLINE
+            coord.block_matchmaking = False
+            coord.banner_message = ""
+            coord.save()
+
+    broadcast_coordinator_state_sync(event_name="patch_available" if activate_now else "coordinator_state")
+    return JsonResponse(
+        {
+            "status": "ok",
+            "patch": serialize_patch_summary(patch, include_manifest=False),
+            **build_coordinator_status_payload(include_manifest=False),
         },
         status=200,
     )

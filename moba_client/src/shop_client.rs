@@ -396,6 +396,8 @@ impl Plugin for ShopPlugin {
                     hud_cart_interaction_system,
                     shop_hover_tooltip_system,
                     update_hud_buffs_bar_system,
+                    animate_hud_buff_env_icons_system,
+                    update_hud_buffs_popup_system,
                     update_shop_notice_toast_system,
                 )
                     .chain(),
@@ -542,6 +544,36 @@ struct HudTpSlotBtn;
 
 #[derive(Component)]
 struct HudBuffsContainer;
+
+#[derive(Component)]
+struct HudBuffsPopupRoot;
+
+#[derive(Component)]
+struct HudBuffCircleBtn {
+    buff_id: String,
+}
+
+#[derive(Component)]
+struct HudBuffTimerText {
+    buff_id: String,
+}
+
+#[derive(Component)]
+struct HudBuffEnvPulse {
+    phase: f32,
+    base_rgb: (f32, f32, f32),
+    is_border: bool,
+}
+
+#[derive(Component)]
+struct HudBuffEnvDrop {
+    base_left: f32,
+    start_top: f32,
+    travel_px: f32,
+    speed: f32,
+    sway_amp: f32,
+    phase: f32,
+}
 
 #[derive(Component)]
 struct HudShopToggleBtn;
@@ -849,18 +881,40 @@ fn spawn_shop_and_inventory_ui(
     });
     let sui = &items_cfg.shop_ui;
 
-    // ۰. نوار نمایشگر مدت‌زمان باف‌ها و آیتم‌های فعال بالای سبد خرید و اینونتوری
+    // ۰. نوار دایره‌ای باف‌ها و دیباف‌ها (مشابه Dota 2؛ وسط صفحه دقیقاً زیر باکس چت)
+    let bh = &config.buff_hud;
     commands.spawn((
         HudBuffsContainer,
         Pickable::IGNORE,
-        GlobalZIndex(190),
+        GlobalZIndex(205),
         Node {
             position_type: PositionType::Absolute,
-            left: px(16.0),
-            bottom: px(208.0),
-            flex_direction: FlexDirection::Column,
-            align_items: AlignItems::FlexStart,
-            row_gap: px(5.0),
+            left: px(0.0),
+            right: px(0.0),
+            bottom: px(bh.bottom_px),
+            width: percent(100),
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            column_gap: px(bh.circle_gap_px),
+            display: Display::None,
+            ..default()
+        },
+    ));
+
+    // ۰.۱ کارت پاپ‌آپ جامع لیست باف‌ها و دیباف‌ها هنگام هاور روی هر دایره
+    commands.spawn((
+        HudBuffsPopupRoot,
+        Pickable::IGNORE,
+        GlobalZIndex(235),
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0.0),
+            right: px(0.0),
+            bottom: px(bh.bottom_px + bh.popup_bottom_offset_px),
+            width: percent(100),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::FlexEnd,
             display: Display::None,
             ..default()
         },
@@ -5747,14 +5801,465 @@ fn courier_hud_and_hotkey_system(
     }
 }
 
+fn build_buff_conic_gradient(
+    buff: &ActiveBuffSnapshot,
+    bh: &moba_shared::BuffHudConfig,
+) -> BackgroundGradient {
+    let segments = bh.ring_segments.max(12) as usize;
+    let track_col = Color::srgba(0.10, 0.13, 0.19, 0.92);
+    let has_pos = buff.details.iter().any(|d| d.starts_with('+'));
+    let has_neg = buff.details.iter().any(|d| d.starts_with('-'));
+    let ring_rgb = if has_pos && has_neg {
+        bh.mixed_ring_color_rgb
+    } else if buff.is_debuff {
+        bh.debuff_ring_color_rgb
+    } else {
+        bh.buff_ring_color_rgb
+    };
+    let ring_col = Color::srgb(ring_rgb.0, ring_rgb.1, ring_rgb.2);
+
+    let ratio = if buff.is_timed {
+        (buff.remaining_secs / buff.total_secs.max(0.01)).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let filled = ((ratio * segments as f32).round() as usize).min(segments);
+    let mut stops: Vec<AngularColorStop> = Vec::with_capacity(segments + 1);
+    for s in 0..=segments {
+        let c = if s < filled || !buff.is_timed {
+            ring_col
+        } else {
+            track_col
+        };
+        stops.push(AngularColorStop::auto(c));
+    }
+
+    BackgroundGradient::from(ConicGradient {
+        start: 0.0,
+        position: UiPosition::CENTER,
+        stops,
+        ..default()
+    })
+}
+
+fn spawn_circular_item_icon(
+    parent: &mut ChildSpawnerCommands,
+    asset_server: &AssetServer,
+    icon_cache: &mut ItemIconCache,
+    item: &ItemDef,
+    size_px: f32,
+    font_px: f32,
+) {
+    let c = item.icon_color_rgb;
+    let bg = Color::srgb(c.0 * 0.25, c.1 * 0.25, c.2 * 0.25);
+
+    parent
+        .spawn((
+            Pickable::IGNORE,
+            Node {
+                width: px(size_px),
+                height: px(size_px),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::MAX,
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            BackgroundColor(bg),
+        ))
+        .with_children(|circle| {
+            if let Some(icon_h) = icon_cache.get_or_load(&item.icon_path, asset_server) {
+                circle.spawn((
+                    Pickable::IGNORE,
+                    ImageNode::new(icon_h),
+                    Node {
+                        width: percent(100),
+                        height: percent(100),
+                        border_radius: BorderRadius::MAX,
+                        ..default()
+                    },
+                ));
+            } else {
+                circle.spawn((
+                    Pickable::IGNORE,
+                    Text::new(&item.short_code),
+                    TextFont {
+                        font_size: FontSize::Px(font_px),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(
+                        (c.0 + 0.35).min(1.0),
+                        (c.1 + 0.35).min(1.0),
+                        (c.2 + 0.35).min(1.0),
+                    )),
+                ));
+            }
+        });
+}
+
+/// آیکون‌های گرافیکی و پویا برای روز، شب، صاف، بارانی و برفی (بدون متن، هماهنگ با بالای ساعت بازی)
+fn spawn_env_buff_icon(parent: &mut ChildSpawnerCommands, buff_id: &str, inner_sz: f32) -> bool {
+    let half = inner_sz * 0.5;
+    match buff_id {
+        "env_day" => {
+            parent
+                .spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: px(inner_sz),
+                        height: px(inner_sz),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border_radius: BorderRadius::MAX,
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.16, 0.24, 0.42, 0.96)),
+                ))
+                .with_children(|sky| {
+                    // هاله طلایی خورشید با پالس نرم
+                    sky.spawn((
+                        HudBuffEnvPulse {
+                            phase: 0.0,
+                            base_rgb: (1.0, 0.90, 0.42),
+                            is_border: true,
+                        },
+                        Pickable::IGNORE,
+                        Node {
+                            width: px(inner_sz * 0.56),
+                            height: px(inner_sz * 0.56),
+                            border: UiRect::all(px(2.5)),
+                            border_radius: BorderRadius::MAX,
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(1.0, 0.92, 0.45, 0.90)),
+                        BackgroundColor(Color::srgb(1.0, 0.80, 0.20)),
+                    ));
+                    // چهار نقطه نورانی پرتو خورشید در اطراف
+                    for (i, (dx, dy)) in [(0.0, -11.5), (0.0, 11.5), (-11.5, 0.0), (11.5, 0.0)].iter().enumerate() {
+                        sky.spawn((
+                            HudBuffEnvPulse {
+                                phase: (i as f32) * 1.57,
+                                base_rgb: (1.0, 0.93, 0.55),
+                                is_border: false,
+                            },
+                            Pickable::IGNORE,
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(half + dx - 1.5),
+                                top: px(half + dy - 1.5),
+                                width: px(3.0),
+                                height: px(3.0),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(1.0, 0.93, 0.55, 0.85)),
+                        ));
+                    }
+                });
+            true
+        }
+        "env_night" => {
+            parent
+                .spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: px(inner_sz),
+                        height: px(inner_sz),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border_radius: BorderRadius::MAX,
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.05, 0.08, 0.17, 0.98)),
+                ))
+                .with_children(|sky| {
+                    // هلال ماه نقره‌ای-آبی مشابه آیکون بالای ساعت
+                    sky.spawn((
+                        HudBuffEnvPulse {
+                            phase: 0.4,
+                            base_rgb: (0.45, 0.74, 1.0),
+                            is_border: true,
+                        },
+                        Pickable::IGNORE,
+                        Node {
+                            width: px(inner_sz * 0.54),
+                            height: px(inner_sz * 0.54),
+                            border: UiRect::all(px(1.8)),
+                            border_radius: BorderRadius::MAX,
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.45, 0.74, 1.0, 0.85)),
+                        BackgroundColor(Color::srgb(0.80, 0.90, 1.0)),
+                    ))
+                    .with_children(|moon| {
+                        moon.spawn((
+                            Pickable::IGNORE,
+                            Node {
+                                position_type: PositionType::Absolute,
+                                top: px(-2.0),
+                                right: px(-2.5),
+                                width: px(inner_sz * 0.36),
+                                height: px(inner_sz * 0.36),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.05, 0.08, 0.17, 1.0)),
+                        ));
+                    });
+                    // ستاره‌های چشمک‌زن شب
+                    for (i, (lx, ty)) in [(6.0, 7.0), (24.0, 22.0), (8.0, 23.0)].iter().enumerate() {
+                        sky.spawn((
+                            HudBuffEnvPulse {
+                                phase: (i as f32) * 2.1,
+                                base_rgb: (0.86, 0.94, 1.0),
+                                is_border: false,
+                            },
+                            Pickable::IGNORE,
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(*lx),
+                                top: px(*ty),
+                                width: px(2.4),
+                                height: px(2.4),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.86, 0.94, 1.0, 0.9)),
+                        ));
+                    }
+                });
+            true
+        }
+        "env_clear" => {
+            parent
+                .spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: px(inner_sz),
+                        height: px(inner_sz),
+                        border_radius: BorderRadius::MAX,
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.14, 0.34, 0.58, 0.96)),
+                ))
+                .with_children(|sky| {
+                    // خورشید درخشان هوای صاف
+                    sky.spawn((
+                        HudBuffEnvPulse {
+                            phase: 0.8,
+                            base_rgb: (1.0, 0.92, 0.50),
+                            is_border: true,
+                        },
+                        Pickable::IGNORE,
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(half - 6.5),
+                            top: px(5.0),
+                            width: px(13.0),
+                            height: px(13.0),
+                            border: UiRect::all(px(2.0)),
+                            border_radius: BorderRadius::MAX,
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(1.0, 0.92, 0.50, 0.90)),
+                        BackgroundColor(Color::srgb(1.0, 0.85, 0.28)),
+                    ));
+                    // ابر سفید ظریف پایین آسمان صاف
+                    for (lx, ty, w, h) in [(6.0, 19.0, 14.0, 7.0), (14.0, 17.5, 13.0, 8.5)] {
+                        sky.spawn((
+                            Pickable::IGNORE,
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(lx),
+                                top: px(ty),
+                                width: px(w),
+                                height: px(h),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.94, 0.97, 1.0, 0.90)),
+                        ));
+                    }
+                });
+            true
+        }
+        "env_rainy" => {
+            parent
+                .spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: px(inner_sz),
+                        height: px(inner_sz),
+                        border_radius: BorderRadius::MAX,
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.08, 0.14, 0.24, 0.98)),
+                ))
+                .with_children(|sky| {
+                    // ابر بارانی سه‌تکه
+                    for (lx, ty, w, h) in [(6.0, 8.0, 13.0, 8.0), (12.0, 5.5, 12.0, 9.5), (16.5, 8.5, 11.0, 7.5)] {
+                        sky.spawn((
+                            Pickable::IGNORE,
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(lx),
+                                top: px(ty),
+                                width: px(w),
+                                height: px(h),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.62, 0.72, 0.84, 0.95)),
+                        ));
+                    }
+                    // قطره‌های باران متحرک رو به پایین
+                    for (i, lx) in [9.5_f32, 16.0, 22.5].iter().enumerate() {
+                        sky.spawn((
+                            HudBuffEnvDrop {
+                                base_left: *lx,
+                                start_top: 16.0,
+                                travel_px: 13.0,
+                                speed: 1.55 + (i as f32) * 0.22,
+                                sway_amp: 0.0,
+                                phase: (i as f32) * 0.34,
+                            },
+                            Pickable::IGNORE,
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(*lx),
+                                top: px(17.0),
+                                width: px(2.2),
+                                height: px(5.5),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.38, 0.84, 1.0)),
+                        ));
+                    }
+                });
+            true
+        }
+        "env_snowy" => {
+            parent
+                .spawn((
+                    Pickable::IGNORE,
+                    Node {
+                        width: px(inner_sz),
+                        height: px(inner_sz),
+                        border_radius: BorderRadius::MAX,
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.14, 0.24, 0.38, 0.98)),
+                ))
+                .with_children(|sky| {
+                    // ابر برفی روشن زمستانی
+                    for (lx, ty, w, h) in [(6.0, 7.5, 13.0, 8.0), (12.0, 5.0, 12.0, 9.5), (16.5, 8.0, 11.0, 7.5)] {
+                        sky.spawn((
+                            Pickable::IGNORE,
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(lx),
+                                top: px(ty),
+                                width: px(w),
+                                height: px(h),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.90, 0.96, 1.0, 0.96)),
+                        ));
+                    }
+                    // دانه‌های برف معلق با حرکت نرم و موج‌دار
+                    for (i, lx) in [8.5_f32, 14.5, 20.5, 25.0].iter().enumerate() {
+                        sky.spawn((
+                            HudBuffEnvDrop {
+                                base_left: *lx,
+                                start_top: 15.5,
+                                travel_px: 13.5,
+                                speed: 0.58 + (i as f32) * 0.11,
+                                sway_amp: 2.0,
+                                phase: (i as f32) * 0.27,
+                            },
+                            Pickable::IGNORE,
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(*lx),
+                                top: px(16.0),
+                                width: px(3.0),
+                                height: px(3.0),
+                                border_radius: BorderRadius::MAX,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.92, 0.98, 1.0)),
+                        ));
+                    }
+                });
+            true
+        }
+        _ => false,
+    }
+}
+
+fn animate_hud_buff_env_icons_system(
+    time: Res<Time>,
+    mut pulse_q: Query<(&HudBuffEnvPulse, &mut BackgroundColor, Option<&mut BorderColor>)>,
+    mut drop_q: Query<(&HudBuffEnvDrop, &mut Node)>,
+) {
+    let t = time.elapsed_secs();
+    for (p, mut bg, border_opt) in &mut pulse_q {
+        let wave = 0.5 + 0.5 * (t * 2.8 + p.phase).sin();
+        if p.is_border {
+            if let Some(mut bc) = border_opt {
+                *bc = BorderColor::all(Color::srgba(
+                    p.base_rgb.0,
+                    p.base_rgb.1,
+                    p.base_rgb.2,
+                    0.50 + 0.48 * wave,
+                ));
+            }
+        } else {
+            bg.0 = Color::srgba(
+                p.base_rgb.0,
+                p.base_rgb.1,
+                p.base_rgb.2,
+                0.35 + 0.65 * wave,
+            );
+        }
+    }
+    for (d, mut node) in &mut drop_q {
+        let prog = (t * d.speed + d.phase).fract();
+        node.top = px(d.start_top + prog * d.travel_px);
+        if d.sway_amp > 0.0 {
+            let sway = (t * 2.6 + d.phase * std::f32::consts::TAU).sin() * d.sway_amp;
+            node.left = px(d.base_left + sway);
+        }
+    }
+}
+
+fn format_buff_timer_short(remaining_secs: f32) -> String {
+    if remaining_secs >= 10.0 {
+        format!("{:.0}", remaining_secs)
+    } else {
+        format!("{:.1}", remaining_secs)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn update_hud_buffs_bar_system(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    config: Res<GameConfig>,
     mut icon_cache: ResMut<ItemIconCache>,
     items_cfg: Res<ItemsConfig>,
     ctx: Res<ShopContextSnapshot>,
     mut container_q: Query<(Entity, &mut Node, Option<&Children>), With<HudBuffsContainer>>,
-    mut last_buffs: Local<Vec<ActiveBuffSnapshot>>,
+    mut circle_grad_q: Query<(&HudBuffCircleBtn, &mut BackgroundGradient)>,
+    mut timer_text_q: Query<(&HudBuffTimerText, &mut Text)>,
+    mut last_layout_key: Local<Vec<(String, String, String, bool)>>,
     mut last_in_game: Local<bool>,
 ) {
     let Ok((ent, mut node, children_opt)) = container_q.single_mut() else {
@@ -5764,117 +6269,331 @@ fn update_hud_buffs_bar_system(
         if node.display != Display::None {
             node.display = Display::None;
             clear_children(&mut commands, children_opt);
-            last_buffs.clear();
+            last_layout_key.clear();
         }
         *last_in_game = ctx.in_game;
         return;
     }
 
-    if *last_in_game == ctx.in_game && *last_buffs == ctx.active_buffs {
+    let bh = &config.buff_hud;
+    let layout_key: Vec<(String, String, String, bool)> = ctx
+        .active_buffs
+        .iter()
+        .map(|b| (b.id.clone(), b.item_id.clone(), b.short_tag.clone(), b.is_timed))
+        .collect();
+
+    // فقط وقتی لیست یا نوع دایره‌ها تغییر کرده باشد، نودها را بازسازی می‌کنیم؛
+    // برای تایمرهای در حال کاهش، گرادیان و متن درجا آپدیت می‌شوند تا Hover قطع نشود!
+    if *last_in_game == ctx.in_game && *last_layout_key == layout_key {
+        for (btn, mut grad) in &mut circle_grad_q {
+            if let Some(buff) = ctx.active_buffs.iter().find(|b| b.id == btn.buff_id) {
+                if buff.is_timed {
+                    *grad = build_buff_conic_gradient(buff, bh);
+                }
+            }
+        }
+        for (timer_tag, mut text) in &mut timer_text_q {
+            if let Some(buff) = ctx.active_buffs.iter().find(|b| b.id == timer_tag.buff_id) {
+                let next_txt = format_buff_timer_short(buff.remaining_secs);
+                if **text != next_txt {
+                    **text = next_txt;
+                }
+            }
+        }
         return;
     }
+
     *last_in_game = ctx.in_game;
-    *last_buffs = ctx.active_buffs.clone();
+    *last_layout_key = layout_key;
 
     node.display = Display::Flex;
     clear_children(&mut commands, children_opt);
 
-    commands.entity(ent).with_children(|col| {
+    let outer_sz = bh.circle_size_px;
+    let inner_sz = (outer_sz - bh.ring_thickness_px * 2.0).max(16.0);
+
+    commands.entity(ent).with_children(|row| {
         for buff in &ctx.active_buffs {
-            let ratio = (buff.remaining_secs / buff.total_secs.max(0.01)).clamp(0.0, 1.0);
-            let bar_col = Color::srgb(buff.color_rgb.0, buff.color_rgb.1, buff.color_rgb.2);
-            col.spawn((
-                Pickable::IGNORE,
+            let icon_tint = Color::srgb(buff.color_rgb.0, buff.color_rgb.1, buff.color_rgb.2);
+            let ring_grad = build_buff_conic_gradient(buff, bh);
+
+            row.spawn((
+                HudBuffCircleBtn {
+                    buff_id: buff.id.clone(),
+                },
+                RelativeCursorPosition::default(),
                 Node {
-                    flex_direction: FlexDirection::Row,
+                    width: px(outer_sz),
+                    height: px(outer_sz),
+                    justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
-                    column_gap: px(6.0),
-                    padding: UiRect::axes(px(6.0), px(3.0)),
-                    border_radius: BorderRadius::all(px(14.0)),
+                    border_radius: BorderRadius::MAX,
+                    overflow: Overflow::clip(),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.03, 0.05, 0.09, 0.88)),
+                ring_grad,
             ))
-            .with_children(|row| {
-                row.spawn((
-                    Pickable::IGNORE,
-                    Node {
-                        width: px(28.0),
-                        height: px(28.0),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border: UiRect::all(px(1.5)),
-                        border_radius: BorderRadius::MAX,
-                        overflow: Overflow::clip(),
-                        ..default()
-                    },
-                    BorderColor::all(bar_col),
-                    BackgroundColor(Color::srgba(0.05, 0.08, 0.14, 0.95)),
-                ))
-                .with_children(|circle| {
-                    if let Some(def) = items_cfg.get_item(&buff.item_id) {
-                        spawn_item_icon_badge(circle, &asset_server, &mut icon_cache, def, 24.0, 9.0);
-                    } else {
-                        let tag = match buff.id.as_str() {
-                            "flame_armor_debuff" => "ARM",
-                            "electric_fire_rate_slow" => "ZAP",
-                            "toxic_slow" => "TOX",
-                            _ => "!",
-                        };
-                        circle.spawn((
-                            Pickable::IGNORE,
-                            Text::new(tag),
-                            TextFont {
-                                font_size: FontSize::Px(8.5),
-                                ..default()
-                            },
-                            TextColor(bar_col),
-                        ));
-                    }
-                });
-
-                row.spawn((
-                    Pickable::IGNORE,
-                    Node {
-                        width: px(164.0),
-                        height: px(18.0),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        border: UiRect::all(px(1.0)),
-                        border_radius: BorderRadius::all(px(5.0)),
-                        overflow: Overflow::clip(),
-                        ..default()
-                    },
-                    BorderColor::all(Color::srgba(0.35, 0.48, 0.62, 0.65)),
-                    BackgroundColor(Color::srgba(0.06, 0.08, 0.12, 0.92)),
-                ))
-                .with_children(|bar| {
-                    bar.spawn((
+            .with_children(|outer| {
+                outer
+                    .spawn((
                         Pickable::IGNORE,
                         Node {
-                            position_type: PositionType::Absolute,
-                            left: px(0.0),
-                            top: px(0.0),
-                            width: percent(ratio * 100.0),
-                            height: percent(100),
+                            width: px(inner_sz),
+                            height: px(inner_sz),
+                            flex_direction: FlexDirection::Column,
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::MAX,
+                            overflow: Overflow::clip(),
                             ..default()
                         },
-                        BackgroundColor(bar_col.with_alpha(0.62)),
-                    ));
-                    bar.spawn((
-                        Pickable::IGNORE,
-                        Text::new(format!("{}  {:.1}s", buff.label, buff.remaining_secs)),
-                        TextFont {
-                            font_size: FontSize::Px(10.5),
-                            ..default()
-                        },
-                        TextColor(Color::WHITE),
-                    ));
-                });
+                        BackgroundColor(Color::srgba(0.04, 0.06, 0.11, 0.96)),
+                    ))
+                    .with_children(|inner| {
+                        if let Some(def) = items_cfg.get_item(&buff.item_id) {
+                            spawn_circular_item_icon(
+                                inner,
+                                &asset_server,
+                                &mut icon_cache,
+                                def,
+                                inner_sz,
+                                9.5,
+                            );
+                        } else if !spawn_env_buff_icon(inner, &buff.id, inner_sz) {
+                            inner.spawn((
+                                Pickable::IGNORE,
+                                Text::new(buff.short_tag.clone()),
+                                TextFont {
+                                    font_size: FontSize::Px(if buff.short_tag.len() >= 4 { 9.0 } else { 10.5 }),
+                                    ..default()
+                                },
+                                TextColor(icon_tint),
+                            ));
+                        }
+
+                        if buff.is_timed {
+                            let time_txt = format_buff_timer_short(buff.remaining_secs);
+                            inner.spawn((
+                                Pickable::IGNORE,
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    bottom: px(1.0),
+                                    padding: UiRect::axes(px(3.0), px(0.5)),
+                                    border_radius: BorderRadius::all(px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.02, 0.03, 0.06, 0.85)),
+                                children![(
+                                    HudBuffTimerText {
+                                        buff_id: buff.id.clone(),
+                                    },
+                                    Pickable::IGNORE,
+                                    Text::new(time_txt),
+                                    TextFont {
+                                        font_size: FontSize::Px(8.5),
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(0.96, 0.98, 1.0)),
+                                )],
+                            ));
+                        }
+                    });
             });
         }
     });
 }
+
+#[allow(clippy::too_many_arguments)]
+fn update_hud_buffs_popup_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    config: Res<GameConfig>,
+    ctx: Res<ShopContextSnapshot>,
+    circle_q: Query<(&HudBuffCircleBtn, &RelativeCursorPosition)>,
+    mut popup_q: Query<(Entity, &mut Node, Option<&Children>), With<HudBuffsPopupRoot>>,
+    mut last_hovered: Local<Option<String>>,
+    mut last_buffs: Local<Vec<ActiveBuffSnapshot>>,
+    mut hide_grace: Local<f32>,
+) {
+    let Ok((popup_ent, mut popup_node, popup_children)) = popup_q.single_mut() else {
+        return;
+    };
+
+    if !ctx.in_game || ctx.active_buffs.is_empty() {
+        if popup_node.display != Display::None {
+            popup_node.display = Display::None;
+            clear_children(&mut commands, popup_children);
+            *last_hovered = None;
+            last_buffs.clear();
+            *hide_grace = 0.0;
+        }
+        return;
+    }
+
+    let hovered_now = circle_q
+        .iter()
+        .find_map(|(btn, rel)| is_cursor_inside(rel).then(|| btn.buff_id.clone()));
+
+    let active_hovered = if let Some(h) = hovered_now {
+        *hide_grace = 0.14;
+        Some(h)
+    } else if *hide_grace > 0.0 {
+        *hide_grace = (*hide_grace - time.delta_secs()).max(0.0);
+        last_hovered.clone()
+    } else {
+        None
+    };
+
+    let Some(hovered_id) = active_hovered else {
+        if popup_node.display != Display::None {
+            popup_node.display = Display::None;
+            clear_children(&mut commands, popup_children);
+            *last_hovered = None;
+        }
+        return;
+    };
+
+    if last_hovered.as_deref() == Some(hovered_id.as_str())
+        && *last_buffs == ctx.active_buffs
+        && popup_node.display == Display::Flex
+    {
+        return;
+    }
+    *last_hovered = Some(hovered_id.clone());
+    *last_buffs = ctx.active_buffs.clone();
+
+    popup_node.display = Display::Flex;
+    clear_children(&mut commands, popup_children);
+
+    let bh = &config.buff_hud;
+    let buff_green = Color::srgb(bh.buff_ring_color_rgb.0, bh.buff_ring_color_rgb.1, bh.buff_ring_color_rgb.2);
+    let debuff_red = Color::srgb(bh.debuff_ring_color_rgb.0, bh.debuff_ring_color_rgb.1, bh.debuff_ring_color_rgb.2);
+    let mixed_gold = Color::srgb(bh.mixed_ring_color_rgb.0, bh.mixed_ring_color_rgb.1, bh.mixed_ring_color_rgb.2);
+
+    commands.entity(popup_ent).with_children(|outer| {
+        outer
+            .spawn((
+                Pickable::IGNORE,
+                Node {
+                    width: px(bh.popup_width_px),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(6.0),
+                    padding: UiRect::all(px(10.0)),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(8.0)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.32, 0.50, 0.72, 0.90)),
+                BackgroundColor(Color::srgba(0.03, 0.05, 0.09, 0.96)),
+            ))
+            .with_children(|card| {
+                card.spawn((
+                    Pickable::IGNORE,
+                    Text::new(format!("ACTIVE BUFFS & DEBUFFS ({})", ctx.active_buffs.len())),
+                    TextFont {
+                        font_size: FontSize::Px(11.5),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.84, 0.92, 1.0)),
+                ));
+
+                for buff in &ctx.active_buffs {
+                    let is_hovered = hovered_id == buff.id;
+                    let has_pos = buff.details.iter().any(|d| d.starts_with('+'));
+                    let has_neg = buff.details.iter().any(|d| d.starts_with('-'));
+                    let accent = if has_pos && has_neg {
+                        mixed_gold
+                    } else if buff.is_debuff {
+                        debuff_red
+                    } else {
+                        buff_green
+                    };
+
+                    let row_bg = if is_hovered {
+                        Color::srgba(0.10, 0.15, 0.24, 0.96)
+                    } else {
+                        Color::srgba(0.05, 0.08, 0.13, 0.90)
+                    };
+
+                    card.spawn((
+                        Pickable::IGNORE,
+                        Node {
+                            width: percent(100),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(2.0),
+                            padding: UiRect::axes(px(8.0), px(5.0)),
+                            border: UiRect::left(px(if is_hovered { 3.5 } else { 2.5 })),
+                            border_radius: BorderRadius::all(px(5.0)),
+                            ..default()
+                        },
+                        BorderColor::all(accent),
+                        BackgroundColor(row_bg),
+                    ))
+                    .with_children(|entry| {
+                        entry
+                            .spawn((
+                                Pickable::IGNORE,
+                                Node {
+                                    width: percent(100),
+                                    flex_direction: FlexDirection::Row,
+                                    justify_content: JustifyContent::SpaceBetween,
+                                    align_items: AlignItems::Center,
+                                    ..default()
+                                },
+                            ))
+                            .with_children(|hdr| {
+                                let prefix = if is_hovered { "> " } else { "" };
+                                hdr.spawn((
+                                    Pickable::IGNORE,
+                                    Text::new(format!("{}{}", prefix, buff.label)),
+                                    TextFont {
+                                        font_size: FontSize::Px(11.0),
+                                        ..default()
+                                    },
+                                    TextColor(accent),
+                                ));
+
+                                let badge_txt = if buff.is_timed {
+                                    format!("{:.1}s", buff.remaining_secs)
+                                } else {
+                                    "PASSIVE".to_string()
+                                };
+                                hdr.spawn((
+                                    Pickable::IGNORE,
+                                    Text::new(badge_txt),
+                                    TextFont {
+                                        font_size: FontSize::Px(9.5),
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(0.76, 0.84, 0.94)),
+                                ));
+                            });
+
+                        for line in &buff.details {
+                            let line_col = if line.starts_with('-') {
+                                debuff_red
+                            } else if line.starts_with('+') {
+                                buff_green
+                            } else {
+                                Color::srgb(0.86, 0.90, 0.96)
+                            };
+                            entry.spawn((
+                                Pickable::IGNORE,
+                                Text::new(format!("  {}", line)),
+                                TextFont {
+                                    font_size: FontSize::Px(10.0),
+                                    ..default()
+                                },
+                                TextColor(line_col),
+                            ));
+                        }
+                    });
+                }
+            });
+    });
+}
+
+
 
 fn hud_cart_interaction_system(
     ctx: Res<ShopContextSnapshot>,

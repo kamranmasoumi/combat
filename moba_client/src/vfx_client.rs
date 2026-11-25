@@ -1,5 +1,6 @@
 use bevy::light::NotShadowCaster;
 use bevy::ecs::system::SystemParam;
+use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
@@ -778,12 +779,23 @@ impl Plugin for MobaVfxPlugin {
             .add_plugins(MaterialPlugin::<WeatherRainMaterial>::default())
             .add_plugins(MaterialPlugin::<WeatherSnowMaterial>::default())
             .add_plugins(MaterialPlugin::<TacticalAuraMaterial>::default())
+            .add_plugins(MaterialPlugin::<AutumnLeafMaterial>::default())
+            .add_plugins(MaterialPlugin::<ExtendedMaterial<StandardMaterial, SnowAccumulationExtension>>::default())
             .init_resource::<VfxEventQueue>()
             .init_resource::<TacticalAuraSyncState>()
+            .init_resource::<BiomeWalkersState>()
+            .init_resource::<SnowAccumulationState>()
             .init_resource::<VfxMaterialPool>()
             .init_resource::<BulletVfxRegistry>()
             .init_resource::<WeatherVfxState>()
-            .add_systems(Startup, (init_hanabi_vfx_assets_system, init_bullet_vfx_registry_system))
+            .add_systems(
+                Startup,
+                (
+                    init_hanabi_vfx_assets_system,
+                    init_bullet_vfx_registry_system,
+                    init_river_biome_foliage_system,
+                ),
+            )
             .add_systems(
                 OnExit(crate::pregame_ui::AppScreenState::InGame),
                 cleanup_ingame_vfx_on_exit_system,
@@ -794,7 +806,9 @@ impl Plugin for MobaVfxPlugin {
                     process_vfx_events_system,
                     update_vfx_lifetimes_system,
                     update_weather_vfx_system,
+                    update_snow_accumulation_system,
                     update_tactical_auras_vfx_system,
+                    update_autumn_leaves_scatter_system,
                 )
                     .chain(),
             );
@@ -2443,7 +2457,10 @@ fn update_vfx_lifetimes_system(
 // ساخت مش سه‌بعدی دره عمیق پرپیچ‌وخم (شمال‌غرب به جنوب‌شرق) و سطح رودخانه
 // -----------------------------------------------------------------------------
 
-pub fn build_canyon_terrain_and_river_meshes(canyon: &moba_shared::CanyonConfig) -> (Mesh, Mesh) {
+pub fn build_canyon_terrain_and_river_meshes(
+    canyon: &moba_shared::CanyonConfig,
+    biome: &moba_shared::MapBiomeConfig,
+) -> (Mesh, Mesh) {
     use bevy::asset::RenderAssetUsages;
     use bevy::mesh::{Indices, PrimitiveTopology};
 
@@ -2483,6 +2500,13 @@ pub fn build_canyon_terrain_and_river_meshes(canyon: &moba_shared::CanyonConfig)
             normals.push([n.x, n.y, n.z]);
             uvs.push([ix as f32 / nx as f32, iz as f32 / nz as f32]);
 
+            let signed_side = moba_shared::canyon_river_side_signed(canyon, x, z);
+            // smooth transition: 0.0 = left (grass), 1.0 = right (autumn)
+            let autumn_t = ((-signed_side / biome.river_transition_width) * 0.5 + 0.5).clamp(0.0, 1.0);
+            let n_scale = biome.ground_noise_scale;
+            let patch_n = biome_fbm_2d(x * n_scale, z * n_scale);
+            let detail_n = biome_fbm_2d(x * n_scale * 2.7 + 19.3, z * n_scale * 2.7 - 11.7);
+
             let srgb_col = if y > 0.25 {
                 let peak_t = ((y - 0.25) / 6.5).clamp(0.0, 1.0);
                 Color::srgb(
@@ -2491,13 +2515,43 @@ pub fn build_canyon_terrain_and_river_meshes(canyon: &moba_shared::CanyonConfig)
                     0.29 + 0.10 * peak_t,
                 )
             } else if y > -0.35 {
-                Color::srgb(0.31, 0.37, 0.24)
+                let lp = biome.left_ground_primary_rgb;
+                let ls = biome.left_ground_secondary_rgb;
+                let lh = biome.left_ground_highlight_rgb;
+                let left_r = lp.0 * (1.0 - patch_n) + ls.0 * patch_n;
+                let left_g = lp.1 * (1.0 - patch_n) + ls.1 * patch_n;
+                let left_b = lp.2 * (1.0 - patch_n) + ls.2 * patch_n;
+                let hl_w = (detail_n - 0.52).max(0.0) * 1.45;
+                let left_rgb = (
+                    (left_r + (lh.0 - left_r) * hl_w).clamp(0.0, 1.0),
+                    (left_g + (lh.1 - left_g) * hl_w).clamp(0.0, 1.0),
+                    (left_b + (lh.2 - left_b) * hl_w).clamp(0.0, 1.0),
+                );
+
+                let rp = biome.right_ground_primary_rgb;
+                let rs = biome.right_ground_secondary_rgb;
+                let rh = biome.right_ground_highlight_rgb;
+                let right_r = rp.0 * (1.0 - patch_n) + rs.0 * patch_n;
+                let right_g = rp.1 * (1.0 - patch_n) + rs.1 * patch_n;
+                let right_b = rp.2 * (1.0 - patch_n) + rs.2 * patch_n;
+                let right_rgb = (
+                    (right_r + (rh.0 - right_r) * hl_w).clamp(0.0, 1.0),
+                    (right_g + (rh.1 - right_g) * hl_w).clamp(0.0, 1.0),
+                    (right_b + (rh.2 - right_b) * hl_w).clamp(0.0, 1.0),
+                );
+
+                Color::srgb(
+                    left_rgb.0 * (1.0 - autumn_t) + right_rgb.0 * autumn_t,
+                    left_rgb.1 * (1.0 - autumn_t) + right_rgb.1 * autumn_t,
+                    left_rgb.2 * (1.0 - autumn_t) + right_rgb.2 * autumn_t,
+                )
             } else if y > canyon.water_y {
                 let rock_t = ((-0.35 - y) / (0.35 - canyon.water_y).abs()).clamp(0.0, 1.0);
+                let warm_shift = autumn_t * 0.06;
                 Color::srgb(
-                    0.38 - 0.14 * rock_t,
-                    0.35 - 0.10 * rock_t,
-                    0.30 - 0.05 * rock_t,
+                    (0.38 - 0.14 * rock_t + warm_shift).clamp(0.0, 1.0),
+                    (0.35 - 0.10 * rock_t - warm_shift * 0.25).clamp(0.0, 1.0),
+                    (0.30 - 0.05 * rock_t - warm_shift * 0.5).clamp(0.0, 1.0),
                 )
             } else {
                 Color::srgb(0.14, 0.26, 0.24)
@@ -3260,5 +3314,825 @@ fn update_tactical_auras_vfx_system(
             mat.uniforms.params.x = t;
             mat.uniforms.params.y = fade;
         }
+    }
+}
+
+// =============================================================================
+// سیستم بیوم دو نیمه نقشه (چمنزار متحرک سمت چپ + برگ‌های پاییزی تعاملی سمت راست)
+// =============================================================================
+
+#[inline]
+fn biome_hash21(x: f32, z: f32) -> f32 {
+    let h = (x * 127.1 + z * 311.7).sin() * 43758.5453;
+    h - h.floor()
+}
+
+fn biome_value_noise_2d(x: f32, z: f32) -> f32 {
+    let ix = x.floor();
+    let iz = z.floor();
+    let fx = x - ix;
+    let fz = z - iz;
+    let ux = fx * fx * (3.0 - 2.0 * fx);
+    let uz = fz * fz * (3.0 - 2.0 * fz);
+    let a = biome_hash21(ix, iz);
+    let b = biome_hash21(ix + 1.0, iz);
+    let c = biome_hash21(ix, iz + 1.0);
+    let d = biome_hash21(ix + 1.0, iz + 1.0);
+    let ab = a + (b - a) * ux;
+    let cd = c + (d - c) * ux;
+    ab + (cd - ab) * uz
+}
+
+fn biome_fbm_2d(x: f32, z: f32) -> f32 {
+    let mut sum = 0.0_f32;
+    let mut amp = 0.5_f32;
+    let mut px = x;
+    let mut pz = z;
+    for _ in 0..3 {
+        sum += amp * biome_value_noise_2d(px, pz);
+        px = px * 2.04 + 13.7;
+        pz = pz * 2.04 - 7.9;
+        amp *= 0.5;
+    }
+    sum
+}
+
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    #[inline]
+    fn new(seed: u64) -> Self {
+        Self(seed.wrapping_add(0x9E37_79B9_7F4A_7C15))
+    }
+
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[inline]
+    fn next_f32(&mut self) -> f32 {
+        ((self.next_u64() >> 40) as f32) / ((1u64 << 24) as f32)
+    }
+
+    #[inline]
+    fn range_f32(&mut self, min_v: f32, max_v: f32) -> f32 {
+        min_v + (max_v - min_v) * self.next_f32()
+    }
+}
+
+fn dist_sq_point_to_segment_2d(px: f32, pz: f32, ax: f32, az: f32, bx: f32, bz: f32) -> f32 {
+    let abx = bx - ax;
+    let abz = bz - az;
+    let len_sq = abx * abx + abz * abz;
+    if len_sq <= 1e-6 {
+        let dx = px - ax;
+        let dz = pz - az;
+        return dx * dx + dz * dz;
+    }
+    let t = (((px - ax) * abx + (pz - az) * abz) / len_sq).clamp(0.0, 1.0);
+    let cx = ax + abx * t;
+    let cz = az + abz * t;
+    let dx = px - cx;
+    let dz = pz - cz;
+    dx * dx + dz * dz
+}
+
+fn is_point_clear_for_ground_foliage(
+    config: &moba_shared::GameConfig,
+    x: f32,
+    z: f32,
+    want_left: bool,
+    min_river_edge_margin: f32,
+    lane_clear_margin: f32,
+    base_clear_margin: f32,
+    tree_clear_radius: f32,
+) -> bool {
+    let canyon = &config.map.canyon;
+    if moba_shared::is_left_of_river(canyon, x, z) != want_left {
+        return false;
+    }
+    if moba_shared::canyon_edge_distance(canyon, x, z) > -min_river_edge_margin {
+        return false;
+    }
+
+    // خارج از پل مرکزی دایره‌ای
+    let br = &config.map.center_bridge;
+    let br_s = br.model_transform.scale.0.max(br.model_transform.scale.2);
+    let br_r = br.outer_radius * br_s + 1.5;
+    let bdx = x - br.model_transform.location.0;
+    let bdz = z - br.model_transform.location.2;
+    if bdx * bdx + bdz * bdz < br_r * br_r {
+        return false;
+    }
+
+    // خارج از پایگاه‌های ارتفاعی (Dawn / Dusk High Ground)
+    for plat in &config.map.terrains {
+        if plat.elevation_tier >= 2 {
+            let loc = plat.model_transform.location;
+            let hx = plat.size.0 * 0.5 + base_clear_margin;
+            let hz = plat.size.2 * 0.5 + base_clear_margin;
+            if (x - loc.0).abs() <= hx && (z - loc.2).abs() <= hz {
+                return false;
+            }
+        }
+    }
+
+    // خارج از جاده لاین‌ها (Top / Mid / Bot)
+    for lane in &config.map.lanes {
+        let half_w = lane.width * 0.5 + lane_clear_margin;
+        let half_w_sq = half_w * half_w;
+        for seg in 0..lane.waypoints.len().saturating_sub(1) {
+            let a = lane.waypoints[seg];
+            let b = lane.waypoints[seg + 1];
+            if dist_sq_point_to_segment_2d(x, z, a.0, a.2, b.0, b.2) < half_w_sq {
+                return false;
+            }
+        }
+    }
+
+    // در صورت نیاز، فاصله از تنه درختان
+    if tree_clear_radius > 0.0 {
+        let tr_sq = tree_clear_radius * tree_clear_radius;
+        for tree in &config.map.trees {
+            let tl = tree.model_transform.location;
+            let dx = x - tl.0;
+            let dz = z - tl.2;
+            if dx * dx + dz * dz < tr_sq {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+#[derive(ShaderType, Clone, Copy, Debug)]
+pub struct AutumnLeafUniforms {
+    pub palette_0: Vec4,
+    pub palette_1: Vec4,
+    pub palette_2: Vec4,
+    pub palette_3: Vec4,
+    pub palette_4: Vec4,
+    pub params: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct AutumnLeafMaterial {
+    #[uniform(0)]
+    pub uniforms: AutumnLeafUniforms,
+}
+
+impl Material for AutumnLeafMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/autumn_leaf.wesl".into()
+    }
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Mask(0.5)
+    }
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BiomeWalkerSnapshot {
+    pub id: u64,
+    pub pos: Vec3,
+}
+
+#[derive(Resource, Default)]
+pub struct BiomeWalkersState {
+    pub walkers: Vec<BiomeWalkerSnapshot>,
+}
+
+struct AutumnLeafParticle {
+    pos: Vec3,
+    vel: Vec3,
+    yaw: f32,
+    pitch: f32,
+    roll: f32,
+    ang_vel: Vec3,
+    size: f32,
+    rest_y: f32,
+    phase: f32,
+    cell: (i32, i32),
+    is_active: bool,
+}
+
+#[derive(Resource)]
+struct AutumnLeavesFieldState {
+    mesh_handle: Handle<Mesh>,
+    leaves: Vec<AutumnLeafParticle>,
+    grid: HashMap<(i32, i32), Vec<usize>>,
+    active_indices: Vec<usize>,
+    prev_walker_pos: HashMap<u64, Vec3>,
+    canyon: moba_shared::CanyonConfig,
+    cfg: moba_shared::AutumnLeavesConfig,
+    map_half_extents: (f32, f32),
+}
+
+#[inline]
+fn leaf_grid_cell(x: f32, z: f32, cell_size: f32) -> (i32, i32) {
+    ((x / cell_size).floor() as i32, (z / cell_size).floor() as i32)
+}
+
+#[inline]
+fn write_leaf_quad_vertices(
+    leaf: &AutumnLeafParticle,
+    positions: &mut [[f32; 3]],
+    normals: &mut [[f32; 3]],
+    base_v: usize,
+) {
+    let rot = Quat::from_euler(EulerRot::YXZ, leaf.yaw, leaf.pitch, leaf.roll);
+    let half = leaf.size * 0.5;
+    let curl = leaf.size * 0.08;
+
+    // کواد مربعی با انحنای ملایم برای نمایش کامل سیلوت شیدر برگ واقعی (افرا، بلوط و دندانه‌دار)
+    let local = [
+        Vec3::new(-half, curl, -half), // پایین-چپ (u=0, v=0)
+        Vec3::new(half, curl, -half),  // پایین-راست (u=1, v=0)
+        Vec3::new(half, curl, half),   // بالا-راست (u=1, v=1)
+        Vec3::new(-half, curl, half),  // بالا-چپ (u=0, v=1)
+    ];
+    let n = (rot * Vec3::Y).normalize_or_zero();
+    let n_arr = [n.x, n.y, n.z];
+    for i in 0..4 {
+        let wp = leaf.pos + rot * local[i];
+        positions[base_v + i] = [wp.x, wp.y, wp.z];
+        normals[base_v + i] = n_arr;
+    }
+}
+
+fn init_river_biome_foliage_system(
+    mut commands: Commands,
+    config: Res<moba_shared::GameConfig>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut leaf_materials: ResMut<Assets<AutumnLeafMaterial>>,
+) {
+    let biome = &config.map.biome;
+
+    // برگ‌های پاییزی تعاملی سمت راست رودخانه با شیدر واقعی برگ (یک Draw Call دینامیک)
+    if biome.autumn_leaves.enabled {
+        use bevy::asset::RenderAssetUsages;
+        use bevy::mesh::{Indices, PrimitiveTopology};
+
+        let lcfg = &biome.autumn_leaves;
+        let half_x = config.map.map_dimensions.0 * 0.5 - 6.0;
+        let half_z = config.map.map_dimensions.1 * 0.5 - 6.0;
+        let target_leaves = lcfg.leaf_count as usize;
+        let mut rng = SplitMix64::new(lcfg.seed);
+
+        let right_trees: Vec<(f32, f32)> = config
+            .map
+            .trees
+            .iter()
+            .filter_map(|t| {
+                let loc = t.model_transform.location;
+                if !moba_shared::is_left_of_river(&config.map.canyon, loc.0, loc.2) {
+                    Some((loc.0, loc.2))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut leaves: Vec<AutumnLeafParticle> = Vec::with_capacity(target_leaves);
+        let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        let mut positions: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0]; target_leaves * 4];
+        let mut normals: Vec<[f32; 3]> = vec![[0.0, 1.0, 0.0]; target_leaves * 4];
+        let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(target_leaves * 4);
+        let mut indices: Vec<u32> = Vec::with_capacity(target_leaves * 12);
+
+        let max_attempts = target_leaves * 20;
+        let mut attempts = 0usize;
+
+        while leaves.len() < target_leaves && attempts < max_attempts {
+            attempts += 1;
+            // حدود ۳۵٪ برگ‌ها اطراف درختان پاییزی (tree4) و ۶۵٪ در سراسر زمین سمت راست پخش می‌شوند
+            let (lx, lz) = if !right_trees.is_empty() && rng.next_f32() < 0.35 {
+                let tidx = (rng.next_u64() as usize) % right_trees.len();
+                let (tx, tz) = right_trees[tidx];
+                let ang = rng.range_f32(0.0, std::f32::consts::TAU);
+                let rad = rng.range_f32(1.8, 11.5);
+                (
+                    (tx + ang.cos() * rad).clamp(-half_x, half_x),
+                    (tz + ang.sin() * rad).clamp(-half_z, half_z),
+                )
+            } else {
+                (rng.range_f32(-half_x, half_x), rng.range_f32(-half_z, half_z))
+            };
+
+            if !is_point_clear_for_ground_foliage(
+                &config,
+                lx,
+                lz,
+                false,
+                lcfg.min_river_edge_margin,
+                lcfg.lane_clear_margin,
+                lcfg.base_clear_margin,
+                0.0,
+            ) {
+                continue;
+            }
+
+            let idx = leaves.len();
+            let rest_y = lcfg.ground_y_offset + rng.range_f32(0.0, 0.035);
+            let cell = leaf_grid_cell(lx, lz, lcfg.spatial_cell_size);
+            let leaf = AutumnLeafParticle {
+                pos: Vec3::new(lx, rest_y, lz),
+                vel: Vec3::ZERO,
+                yaw: rng.range_f32(0.0, std::f32::consts::TAU),
+                pitch: rng.range_f32(-0.08, 0.08),
+                roll: rng.range_f32(-0.08, 0.08),
+                ang_vel: Vec3::ZERO,
+                size: rng.range_f32(lcfg.leaf_size_min, lcfg.leaf_size_max),
+                rest_y,
+                phase: rng.range_f32(0.0, std::f32::consts::TAU),
+                cell,
+                is_active: false,
+            };
+
+            let base_v = idx * 4;
+            write_leaf_quad_vertices(&leaf, &mut positions, &mut normals, base_v);
+
+            // کدگذاری نوع برگ (0=افرا، 1=بلوط، 2=دندانه‌دار) و اندیس رنگ پالت (0..4) در بخش صحیح UV
+            let species_offset = (idx % 3) as f32;
+            let color_offset = (idx % lcfg.palette_rgb.len().min(5)) as f32;
+            uvs.push([species_offset + 0.001, color_offset + 0.001]);
+            uvs.push([species_offset + 0.999, color_offset + 0.001]);
+            uvs.push([species_offset + 0.999, color_offset + 0.999]);
+            uvs.push([species_offset + 0.001, color_offset + 0.999]);
+
+            let v0 = base_v as u32;
+            indices.extend_from_slice(&[
+                v0, v0 + 1, v0 + 2,
+                v0, v0 + 2, v0 + 3,
+                v0, v0 + 2, v0 + 1,
+                v0, v0 + 3, v0 + 2,
+            ]);
+
+            grid.entry(cell).or_default().push(idx);
+            leaves.push(leaf);
+        }
+
+        let actual_verts = leaves.len() * 4;
+        positions.truncate(actual_verts);
+        normals.truncate(actual_verts);
+
+        let mut leaf_mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        leaf_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        leaf_mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+        leaf_mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        leaf_mesh.insert_indices(Indices::U32(indices));
+
+        let pal_vec4 = |i: usize| -> Vec4 {
+            let c = lcfg.palette_rgb[i % lcfg.palette_rgb.len()];
+            let lin = Color::srgb(c.0, c.1, c.2).to_linear();
+            Vec4::new(lin.red, lin.green, lin.blue, 1.0)
+        };
+
+        let mesh_handle = meshes.add(leaf_mesh);
+        let leaf_mat = leaf_materials.add(AutumnLeafMaterial {
+            uniforms: AutumnLeafUniforms {
+                palette_0: pal_vec4(0),
+                palette_1: pal_vec4(1),
+                palette_2: pal_vec4(2),
+                palette_3: pal_vec4(3),
+                palette_4: pal_vec4(4),
+                params: Vec4::new(lcfg.roughness, lcfg.vein_contrast, lcfg.edge_darkening, 0.0),
+            },
+        });
+
+        commands.spawn((
+            Mesh3d(mesh_handle.clone()),
+            MeshMaterial3d(leaf_mat),
+            Transform::IDENTITY,
+            Visibility::Visible,
+            bevy::light::NotShadowCaster,
+        ));
+
+        commands.insert_resource(AutumnLeavesFieldState {
+            mesh_handle,
+            leaves,
+            grid,
+            active_indices: Vec::new(),
+            prev_walker_pos: HashMap::new(),
+            canyon: config.map.canyon.clone(),
+            cfg: lcfg.clone(),
+            map_half_extents: (half_x, half_z),
+        });
+    }
+}
+
+fn update_autumn_leaves_scatter_system(
+    time: Res<Time>,
+    world_opt: Option<Res<moba_shared::AuthoritativeWorldState>>,
+    walkers: Res<BiomeWalkersState>,
+    field_opt: Option<ResMut<AutumnLeavesFieldState>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    if world_opt
+        .as_ref()
+        .is_some_and(|w| w.pause_phase != moba_shared::PausePhase::Running)
+    {
+        return;
+    }
+    let Some(mut field) = field_opt else {
+        return;
+    };
+    let dt = time.delta_secs().clamp(0.0001, 0.05);
+    let elapsed = time.elapsed_secs();
+
+    let cell_size = field.cfg.spatial_cell_size;
+    let scatter_r = field.cfg.scatter_radius;
+    let scatter_r_sq = scatter_r * scatter_r;
+    let min_speed = field.cfg.min_walker_speed;
+    let cell_span = (scatter_r / cell_size).ceil() as i32;
+
+    // ۱. تشخیص حرکت قهرمان‌ها و کریپ‌ها و اعمال ضربه پخش‌کننده به برگ‌های اطراف
+    for w in &walkers.walkers {
+        let prev = field.prev_walker_pos.insert(w.id, w.pos);
+        let Some(prev_pos) = prev else {
+            continue;
+        };
+        let delta = Vec2::new(w.pos.x - prev_pos.x, w.pos.z - prev_pos.z);
+        let dist_moved = delta.length();
+        // جلوگیری از انفجار برگ هنگام تلپورت
+        if dist_moved > 12.0 {
+            continue;
+        }
+        let speed = dist_moved / dt;
+        if speed < min_speed {
+            continue;
+        }
+        // فقط اگر در نیمه راست (پاییزی) یا نزدیک ساحل راست است بررسی کن
+        if moba_shared::canyon_river_side_signed(&field.canyon, w.pos.x, w.pos.z) > scatter_r + 2.0 {
+            continue;
+        }
+
+        let move_dir = delta / dist_moved.max(1e-4);
+        let speed_factor = (speed / 8.0).clamp(0.40, 1.85);
+        let (cx, cz) = leaf_grid_cell(w.pos.x, w.pos.z, cell_size);
+
+        let mut candidate_leaves: Vec<usize> = Vec::new();
+        for gx in (cx - cell_span)..=(cx + cell_span) {
+            for gz in (cz - cell_span)..=(cz + cell_span) {
+                if let Some(bucket) = field.grid.get(&(gx, gz)) {
+                    candidate_leaves.extend_from_slice(bucket);
+                }
+            }
+        }
+
+        let out_imp = field.cfg.scatter_outward_impulse;
+        let up_imp = field.cfg.scatter_upward_impulse;
+        let swirl_imp = field.cfg.scatter_swirl_impulse;
+        let spin_spd = field.cfg.scatter_spin_speed;
+
+        for leaf_idx in candidate_leaves {
+            let leaf = &mut field.leaves[leaf_idx];
+            let dx = leaf.pos.x - w.pos.x;
+            let dz = leaf.pos.z - w.pos.z;
+            let d_sq = dx * dx + dz * dz;
+            if d_sq > scatter_r_sq {
+                continue;
+            }
+            let d = d_sq.sqrt();
+            let falloff = (1.0 - d / scatter_r).clamp(0.0, 1.0);
+            let strength = falloff * speed_factor;
+
+            let away = if d > 0.08 {
+                Vec2::new(dx / d, dz / d)
+            } else {
+                Vec2::new(leaf.phase.cos(), leaf.phase.sin())
+            };
+            let swirl_sign = if leaf_idx % 2 == 0 { 1.0 } else { -1.0 };
+            let tangent = Vec2::new(-away.y * swirl_sign, away.x * swirl_sign);
+
+            let jitter = 0.70 + 0.60 * ((leaf.phase * 3.17).sin() * 0.5 + 0.5);
+            leaf.vel.x += (away.x * out_imp + tangent.x * swirl_imp + move_dir.x * 1.15) * strength * dt * 14.0;
+            leaf.vel.z += (away.y * out_imp + tangent.y * swirl_imp + move_dir.y * 1.15) * strength * dt * 14.0;
+            leaf.vel.y = leaf.vel.y.max(up_imp * strength * jitter);
+
+            leaf.ang_vel.x = (leaf.phase.sin() * spin_spd) * strength;
+            leaf.ang_vel.y = (swirl_sign * spin_spd * 0.85) * strength;
+            leaf.ang_vel.z = (leaf.phase.cos() * spin_spd) * strength;
+
+            if !leaf.is_active {
+                leaf.is_active = true;
+                field.active_indices.push(leaf_idx);
+            }
+        }
+    }
+
+    if field.active_indices.is_empty() {
+        return;
+    }
+
+    // ۲. شبیه‌سازی فیزیک سبک فقط برای برگ‌های فعال و به‌روزرسانی مستقیم ورتکس‌های مش
+    let gravity = field.cfg.gravity;
+    let air_drag_factor = (-field.cfg.air_drag * dt).exp();
+    let ground_fric_factor = (-field.cfg.ground_friction * dt).exp();
+    let flutter_amp = field.cfg.flutter_amplitude;
+    let flutter_freq = field.cfg.flutter_frequency;
+    let min_river_margin = field.cfg.min_river_edge_margin;
+    let (half_x, half_z) = field.map_half_extents;
+    let canyon = field.canyon.clone();
+
+    let mut moved_cells: Vec<(usize, (i32, i32), (i32, i32))> = Vec::new();
+    let mut updated_leaves: Vec<usize> = Vec::with_capacity(field.active_indices.len());
+    let mut still_active: Vec<usize> = Vec::with_capacity(field.active_indices.len());
+
+    let active_snapshot = std::mem::take(&mut field.active_indices);
+    for leaf_idx in active_snapshot {
+        let leaf = &mut field.leaves[leaf_idx];
+        let airborne = leaf.pos.y > leaf.rest_y + 0.015 || leaf.vel.y > 0.01;
+
+        if airborne {
+            leaf.vel.y -= gravity * dt;
+            leaf.vel.x *= air_drag_factor;
+            leaf.vel.z *= air_drag_factor;
+            let flutter = (elapsed * flutter_freq + leaf.phase).sin() * flutter_amp;
+            leaf.pos.x += (leaf.vel.x + flutter * 0.35) * dt;
+            leaf.pos.z += (leaf.vel.z + (elapsed * flutter_freq * 0.8 + leaf.phase).cos() * flutter_amp * 0.35) * dt;
+            leaf.pos.y += leaf.vel.y * dt;
+
+            leaf.yaw += leaf.ang_vel.y * dt;
+            leaf.pitch += leaf.ang_vel.x * dt;
+            leaf.roll += leaf.ang_vel.z * dt;
+            leaf.ang_vel *= air_drag_factor;
+        } else {
+            leaf.vel.x *= ground_fric_factor;
+            leaf.vel.z *= ground_fric_factor;
+            leaf.pos.x += leaf.vel.x * dt;
+            leaf.pos.z += leaf.vel.z * dt;
+            leaf.pitch *= ground_fric_factor;
+            leaf.roll *= ground_fric_factor;
+        }
+
+        // نگه داشتن برگ در محدوده زمین سمت راست (جلوگیری از سقوط داخل دره)
+        leaf.pos.x = leaf.pos.x.clamp(-half_x, half_x);
+        leaf.pos.z = leaf.pos.z.clamp(-half_z, half_z);
+        if moba_shared::canyon_edge_distance(&canyon, leaf.pos.x, leaf.pos.z) > -min_river_margin {
+            leaf.vel.x = -leaf.vel.x * 0.35;
+            leaf.vel.z = -leaf.vel.z * 0.35;
+        }
+
+        if leaf.pos.y <= leaf.rest_y {
+            leaf.pos.y = leaf.rest_y;
+            if leaf.vel.y < 0.0 {
+                leaf.vel.y = 0.0;
+            }
+        }
+
+        let new_cell = leaf_grid_cell(leaf.pos.x, leaf.pos.z, cell_size);
+        if new_cell != leaf.cell {
+            moved_cells.push((leaf_idx, leaf.cell, new_cell));
+            leaf.cell = new_cell;
+        }
+
+        updated_leaves.push(leaf_idx);
+
+        let horiz_speed_sq = leaf.vel.x * leaf.vel.x + leaf.vel.z * leaf.vel.z;
+        let settled = leaf.pos.y <= leaf.rest_y + 0.005
+            && leaf.vel.y <= 0.01
+            && horiz_speed_sq < 0.008
+            && leaf.pitch.abs() < 0.09
+            && leaf.roll.abs() < 0.09;
+
+        if settled {
+            leaf.pos.y = leaf.rest_y;
+            leaf.vel = Vec3::ZERO;
+            leaf.ang_vel = Vec3::ZERO;
+            leaf.is_active = false;
+        } else {
+            still_active.push(leaf_idx);
+        }
+    }
+    field.active_indices = still_active;
+
+    for (leaf_idx, old_cell, new_cell) in moved_cells {
+        if let Some(bucket) = field.grid.get_mut(&old_cell) {
+            if let Some(pos) = bucket.iter().position(|&i| i == leaf_idx) {
+                bucket.swap_remove(pos);
+            }
+        }
+        field.grid.entry(new_cell).or_default().push(leaf_idx);
+    }
+
+    if let Some(mut mesh) = meshes.get_mut(&field.mesh_handle) {
+        let mut pos_copy = if let Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        {
+            p.clone()
+        } else {
+            return;
+        };
+        let mut norm_copy = if let Some(bevy::mesh::VertexAttributeValues::Float32x3(n)) =
+            mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+        {
+            n.clone()
+        } else {
+            return;
+        };
+
+        for leaf_idx in updated_leaves {
+            write_leaf_quad_vertices(&field.leaves[leaf_idx], &mut pos_copy, &mut norm_copy, leaf_idx * 4);
+        }
+
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos_copy);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, norm_copy);
+    }
+}
+
+
+// =============================================================================
+// سیستم پویا نشستن برف روی زمین، درختان، کوه‌ها و ساختمان‌ها (ExtendedMaterial)
+// =============================================================================
+
+#[derive(Component)]
+pub struct SnowSurfaceRoot;
+
+#[derive(Component)]
+pub struct SnowConvertedMaterial {
+    pub original_handle: Handle<StandardMaterial>,
+}
+
+#[derive(ShaderType, Clone, Copy, Debug)]
+pub struct SnowAccumulationUniforms {
+    pub snow_color: Vec4,
+    pub snow_shadow_tint: Vec4,
+    pub night_glow_color: Vec4,
+    pub snow_params: Vec4,
+    pub detail_params: Vec4,
+    pub fx_params: Vec4,
+}
+
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub struct SnowAccumulationExtension {
+    #[uniform(100)]
+    pub uniforms: SnowAccumulationUniforms,
+}
+
+impl MaterialExtension for SnowAccumulationExtension {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/snow_accumulation.wesl".into()
+    }
+    fn deferred_fragment_shader() -> ShaderRef {
+        "shaders/snow_accumulation.wesl".into()
+    }
+}
+
+pub type SnowExtendedMaterial = ExtendedMaterial<StandardMaterial, SnowAccumulationExtension>;
+
+#[derive(Resource, Default)]
+pub struct SnowAccumulationState {
+    pub snow_amount: f32,
+    pub night_blend: f32,
+    last_pushed_snow: f32,
+    last_pushed_night: f32,
+    converted_map: HashMap<AssetId<StandardMaterial>, Handle<SnowExtendedMaterial>>,
+}
+
+fn build_snow_uniforms(config: &moba_shared::GameConfig, snow_amount: f32, night_blend: f32) -> SnowAccumulationUniforms {
+    let s = &config.weather.snow_accumulation;
+    let sc = Color::srgb(s.snow_color_rgb.0, s.snow_color_rgb.1, s.snow_color_rgb.2).to_linear();
+    let st = Color::srgb(s.snow_shadow_tint_rgb.0, s.snow_shadow_tint_rgb.1, s.snow_shadow_tint_rgb.2).to_linear();
+    let ng = Color::srgb(s.night_snow_glow_rgb.0, s.night_snow_glow_rgb.1, s.night_snow_glow_rgb.2).to_linear();
+    let water_excl_y = config.map.canyon.water_y + s.water_exclusion_margin;
+
+    SnowAccumulationUniforms {
+        snow_color: Vec4::new(sc.red, sc.green, sc.blue, 1.0),
+        snow_shadow_tint: Vec4::new(st.red, st.green, st.blue, 1.0),
+        night_glow_color: Vec4::new(ng.red, ng.green, ng.blue, 1.0),
+        snow_params: Vec4::new(snow_amount, s.slope_threshold, s.slope_softness, s.ground_coverage_boost),
+        detail_params: Vec4::new(s.noise_scale, s.noise_strength, s.snow_roughness, night_blend),
+        fx_params: Vec4::new(s.sparkle_strength, s.sparkle_scale, water_excl_y, s.night_snow_glow_strength),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_snow_accumulation_system(
+    mut commands: Commands,
+    time: Res<Time>,
+    config: Res<moba_shared::GameConfig>,
+    world_opt: Option<Res<moba_shared::AuthoritativeWorldState>>,
+    weather_state: Res<WeatherVfxState>,
+    mut snow_state: ResMut<SnowAccumulationState>,
+    std_materials: Res<Assets<StandardMaterial>>,
+    mut snow_materials: ResMut<Assets<SnowExtendedMaterial>>,
+    mut leaf_materials: ResMut<Assets<AutumnLeafMaterial>>,
+    roots_q: Query<Entity, With<SnowSurfaceRoot>>,
+    children_q: Query<&Children>,
+    std_mesh_q: Query<&MeshMaterial3d<StandardMaterial>, Without<SnowConvertedMaterial>>,
+    converted_q: Query<(Entity, &SnowConvertedMaterial)>,
+) {
+    if world_opt
+        .as_ref()
+        .is_some_and(|w| w.pause_phase != moba_shared::PausePhase::Running)
+    {
+        return;
+    }
+
+    let s_cfg = &config.weather.snow_accumulation;
+    if !s_cfg.enabled {
+        return;
+    }
+
+    let dt = time.delta_secs().clamp(0.0, 0.1);
+    let want_snow = weather_state.active_weather == Some(WeatherKind::Snowy);
+    if want_snow {
+        let rate = dt / s_cfg.accumulate_duration_secs.max(0.1);
+        snow_state.snow_amount = (snow_state.snow_amount + rate).min(1.0);
+    } else {
+        let rate = dt / s_cfg.melt_duration_secs.max(0.1);
+        snow_state.snow_amount = (snow_state.snow_amount - rate).max(0.0);
+    }
+
+    let snow_amt = snow_state.snow_amount;
+    let night_b = snow_state.night_blend;
+
+    // به‌روزرسانی میزان نشستن برف روی برگ‌های پاییزی سمت راست
+    if (snow_amt - snow_state.last_pushed_snow).abs() > 0.0005 {
+        for (_, mat) in leaf_materials.iter_mut() {
+            mat.uniforms.params.w = snow_amt;
+        }
+    }
+
+    // وقتی برف کاملاً آب شد، متریال اصلی StandardMaterial را برمی‌گردانیم
+    if snow_amt <= 0.001 {
+        if !converted_q.is_empty() {
+            for (ent, conv) in &converted_q {
+                commands
+                    .entity(ent)
+                    .remove::<MeshMaterial3d<SnowExtendedMaterial>>()
+                    .remove::<SnowConvertedMaterial>()
+                    .insert(MeshMaterial3d(conv.original_handle.clone()));
+            }
+        }
+        snow_state.last_pushed_snow = 0.0;
+        return;
+    }
+
+    let uniforms = build_snow_uniforms(&config, snow_amt, night_b);
+
+    // تبدیل متریال آبجکت‌های محیطی (زمین، درختان، کوه‌ها، برج‌ها و ساختمان‌ها) با حفظ کامل GPU Instancing
+    let mut to_convert: Vec<(Entity, Handle<StandardMaterial>)> = Vec::new();
+    for root_ent in &roots_q {
+        if let Ok(mat_comp) = std_mesh_q.get(root_ent) {
+            to_convert.push((root_ent, mat_comp.0.clone()));
+        }
+        for desc in children_q.iter_descendants(root_ent) {
+            if let Ok(mat_comp) = std_mesh_q.get(desc) {
+                to_convert.push((desc, mat_comp.0.clone()));
+            }
+        }
+    }
+
+    for (ent, orig_handle) in to_convert {
+        let asset_id = orig_handle.id();
+        let ext_handle = if let Some(cached) = snow_state.converted_map.get(&asset_id) {
+            cached.clone()
+        } else if let Some(base_mat) = std_materials.get(&orig_handle) {
+            let new_ext = snow_materials.add(ExtendedMaterial {
+                base: base_mat.clone(),
+                extension: SnowAccumulationExtension { uniforms },
+            });
+            snow_state.converted_map.insert(asset_id, new_ext.clone());
+            new_ext
+        } else {
+            continue;
+        };
+
+        commands
+            .entity(ent)
+            .remove::<MeshMaterial3d<StandardMaterial>>()
+            .insert((
+                MeshMaterial3d(ext_handle),
+                SnowConvertedMaterial {
+                    original_handle: orig_handle,
+                },
+            ));
+    }
+
+    // به‌روزرسانی Uniform برف و روشنایی شب روی تمام متریال‌های کش‌شده (بسیار سبک؛ حدود ۲۰ متریال)
+    if (snow_amt - snow_state.last_pushed_snow).abs() > 0.0005
+        || (night_b - snow_state.last_pushed_night).abs() > 0.0005
+    {
+        for (_, mat) in snow_materials.iter_mut() {
+            mat.extension.uniforms = uniforms;
+        }
+        snow_state.last_pushed_snow = snow_amt;
+        snow_state.last_pushed_night = night_b;
     }
 }

@@ -130,6 +130,77 @@ impl HeroEnvironmentStatModifier {
         self.vision_range_bonus += other.vision_range_bonus;
     }
 
+    /// خروجی خوانای تمام باف‌ها و دیباف‌های غیرصفر محیطی برای نمایش در کارت پاپ‌آپ HUD
+    pub fn describe_effects(&self) -> (Vec<String>, u32, u32) {
+        fn push_pct(lines: &mut Vec<String>, buffs: &mut u32, debuffs: &mut u32, v: f32, label: &str) {
+            if v.abs() >= 0.001 {
+                if v > 0.0 {
+                    *buffs += 1;
+                    lines.push(format!("+{:.0}% {}", v * 100.0, label));
+                } else {
+                    *debuffs += 1;
+                    lines.push(format!("-{:.0}% {}", v.abs() * 100.0, label));
+                }
+            }
+        }
+        fn push_flat(lines: &mut Vec<String>, buffs: &mut u32, debuffs: &mut u32, v: f32, label: &str) {
+            if v.abs() >= 0.01 {
+                let abs_v = v.abs();
+                let fmt_v = if (abs_v - abs_v.round()).abs() < 0.05 {
+                    format!("{:.0}", abs_v)
+                } else {
+                    format!("{:.1}", abs_v)
+                };
+                if v > 0.0 {
+                    *buffs += 1;
+                    lines.push(format!("+{} {}", fmt_v, label));
+                } else {
+                    *debuffs += 1;
+                    lines.push(format!("-{} {}", fmt_v, label));
+                }
+            }
+        }
+        fn push_int(lines: &mut Vec<String>, buffs: &mut u32, debuffs: &mut u32, v: i32, label: &str) {
+            if v != 0 {
+                if v > 0 {
+                    *buffs += 1;
+                    lines.push(format!("+{} {}", v, label));
+                } else {
+                    *debuffs += 1;
+                    lines.push(format!("-{} {}", v.abs(), label));
+                }
+            }
+        }
+
+        let mut lines = Vec::new();
+        let mut buffs = 0u32;
+        let mut debuffs = 0u32;
+
+        push_pct(&mut lines, &mut buffs, &mut debuffs, self.move_speed_pct, "Move Speed");
+        push_pct(&mut lines, &mut buffs, &mut debuffs, self.primary_fire_rate_pct, "Primary Fire Rate");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.primary_damage_bonus, "Primary Damage");
+        push_pct(&mut lines, &mut buffs, &mut debuffs, self.primary_reload_speed_pct, "Primary Reload Speed");
+        push_int(&mut lines, &mut buffs, &mut debuffs, self.primary_magazine_bonus, "Primary Mag Size");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.primary_range_bonus, "Primary Range");
+        push_pct(&mut lines, &mut buffs, &mut debuffs, self.pistol_fire_rate_pct, "Pistol Fire Rate");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.pistol_damage_bonus, "Pistol Damage");
+        push_pct(&mut lines, &mut buffs, &mut debuffs, self.pistol_reload_speed_pct, "Pistol Reload Speed");
+        push_int(&mut lines, &mut buffs, &mut debuffs, self.pistol_magazine_bonus, "Pistol Mag Size");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.pistol_range_bonus, "Pistol Range");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.hp_regen_bonus, "HP/s Regen");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.stamina_regen_bonus, "Stamina/s Regen");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.max_hp_bonus, "Max HP");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.max_stamina_bonus, "Max Stamina");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.armor_bonus, "Armor");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.grenade_damage_bonus, "Grenade Damage");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.grenade_aoe_bonus, "Grenade AoE");
+        push_int(&mut lines, &mut buffs, &mut debuffs, self.grenade_max_charges_bonus, "Grenade Charges");
+        push_pct(&mut lines, &mut buffs, &mut debuffs, self.grenade_recharge_speed_pct, "Grenade Recharge");
+        push_flat(&mut lines, &mut buffs, &mut debuffs, self.vision_range_bonus, "Vision Range");
+
+        (lines, buffs, debuffs)
+    }
+
     pub fn to_item_stats_modifier(&self) -> ItemStatsModifier {
         ItemStatsModifier {
             move_speed_pct: self.move_speed_pct,

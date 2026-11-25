@@ -245,6 +245,33 @@ pub enum WeatherKind {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SnowAccumulationConfig {
+    pub enabled: bool,
+    pub shader_path: String,
+    pub accumulate_duration_secs: f32,
+    pub melt_duration_secs: f32,
+    pub slope_threshold: f32,
+    pub slope_softness: f32,
+    pub noise_scale: f32,
+    pub noise_strength: f32,
+    pub ground_coverage_boost: f32,
+    pub snow_color_rgb: (f32, f32, f32),
+    pub snow_shadow_tint_rgb: (f32, f32, f32),
+    pub snow_roughness: f32,
+    pub sparkle_strength: f32,
+    pub sparkle_scale: f32,
+    pub night_snow_glow_rgb: (f32, f32, f32),
+    pub night_snow_glow_strength: f32,
+    pub night_directional_illuminance_mult: f32,
+    pub night_ambient_brightness_mult: f32,
+    pub night_ambient_color_rgb: (f32, f32, f32),
+    pub night_fog_color_rgb: (f32, f32, f32),
+    pub night_fog_start_mult: f32,
+    pub night_fog_end_mult: f32,
+    pub water_exclusion_margin: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WeatherConfig {
     pub initial_weather: WeatherKind,
     pub weather_cycle_start_secs: f32,
@@ -298,6 +325,7 @@ pub struct WeatherConfig {
     pub snow_loop_sound: String,
     pub snow_loop_volume: f32,
     pub audio_fade_speed: f32,
+    pub snow_accumulation: SnowAccumulationConfig,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -331,6 +359,25 @@ pub struct TelemetryConfig {
     pub low_fps_critical_threshold: u32,
     pub high_ping_warning_ms: u32,
     pub high_ping_critical_ms: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BuffHudConfig {
+    pub bottom_px: f32,
+    pub circle_size_px: f32,
+    pub ring_thickness_px: f32,
+    pub circle_gap_px: f32,
+    pub ring_segments: u32,
+    pub buff_ring_color_rgb: (f32, f32, f32),
+    pub debuff_ring_color_rgb: (f32, f32, f32),
+    pub mixed_ring_color_rgb: (f32, f32, f32),
+    pub day_color_rgb: (f32, f32, f32),
+    pub night_color_rgb: (f32, f32, f32),
+    pub clear_color_rgb: (f32, f32, f32),
+    pub rainy_color_rgb: (f32, f32, f32),
+    pub snowy_color_rgb: (f32, f32, f32),
+    pub popup_width_px: f32,
+    pub popup_bottom_offset_px: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,6 +439,7 @@ pub struct GameConfig {
     pub weather: WeatherConfig,
     pub day_night: DayNightConfig,
     pub telemetry: TelemetryConfig,
+    pub buff_hud: BuffHudConfig,
     pub pause: PauseConfig,
     pub ping: PingConfig,
     pub chat: ChatConfig,
@@ -432,6 +480,7 @@ impl GameConfig {
             )
         });
         cfg.validate_unique_map_ids();
+        cfg.validate_biome();
         cfg.validate_roshan_pit();
         cfg.validate_fountains();
         cfg.validate_barracks();
@@ -442,6 +491,7 @@ impl GameConfig {
         cfg.validate_weather();
         cfg.validate_day_night();
         cfg.validate_telemetry();
+        cfg.validate_buff_hud();
         cfg.validate_ping();
         cfg.validate_pause();
         cfg.validate_camera();
@@ -937,6 +987,32 @@ impl GameConfig {
         assert!(!w.thunder_sound.trim().is_empty() && !w.rain_loop_sound.trim().is_empty() && !w.snow_loop_sound.trim().is_empty(), "مسیر فایل‌های صوتی آب و هوا نباید خالی باشد");
         assert!((0.0..=2.0).contains(&w.thunder_volume) && (0.0..=2.0).contains(&w.rain_loop_volume) && (0.0..=2.0).contains(&w.snow_loop_volume), "ولوم صدای آب و هوا باید بین 0 تا 2 باشد");
         assert!(w.audio_fade_speed > 0.0, "weather.audio_fade_speed باید مثبت باشد");
+        let s = &w.snow_accumulation;
+        assert!(!s.shader_path.trim().is_empty(), "weather.snow_accumulation.shader_path خالی است");
+        assert!(
+            s.accumulate_duration_secs > 0.0 && s.melt_duration_secs > 0.0,
+            "مدت زمان نشستن و آب شدن برف باید مثبت باشد"
+        );
+        assert!(
+            (0.0..=1.0).contains(&s.slope_threshold) && s.slope_softness > 0.0,
+            "پارامترهای شیب نشستن برف نامعتبر است"
+        );
+        assert!(
+            s.noise_scale > 0.0 && s.noise_strength >= 0.0 && s.ground_coverage_boost >= 0.0,
+            "پارامترهای نویز و پوشش زمین برف نامعتبر است"
+        );
+        assert!(
+            (0.05..=1.0).contains(&s.snow_roughness) && s.sparkle_strength >= 0.0 && s.sparkle_scale > 0.0,
+            "پارامترهای زبری و درخشش برف نامعتبر است"
+        );
+        assert!(
+            s.night_snow_glow_strength >= 0.0
+                && s.night_directional_illuminance_mult > 0.0
+                && s.night_ambient_brightness_mult > 0.0
+                && s.night_fog_start_mult > 0.0
+                && s.night_fog_end_mult > 0.0,
+            "پارامترهای روشنایی شب برفی نامعتبر است"
+        );
     }
 
     pub fn effective_vision_multiplier(&self, match_elapsed_secs: f32, night_mult: f32) -> f32 {
@@ -957,6 +1033,26 @@ impl GameConfig {
         assert!(dn.day_fog_end > dn.day_fog_start && dn.night_fog_end > dn.night_fog_start, "فواصل مه روز و شب نامعتبر است");
         assert!(!dn.day_start_sound.trim().is_empty() && !dn.night_start_sound.trim().is_empty(), "مسیر صدای شب و روز نباید خالی باشد");
         assert!((0.0..=2.0).contains(&dn.day_start_volume) && (0.0..=2.0).contains(&dn.night_start_volume), "حجم صدای شب و روز باید بین 0 تا 2 باشد");
+    }
+
+    pub fn validate_buff_hud(&self) {
+        let b = &self.buff_hud;
+        assert!(
+            b.bottom_px >= 0.0 && b.circle_size_px >= 20.0 && b.ring_thickness_px >= 1.5,
+            "خطای بحرانی کانفیگ: ابعاد نوار باف و دیباف (buff_hud) نامعتبر است"
+        );
+        assert!(
+            b.circle_size_px > b.ring_thickness_px * 2.5 && b.circle_gap_px >= 0.0,
+            "خطای بحرانی کانفیگ: ضخامت حلقه یا فاصله دایره‌های buff_hud نامعتبر است"
+        );
+        assert!(
+            b.ring_segments >= 12 && b.ring_segments <= 72,
+            "خطای بحرانی کانفیگ: buff_hud.ring_segments باید بین 12 تا 72 باشد"
+        );
+        assert!(
+            b.popup_width_px >= 180.0 && b.popup_bottom_offset_px >= 10.0,
+            "خطای بحرانی کانفیگ: ابعاد کارت پاپ‌آپ buff_hud نامعتبر است"
+        );
     }
 
     pub fn validate_telemetry(&self) {
@@ -1240,6 +1336,117 @@ impl GameConfig {
 
     pub fn hero_by_id(&self, id: &str) -> &HeroDef {
         self.heroes.iter().find(|h| h.id == id).unwrap_or_else(|| self.active_hero(0))
+    }
+
+    pub fn validate_biome(&self) {
+        let b = &self.map.biome;
+        assert!(
+            !b.left_tree_model_path.trim().is_empty(),
+            "خطای بحرانی کانفیگ: map.biome.left_tree_model_path خالی است"
+        );
+        assert!(
+            !b.right_tree_model_path.trim().is_empty(),
+            "خطای بحرانی کانفیگ: map.biome.right_tree_model_path خالی است"
+        );
+        assert!(
+            b.ground_noise_scale > 0.0 && b.ground_noise_scale.is_finite(),
+            "خطای بحرانی کانفیگ: map.biome.ground_noise_scale باید مثبت باشد"
+        );
+        assert!(
+            b.river_transition_width > 0.0 && b.river_transition_width.is_finite(),
+            "خطای بحرانی کانفیگ: map.biome.river_transition_width باید مثبت باشد"
+        );
+
+        let l = &b.autumn_leaves;
+        assert!(
+            !l.shader_path.trim().is_empty(),
+            "خطای بحرانی کانفیگ: map.biome.autumn_leaves.shader_path خالی است"
+        );
+        assert!(
+            l.vein_contrast >= 0.0 && l.vein_contrast <= 1.0 && l.edge_darkening >= 0.0 && l.edge_darkening <= 1.0,
+            "خطای بحرانی کانفیگ: پارامترهای ظاهری برگ‌های پاییزی باید بین 0 تا 1 باشد"
+        );
+        assert!(
+            l.leaf_count > 0,
+            "خطای بحرانی کانفیگ: map.biome.autumn_leaves.leaf_count باید مثبت باشد"
+        );
+        assert!(
+            l.leaf_size_min > 0.0 && l.leaf_size_max >= l.leaf_size_min,
+            "خطای بحرانی کانفیگ: ابعاد برگ‌های پاییزی نامعتبر است"
+        );
+        assert!(
+            l.ground_y_offset > 0.0 && l.min_river_edge_margin >= 0.0 && l.lane_clear_margin >= 0.0 && l.base_clear_margin >= 0.0,
+            "خطای بحرانی کانفیگ: ارتفاع و حاشیه‌های برگ‌های پاییزی نامعتبر است"
+        );
+        assert!(
+            l.scatter_radius > 0.0 && l.min_walker_speed >= 0.0 && l.scatter_outward_impulse > 0.0 && l.scatter_upward_impulse > 0.0,
+            "خطای بحرانی کانفیگ: پارامترهای پخش شدن برگ‌های پاییزی نامعتبر است"
+        );
+        assert!(
+            l.gravity > 0.0 && l.air_drag >= 0.0 && l.ground_friction > 0.0 && l.spatial_cell_size > 0.0,
+            "خطای بحرانی کانفیگ: پارامترهای فیزیک برگ‌های پاییزی نامعتبر است"
+        );
+        assert!(
+            !l.palette_rgb.is_empty(),
+            "خطای بحرانی کانفیگ: پالت رنگی برگ‌های پاییزی نباید خالی باشد"
+        );
+        for (idx, c) in l.palette_rgb.iter().enumerate() {
+            assert!(
+                c.0 >= 0.0 && c.1 >= 0.0 && c.2 >= 0.0 && c.0.is_finite() && c.1.is_finite() && c.2.is_finite(),
+                "خطای بحرانی کانفیگ: رنگ شماره {} در پالت برگ‌های پاییزی نامعتبر است",
+                idx
+            );
+        }
+
+        assert!(
+            b.tree_fow_blocker_radius_mult > 0.0
+                && b.tree_fow_blocker_min_radius > 0.0
+                && b.tree_fow_blocker_max_radius >= b.tree_fow_blocker_min_radius,
+            "خطای بحرانی کانفیگ: پارامترهای مسدودسازی دید (FOW) درختان در map.biome نامعتبر است"
+        );
+        assert!(
+            b.tree_min_scale.0 > 0.0
+                && b.tree_min_scale.1 > 0.0
+                && b.tree_min_scale.2 > 0.0
+                && b.tree_max_scale.0 >= b.tree_min_scale.0
+                && b.tree_max_scale.1 >= b.tree_min_scale.1
+                && b.tree_max_scale.2 >= b.tree_min_scale.2,
+            "خطای بحرانی کانفیگ: بازه tree_min_scale و tree_max_scale در map.biome نامعتبر است"
+        );
+
+        for tree in &self.map.trees {
+            let scl = tree.model_transform.scale;
+            assert!(
+                scl.0 >= b.tree_min_scale.0
+                    && scl.0 <= b.tree_max_scale.0
+                    && scl.1 >= b.tree_min_scale.1
+                    && scl.1 <= b.tree_max_scale.1
+                    && scl.2 >= b.tree_min_scale.2
+                    && scl.2 <= b.tree_max_scale.2,
+                "خطای بحرانی کانفیگ: مقیاس درخت '{}' برابر ({:.2}, {:.2}, {:.2}) خارج از بازه مجاز ({:.2}..={:.2}) است",
+                tree.id,
+                scl.0,
+                scl.1,
+                scl.2,
+                b.tree_min_scale.0,
+                b.tree_max_scale.0
+            );
+            let loc = tree.model_transform.location;
+            let expected_model = if is_left_of_river(&self.map.canyon, loc.0, loc.2) {
+                &b.left_tree_model_path
+            } else {
+                &b.right_tree_model_path
+            };
+            assert!(
+                tree.model_path == *expected_model,
+                "خطای بحرانی کانفیگ: درخت '{}' در مختصات ({:.2}, {:.2}) مدل '{}' دارد ولی باید '{}' باشد",
+                tree.id,
+                loc.0,
+                loc.2,
+                tree.model_path,
+                expected_model
+            );
+        }
     }
 
     pub fn validate_unique_map_ids(&self) {
@@ -2342,6 +2549,56 @@ pub struct RoshanPitConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AutumnLeavesConfig {
+    pub enabled: bool,
+    pub leaf_count: u32,
+    pub leaf_size_min: f32,
+    pub leaf_size_max: f32,
+    pub ground_y_offset: f32,
+    pub min_river_edge_margin: f32,
+    pub lane_clear_margin: f32,
+    pub base_clear_margin: f32,
+    pub scatter_radius: f32,
+    pub min_walker_speed: f32,
+    pub scatter_outward_impulse: f32,
+    pub scatter_upward_impulse: f32,
+    pub scatter_swirl_impulse: f32,
+    pub scatter_spin_speed: f32,
+    pub gravity: f32,
+    pub air_drag: f32,
+    pub flutter_amplitude: f32,
+    pub flutter_frequency: f32,
+    pub ground_friction: f32,
+    pub spatial_cell_size: f32,
+    pub roughness: f32,
+    pub vein_contrast: f32,
+    pub edge_darkening: f32,
+    pub shader_path: String,
+    pub palette_rgb: Vec<(f32, f32, f32)>,
+    pub seed: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MapBiomeConfig {
+    pub left_tree_model_path: String,
+    pub right_tree_model_path: String,
+    pub tree_min_scale: (f32, f32, f32),
+    pub tree_max_scale: (f32, f32, f32),
+    pub tree_fow_blocker_radius_mult: f32,
+    pub tree_fow_blocker_min_radius: f32,
+    pub tree_fow_blocker_max_radius: f32,
+    pub left_ground_primary_rgb: (f32, f32, f32),
+    pub left_ground_secondary_rgb: (f32, f32, f32),
+    pub left_ground_highlight_rgb: (f32, f32, f32),
+    pub right_ground_primary_rgb: (f32, f32, f32),
+    pub right_ground_secondary_rgb: (f32, f32, f32),
+    pub right_ground_highlight_rgb: (f32, f32, f32),
+    pub ground_noise_scale: f32,
+    pub river_transition_width: f32,
+    pub autumn_leaves: AutumnLeavesConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MapConfig {
     pub map_dimensions: (f32, f32),
     pub show_object_labels: bool,
@@ -2353,6 +2610,7 @@ pub struct MapConfig {
     pub fog_explored_alpha: f32,
     pub fog_unexplored_alpha: f32,
     pub canyon: CanyonConfig,
+    pub biome: MapBiomeConfig,
     pub terrains: Vec<TerrainPlatformDef>,
     pub ramps: Vec<RampDef>,
     pub river_segments: Vec<RiverSegmentDef>,
@@ -3466,6 +3724,10 @@ pub struct ActiveBuffSnapshot {
     pub id: String,
     pub item_id: String,
     pub label: String,
+    pub short_tag: String,
+    pub details: Vec<String>,
+    pub is_debuff: bool,
+    pub is_timed: bool,
     pub remaining_secs: f32,
     pub total_secs: f32,
     pub color_rgb: (f32, f32, f32),
@@ -3869,6 +4131,22 @@ pub fn canyon_edge_distance(canyon: &CanyonConfig, x: f32, z: f32) -> f32 {
     }
     let (dist, half_w, _, _, _) = canyon_meander_and_half_w(canyon, x, z);
     half_w - dist
+}
+
+/// فاصله علامت‌دار از خط مرکزی رودخانه خمیده:
+/// مقدار >= 0 یعنی سمت چپ رودخانه (Dawn / چمنزار) و مقدار < 0 یعنی سمت راست رودخانه (Dusk / پاییزی)
+pub fn canyon_river_side_signed(canyon: &CanyonConfig, x: f32, z: f32) -> f32 {
+    if !canyon.enabled {
+        return -x;
+    }
+    let (_, _, signed_perp, _, _) = canyon_meander_and_half_w(canyon, x, z);
+    signed_perp
+}
+
+/// آیا مختصات (x, z) در سمت چپ رودخانه قرار دارد؟
+#[inline]
+pub fn is_left_of_river(canyon: &CanyonConfig, x: f32, z: f32) -> bool {
+    canyon_river_side_signed(canyon, x, z) >= 0.0
 }
 
 /// ارتفاع دقیق دره با دیواره‌های کاملاً عمودی ۹۰ درجه (بدون شیب بالا رفتن)
@@ -6711,12 +6989,15 @@ impl SharedFogOfWar {
                         max_blocker_y = max_blocker_y.max(top_y);
                     }
                 }
+                let fow_r_mult = config.map.biome.tree_fow_blocker_radius_mult;
+                let fow_r_min = config.map.biome.tree_fow_blocker_min_radius;
+                let fow_r_max = config.map.biome.tree_fow_blocker_max_radius;
                 for tree in &config.map.trees {
                     let loc = tree.model_transform.location;
                     let scl = tree.model_transform.scale;
                     let ts = scl.0.abs().max(scl.2.abs());
                     let top_y = loc.1 + (tree.trunk_height + tree.canopy_height) * scl.1.abs();
-                    let r = (tree.trunk_radius * 0.55 * ts).clamp(0.45, 1.1);
+                    let r = (tree.trunk_radius * fow_r_mult * ts).clamp(fow_r_min, fow_r_max);
                     let tdx = wx - loc.0;
                     let tdz = wz - loc.2;
                     if tdx * tdx + tdz * tdz <= r * r {
@@ -6724,6 +7005,17 @@ impl SharedFogOfWar {
                     }
                 }
                 blocker_top_y[idx] = max_blocker_y;
+            }
+        }
+
+        // تضمین ثبت قطعی سلول دقیق هر درخت در شبکه Fog of War (جلوگیری از رد شدن دید از درختان کوچک بین مراکز سلول‌ها)
+        for tree in &config.map.trees {
+            let loc = tree.model_transform.location;
+            let scl = tree.model_transform.scale;
+            let top_y = loc.1 + (tree.trunk_height + tree.canopy_height) * scl.1.abs();
+            if let Some((gx, gz)) = Self::world_to_cell(config, loc.0, loc.2) {
+                let idx = gz * FOW_GRID_W + gx;
+                blocker_top_y[idx] = blocker_top_y[idx].max(top_y);
             }
         }
 
@@ -9302,11 +9594,85 @@ impl AuthoritativeWorldState {
                 is_sonar_revealed: self.sonar_revealed_remaining > 0.0,
                 active_buffs: {
                     let mut buffs = Vec::new();
+                    let bh = &config.buff_hud;
+
+                    // ۱. باف‌ها و دیباف‌های محیطی شب/روز و آب‌وهوا بر اساس هیرو و سلاح فعلی
+                    if let Some(hero_def) = config.heroes.iter().find(|h| h.id == self.hero_id) {
+                        let is_night = config.is_night_at(self.match_elapsed_secs);
+                        let time_mod = if is_night {
+                            &hero_def.environment.night
+                        } else {
+                            &hero_def.environment.day
+                        };
+                        let (time_lines, t_buffs, t_debuffs) = time_mod.describe_effects();
+                        if !time_lines.is_empty() {
+                            let is_debuff = t_debuffs > t_buffs;
+                            let col = if is_night { bh.night_color_rgb } else { bh.day_color_rgb };
+                            buffs.push(ActiveBuffSnapshot {
+                                id: if is_night { "env_night".to_string() } else { "env_day".to_string() },
+                                item_id: String::new(),
+                                label: if is_night { "NIGHT EFFECT".to_string() } else { "DAYLIGHT EFFECT".to_string() },
+                                short_tag: if is_night { "NGT".to_string() } else { "DAY".to_string() },
+                                details: time_lines,
+                                is_debuff,
+                                is_timed: false,
+                                remaining_secs: 0.0,
+                                total_secs: 1.0,
+                                color_rgb: col,
+                            });
+                        }
+
+                        let (w_mod, w_id, w_label, w_tag, w_col) = match self.current_weather {
+                            WeatherKind::Clear => (
+                                &hero_def.environment.clear,
+                                "env_clear",
+                                "CLEAR WEATHER",
+                                "SUN",
+                                bh.clear_color_rgb,
+                            ),
+                            WeatherKind::Rainy => (
+                                &hero_def.environment.rainy,
+                                "env_rainy",
+                                "RAINY WEATHER",
+                                "RAIN",
+                                bh.rainy_color_rgb,
+                            ),
+                            WeatherKind::Snowy => (
+                                &hero_def.environment.snowy,
+                                "env_snowy",
+                                "SNOWY WEATHER",
+                                "SNOW",
+                                bh.snowy_color_rgb,
+                            ),
+                        };
+                        let (w_lines, w_buffs, w_debuffs) = w_mod.describe_effects();
+                        if !w_lines.is_empty() {
+                            let is_debuff = w_debuffs > w_buffs;
+                            buffs.push(ActiveBuffSnapshot {
+                                id: w_id.to_string(),
+                                item_id: String::new(),
+                                label: w_label.to_string(),
+                                short_tag: w_tag.to_string(),
+                                details: w_lines,
+                                is_debuff,
+                                is_timed: false,
+                                remaining_secs: 0.0,
+                                total_secs: 1.0,
+                                color_rgb: w_col,
+                            });
+                        }
+                    }
+
+                    // ۲. باف‌ها و دیباف‌های زمان‌دار آیتم‌ها و نبرد
                     if let Some(ref tp) = self.active_teleport {
                         buffs.push(ActiveBuffSnapshot {
                             id: "teleport".to_string(),
                             item_id: items_cfg.teleport.item_id.clone(),
                             label: "TELEPORTING".to_string(),
+                            short_tag: "TP".to_string(),
+                            details: vec!["+Channeling Town Portal".to_string()],
+                            is_debuff: false,
+                            is_timed: true,
                             remaining_secs: (tp.total_secs - tp.elapsed_secs).max(0.0),
                             total_secs: tp.total_secs.max(0.01),
                             color_rgb: items_cfg.teleport.portal_core_color_rgb,
@@ -9316,47 +9682,31 @@ impl AuthoritativeWorldState {
                         buffs.push(ActiveBuffSnapshot {
                             id: "shadow_blade".to_string(),
                             item_id: items_cfg.shadow_blade.item_id.clone(),
-                            label: "INVISIBLE".to_string(),
+                            label: "SHADOW INVISIBILITY".to_string(),
+                            short_tag: "INV".to_string(),
+                            details: vec![
+                                "+Invisible to Enemies".to_string(),
+                                format!("+{:.0}% Move Speed", items_cfg.shadow_blade.invis_move_speed_bonus_pct * 100.0),
+                            ],
+                            is_debuff: false,
+                            is_timed: true,
                             remaining_secs: self.invisibility_remaining.max(0.0),
                             total_secs: self.invisibility_total_secs.max(0.01),
                             color_rgb: items_cfg.shadow_blade.buff_bar_color_rgb,
-                        });
-                    }
-                    if self.flame_armor_debuff_remaining > 0.0 && self.flame_armor_debuff_amount > 0.0 {
-                        buffs.push(ActiveBuffSnapshot {
-                            id: "flame_armor_debuff".to_string(),
-                            item_id: String::new(),
-                            label: format!("ARMOR -{:.1}", self.flame_armor_debuff_amount),
-                            remaining_secs: self.flame_armor_debuff_remaining.max(0.0),
-                            total_secs: self.flame_armor_debuff_remaining.max(0.1),
-                            color_rgb: items_cfg.stat_limits.flame_debuff_bar_color_rgb,
-                        });
-                    }
-                    if self.electric_fire_rate_slow_remaining > 0.0 && self.electric_fire_rate_slow_ratio > 0.0 {
-                        buffs.push(ActiveBuffSnapshot {
-                            id: "electric_fire_rate_slow".to_string(),
-                            item_id: String::new(),
-                            label: format!("FIRE SLOW -{:.0}%", self.electric_fire_rate_slow_ratio * 100.0),
-                            remaining_secs: self.electric_fire_rate_slow_remaining.max(0.0),
-                            total_secs: self.electric_fire_rate_slow_remaining.max(0.1),
-                            color_rgb: items_cfg.stat_limits.electric_debuff_bar_color_rgb,
-                        });
-                    }
-                    if self.toxic_slow_multiplier < 0.999 {
-                        buffs.push(ActiveBuffSnapshot {
-                            id: "toxic_slow".to_string(),
-                            item_id: String::new(),
-                            label: format!("TOXIC SLOW -{:.0}%", (1.0 - self.toxic_slow_multiplier) * 100.0),
-                            remaining_secs: 1.0,
-                            total_secs: 1.0,
-                            color_rgb: items_cfg.stat_limits.toxic_debuff_bar_color_rgb,
                         });
                     }
                     if self.reflect_armor_remaining > 0.0 {
                         buffs.push(ActiveBuffSnapshot {
                             id: "reflect_armor".to_string(),
                             item_id: items_cfg.reflect_armor.item_id.clone(),
-                            label: format!("MIRROR {:.0}%", items_cfg.reflect_armor.active_damage_ratio * 100.0),
+                            label: "MIRROR REFLECT".to_string(),
+                            short_tag: "REF".to_string(),
+                            details: vec![format!(
+                                "+Reflects {:.0}% Incoming Damage",
+                                items_cfg.reflect_armor.active_damage_ratio * 100.0
+                            )],
+                            is_debuff: false,
+                            is_timed: true,
                             remaining_secs: self.reflect_armor_remaining.max(0.0),
                             total_secs: self.reflect_armor_total_secs.max(0.01),
                             color_rgb: items_cfg.reflect_armor.buff_bar_color_rgb,
@@ -9366,21 +9716,70 @@ impl AuthoritativeWorldState {
                         buffs.push(ActiveBuffSnapshot {
                             id: "bullet_immunity".to_string(),
                             item_id: items_cfg.bullet_immunity.item_id.clone(),
-                            label: "PHASE IMMUNE".to_string(),
+                            label: "PHASE IMMUNITY".to_string(),
+                            short_tag: "IMM".to_string(),
+                            details: vec!["+100% Immune to Bullets & Beams".to_string()],
+                            is_debuff: false,
+                            is_timed: true,
                             remaining_secs: self.bullet_immunity_remaining.max(0.0),
                             total_secs: self.bullet_immunity_total_secs.max(0.01),
                             color_rgb: items_cfg.bullet_immunity.buff_bar_color_rgb,
+                        });
+                    }
+                    if self.flame_armor_debuff_remaining > 0.0 && self.flame_armor_debuff_amount > 0.0 {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "flame_armor_debuff".to_string(),
+                            item_id: String::new(),
+                            label: "MELTED ARMOR".to_string(),
+                            short_tag: "ARM".to_string(),
+                            details: vec![format!("-{:.1} Armor", self.flame_armor_debuff_amount)],
+                            is_debuff: true,
+                            is_timed: true,
+                            remaining_secs: self.flame_armor_debuff_remaining.max(0.0),
+                            total_secs: self.flame_armor_debuff_remaining.max(0.1),
+                            color_rgb: items_cfg.stat_limits.flame_debuff_bar_color_rgb,
+                        });
+                    }
+                    if self.electric_fire_rate_slow_remaining > 0.0 && self.electric_fire_rate_slow_ratio > 0.0 {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "electric_fire_rate_slow".to_string(),
+                            item_id: String::new(),
+                            label: "SHOCKED".to_string(),
+                            short_tag: "ZAP".to_string(),
+                            details: vec![format!("-{:.0}% Fire Rate", self.electric_fire_rate_slow_ratio * 100.0)],
+                            is_debuff: true,
+                            is_timed: true,
+                            remaining_secs: self.electric_fire_rate_slow_remaining.max(0.0),
+                            total_secs: self.electric_fire_rate_slow_remaining.max(0.1),
+                            color_rgb: items_cfg.stat_limits.electric_debuff_bar_color_rgb,
+                        });
+                    }
+                    if self.toxic_slow_multiplier < 0.999 {
+                        buffs.push(ActiveBuffSnapshot {
+                            id: "toxic_slow".to_string(),
+                            item_id: String::new(),
+                            label: "TOXIC MIASMA".to_string(),
+                            short_tag: "TOX".to_string(),
+                            details: vec![format!("-{:.0}% Move Speed", (1.0 - self.toxic_slow_multiplier) * 100.0)],
+                            is_debuff: true,
+                            is_timed: false,
+                            remaining_secs: 0.0,
+                            total_secs: 1.0,
+                            color_rgb: items_cfg.stat_limits.toxic_debuff_bar_color_rgb,
                         });
                     }
                     if self.cryo_debuff_remaining > 0.0 {
                         buffs.push(ActiveBuffSnapshot {
                             id: "cryo_debuff".to_string(),
                             item_id: String::new(),
-                            label: format!(
-                                "CRYO -{:.0}% / HEAL -{:.0}%",
-                                self.cryo_slow_ratio * 100.0,
-                                self.cryo_heal_reduction_ratio * 100.0
-                            ),
+                            label: "CRYO STASIS".to_string(),
+                            short_tag: "CRYO".to_string(),
+                            details: vec![
+                                format!("-{:.0}% Move Speed", self.cryo_slow_ratio * 100.0),
+                                format!("-{:.0}% Healing & Regen", self.cryo_heal_reduction_ratio * 100.0),
+                            ],
+                            is_debuff: true,
+                            is_timed: true,
                             remaining_secs: self.cryo_debuff_remaining.max(0.0),
                             total_secs: self.cryo_debuff_total_secs.max(0.01),
                             color_rgb: items_cfg.stat_limits.cryo_debuff_bar_color_rgb,
@@ -9391,6 +9790,10 @@ impl AuthoritativeWorldState {
                             id: "null_mute".to_string(),
                             item_id: String::new(),
                             label: "ITEMS MUTED".to_string(),
+                            short_tag: "MUTE".to_string(),
+                            details: vec!["-Active Items & Buffs Disabled".to_string()],
+                            is_debuff: true,
+                            is_timed: true,
                             remaining_secs: self.null_mute_remaining.max(0.0),
                             total_secs: self.null_mute_total_secs.max(0.01),
                             color_rgb: items_cfg.stat_limits.null_mute_debuff_bar_color_rgb,
@@ -9401,6 +9804,10 @@ impl AuthoritativeWorldState {
                             id: "sonar_revealed".to_string(),
                             item_id: String::new(),
                             label: "SONAR TRACKED".to_string(),
+                            short_tag: "SCAN".to_string(),
+                            details: vec!["-Revealed Through Fog & Invisibility".to_string()],
+                            is_debuff: true,
+                            is_timed: true,
                             remaining_secs: self.sonar_revealed_remaining.max(0.0),
                             total_secs: self.sonar_revealed_total_secs.max(0.01),
                             color_rgb: items_cfg.stat_limits.sonar_debuff_bar_color_rgb,

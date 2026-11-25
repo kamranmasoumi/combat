@@ -459,7 +459,7 @@ fn main() {
         )
         .add_systems(
             Update,
-            (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, update_inventory_world_drop_target_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system, teleport_preview_and_input_system.before(minimap_interaction_system), sync_active_teleports_visual_system, sync_invisibility_visual_system, sync_tactical_aura_snapshots_system)
+            (adaptive_ui_performance_mode_system, sync_couriers_system, update_overhead_courier_bars_system, courier_manual_move_input_system, update_inventory_world_drop_target_system, hover_ally_highlight_system, animate_move_click_arrows_system, update_scoreboard_ui_system, sync_audio_context_system, teleport_preview_and_input_system.before(minimap_interaction_system), sync_active_teleports_visual_system, sync_invisibility_visual_system, sync_tactical_aura_snapshots_system, sync_biome_walkers_system)
                 .run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
@@ -1476,6 +1476,7 @@ fn setup_scene(
         let mut ent_cmds = commands.spawn((
             terrain_platform_physics_bundle(&config, plat),
             Visibility::Visible,
+            vfx_client::SnowSurfaceRoot,
         ));
         let ent = ent_cmds.id();
 
@@ -1489,7 +1490,7 @@ fn setup_scene(
             });
         } else if plat.id == "terrain_center_mid_strip" {
             let canyon = &config.map.canyon;
-            let (canyon_terrain_mesh, canyon_river_mesh) = build_canyon_terrain_and_river_meshes(canyon);
+            let (canyon_terrain_mesh, canyon_river_mesh) = build_canyon_terrain_and_river_meshes(canyon, &config.map.biome);
             let offset_y = -plat.model_transform.location.1;
             let wc = canyon.water_color_rgb;
             let fc = canyon.foam_color_rgb;
@@ -1884,6 +1885,7 @@ fn setup_scene(
     let mut bridge_cmds = commands.spawn((
         center_bridge_physics_bundle(&config, bridge),
         Visibility::Visible,
+        vfx_client::SnowSurfaceRoot,
     ));
     if bridge.occlusion_fade_enabled {
         bridge_cmds.insert(VisionOccludable {
@@ -2103,6 +2105,7 @@ fn setup_scene(
                     WorldAssetRoot(scene_handle),
                     model_transform_to_bevy(&stair.model_transform),
                     Visibility::Visible,
+                    vfx_client::SnowSurfaceRoot,
                 ));
                 if stair.occlusion_fade_enabled {
                     stair_cmds.insert(VisionOccludable {
@@ -2117,6 +2120,7 @@ fn setup_scene(
             } else {
                 // سایر سگمنت‌های لاین (از جمله پل میانی) همچنان با طراحی فعلی Bevy رندر می‌شوند
                 let mut seg_cmds = commands.spawn((
+                    vfx_client::SnowSurfaceRoot,
                     Mesh3d(meshes.add(Cuboid::new(lane.width, lane.thickness, len_3d))),
                     MeshMaterial3d(lane_mat.clone()),
                     lane_segment_physics_bundle(
@@ -2163,6 +2167,7 @@ fn setup_scene(
             MapObjectId(ftn.id.clone()),
             tf,
             Visibility::Visible,
+            vfx_client::SnowSurfaceRoot,
         ));
         let ftn_ent = ftn_cmds.id();
         if custom_glb_exists(&ftn.model_path) {
@@ -2214,6 +2219,7 @@ fn setup_scene(
         };
 
         let mut anc_cmds = commands.spawn((
+            vfx_client::SnowSurfaceRoot,
             ancient_physics_bundle(&config, anc_idx, anc),
             AncientVisualRoot {
                 index: anc_idx,
@@ -2323,6 +2329,7 @@ fn setup_scene(
         let tc = tur.color_rgb;
         let ce = tur.crystal_emissive_rgb;
         let mut tur_cmds = commands.spawn((
+            vfx_client::SnowSurfaceRoot,
             turret_physics_bundle(&config, t_idx, tur),
             TurretVisualRoot {
                 index: t_idx,
@@ -2412,6 +2419,7 @@ fn setup_scene(
         let bc = bar.color_rgb;
         let ae = bar.accent_emissive_rgb;
         let mut bar_cmds = commands.spawn((
+            vfx_client::SnowSurfaceRoot,
             barracks_physics_bundle(&config, b_idx, bar),
             BarracksVisualRoot {
                 index: b_idx,
@@ -2489,6 +2497,7 @@ fn setup_scene(
         let size = Vec3::new(mtn.size.0, mtn.size.1, mtn.size.2);
         let mc = mtn.color_rgb;
         let mut mtn_cmds = commands.spawn((
+            vfx_client::SnowSurfaceRoot,
             mountain_physics_bundle(&config, mtn),
             Visibility::Visible,
             MountainVisualMarker {
@@ -2556,6 +2565,7 @@ fn setup_scene(
         let tc = tree.trunk_color_rgb;
         let cc = tree.canopy_color_rgb;
         let mut tree_cmds = commands.spawn((
+            vfx_client::SnowSurfaceRoot,
             tree_physics_bundle(&config, tree),
             Visibility::Visible,
         ));
@@ -2651,6 +2661,7 @@ fn setup_scene(
         let size = Vec3::new(obs.size.0, obs.size.1, obs.size.2);
         let oc = obs.color_rgb;
         let mut obs_cmds = commands.spawn((
+            vfx_client::SnowSurfaceRoot,
             obstacle_physics_bundle(&config, obs),
             Visibility::Visible,
         ));
@@ -7189,8 +7200,28 @@ fn bake_minimap_image(config: &GameConfig) -> Image {
         }
     };
 
-    // ۱. پلتفرم‌های زمین و پایگاه‌ها
+    // ۱. پلتفرم‌های زمین و پایگاه‌ها (تفکیک رنگی چمن سمت چپ و پاییزی سمت راست روی مینی‌مپ)
     for plat in &config.map.terrains {
+        if plat.id == "terrain_center_mid_strip" {
+            let left_col = rgb_to_u8(config.map.biome.left_ground_primary_rgb, 1.20, 255);
+            let right_col = rgb_to_u8(config.map.biome.right_ground_primary_rgb, 1.18, 255);
+            let river_col = rgb_to_u8(config.map.canyon.water_color_rgb, 1.35, 255);
+            for py in 0..h as i32 {
+                let wz = (py as f32 / h as f32 - 0.5) * map_h;
+                for px in 0..w as i32 {
+                    let wx = (px as f32 / w as f32 - 0.5) * map_w;
+                    let col = if moba_shared::canyon_edge_distance(&config.map.canyon, wx, wz) > 0.0 {
+                        river_col
+                    } else if moba_shared::is_left_of_river(&config.map.canyon, wx, wz) {
+                        left_col
+                    } else {
+                        right_col
+                    };
+                    put_pixel(&mut pixels, px, py, col);
+                }
+            }
+            continue;
+        }
         let boost = if plat.elevation_tier >= 2 { 1.35 } else { 1.15 };
         let col = rgb_to_u8(plat.color_rgb, boost, 255);
         let loc = plat.model_transform.location;
@@ -12530,6 +12561,7 @@ fn day_night_cycle_system(
     top_bar: Res<LatestTopBarState>,
     mut weather_flash: ResMut<WeatherLightningFlashState>,
     mut ambient: ResMut<GlobalAmbientLight>,
+    mut snow_state: ResMut<vfx_client::SnowAccumulationState>,
     mut q: DayNightVisualQueries,
     mut last_is_night: Local<Option<bool>>,
     mut rain_blend: Local<f32>,
@@ -12604,13 +12636,25 @@ fn day_night_cycle_system(
     let mut dir_col = day_dir_col.lerp(night_dir_col, blend);
     let mut dir_illum = config.lighting.directional_illuminance + (dn.night_directional_illuminance - config.lighting.directional_illuminance) * blend;
 
+    snow_state.night_blend = blend;
+    let snow_acc = &w_cfg.snow_accumulation;
+    // شدت اتمسفر برفی هم از بارش و هم از برفِ نشسته روی زمین پیروی می‌کند
+    let snow_atm = (*snow_blend).max(snow_state.snow_amount);
+    let day_snow_atm = snow_atm * (1.0 - blend);
+    let night_snow_atm = snow_atm * blend;
+
     // در شب، باران نورپردازی و مه شبانه را تغییر نمی‌دهد (فقط قطرات باران نمایش داده می‌شوند)
     let day_rain_atm = *rain_blend * (1.0 - blend);
     let rain_dir_col = Vec3::new(w_cfg.rain_directional_color_rgb.0, w_cfg.rain_directional_color_rgb.1, w_cfg.rain_directional_color_rgb.2);
-    let snow_dir_col = Vec3::new(w_cfg.snow_directional_color_rgb.0, w_cfg.snow_directional_color_rgb.1, w_cfg.snow_directional_color_rgb.2);
-    dir_col = dir_col.lerp(rain_dir_col, day_rain_atm * 0.45).lerp(snow_dir_col, *snow_blend * 0.55);
+    let snow_day_dir_col = Vec3::new(w_cfg.snow_directional_color_rgb.0, w_cfg.snow_directional_color_rgb.1, w_cfg.snow_directional_color_rgb.2);
+    let snow_night_dir_col = Vec3::new(0.76, 0.86, 1.0);
+    dir_col = dir_col
+        .lerp(rain_dir_col, day_rain_atm * 0.45)
+        .lerp(snow_day_dir_col, day_snow_atm * 0.65)
+        .lerp(snow_night_dir_col, night_snow_atm * 0.68);
     dir_illum *= 1.0 + (w_cfg.rain_directional_illuminance_mult - 1.0) * day_rain_atm;
-    dir_illum *= 1.0 + (w_cfg.snow_directional_illuminance_mult - 1.0) * *snow_blend;
+    dir_illum *= 1.0 + (w_cfg.snow_directional_illuminance_mult - 1.0) * day_snow_atm;
+    dir_illum *= 1.0 + (snow_acc.night_directional_illuminance_mult - 1.0) * night_snow_atm;
 
     let flash_col = Vec3::new(w_cfg.lightning_flash_color_rgb.0, w_cfg.lightning_flash_color_rgb.1, w_cfg.lightning_flash_color_rgb.2);
     if flash_alpha > 0.001 {
@@ -12623,17 +12667,22 @@ fn day_night_cycle_system(
         light.illuminance = dir_illum;
     }
 
-    // تغییر نرم نور محیطی (GlobalAmbientLight)
+    // تغییر نرم نور محیطی (GlobalAmbientLight): روز آفتابی برفی روشن + شب روشن‌شده از بازتاب برف
     let day_amb = Vec3::new(config.lighting.ambient_color_rgb.0, config.lighting.ambient_color_rgb.1, config.lighting.ambient_color_rgb.2);
     let night_amb = Vec3::new(dn.night_ambient_color_rgb.0, dn.night_ambient_color_rgb.1, dn.night_ambient_color_rgb.2);
     let mut amb_col = day_amb.lerp(night_amb, blend);
     let mut amb_bright = config.lighting.ambient_brightness + (dn.night_ambient_brightness - config.lighting.ambient_brightness) * blend;
 
     let rain_amb_col = Vec3::new(w_cfg.rain_ambient_color_rgb.0, w_cfg.rain_ambient_color_rgb.1, w_cfg.rain_ambient_color_rgb.2);
-    let snow_amb_col = Vec3::new(w_cfg.snow_ambient_color_rgb.0, w_cfg.snow_ambient_color_rgb.1, w_cfg.snow_ambient_color_rgb.2);
-    amb_col = amb_col.lerp(rain_amb_col, day_rain_atm * 0.45).lerp(snow_amb_col, *snow_blend * 0.58);
+    let snow_day_amb_col = Vec3::new(w_cfg.snow_ambient_color_rgb.0, w_cfg.snow_ambient_color_rgb.1, w_cfg.snow_ambient_color_rgb.2);
+    let snow_night_amb_col = Vec3::new(snow_acc.night_ambient_color_rgb.0, snow_acc.night_ambient_color_rgb.1, snow_acc.night_ambient_color_rgb.2);
+    amb_col = amb_col
+        .lerp(rain_amb_col, day_rain_atm * 0.45)
+        .lerp(snow_day_amb_col, day_snow_atm * 0.65)
+        .lerp(snow_night_amb_col, night_snow_atm * 0.80);
     amb_bright *= 1.0 + (w_cfg.rain_ambient_brightness_mult - 1.0) * day_rain_atm;
-    amb_bright *= 1.0 + (w_cfg.snow_ambient_brightness_mult - 1.0) * *snow_blend;
+    amb_bright *= 1.0 + (w_cfg.snow_ambient_brightness_mult - 1.0) * day_snow_atm;
+    amb_bright *= 1.0 + (snow_acc.night_ambient_brightness_mult - 1.0) * night_snow_atm;
     if flash_alpha > 0.001 {
         amb_col = amb_col.lerp(flash_col, flash_alpha.min(1.0));
         amb_bright += w_cfg.lightning_flash_ambient_brightness * flash_alpha;
@@ -12641,7 +12690,7 @@ fn day_night_cycle_system(
     ambient.color = Color::srgb(amb_col.x, amb_col.y, amb_col.z);
     ambient.brightness = amb_bright;
 
-    // تغییر مه اتمسفریک شب و روز + آب و هوا + صفحه مرگ
+    // تغییر مه اتمسفریک شب و روز + زمستان آفتابی شفاف و شب برفی روشن
     let day_fog_c = Vec3::new(dn.day_fog_color_rgb.0, dn.day_fog_color_rgb.1, dn.day_fog_color_rgb.2);
     let night_fog_c = Vec3::new(dn.night_fog_color_rgb.0, dn.night_fog_color_rgb.1, dn.night_fog_color_rgb.2);
     let mut fog_c = day_fog_c.lerp(night_fog_c, blend);
@@ -12649,12 +12698,18 @@ fn day_night_cycle_system(
     let mut fog_end = dn.day_fog_end + (dn.night_fog_end - dn.day_fog_end) * blend;
 
     let rain_fog_c = Vec3::new(w_cfg.rain_fog_color_rgb.0, w_cfg.rain_fog_color_rgb.1, w_cfg.rain_fog_color_rgb.2);
-    let snow_fog_c = Vec3::new(w_cfg.snow_fog_color_rgb.0, w_cfg.snow_fog_color_rgb.1, w_cfg.snow_fog_color_rgb.2) * (1.0 - 0.45 * blend);
-    fog_c = fog_c.lerp(rain_fog_c, day_rain_atm * 0.55).lerp(snow_fog_c, *snow_blend * 0.85);
+    let snow_day_fog_c = Vec3::new(w_cfg.snow_fog_color_rgb.0, w_cfg.snow_fog_color_rgb.1, w_cfg.snow_fog_color_rgb.2);
+    let snow_night_fog_c = Vec3::new(snow_acc.night_fog_color_rgb.0, snow_acc.night_fog_color_rgb.1, snow_acc.night_fog_color_rgb.2);
+    fog_c = fog_c
+        .lerp(rain_fog_c, day_rain_atm * 0.55)
+        .lerp(snow_day_fog_c, day_snow_atm * 0.72)
+        .lerp(snow_night_fog_c, night_snow_atm * 0.82);
     fog_start *= 1.0 + (w_cfg.rain_fog_start_mult - 1.0) * day_rain_atm;
-    fog_start *= 1.0 + (w_cfg.snow_fog_start_mult - 1.0) * *snow_blend;
+    fog_start *= 1.0 + (w_cfg.snow_fog_start_mult - 1.0) * day_snow_atm;
+    fog_start *= 1.0 + (snow_acc.night_fog_start_mult - 1.0) * night_snow_atm;
     fog_end *= 1.0 + (w_cfg.rain_fog_end_mult - 1.0) * day_rain_atm;
-    fog_end *= 1.0 + (w_cfg.snow_fog_end_mult - 1.0) * *snow_blend;
+    fog_end *= 1.0 + (w_cfg.snow_fog_end_mult - 1.0) * day_snow_atm;
+    fog_end *= 1.0 + (snow_acc.night_fog_end_mult - 1.0) * night_snow_atm;
     if flash_alpha > 0.001 {
         fog_c = fog_c.lerp(flash_col, (flash_alpha * 0.45).min(0.65));
     }
@@ -18463,6 +18518,45 @@ fn sync_tactical_aura_snapshots_system(
             is_cryo_debuffed: rp.is_cryo_debuffed,
             is_null_muted: rp.is_null_muted,
             is_sonar_revealed: rp.is_sonar_revealed,
+        });
+    }
+}
+
+fn sync_biome_walkers_system(
+    match_flow: Res<ClientMatchFlow>,
+    render_state: Res<ClientRenderState>,
+    remote_players: Res<LatestRemotePlayers>,
+    creeps: Res<LatestCreeps>,
+    mut walkers: ResMut<vfx_client::BiomeWalkersState>,
+) {
+    walkers.walkers.clear();
+    if !match_flow.is_in_game() {
+        return;
+    }
+    if let Some(my_slot) = match_flow.your_slot {
+        if !render_state.is_dead {
+            walkers.walkers.push(vfx_client::BiomeWalkerSnapshot {
+                id: 1_000_000 + my_slot as u64,
+                pos: render_state.soldier_pos,
+            });
+        }
+    }
+    for rp in &remote_players.0 {
+        if !rp.is_visible || rp.is_dead {
+            continue;
+        }
+        walkers.walkers.push(vfx_client::BiomeWalkerSnapshot {
+            id: 2_000_000 + rp.slot_index as u64,
+            pos: rp.pos,
+        });
+    }
+    for creep in &creeps.0 {
+        if !creep.is_visible || creep.is_dead {
+            continue;
+        }
+        walkers.walkers.push(vfx_client::BiomeWalkerSnapshot {
+            id: 3_000_000 + creep.id,
+            pos: creep.pos,
         });
     }
 }

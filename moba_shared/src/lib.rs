@@ -473,7 +473,7 @@ impl GameConfig {
     }
 
     pub fn load_from_str(content: &str, label: &str) -> Self {
-        let cfg = ron::from_str::<GameConfig>(content).unwrap_or_else(|e| {
+        let mut cfg = ron::from_str::<GameConfig>(content).unwrap_or_else(|e| {
             panic!(
                 "خطای بحرانی: ساختار فایل کانفیگ '{}' نامعتبر است: {}",
                 label, e
@@ -500,7 +500,37 @@ impl GameConfig {
         cfg.validate_creeps();
         cfg.validate_neutral_camps();
         cfg.validate_obstacles();
+        cfg.validate_canyon_mountain_align();
+        align_canyon_mountains_to_rim(
+            &cfg.map.canyon,
+            &cfg.physics.canyon_mountain_align,
+            &mut cfg.map.mountains,
+        );
         cfg
+    }
+
+    pub fn validate_canyon_mountain_align(&self) {
+        let align = &self.physics.canyon_mountain_align;
+        assert!(
+            !align.id_prefix.trim().is_empty(),
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.id_prefix خالی است"
+        );
+        assert!(
+            align.target_edge_offset.is_finite(),
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.target_edge_offset نامعتبر است"
+        );
+        assert!(
+            align.gradient_sample_eps > 0.0 && align.gradient_sample_eps <= 5.0,
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.gradient_sample_eps باید بین ۰ و ۵ باشد"
+        );
+        assert!(
+            align.max_snap_iterations >= 1 && align.max_snap_iterations <= 64,
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.max_snap_iterations باید بین ۱ تا ۶۴ باشد"
+        );
+        assert!(
+            align.yaw_offset_deg.is_finite(),
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.yaw_offset_deg نامعتبر است"
+        );
     }
 
     pub fn exact_anim_duration(&self, anim_name: &str) -> f32 {
@@ -747,6 +777,9 @@ impl GameConfig {
             assert!(hero.swim_stamina_drain_per_sec >= 0.0 && hero.swim_stamina_drain_per_sec.is_finite(), "swim_stamina_drain_per_sec هیرو '{}' نامعتبر است", hero.id);
             assert!(hero.climb_stamina_drain_per_sec >= 0.0 && hero.climb_stamina_drain_per_sec.is_finite(), "climb_stamina_drain_per_sec هیرو '{}' نامعتبر است", hero.id);
             assert!(hero.stamina_exhausted_resume_min > 0.0 && hero.stamina_exhausted_resume_min <= hero.max_stamina && hero.stamina_exhausted_resume_min.is_finite(), "stamina_exhausted_resume_min هیرو '{}' باید بین 0 و max_stamina باشد", hero.id);
+            assert!(hero.exhausted_run_speed_multiplier > 0.0 && hero.exhausted_run_speed_multiplier <= 1.0 && hero.exhausted_run_speed_multiplier.is_finite(), "exhausted_run_speed_multiplier هیرو '{}' باید بین 0 و 1 باشد", hero.id);
+            assert!(hero.exhausted_swim_speed_multiplier > 0.0 && hero.exhausted_swim_speed_multiplier <= 1.0 && hero.exhausted_swim_speed_multiplier.is_finite(), "exhausted_swim_speed_multiplier هیرو '{}' باید بین 0 و 1 باشد", hero.id);
+            assert!(hero.exhausted_climb_speed_multiplier > 0.0 && hero.exhausted_climb_speed_multiplier <= 1.0 && hero.exhausted_climb_speed_multiplier.is_finite(), "exhausted_climb_speed_multiplier هیرو '{}' باید بین 0 و 1 باشد", hero.id);
             assert!(hero.level_growth.stamina_regen_per_level >= 0.0, "stamina_regen_per_level هیرو '{}' نمی‌تواند منفی باشد", hero.id);
             assert!(hero.hero_scale > 0.0, "hero_scale هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.xp_gain_radius > 0.0, "xp_gain_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -1938,6 +1971,18 @@ pub struct PhysicsConfig {
     pub water_move_speed_multiplier: f32,
     pub water_splash_interval_secs: f32,
     pub deep_water_swim_depth: f32,
+    pub canyon_mountain_align: CanyonMountainAlignConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CanyonMountainAlignConfig {
+    pub enabled: bool,
+    pub id_prefix: String,
+    pub target_edge_offset: f32,
+    pub gradient_sample_eps: f32,
+    pub max_snap_iterations: usize,
+    pub align_yaw_to_canyon_normal: bool,
+    pub yaw_offset_deg: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -2078,6 +2123,9 @@ pub struct HeroDef {
     pub swim_stamina_drain_per_sec: f32,
     pub climb_stamina_drain_per_sec: f32,
     pub stamina_exhausted_resume_min: f32,
+    pub exhausted_run_speed_multiplier: f32,
+    pub exhausted_swim_speed_multiplier: f32,
+    pub exhausted_climb_speed_multiplier: f32,
     pub armor: f32,
     pub hero_scale: f32,
     pub move_speed_multiplier: f32,
@@ -4219,6 +4267,70 @@ pub fn canyon_edge_distance(canyon: &CanyonConfig, x: f32, z: f32) -> f32 {
     }
     let (dist, half_w, _, _, _) = canyon_meander_and_half_w(canyon, x, z);
     half_w - dist
+}
+
+/// هم‌ترازی دقیق و ریاضی کوه‌های دو طرف دره با دیواره واقعی دره
+pub fn align_canyon_mountains_to_rim(
+    canyon: &CanyonConfig,
+    align: &CanyonMountainAlignConfig,
+    mountains: &mut [MountainDef],
+) {
+    if !canyon.enabled || !align.enabled {
+        return;
+    }
+
+    let eps = align.gradient_sample_eps;
+    let inv_2eps = 0.5 / eps;
+
+    for mtn in mountains.iter_mut() {
+        if !mtn.id.starts_with(&align.id_prefix) {
+            continue;
+        }
+
+        let mut x = mtn.model_transform.location.0;
+        let mut z = mtn.model_transform.location.2;
+
+        for _ in 0..align.max_snap_iterations {
+            let cur_edge = canyon_edge_distance(canyon, x, z);
+            let err = align.target_edge_offset - cur_edge;
+            if err.abs() < 1e-3 {
+                break;
+            }
+            let gx = (canyon_edge_distance(canyon, x + eps, z)
+                - canyon_edge_distance(canyon, x - eps, z))
+                * inv_2eps;
+            let gz = (canyon_edge_distance(canyon, x, z + eps)
+                - canyon_edge_distance(canyon, x, z - eps))
+                * inv_2eps;
+            let grad_sq = gx * gx + gz * gz;
+            if grad_sq <= 1e-8 {
+                break;
+            }
+            let step = (err / grad_sq).clamp(-3.0, 3.0);
+            x += gx * step;
+            z += gz * step;
+        }
+
+        mtn.model_transform.location.0 = x;
+        mtn.model_transform.location.2 = z;
+
+        if align.align_yaw_to_canyon_normal {
+            let gx = canyon_edge_distance(canyon, x + eps, z)
+                - canyon_edge_distance(canyon, x - eps, z);
+            let gz = canyon_edge_distance(canyon, x, z + eps)
+                - canyon_edge_distance(canyon, x, z - eps);
+            if gx * gx + gz * gz > 1e-8 {
+                let mut yaw = gx.atan2(gz).to_degrees() + align.yaw_offset_deg;
+                while yaw > 180.0 {
+                    yaw -= 360.0;
+                }
+                while yaw <= -180.0 {
+                    yaw += 360.0;
+                }
+                mtn.model_transform.rotation.1 = yaw;
+            }
+        }
+    }
 }
 
 /// فاصله علامت‌دار از خط مرکزی رودخانه خمیده:
@@ -11839,11 +11951,6 @@ fn shared_drive_single_player(
 
         world.effective_stance = if input.shift_held {
             Stance::Walk
-        } else if world.base_stance == Stance::Run
-            && (world.stamina_exhausted || world.hero_stamina <= 0.0)
-        {
-            // در صورت تمام شدن استامینا هنگام دویدن، به‌صورت خودکار به راه رفتن تبدیل می‌شود
-            Stance::Walk
         } else {
             world.base_stance
         };
@@ -12224,9 +12331,8 @@ fn shared_drive_single_player(
             let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
             let deep_mult = hero_cfg.deep_water_speed_multiplier;
 
-            let can_swim_move = !world.stamina_exhausted && world.hero_stamina > 0.0;
             if is_deep_water && !world.traversal.is_active && world.wall_climb_mountain_index.is_none() {
-                if world.is_moving && can_swim_move {
+                if world.is_moving {
                     let swim_drain = hero_cfg.swim_stamina_drain_per_sec * dt;
                     if swim_drain > 0.0 {
                         world.hero_stamina = (world.hero_stamina - swim_drain).max(0.0);
@@ -12240,7 +12346,6 @@ fn shared_drive_single_player(
                     // در عمق زیاد آب، هیرو به سمت جهت حرکت خود می‌چرخد
                     world.soldier_facing_dir = world.move_input.normalize();
                 } else {
-                    // با اتمام استامینا در آب عمیق، هیرو در حالت شناور باقی می‌ماند و حرکت نمی‌کند
                     world.current_locomotion = "treading_water".to_string();
                 }
             }
@@ -12275,7 +12380,6 @@ fn shared_drive_single_player(
                 } else {
                     shallow_mult
                 };
-                let water_speed = base_speed * depth_mult;
                 if !is_deep_water && world.is_moving && world.effective_stance == Stance::Run {
                     let run_drain = hero_cfg.run_stamina_drain_per_sec * dt;
                     if run_drain > 0.0 {
@@ -12286,15 +12390,21 @@ fn shared_drive_single_player(
                         }
                     }
                 }
-                let allow_water_move = if is_deep_water { can_swim_move } else { true };
-                world.current_move_speed = if allow_water_move { water_speed } else { 0.0 };
-                if world.is_moving && allow_water_move {
+                let is_stamina_low = world.stamina_exhausted || world.hero_stamina <= 0.0;
+                let stamina_speed_mult = if is_deep_water {
+                    if is_stamina_low { hero_cfg.exhausted_swim_speed_multiplier } else { 1.0 }
+                } else if world.effective_stance == Stance::Run && is_stamina_low {
+                    hero_cfg.exhausted_run_speed_multiplier
+                } else {
+                    1.0
+                };
+                let water_speed = base_speed * depth_mult * stamina_speed_mult;
+                world.current_move_speed = water_speed;
+                if world.is_moving {
                     let desired_delta =
                         world.move_input.normalize() * water_speed * dt + flow_drift;
                     controller.translation =
                         Some(Vec3::new(desired_delta.x, grav_y, desired_delta.z));
-                } else if is_deep_water && !can_swim_move {
-                    controller.translation = Some(Vec3::new(0.0, grav_y, 0.0));
                 } else {
                     controller.translation = Some(Vec3::new(flow_drift.x, grav_y, flow_drift.z));
                 }
@@ -12323,13 +12433,9 @@ fn shared_drive_single_player(
                 } else {
                     1.0
                 };
-            let speed = match world.effective_stance {
-                Stance::Run => config.soldier.run_speed,
-                Stance::Walk => config.soldier.walk_speed,
-                Stance::Crouch => config.soldier.crouch_speed,
-            } * hero_move_mult;
+            let hero_cfg_land = config.active_hero(world.hero_index);
             if world.is_moving && world.effective_stance == Stance::Run {
-                let run_drain = config.active_hero(world.hero_index).run_stamina_drain_per_sec * dt;
+                let run_drain = hero_cfg_land.run_stamina_drain_per_sec * dt;
                 if run_drain > 0.0 {
                     world.hero_stamina = (world.hero_stamina - run_drain).max(0.0);
                     stamina_drained_this_tick = true;
@@ -12338,6 +12444,18 @@ fn shared_drive_single_player(
                     }
                 }
             }
+            let run_stamina_mult = if world.effective_stance == Stance::Run
+                && (world.stamina_exhausted || world.hero_stamina <= 0.0)
+            {
+                hero_cfg_land.exhausted_run_speed_multiplier
+            } else {
+                1.0
+            };
+            let speed = match world.effective_stance {
+                Stance::Run => config.soldier.run_speed * run_stamina_mult,
+                Stance::Walk => config.soldier.walk_speed,
+                Stance::Crouch => config.soldier.crouch_speed,
+            } * hero_move_mult;
             world.current_move_speed = speed;
             if world.is_moving {
                 let desired_delta = world.move_input.normalize() * speed * dt;
@@ -12453,9 +12571,8 @@ fn step_wall_climb_custom(
         let mut cur_y = world.soldier_pos.y;
         let move_up = input.move_input.z < -0.15;
         let move_down = input.move_input.z > 0.15;
-        let can_climb_move = !world.stamina_exhausted && world.hero_stamina > 0.0;
 
-        if (move_up || move_down) && can_climb_move {
+        if move_up || move_down {
             let climb_drain = hero_cfg.climb_stamina_drain_per_sec * dt;
             if climb_drain > 0.0 {
                 world.hero_stamina = (world.hero_stamina - climb_drain).max(0.0);
@@ -12464,17 +12581,21 @@ fn step_wall_climb_custom(
                     world.stamina_exhausted = true;
                 }
             }
+            let climb_speed_mult = if world.stamina_exhausted || world.hero_stamina <= 0.0 {
+                hero_cfg.exhausted_climb_speed_multiplier
+            } else {
+                1.0
+            };
             if move_up {
-                cur_y += wc.climb_up_speed * dt;
+                cur_y += wc.climb_up_speed * climb_speed_mult * dt;
                 world.wall_climb_last_dir = 1;
                 world.current_locomotion = "climbing_up_wall".to_string();
             } else {
-                cur_y -= wc.climb_down_speed * dt;
+                cur_y -= wc.climb_down_speed * climb_speed_mult * dt;
                 world.wall_climb_last_dir = -1;
                 world.current_locomotion = "climbing_down_wall".to_string();
             }
         } else {
-            // با اتمام استامینا روی صخره، هیرو سر جای خود می‌ماند و حرکت نمی‌کند تا استامینا برگردد
             world.current_locomotion = if world.wall_climb_last_dir >= 0 {
                 "climbing_up_wall_paused".to_string()
             } else {
@@ -12482,7 +12603,7 @@ fn step_wall_climb_custom(
             };
         }
 
-        if cur_y >= wc.top_exit_y - wc.top_ledge_trigger_below && move_up && can_climb_move {
+        if cur_y >= wc.top_exit_y - wc.top_ledge_trigger_below && move_up {
             world.wall_climb_mountain_index = None;
             let into_plateau = -wall_normal;
             let start_pos = Vec3::new(

@@ -1115,14 +1115,22 @@ impl ClientRenderState {
 /// - در حالت توسعه (cargo run -p moba_client): دقیقاً `moba_client/assets`
 /// - در نسخه عملیاتی (اجرای مستقیم exe): دقیقاً `assets` کنار فایل اجرایی
 pub fn client_assets_dir() -> std::path::PathBuf {
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        std::path::PathBuf::from(manifest_dir).join("assets")
-    } else {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("assets")))
-            .unwrap_or_else(|| std::path::PathBuf::from("assets"))
+    let manifest_assets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+    if manifest_assets.is_dir() {
+        return manifest_assets;
     }
+    if let Ok(cwd) = std::env::current_dir() {
+        for rel in ["moba_client/assets", "assets"] {
+            let candidate = cwd.join(rel);
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
+    }
+    panic!(
+        "خطای بحرانی: دایرکتوری moba_client/assets در مسیر '{}' پیدا نشد!",
+        manifest_assets.display()
+    );
 }
 
 fn custom_glb_exists(model_path: &str) -> bool {
@@ -1130,6 +1138,20 @@ fn custom_glb_exists(model_path: &str) -> bool {
         return false;
     }
     client_assets_dir().join(model_path).is_file()
+}
+
+fn check_glb_exists(label: &str, model_path: &str) -> bool {
+    let full_path = client_assets_dir().join(model_path);
+    if full_path.is_file() {
+        true
+    } else {
+        error!(
+            "فایل مدل GLB ({}) در مسیر '{}' پیدا نشد!",
+            label,
+            full_path.display()
+        );
+        false
+    }
 }
 
 fn model_transform_to_bevy(t: &ModelTransformConfig) -> Transform {
@@ -1947,25 +1969,6 @@ fn setup_scene(
         }
 
         let pit_tf = pit.model_transform.to_transform();
-        let pit_mat = materials.add(StandardMaterial {
-            base_color: Color::srgb(pit.color_rgb.0, pit.color_rgb.1, pit.color_rgb.2),
-            perceptual_roughness: pit.roughness,
-            ..default()
-        });
-        let roof_mat = materials.add(StandardMaterial {
-            base_color: Color::srgb(
-                pit.color_rgb.0 * 0.85,
-                pit.color_rgb.1 * 0.88,
-                pit.color_rgb.2 * 0.82,
-            ),
-            perceptual_roughness: 0.94,
-            ..default()
-        });
-        let floor_mat = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.32, 0.30, 0.27),
-            perceptual_roughness: 0.92,
-            ..default()
-        });
 
         let mut pit_cmds = commands.spawn((
             RoshanPitVisualRoot,
@@ -1980,64 +1983,12 @@ fn setup_scene(
         }
         let pit_ent = pit_cmds.id();
 
-        if custom_glb_exists(&pit.model_path) {
+        if check_glb_exists("RoshanPit", &pit.model_path) {
             pit_cmds.with_children(|parent| {
                 parent.spawn(glb_model_bundle(
                     &asset_server,
                     &pit.model_path,
                     &pit.model_transform,
-                ));
-            });
-        } else {
-            let ent_rad = pit.entrance_angle_deg.to_radians();
-            let half_gap_rad = pit.entrance_half_angle_deg.to_radians();
-            let arc_span = std::f32::consts::TAU - 2.0 * half_gap_rad;
-            let start_ang = ent_rad + half_gap_rad;
-            let segments = 16_usize;
-            let step_ang = arc_span / (segments as f32);
-            let r_mid = 0.5 * (pit.inner_radius + pit.outer_radius);
-            let wall_thick = (pit.outer_radius - pit.inner_radius).max(0.5);
-            let seg_len = 2.0 * r_mid * (step_ang * 0.5).sin() + 0.35;
-
-            pit_cmds.with_children(|parent| {
-                // کف خشک سنگی روی آب رودخانه
-                parent.spawn((
-                    Mesh3d(meshes.add(Cylinder::new(pit.outer_radius, pit.floor_thickness))),
-                    MeshMaterial3d(floor_mat),
-                    Transform::from_xyz(0.0, 0.15 - pit.floor_thickness * 0.5, 0.0),
-                ));
-
-                // دیواره‌های استوانه‌ای نیم‌دایره
-                let wall_mesh = meshes.add(Cuboid::new(seg_len, pit.wall_height, wall_thick));
-                for i in 0..segments {
-                    let ang = start_ang + (i as f32 + 0.5) * step_ang;
-                    let offset = Vec3::new(ang.cos() * r_mid, pit.wall_height * 0.5, ang.sin() * r_mid);
-                    let radial = Vec3::new(offset.x, 0.0, offset.z).normalize_or_zero();
-                    let rot = Transform::IDENTITY.looking_to(radial, Vec3::Y).rotation;
-                    parent.spawn((
-                        Mesh3d(wall_mesh.clone()),
-                        MeshMaterial3d(pit_mat.clone()),
-                        Transform::from_translation(offset).with_rotation(rot),
-                    ));
-                }
-
-                // سقف سرپوشیده غار تا از بیرون اصلاً داخلش دیده نشود
-                parent.spawn((
-                    Mesh3d(meshes.add(Cylinder::new(pit.outer_radius + 0.3, pit.roof_thickness))),
-                    MeshMaterial3d(roof_mat),
-                    Transform::from_xyz(0.0, pit.wall_height + pit.roof_thickness * 0.5, 0.0),
-                ));
-
-                // نور مشعل گرم فقط برای فضای داخلی غار
-                parent.spawn((
-                    PointLight {
-                        color: Color::srgb(1.0, 0.62, 0.25),
-                        intensity: 220_000.0,
-                        range: pit.inner_radius * 1.4,
-                        shadow_maps_enabled: false,
-                        ..default()
-                    },
-                    Transform::from_xyz(0.0, 3.8, 0.0),
                 ));
             });
         }
@@ -2161,8 +2112,6 @@ fn setup_scene(
     for ftn in &config.map.fountains {
         let mut tf = ftn.model_transform.to_transform();
         tf.translation.y += ftn.rim_height * 0.5 * tf.scale.y;
-        let sc = ftn.stone_color_rgb;
-        let we = ftn.water_emissive_rgb;
         let mut ftn_cmds = commands.spawn((
             MapObjectId(ftn.id.clone()),
             tf,
@@ -2170,7 +2119,7 @@ fn setup_scene(
             vfx_client::SnowSurfaceRoot,
         ));
         let ftn_ent = ftn_cmds.id();
-        if custom_glb_exists(&ftn.model_path) {
+        if check_glb_exists("Fountain", &ftn.model_path) {
             ftn_cmds.with_children(|parent| {
                 parent.spawn(glb_model_bundle(
                     &asset_server,
@@ -2178,31 +2127,6 @@ fn setup_scene(
                     &ftn.model_transform,
                 ));
             });
-        } else {
-            ftn_cmds
-                .insert((
-                    Mesh3d(meshes.add(Cylinder::new(ftn.outer_radius, ftn.rim_height))),
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: Color::srgb(sc.0, sc.1, sc.2),
-                        perceptual_roughness: 0.65,
-                        ..default()
-                    })),
-                ))
-                .with_children(|parent| {
-                    parent.spawn((
-                        Mesh3d(meshes.add(Cylinder::new(
-                            ftn.inner_radius,
-                            ftn.rim_height * 1.12,
-                        ))),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: Color::srgb(0.2, 0.85, 0.95),
-                            emissive: LinearRgba::new(we.0, we.1, we.2, 1.0),
-                            unlit: true,
-                            ..default()
-                        })),
-                        Transform::from_xyz(0.0, 0.05, 0.0),
-                    ));
-                });
         }
         spawn_map_object_label(&mut commands, config.map.show_object_labels, ftn_ent, &ftn.id, ftn.rim_height * 0.5 + 1.0);
     }
@@ -2210,13 +2134,6 @@ fn setup_scene(
     // ۹. کریستال‌های باستانی هر دو تیم (Ancients: زمردی در غرب، یاقوتی در شرق)
     for (anc_idx, anc) in config.map.ancients.iter().enumerate() {
         let bs = Vec3::new(anc.base_size.0, anc.base_size.1, anc.base_size.2);
-        let c = anc.color_rgb;
-        let ce = anc.core_emissive_rgb;
-        let light_col = if anc.team == TeamId::Dawn {
-            Color::srgb(0.18, 0.95, 0.68)
-        } else {
-            Color::srgb(1.0, 0.25, 0.18)
-        };
 
         let mut anc_cmds = commands.spawn((
             vfx_client::SnowSurfaceRoot,
@@ -2233,7 +2150,7 @@ fn setup_scene(
             anc_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(bs.x * 0.5, anc.core_height * 0.6, bs.z * 0.5) });
         }
         let anc_ent = anc_cmds.id();
-        if custom_glb_exists(&anc.model_path) {
+        if check_glb_exists("Ancient", &anc.model_path) {
             anc_cmds.with_children(|parent| {
                 let mut glb = glb_model_bundle(
                     &asset_server,
@@ -2243,91 +2160,12 @@ fn setup_scene(
                 glb.1.translation.y = -anc.core_height * 0.5;
                 parent.spawn(glb);
             });
-        } else {
-            anc_cmds
-                .insert((
-                    Mesh3d(meshes.add(Cylinder::new(bs.x * 0.55, bs.y))),
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: Color::srgb(c.0, c.1, c.2),
-                        metallic: 0.35,
-                        perceptual_roughness: 0.45,
-                        ..default()
-                    })),
-                ))
-                .with_children(|parent| {
-                    // پله دوم محراب سنگی
-                    parent.spawn((
-                        Mesh3d(meshes.add(Cylinder::new(bs.x * 0.38, bs.y * 0.65))),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: Color::srgb(c.0 * 1.15, c.1 * 1.15, c.2 * 1.15),
-                            perceptual_roughness: 0.4,
-                            ..default()
-                        })),
-                        Transform::from_xyz(0.0, bs.y * 0.45, 0.0),
-                    ));
-
-                    // منشور کریستال عظیم مرکزی (در حال چرخش و شناور بودن)
-                    let base_crystal_y = bs.y * 0.5 + anc.core_height * 0.52;
-                    parent
-                        .spawn((
-                            Mesh3d(meshes.add(Cone {
-                                radius: anc.core_radius,
-                                height: anc.core_height,
-                            })),
-                            MeshMaterial3d(materials.add(StandardMaterial {
-                                base_color: light_col,
-                                emissive: LinearRgba::new(ce.0, ce.1, ce.2, 1.0),
-                                perceptual_roughness: 0.1,
-                                metallic: 0.2,
-                                ..default()
-                            })),
-                            Transform::from_xyz(0.0, base_crystal_y, 0.0),
-                            AnimatedCrystalCore {
-                                base_y: base_crystal_y,
-                                bob_amp: 0.32,
-                                bob_speed: 1.8,
-                                rot_speed: 0.9,
-                                phase: 0.0,
-                            },
-                        ))
-                        .with_children(|crystal| {
-                            // مخروط معکوس پایینی برای شکل منشوری کامل کریستال
-                            crystal.spawn((
-                                Mesh3d(meshes.add(Cone {
-                                    radius: anc.core_radius * 0.92,
-                                    height: anc.core_height * 0.45,
-                                })),
-                                MeshMaterial3d(materials.add(StandardMaterial {
-                                    base_color: light_col,
-                                    emissive: LinearRgba::new(ce.0, ce.1, ce.2, 1.0),
-                                    unlit: true,
-                                    ..default()
-                                })),
-                                Transform::from_xyz(0.0, -anc.core_height * 0.35, 0.0)
-                                    .with_rotation(Quat::from_rotation_x(PI)),
-                            ));
-                        });
-
-                    // نور نقطه‌ای قدرتمند کریستال Ancient
-                    parent.spawn((
-                        PointLight {
-                            color: light_col,
-                            intensity: 320_000.0,
-                            range: 28.0,
-                            shadow_maps_enabled: false,
-                            ..default()
-                        },
-                        Transform::from_xyz(0.0, base_crystal_y + 1.5, 0.0),
-                    ));
-                });
         }
         spawn_map_object_label(&mut commands, config.map.show_object_labels, anc_ent, &anc.id, anc.base_size.1 * 0.5 + anc.core_height + 1.0);
     }
 
     // ۱۰. ۱۸ برج دفاعی (Turrets) در هر ۳ لاین مطابق تصویر مرجع
     for (t_idx, tur) in config.map.turrets.iter().enumerate() {
-        let tc = tur.color_rgb;
-        let ce = tur.crystal_emissive_rgb;
         let mut tur_cmds = commands.spawn((
             vfx_client::SnowSurfaceRoot,
             turret_physics_bundle(&config, t_idx, tur),
@@ -2343,7 +2181,7 @@ fn setup_scene(
             tur_cmds.insert(VisionOccludable { is_faded: false, half_extents: Vec3::new(tur.base_radius * 1.4, tur.height * 0.55, tur.base_radius * 1.4) });
         }
         let tur_ent = tur_cmds.id();
-        if custom_glb_exists(&tur.model_path) {
+        if check_glb_exists("Turret", &tur.model_path) {
             tur_cmds.with_children(|parent| {
                 parent.spawn(glb_model_bundle(
                     &asset_server,
@@ -2351,64 +2189,6 @@ fn setup_scene(
                     &tur.model_transform,
                 ));
             });
-        } else {
-            tur_cmds
-                .insert((
-                    Mesh3d(meshes.add(Cylinder::new(tur.base_radius, tur.height))),
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: Color::srgb(tc.0, tc.1, tc.2),
-                        metallic: 0.35,
-                        perceptual_roughness: 0.55,
-                        ..default()
-                    })),
-                ))
-                .with_children(|parent| {
-                    // پایه سنگی پهن‌تر برج
-                    parent.spawn((
-                        Mesh3d(meshes.add(Cylinder::new(
-                            tur.base_radius * 1.32,
-                            tur.height * 0.28,
-                        ))),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: Color::srgb(tc.0 * 0.85, tc.1 * 0.85, tc.2 * 0.85),
-                            perceptual_roughness: 0.75,
-                            ..default()
-                        })),
-                        Transform::from_xyz(0.0, -tur.height * 0.36, 0.0),
-                    ));
-                    // تاج بالایی برج
-                    parent.spawn((
-                        Mesh3d(meshes.add(Torus::new(
-                            tur.base_radius * 0.85,
-                            tur.base_radius * 1.18,
-                        ))),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: Color::srgb(tc.0 * 1.1, tc.1 * 1.1, tc.2 * 1.1),
-                            perceptual_roughness: 0.5,
-                            ..default()
-                        })),
-                        Transform::from_xyz(0.0, tur.height * 0.46, 0.0),
-                    ));
-                    // گوی کریستالی شناور بالای برج
-                    let crystal_y = tur.height * 0.5 + tur.head_radius * 1.05;
-                    parent.spawn((
-                        Mesh3d(meshes.add(Sphere::new(tur.head_radius))),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: Color::WHITE,
-                            emissive: LinearRgba::new(ce.0, ce.1, ce.2, 1.0),
-                            unlit: true,
-                            ..default()
-                        })),
-                        Transform::from_xyz(0.0, crystal_y, 0.0),
-                        AnimatedCrystalCore {
-                            base_y: crystal_y,
-                            bob_amp: 0.16,
-                            bob_speed: 2.4,
-                            rot_speed: 1.5,
-                            phase: (t_idx as f32) * 0.5,
-                        },
-                    ));
-                });
         }
         spawn_map_object_label(&mut commands, config.map.show_object_labels, tur_ent, &tur.id, tur.height * 0.5 + tur.head_radius * 2.0 + 1.0);
     }
@@ -2416,8 +2196,6 @@ fn setup_scene(
     // ۱۰-ب. ۱۲ باراکس (۲ ساختمان پشت هر تاور Tier 3 در هر لاین)
     for (b_idx, bar) in config.map.barracks.iter().enumerate() {
         let bs = Vec3::new(bar.size.0, bar.size.1, bar.size.2);
-        let bc = bar.color_rgb;
-        let ae = bar.accent_emissive_rgb;
         let mut bar_cmds = commands.spawn((
             vfx_client::SnowSurfaceRoot,
             barracks_physics_bundle(&config, b_idx, bar),
@@ -2435,7 +2213,7 @@ fn setup_scene(
             });
         }
         let bar_ent = bar_cmds.id();
-        if custom_glb_exists(&bar.model_path) {
+        if check_glb_exists("Barracks", &bar.model_path) {
             bar_cmds.with_children(|parent| {
                 parent.spawn(glb_model_bundle(
                     &asset_server,
@@ -2443,51 +2221,6 @@ fn setup_scene(
                     &bar.model_transform,
                 ));
             });
-        } else {
-            let accent_col = if bar.team == TeamId::Dawn {
-                Color::srgb(0.20, 0.92, 0.72)
-            } else {
-                Color::srgb(0.98, 0.30, 0.24)
-            };
-            bar_cmds
-                .insert((
-                    Mesh3d(meshes.add(Cuboid::new(bs.x, bs.y, bs.z))),
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: Color::srgb(bc.0, bc.1, bc.2),
-                        metallic: 0.25,
-                        perceptual_roughness: 0.65,
-                        ..default()
-                    })),
-                ))
-                .with_children(|parent| {
-                    // سقف/تاج متمایز برای باراکس Melee (زره/سلامت) و Ranged (قدرت آتش)
-                    if bar.kind == BarracksKind::Melee {
-                        parent.spawn((
-                            Mesh3d(meshes.add(Cuboid::new(bs.x * 0.72, bs.y * 0.32, bs.z * 0.72))),
-                            MeshMaterial3d(materials.add(StandardMaterial {
-                                base_color: accent_col,
-                                emissive: LinearRgba::new(ae.0, ae.1, ae.2, 1.0),
-                                perceptual_roughness: 0.35,
-                                ..default()
-                            })),
-                            Transform::from_xyz(0.0, bs.y * 0.62, 0.0),
-                        ));
-                    } else {
-                        parent.spawn((
-                            Mesh3d(meshes.add(Cone {
-                                radius: bs.x * 0.38,
-                                height: bs.y * 0.55,
-                            })),
-                            MeshMaterial3d(materials.add(StandardMaterial {
-                                base_color: accent_col,
-                                emissive: LinearRgba::new(ae.0, ae.1, ae.2, 1.0),
-                                perceptual_roughness: 0.30,
-                                ..default()
-                            })),
-                            Transform::from_xyz(0.0, bs.y * 0.72, 0.0),
-                        ));
-                    }
-                });
         }
         spawn_map_object_label(&mut commands, config.map.show_object_labels, bar_ent, &bar.id, bs.y * 0.5 + 1.2);
     }
@@ -2495,7 +2228,6 @@ fn setup_scene(
     // ۱۱. کوه‌ها، صخره‌های چندلایه خزه‌دار و باروهای سنگی دور نقشه
     for mtn in &config.map.mountains {
         let size = Vec3::new(mtn.size.0, mtn.size.1, mtn.size.2);
-        let mc = mtn.color_rgb;
         let mut mtn_cmds = commands.spawn((
             vfx_client::SnowSurfaceRoot,
             mountain_physics_bundle(&config, mtn),
@@ -2509,7 +2241,7 @@ fn setup_scene(
             mtn_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
         }
         let mtn_ent = mtn_cmds.id();
-        if custom_glb_exists(&mtn.model_path) {
+        if check_glb_exists("Mountain", &mtn.model_path) {
             mtn_cmds.with_children(|parent| {
                 parent.spawn(glb_model_bundle(
                     &asset_server,
@@ -2517,53 +2249,12 @@ fn setup_scene(
                     &mtn.model_transform,
                 ));
             });
-        } else {
-            mtn_cmds
-                .insert((
-                    Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: Color::srgb(mc.0, mc.1, mc.2),
-                        perceptual_roughness: mtn.roughness,
-                        ..default()
-                    })),
-                ))
-                .with_children(|parent| {
-                    // لایه صخره‌ای پله‌ای و پوشش خزه سبز روی قله صخره‌ها
-                    parent.spawn((
-                        Mesh3d(meshes.add(Cuboid::new(
-                            size.x * 0.76,
-                            size.y * 0.28,
-                            size.z * 0.76,
-                        ))),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: Color::srgb(mc.0 * 0.92, mc.1 * 0.92, mc.2 * 0.92),
-                            perceptual_roughness: 0.92,
-                            ..default()
-                        })),
-                        Transform::from_xyz(0.0, size.y * 0.52, 0.0),
-                    ));
-                    parent.spawn((
-                        Mesh3d(meshes.add(Cuboid::new(
-                            size.x * 0.72,
-                            0.24,
-                            size.z * 0.72,
-                        ))),
-                        MeshMaterial3d(materials.add(StandardMaterial {
-                            base_color: Color::srgb(0.24, 0.36, 0.20),
-                            perceptual_roughness: 0.94,
-                            ..default()
-                        })),
-                        Transform::from_xyz(0.0, size.y * 0.66, 0.0),
-                    ));
-                });
         }
         spawn_map_object_label(&mut commands, config.map.show_object_labels, mtn_ent, &mtn.id, size.y * 0.5 + 1.5);
     }
 
     // ۱۲. جنگل انبوه درختان کاج چندطبقه (۸۸ درخت در سراسر برکه‌ها و مسیرهای جنگلی)
     for tree in &config.map.trees {
-        let tc = tree.trunk_color_rgb;
-        let cc = tree.canopy_color_rgb;
         let mut tree_cmds = commands.spawn((
             vfx_client::SnowSurfaceRoot,
             tree_physics_bundle(&config, tree),
@@ -2575,7 +2266,7 @@ fn setup_scene(
         }
         tree_cmds.insert(TreeVisualMarker { shadows_optimized: false });
         let tree_ent = tree_cmds.id();
-        if custom_glb_exists(&tree.model_path) {
+        if check_glb_exists("Tree", &tree.model_path) {
             tree_cmds.with_children(|parent| {
                 parent.spawn(glb_model_bundle(
                     &asset_server,
@@ -2583,75 +2274,6 @@ fn setup_scene(
                     &tree.model_transform,
                 ));
             });
-        } else {
-            let tier1_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(cc.0 * 0.88, cc.1 * 0.88, cc.2 * 0.88),
-                perceptual_roughness: 0.88,
-                ..default()
-            });
-            let tier2_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(cc.0, cc.1, cc.2),
-                perceptual_roughness: 0.85,
-                ..default()
-            });
-            let tier3_mat = materials.add(StandardMaterial {
-                base_color: Color::srgb(
-                    (cc.0 * 1.12).min(1.0),
-                    (cc.1 * 1.12).min(1.0),
-                    (cc.2 * 1.12).min(1.0),
-                ),
-                perceptual_roughness: 0.82,
-                ..default()
-            });
-
-            tree_cmds
-                .insert((
-                    Mesh3d(meshes.add(Cylinder::new(tree.trunk_radius, tree.trunk_height))),
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: Color::srgb(tc.0, tc.1, tc.2),
-                        perceptual_roughness: 0.92,
-                        ..default()
-                    })),
-                ))
-                .with_children(|parent| {
-                    // ۳ طبقه مخروطی شاخ‌وبرگ کاج برای ظاهر طبیعی و پرپشت
-                    parent.spawn((
-                        Mesh3d(meshes.add(Cone {
-                            radius: tree.canopy_radius * 1.05,
-                            height: tree.canopy_height * 0.52,
-                        })),
-                        MeshMaterial3d(tier1_mat),
-                        Transform::from_xyz(
-                            0.0,
-                            tree.trunk_height * 0.42 + tree.canopy_height * 0.18,
-                            0.0,
-                        ),
-                    ));
-                    parent.spawn((
-                        Mesh3d(meshes.add(Cone {
-                            radius: tree.canopy_radius * 0.82,
-                            height: tree.canopy_height * 0.48,
-                        })),
-                        MeshMaterial3d(tier2_mat),
-                        Transform::from_xyz(
-                            0.0,
-                            tree.trunk_height * 0.42 + tree.canopy_height * 0.46,
-                            0.0,
-                        ),
-                    ));
-                    parent.spawn((
-                        Mesh3d(meshes.add(Cone {
-                            radius: tree.canopy_radius * 0.56,
-                            height: tree.canopy_height * 0.42,
-                        })),
-                        MeshMaterial3d(tier3_mat),
-                        Transform::from_xyz(
-                            0.0,
-                            tree.trunk_height * 0.42 + tree.canopy_height * 0.72,
-                            0.0,
-                        ),
-                    ));
-                });
         }
         spawn_map_object_label(&mut commands, config.map.show_object_labels, tree_ent, &tree.id, tree.trunk_height * 0.5 + tree.canopy_height + 0.8);
     }
@@ -2659,7 +2281,6 @@ fn setup_scene(
     // ۱۳. خرابه‌های باستانی، دیوارهای شکسته و سنگرهای تاکتیکی (Obstacles)
     for obs in &config.obstacles {
         let size = Vec3::new(obs.size.0, obs.size.1, obs.size.2);
-        let oc = obs.color_rgb;
         let mut obs_cmds = commands.spawn((
             vfx_client::SnowSurfaceRoot,
             obstacle_physics_bundle(&config, obs),
@@ -2670,7 +2291,7 @@ fn setup_scene(
             obs_cmds.insert(VisionOccludable { is_faded: false, half_extents: size * 0.5 });
         }
         let obs_ent = obs_cmds.id();
-        if custom_glb_exists(&obs.model_path) {
+        if check_glb_exists("Obstacle", &obs.model_path) {
             obs_cmds.with_children(|parent| {
                 parent.spawn(glb_model_bundle(
                     &asset_server,
@@ -2678,15 +2299,6 @@ fn setup_scene(
                     &obs.model_transform,
                 ));
             });
-        } else {
-            obs_cmds.insert((
-                Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(oc.0, oc.1, oc.2),
-                    perceptual_roughness: obs.roughness,
-                    ..default()
-                })),
-            ));
         }
         spawn_map_object_label(&mut commands, config.map.show_object_labels, obs_ent, &obs.id, size.y * 0.5 + 0.8);
     }
@@ -2713,7 +2325,7 @@ fn setup_scene(
         ));
 
         let target_ent = target_cmds.id();
-        if custom_glb_exists(&t.model_path) {
+        if check_glb_exists("Target", &t.model_path) {
             target_cmds.with_children(|parent| {
                 parent.spawn(glb_model_bundle(
                     &asset_server,
@@ -2721,16 +2333,6 @@ fn setup_scene(
                     &t.model_transform,
                 ));
             });
-        } else {
-            target_cmds.insert((
-                Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: color,
-                    perceptual_roughness: t.roughness,
-                    metallic: t.metallic,
-                    ..default()
-                })),
-            ));
         }
         spawn_map_object_label(&mut commands, config.map.show_object_labels, target_ent, &t.id, size.y * 0.5 + 0.8);
     }
@@ -3999,15 +3601,18 @@ fn attach_weapon_to_left_hand(
                         Visibility::Visible,
                     ))
                     .with_children(|weapon| {
-                        if custom_glb_exists(&w_model_def.model_path) {
-                            let mut glb = glb_model_bundle(
-                                &asset_server,
-                                &w_model_def.model_path,
-                                &w_model_def.model_transform,
-                            );
-                            glb.1 = model_transform_to_bevy(&w_model_def.model_transform);
-                            weapon.spawn(glb);
-                        }
+                        assert!(
+                            custom_glb_exists(&w_model_def.model_path),
+                            "خطای بحرانی: فایل مدل GLB سلاح '{}' پیدا نشد!",
+                            w_model_def.model_path
+                        );
+                        let mut glb = glb_model_bundle(
+                            &asset_server,
+                            &w_model_def.model_path,
+                            &w_model_def.model_transform,
+                        );
+                        glb.1 = model_transform_to_bevy(&w_model_def.model_transform);
+                        weapon.spawn(glb);
                         weapon.spawn((
                             MuzzlePoint,
                             Transform::from_xyz(m_off.0, m_off.1, m_off.2),
@@ -9897,27 +9502,30 @@ fn spawn_showcase_weapon_on_hand(
     tuner: &moba_shared::WeaponTunerConfig,
 ) {
     if let Some(wm) = weapon_model {
-        if custom_glb_exists(&wm.model_path) {
-            let mut glb = glb_model_bundle(asset_server, &wm.model_path, &wm.model_transform);
-            glb.1 = model_transform_to_bevy(&wm.model_transform);
-            commands
-                .entity(hand_ent)
-                .insert(ShowcaseWeaponAttached)
-                .with_children(|parent| {
-                    parent
-                        .spawn((
-                            HorizontalWeaponAlign {
-                                root_entity: root_ent,
-                                hand_entity: hand_ent,
-                            },
-                            Transform::from_scale(Vec3::splat(tuner.initial_scale)),
-                            Visibility::Visible,
-                        ))
-                        .with_children(|w| {
-                            w.spawn(glb);
-                        });
-                });
-        }
+        assert!(
+            custom_glb_exists(&wm.model_path),
+            "خطای بحرانی: فایل مدل GLB سلاح پیش‌نمایش '{}' پیدا نشد!",
+            wm.model_path
+        );
+        let mut glb = glb_model_bundle(asset_server, &wm.model_path, &wm.model_transform);
+        glb.1 = model_transform_to_bevy(&wm.model_transform);
+        commands
+            .entity(hand_ent)
+            .insert(ShowcaseWeaponAttached)
+            .with_children(|parent| {
+                parent
+                    .spawn((
+                        HorizontalWeaponAlign {
+                            root_entity: root_ent,
+                            hand_entity: hand_ent,
+                        },
+                        Transform::from_scale(Vec3::splat(tuner.initial_scale)),
+                        Visibility::Visible,
+                    ))
+                    .with_children(|w| {
+                        w.spawn(glb);
+                    });
+            });
     }
 }
 
@@ -11165,28 +10773,31 @@ fn sync_remote_players_system(
                                 } else {
                                     &rp_hero_cfg.weapon_models.primary
                                 };
-                                if custom_glb_exists(&rp_w_model.model_path) {
-                                    let mut glb = glb_model_bundle(
-                                        &res.asset_server,
-                                        &rp_w_model.model_path,
-                                        &rp_w_model.model_transform,
-                                    );
-                                    glb.1 = model_transform_to_bevy(&rp_w_model.model_transform);
-                                    commands.entity(h_ent).insert(RemoteWeaponAttached).with_children(|parent| {
-                                        parent
-                                            .spawn((
-                                                HorizontalWeaponAlign {
-                                                    root_entity: root_ent,
-                                                    hand_entity: h_ent,
-                                                },
-                                                Transform::from_scale(Vec3::splat(res.config.weapon_tuner.initial_scale)),
-                                                Visibility::Visible,
-                                            ))
-                                            .with_children(|w| {
-                                                w.spawn(glb);
-                                            });
-                                    });
-                                }
+                                assert!(
+                                    custom_glb_exists(&rp_w_model.model_path),
+                                    "خطای بحرانی: فایل مدل GLB سلاح بازیکن مقابل '{}' پیدا نشد!",
+                                    rp_w_model.model_path
+                                );
+                                let mut glb = glb_model_bundle(
+                                    &res.asset_server,
+                                    &rp_w_model.model_path,
+                                    &rp_w_model.model_transform,
+                                );
+                                glb.1 = model_transform_to_bevy(&rp_w_model.model_transform);
+                                commands.entity(h_ent).insert(RemoteWeaponAttached).with_children(|parent| {
+                                    parent
+                                        .spawn((
+                                            HorizontalWeaponAlign {
+                                                root_entity: root_ent,
+                                                hand_entity: h_ent,
+                                            },
+                                            Transform::from_scale(Vec3::splat(res.config.weapon_tuner.initial_scale)),
+                                            Visibility::Visible,
+                                        ))
+                                        .with_children(|w| {
+                                            w.spawn(glb);
+                                        });
+                                });
                             }
                         }
                     }

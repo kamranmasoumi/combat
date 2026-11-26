@@ -3765,7 +3765,7 @@ GameConfig(
     ),
     map: MapConfig(
             map_dimensions: (340.0, 240.0),
-            show_object_labels: true,
+            show_object_labels: false,
             base_vision_range: 38.0,
             high_ground_vision_bonus: 14.0,
             high_ground_occlusion_min_diff: 1.2,

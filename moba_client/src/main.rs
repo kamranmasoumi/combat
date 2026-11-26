@@ -2812,7 +2812,7 @@ fn setup_scene(
             unlit: true,
             ..default()
         })),
-        Transform::from_xyz(0.0, 2.75, 0.0),
+        Transform::from_xyz(0.0, 2.52, 0.0),
     ));
     commands.insert_resource(fow_state);
 
@@ -7503,7 +7503,8 @@ fn fog_of_war_update_system(
     if fow.target_dirty {
         let exp_a = config.map.fog_explored_alpha;
         let unexp_a = config.map.fog_unexplored_alpha;
-        // ۱. پر کردن حفره‌های تک‌سلولی ناشی از Raycast و تبدیل شبکه باینری به آلفای هدف
+        // ۱. تبدیل شبکه باینری دقیق سرور به آلفای هدف بدون نشت تاریکی به داخل ناحیه قابل‌دیدن
+        let mut clear_mask = vec![false; total];
         for gz in 0..FOW_GRID_H {
             for gx in 0..FOW_GRID_W {
                 let idx = gz * FOW_GRID_W + gx;
@@ -7517,6 +7518,7 @@ fn fog_of_war_update_system(
                         vis = true;
                     }
                 }
+                clear_mask[idx] = vis;
                 fow.blurred_target[idx] = if vis {
                     0.0
                 } else if fow.shared.explored[idx] {
@@ -7527,7 +7529,8 @@ fn fog_of_war_update_system(
             }
         }
 
-        // ۲. بلور فضایی نرم (Separable Gaussian [0.25, 0.5, 0.25]) برای ایجاد حاشیه مه شبیه Dota 2
+        // ۲. بلور فضایی نرم صرفاً به سمت بیرون مرز دید (Outward-Only Feathering)
+        // سلول‌هایی که سرور آن‌ها را قابل‌دیدن می‌داند هرگز تاریک نمی‌شوند تا دشمن روی مرز دید داخل تاریکی نیفتد
         for _ in 0..config.map.fog_blur_passes {
             for gz in 0..FOW_GRID_H {
                 let row = gz * FOW_GRID_W;
@@ -7542,10 +7545,15 @@ fn fog_of_war_update_system(
                 let up_z = gz.saturating_sub(1);
                 let dn_z = (gz + 1).min(FOW_GRID_H - 1);
                 for gx in 0..FOW_GRID_W {
-                    let u = fow.blur_scratch[up_z * FOW_GRID_W + gx];
-                    let c = fow.blur_scratch[gz * FOW_GRID_W + gx];
-                    let d = fow.blur_scratch[dn_z * FOW_GRID_W + gx];
-                    fow.blurred_target[gz * FOW_GRID_W + gx] = u * 0.25 + c * 0.5 + d * 0.25;
+                    let idx = gz * FOW_GRID_W + gx;
+                    if clear_mask[idx] {
+                        fow.blurred_target[idx] = 0.0;
+                    } else {
+                        let u = fow.blur_scratch[up_z * FOW_GRID_W + gx];
+                        let c = fow.blur_scratch[idx];
+                        let d = fow.blur_scratch[dn_z * FOW_GRID_W + gx];
+                        fow.blurred_target[idx] = u * 0.25 + c * 0.5 + d * 0.25;
+                    }
                 }
             }
         }

@@ -699,6 +699,12 @@ impl GameConfig {
         assert!(self.combat.hero_kill_credit_window_secs.is_finite() && self.combat.hero_kill_credit_window_secs > 0.0, "combat.hero_kill_credit_window_secs نامعتبر است");
         assert!(self.combat.turret_hero_aggro_window_secs.is_finite() && self.combat.turret_hero_aggro_window_secs > 0.0, "combat.turret_hero_aggro_window_secs نامعتبر است");
         assert!(self.combat.weapon_swap_min_cooldown_secs.is_finite() && self.combat.weapon_swap_min_cooldown_secs >= 0.0, "combat.weapon_swap_min_cooldown_secs نامعتبر است");
+        assert!(self.combat.attack_reveal_duration_secs.is_finite() && self.combat.attack_reveal_duration_secs > 0.0, "combat.attack_reveal_duration_secs باید بزرگ‌تر از صفر باشد");
+        assert!(self.combat.attack_reveal_vision_radius.is_finite() && self.combat.attack_reveal_vision_radius > 0.0, "combat.attack_reveal_vision_radius باید بزرگ‌تر از صفر باشد");
+        assert!(self.combat.creep_hero_aggro_radius.is_finite() && self.combat.creep_hero_aggro_radius > 0.0, "combat.creep_hero_aggro_radius باید بزرگ‌تر از صفر باشد");
+        assert!(self.combat.creep_hero_aggro_duration_secs.is_finite() && self.combat.creep_hero_aggro_duration_secs > 0.0, "combat.creep_hero_aggro_duration_secs باید بزرگ‌تر از صفر باشد");
+        assert!(self.combat.creep_hero_aggro_cooldown_secs.is_finite() && self.combat.creep_hero_aggro_cooldown_secs >= 0.0, "combat.creep_hero_aggro_cooldown_secs نامعتبر است");
+        assert!(self.combat.creep_hero_aggro_max_chase_dist.is_finite() && self.combat.creep_hero_aggro_max_chase_dist >= self.combat.creep_hero_aggro_radius, "combat.creep_hero_aggro_max_chase_dist باید بزرگ‌تر یا مساوی creep_hero_aggro_radius باشد");
         assert!(self.soldier.jump_over_speed > 0.0, "soldier.jump_over_speed باید بزرگ‌تر از صفر باشد");
         assert!(self.soldier.jump_over_clearance_height > 0.0, "soldier.jump_over_clearance_height باید بزرگ‌تر از صفر باشد");
         assert!(self.soldier.space_hold_threshold_secs > 0.0, "soldier.space_hold_threshold_secs باید بزرگ‌تر از صفر باشد");
@@ -737,6 +743,10 @@ impl GameConfig {
             assert!(hero.stamina_regen_per_sec > 0.0, "stamina_regen_per_sec هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.slide_stamina_cost > 0.0, "slide_stamina_cost هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.jump_over_stamina_cost > 0.0, "jump_over_stamina_cost هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
+            assert!(hero.run_stamina_drain_per_sec >= 0.0 && hero.run_stamina_drain_per_sec.is_finite(), "run_stamina_drain_per_sec هیرو '{}' نامعتبر است", hero.id);
+            assert!(hero.swim_stamina_drain_per_sec >= 0.0 && hero.swim_stamina_drain_per_sec.is_finite(), "swim_stamina_drain_per_sec هیرو '{}' نامعتبر است", hero.id);
+            assert!(hero.climb_stamina_drain_per_sec >= 0.0 && hero.climb_stamina_drain_per_sec.is_finite(), "climb_stamina_drain_per_sec هیرو '{}' نامعتبر است", hero.id);
+            assert!(hero.stamina_exhausted_resume_min > 0.0 && hero.stamina_exhausted_resume_min <= hero.max_stamina && hero.stamina_exhausted_resume_min.is_finite(), "stamina_exhausted_resume_min هیرو '{}' باید بین 0 و max_stamina باشد", hero.id);
             assert!(hero.level_growth.stamina_regen_per_level >= 0.0, "stamina_regen_per_level هیرو '{}' نمی‌تواند منفی باشد", hero.id);
             assert!(hero.hero_scale > 0.0, "hero_scale هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
             assert!(hero.xp_gain_radius > 0.0, "xp_gain_radius هیرو '{}' باید بزرگ‌تر از صفر باشد", hero.id);
@@ -872,6 +882,18 @@ impl GameConfig {
         assert!(
             (0.0..=1.0).contains(&c.hero_block_front_cone_dot),
             "hero_block_front_cone_dot باید در بازه [0.0, 1.0] باشد"
+        );
+        assert!(
+            c.obstacle_avoid_margin >= 0.0 && c.obstacle_avoid_margin.is_finite(),
+            "obstacle_avoid_margin باید عددی نامنفی و معتبر باشد"
+        );
+        assert!(
+            c.obstacle_avoid_lookahead_dist > 0.0 && c.obstacle_avoid_lookahead_dist.is_finite(),
+            "obstacle_avoid_lookahead_dist باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            c.obstacle_avoid_steer_strength > 0.0 && c.obstacle_avoid_steer_strength.is_finite(),
+            "obstacle_avoid_steer_strength باید بزرگ‌تر از صفر باشد"
         );
         assert!(
             c.hero_block_hesitation_secs >= 0.0 && c.hero_block_hesitation_secs.is_finite(),
@@ -1092,6 +1114,49 @@ impl GameConfig {
             (0.0..=1.0).contains(&self.map.fog_explored_alpha)
                 && (0.0..=1.0).contains(&self.map.fog_unexplored_alpha),
             "map.fog_explored_alpha و fog_unexplored_alpha باید بین 0 و 1 باشند"
+        );
+        assert!(
+            self.map.high_ground_occlusion_min_diff > 0.0
+                && self.map.high_ground_occlusion_min_diff.is_finite(),
+            "map.high_ground_occlusion_min_diff باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            self.map.fow_ray_step_size > 0.0
+                && self.map.fow_ray_step_size <= 4.0
+                && self.map.fow_ray_step_size.is_finite(),
+            "map.fow_ray_step_size باید در بازه (0.0, 4.0] باشد"
+        );
+        assert!(
+            self.map.fow_blocker_min_dist >= 0.0 && self.map.fow_blocker_min_dist.is_finite(),
+            "map.fow_blocker_min_dist باید عددی نامنفی و معتبر باشد"
+        );
+        assert!(
+            self.map.fow_fountain_vision_range > 0.0
+                && self.map.fow_ancient_vision_range > 0.0
+                && self.map.fow_barracks_vision_range > 0.0
+                && self.map.fow_fountain_vision_range.is_finite()
+                && self.map.fow_ancient_vision_range.is_finite()
+                && self.map.fow_barracks_vision_range.is_finite(),
+            "شعاع دید سازه‌ها در map (fow_*_vision_range) باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            self.map.fow_stand_eye_height > self.map.fow_crouch_eye_height
+                && self.map.fow_crouch_eye_height > 0.0
+                && self.map.fow_stand_eye_height.is_finite()
+                && self.map.fow_crouch_eye_height.is_finite(),
+            "map.fow_stand_eye_height و fow_crouch_eye_height نامعتبر هستند"
+        );
+        assert!(
+            self.map.fow_stand_visible_height > self.map.fow_crouch_visible_height
+                && self.map.fow_crouch_visible_height > 0.0
+                && self.map.fow_stand_visible_height.is_finite()
+                && self.map.fow_crouch_visible_height.is_finite(),
+            "map.fow_stand_visible_height و fow_crouch_visible_height نامعتبر هستند"
+        );
+        assert!(
+            self.map.fow_low_cover_ground_epsilon >= 0.0
+                && self.map.fow_low_cover_ground_epsilon.is_finite(),
+            "map.fow_low_cover_ground_epsilon باید عددی نامنفی و معتبر باشد"
         );
     }
 
@@ -2009,6 +2074,10 @@ pub struct HeroDef {
     pub stamina_regen_per_sec: f32,
     pub slide_stamina_cost: f32,
     pub jump_over_stamina_cost: f32,
+    pub run_stamina_drain_per_sec: f32,
+    pub swim_stamina_drain_per_sec: f32,
+    pub climb_stamina_drain_per_sec: f32,
+    pub stamina_exhausted_resume_min: f32,
     pub armor: f32,
     pub hero_scale: f32,
     pub move_speed_multiplier: f32,
@@ -2195,6 +2264,12 @@ pub struct CombatConfig {
     pub hero_kill_credit_window_secs: f32,
     pub turret_hero_aggro_window_secs: f32,
     pub weapon_swap_min_cooldown_secs: f32,
+    pub attack_reveal_duration_secs: f32,
+    pub attack_reveal_vision_radius: f32,
+    pub creep_hero_aggro_radius: f32,
+    pub creep_hero_aggro_duration_secs: f32,
+    pub creep_hero_aggro_cooldown_secs: f32,
+    pub creep_hero_aggro_max_chase_dist: f32,
     pub respawn_times_per_level: Vec<f32>,
     pub xp_thresholds_per_level: Vec<u32>,
 }
@@ -2283,6 +2358,9 @@ pub struct CreepConfig {
     pub hero_block_hesitation_secs: f32,
     pub hero_block_hesitation_cooldown_secs: f32,
     pub hero_block_steer_strength: f32,
+    pub obstacle_avoid_margin: f32,
+    pub obstacle_avoid_lookahead_dist: f32,
+    pub obstacle_avoid_steer_strength: f32,
     pub hovered_tint_emissive_rgb: (f32, f32, f32),
 }
 
@@ -2609,6 +2687,16 @@ pub struct MapConfig {
     pub fog_blur_passes: u32,
     pub fog_explored_alpha: f32,
     pub fog_unexplored_alpha: f32,
+    pub fow_ray_step_size: f32,
+    pub fow_blocker_min_dist: f32,
+    pub fow_fountain_vision_range: f32,
+    pub fow_ancient_vision_range: f32,
+    pub fow_barracks_vision_range: f32,
+    pub fow_stand_eye_height: f32,
+    pub fow_crouch_eye_height: f32,
+    pub fow_stand_visible_height: f32,
+    pub fow_crouch_visible_height: f32,
+    pub fow_low_cover_ground_epsilon: f32,
     pub canyon: CanyonConfig,
     pub biome: MapBiomeConfig,
     pub terrains: Vec<TerrainPlatformDef>,
@@ -6807,17 +6895,25 @@ pub fn sample_terrain_top_y(config: &GameConfig, x: f32, z: f32) -> f32 {
     best_y
 }
 
-pub fn can_observer_see_point_with_range(
+/// قانون واحد و فیزیکی خط دید سه‌بعدی برای تمام موجودیت‌های بازی (هیروها، سربازان لاین و جنگل، تاورها، سازه‌ها و کوریرها)
+/// با تفکیک دقیق ارتفاع چشم ناظر و ارتفاع قابل‌دیدن هدف (ایستاده در برابر نشسته پشت سنگر)
+pub fn can_observer_see_target_3d(
     physics_world: &CustomPhysicsWorld,
     config: &GameConfig,
     observer_feet_pos: Vec3,
+    observer_eye_height: f32,
     target_feet_pos: Vec3,
-    eye_height: f32,
+    target_visible_height: f32,
     base_range: f32,
     high_ground_bonus: f32,
 ) -> bool {
-    let obs_in_pit = is_point_inside_roshan_pit(&config.map.roshan_pit, observer_feet_pos.x, observer_feet_pos.z);
-    let tgt_in_pit = is_point_inside_roshan_pit(&config.map.roshan_pit, target_feet_pos.x, target_feet_pos.z);
+    if base_range <= 0.0 {
+        return false;
+    }
+    let obs_in_pit =
+        is_point_inside_roshan_pit(&config.map.roshan_pit, observer_feet_pos.x, observer_feet_pos.z);
+    let tgt_in_pit =
+        is_point_inside_roshan_pit(&config.map.roshan_pit, target_feet_pos.x, target_feet_pos.z);
     if obs_in_pit != tgt_in_pit {
         return false;
     }
@@ -6835,13 +6931,19 @@ pub fn can_observer_see_point_with_range(
         base_range
     };
 
-    let eye_origin = observer_feet_pos + Vec3::Y * eye_height;
-    let target_point = target_feet_pos + Vec3::Y * eye_height;
-    let to_target = target_point - eye_origin;
-    let dist = to_target.length();
-    if dist > effective_range {
+    let dist_xz = Vec2::new(
+        target_feet_pos.x - observer_feet_pos.x,
+        target_feet_pos.z - observer_feet_pos.z,
+    )
+    .length();
+    if dist_xz > effective_range {
         return false;
     }
+
+    let eye_origin = observer_feet_pos + Vec3::Y * observer_eye_height;
+    let target_point = target_feet_pos + Vec3::Y * target_visible_height;
+    let to_target = target_point - eye_origin;
+    let dist = to_target.length();
     if dist <= f32::EPSILON {
         return true;
     }
@@ -6850,6 +6952,27 @@ pub fn can_observer_see_point_with_range(
     physics_world
         .cast_ray(eye_origin, to_target / dist, dist, query_groups, |_| true)
         .is_none()
+}
+
+pub fn can_observer_see_point_with_range(
+    physics_world: &CustomPhysicsWorld,
+    config: &GameConfig,
+    observer_feet_pos: Vec3,
+    target_feet_pos: Vec3,
+    eye_height: f32,
+    base_range: f32,
+    high_ground_bonus: f32,
+) -> bool {
+    can_observer_see_target_3d(
+        physics_world,
+        config,
+        observer_feet_pos,
+        eye_height,
+        target_feet_pos,
+        eye_height,
+        base_range,
+        high_ground_bonus,
+    )
 }
 
 /// قانون برتری دید ارتفاعی (Dota 2 High-Ground Vision Rule) با استفاده از موتور فیزیک اختصاصی
@@ -6880,9 +7003,15 @@ pub const FOW_GRID_H: usize = 120;
 #[derive(Clone, Debug)]
 pub struct SharedFogOfWar {
     pub terrain_y: Vec<f32>,
+    pub ground_terrain_y: Vec<f32>,
+    pub bridge_deck_y: Vec<f32>,
     pub blocker_top_y: Vec<f32>,
+    pub low_cover_top_y: Vec<f32>,
+    pub under_bridge_blocker_top_y: Vec<f32>,
     pub explored: Vec<bool>,
     pub visible_now: Vec<bool>,
+    pub min_visible_y: Vec<f32>,
+    pub under_bridge_visible: Vec<bool>,
     pub allied_sources: Vec<(Vec3, f32)>,
 }
 
@@ -6890,7 +7019,13 @@ impl SharedFogOfWar {
     pub fn from_config(config: &GameConfig, hero_team: TeamId) -> Self {
         let total = FOW_GRID_W * FOW_GRID_H;
         let mut terrain_y = vec![0.0_f32; total];
+        let mut ground_terrain_y = vec![0.0_f32; total];
+        let mut bridge_deck_y = vec![f32::NEG_INFINITY; total];
         let mut blocker_top_y = vec![f32::NEG_INFINITY; total];
+        let mut low_cover_top_y = vec![f32::NEG_INFINITY; total];
+        let mut under_bridge_blocker_top_y = vec![f32::NEG_INFINITY; total];
+
+        let min_diff = config.map.high_ground_occlusion_min_diff;
 
         for gz in 0..FOW_GRID_H {
             for gx in 0..FOW_GRID_W {
@@ -6899,7 +7034,7 @@ impl SharedFogOfWar {
 
                 let canyon_h = canyon_sample_height(&config.map.canyon, wx, wz);
                 let inside_canyon = config.map.canyon.enabled && canyon_h < -0.15;
-                let mut best_y = if inside_canyon { canyon_h } else { -1.6_f32 };
+                let mut ground_y = if inside_canyon { canyon_h } else { -1.6_f32 };
                 for plat in &config.map.terrains {
                     if inside_canyon && plat.elevation_tier <= 0 {
                         continue;
@@ -6908,11 +7043,17 @@ impl SharedFogOfWar {
                     let scl = plat.model_transform.scale;
                     let hx = plat.size.0 * 0.5 * scl.0.abs();
                     let hz = plat.size.2 * 0.5 * scl.2.abs();
-                    if (wx - loc.0).abs() <= hx && (wz - loc.2).abs() <= hz {
+                    let inv_rot =
+                        Quat::from_rotation_y(-plat.model_transform.rotation.1.to_radians());
+                    let local = inv_rot * Vec3::new(wx - loc.0, 0.0, wz - loc.2);
+                    if local.x.abs() <= hx && local.z.abs() <= hz {
                         let top_y = loc.1 + plat.size.1 * 0.5 * scl.1.abs();
-                        best_y = best_y.max(top_y);
+                        ground_y = ground_y.max(top_y);
                     }
                 }
+
+                // جدا کردن ارتفاع عرشه پل‌های روی دره (پل مرکزی و پل‌های لاین) از بستر زیر پل
+                let mut bridge_y = f32::NEG_INFINITY;
                 if inside_canyon {
                     for lane in &config.map.lanes {
                         let half_w = lane.width * 0.5;
@@ -6931,7 +7072,7 @@ impl SharedFogOfWar {
                             let cz = a.2 + abz * t;
                             if (wx - cx).hypot(wz - cz) <= half_w {
                                 let cy = a.1 + (b.1 - a.1) * t + lane.thickness * 0.5;
-                                best_y = best_y.max(cy);
+                                bridge_y = bridge_y.max(cy);
                             }
                         }
                     }
@@ -6949,44 +7090,73 @@ impl SharedFogOfWar {
                 let dx = wx - b_loc.0;
                 let dz = wz - b_loc.2;
                 if dx * dx + dz * dz <= b_rad * b_rad {
-                    best_y = best_y.max(
+                    bridge_y = bridge_y.max(
                         b_loc.1 + bridge.deck_thickness * 0.5 * bridge.model_transform.scale.1.abs(),
                     );
                 }
 
+                let best_y = ground_y.max(bridge_y);
+                ground_terrain_y[idx] = ground_y;
+                bridge_deck_y[idx] = bridge_y;
                 terrain_y[idx] = best_y;
 
+                let has_bridge = bridge_y.is_finite();
                 let mut max_blocker_y = f32::NEG_INFINITY;
+                let mut max_low_cover_y = f32::NEG_INFINITY;
+                let mut max_under_blocker_y = f32::NEG_INFINITY;
+
                 for mtn in &config.map.mountains {
                     let loc = mtn.model_transform.location;
                     let scl = mtn.model_transform.scale;
-                    let top_y = loc.1 + mtn.size.1 * 0.5 * scl.1.abs();
-                    if top_y < best_y + config.map.high_ground_occlusion_min_diff {
-                        continue;
-                    }
+                    let hy = mtn.size.1 * 0.5 * scl.1.abs();
+                    let top_y = loc.1 + hy;
+                    let bottom_y = loc.1 - hy;
                     let hx = mtn.size.0 * 0.5 * scl.0.abs();
                     let hz = mtn.size.2 * 0.5 * scl.2.abs();
                     let inv_rot =
                         Quat::from_rotation_y(-mtn.model_transform.rotation.1.to_radians());
                     let local = inv_rot * Vec3::new(wx - loc.0, 0.0, wz - loc.2);
                     if local.x.abs() <= hx && local.z.abs() <= hz {
-                        max_blocker_y = max_blocker_y.max(top_y);
+                        if top_y >= best_y + min_diff {
+                            max_blocker_y = max_blocker_y.max(top_y);
+                        }
+                        if has_bridge
+                            && bottom_y < bridge_y - min_diff
+                            && top_y >= ground_y + min_diff
+                        {
+                            max_under_blocker_y = max_under_blocker_y.max(top_y);
+                        }
                     }
                 }
                 for obs in &config.obstacles {
-                    if obs.can_vault {
+                    if obs.size.0 <= 1e-4 || obs.size.1 <= 1e-4 || obs.size.2 <= 1e-4 {
                         continue;
                     }
                     let loc = obs.model_transform.location;
                     let scl = obs.model_transform.scale;
-                    let top_y = loc.1 + obs.size.1 * 0.5 * scl.1.abs();
+                    let hy = obs.size.1 * 0.5 * scl.1.abs();
+                    let top_y = loc.1 + hy;
+                    let bottom_y = loc.1 - hy;
                     let hx = obs.size.0 * 0.5 * scl.0.abs();
                     let hz = obs.size.2 * 0.5 * scl.2.abs();
                     let inv_rot =
                         Quat::from_rotation_y(-obs.model_transform.rotation.1.to_radians());
                     let local = inv_rot * Vec3::new(wx - loc.0, 0.0, wz - loc.2);
                     if local.x.abs() <= hx && local.z.abs() <= hz {
-                        max_blocker_y = max_blocker_y.max(top_y);
+                        if obs.can_vault {
+                            // سنگرها و موانع کم‌ارتفاع (مثل sandbag.glb): سایه دید پروجکتیو به اندازه ارتفاع واقعی خود می‌اندازند
+                            if !has_bridge || top_y >= bridge_y - 0.5 {
+                                max_low_cover_y = max_low_cover_y.max(top_y);
+                            }
+                        } else {
+                            // موانع بلند غیرقابل‌پرش: مسدودکننده کامل خط دید
+                            if !has_bridge || top_y >= bridge_y - 0.5 {
+                                max_blocker_y = max_blocker_y.max(top_y);
+                            }
+                            if has_bridge && bottom_y < bridge_y - min_diff {
+                                max_under_blocker_y = max_under_blocker_y.max(top_y);
+                            }
+                        }
                     }
                 }
                 let fow_r_mult = config.map.biome.tree_fow_blocker_radius_mult;
@@ -6996,15 +7166,21 @@ impl SharedFogOfWar {
                     let loc = tree.model_transform.location;
                     let scl = tree.model_transform.scale;
                     let ts = scl.0.abs().max(scl.2.abs());
+                    let bottom_y = loc.1;
                     let top_y = loc.1 + (tree.trunk_height + tree.canopy_height) * scl.1.abs();
                     let r = (tree.trunk_radius * fow_r_mult * ts).clamp(fow_r_min, fow_r_max);
                     let tdx = wx - loc.0;
                     let tdz = wz - loc.2;
                     if tdx * tdx + tdz * tdz <= r * r {
                         max_blocker_y = max_blocker_y.max(top_y);
+                        if has_bridge && bottom_y < bridge_y - min_diff {
+                            max_under_blocker_y = max_under_blocker_y.max(top_y);
+                        }
                     }
                 }
                 blocker_top_y[idx] = max_blocker_y;
+                low_cover_top_y[idx] = max_low_cover_y;
+                under_bridge_blocker_top_y[idx] = max_under_blocker_y;
             }
         }
 
@@ -7012,10 +7188,59 @@ impl SharedFogOfWar {
         for tree in &config.map.trees {
             let loc = tree.model_transform.location;
             let scl = tree.model_transform.scale;
+            let bottom_y = loc.1;
             let top_y = loc.1 + (tree.trunk_height + tree.canopy_height) * scl.1.abs();
             if let Some((gx, gz)) = Self::world_to_cell(config, loc.0, loc.2) {
                 let idx = gz * FOW_GRID_W + gx;
                 blocker_top_y[idx] = blocker_top_y[idx].max(top_y);
+                if bridge_deck_y[idx].is_finite() && bottom_y < bridge_deck_y[idx] - min_diff {
+                    under_bridge_blocker_top_y[idx] = under_bridge_blocker_top_y[idx].max(top_y);
+                }
+            }
+        }
+
+        // تضمین ثبت قطعی دیوارها و سنگرهای باریک (مثل sandbag.glb) در سلول‌های شبکه Fog of War
+        let cell_step = (config.map.map_dimensions.0 / FOW_GRID_W as f32)
+            .min(config.map.map_dimensions.1 / FOW_GRID_H as f32)
+            .max(0.25)
+            * 0.5;
+        for obs in &config.obstacles {
+            if obs.size.0 <= 1e-4 || obs.size.1 <= 1e-4 || obs.size.2 <= 1e-4 {
+                continue;
+            }
+            let loc = obs.model_transform.location;
+            let scl = obs.model_transform.scale;
+            let hx = obs.size.0 * 0.5 * scl.0.abs();
+            let hy = obs.size.1 * 0.5 * scl.1.abs();
+            let hz = obs.size.2 * 0.5 * scl.2.abs();
+            let top_y = loc.1 + hy;
+            let bottom_y = loc.1 - hy;
+            let rot = Quat::from_rotation_y(obs.model_transform.rotation.1.to_radians());
+            let steps_x = ((hx * 2.0) / cell_step).ceil().max(1.0) as usize;
+            let steps_z = ((hz * 2.0) / cell_step).ceil().max(1.0) as usize;
+            for ix in 0..=steps_x {
+                let lx = -hx + (hx * 2.0) * (ix as f32 / steps_x as f32);
+                for iz in 0..=steps_z {
+                    let lz = -hz + (hz * 2.0) * (iz as f32 / steps_z as f32);
+                    let wp = Vec3::new(loc.0, 0.0, loc.2) + rot * Vec3::new(lx, 0.0, lz);
+                    if let Some((gx, gz)) = Self::world_to_cell(config, wp.x, wp.z) {
+                        let idx = gz * FOW_GRID_W + gx;
+                        let by = bridge_deck_y[idx];
+                        if obs.can_vault {
+                            if !by.is_finite() || top_y >= by - 0.5 {
+                                low_cover_top_y[idx] = low_cover_top_y[idx].max(top_y);
+                            }
+                        } else {
+                            if !by.is_finite() || top_y >= by - 0.5 {
+                                blocker_top_y[idx] = blocker_top_y[idx].max(top_y);
+                            }
+                            if by.is_finite() && bottom_y < by - min_diff {
+                                under_bridge_blocker_top_y[idx] =
+                                    under_bridge_blocker_top_y[idx].max(top_y);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -7023,33 +7248,48 @@ impl SharedFogOfWar {
         for ftn in &config.map.fountains {
             if ftn.team == hero_team {
                 let loc = ftn.model_transform.location;
-                allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), 24.0));
+                allied_sources.push((
+                    Vec3::new(loc.0, loc.1, loc.2),
+                    config.map.fow_fountain_vision_range,
+                ));
             }
         }
         for anc in &config.map.ancients {
             if anc.team == hero_team {
                 let loc = anc.model_transform.location;
-                allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), 26.0));
+                allied_sources.push((
+                    Vec3::new(loc.0, loc.1, loc.2),
+                    config.map.fow_ancient_vision_range,
+                ));
             }
         }
         for tur in &config.map.turrets {
             if tur.team == hero_team {
                 let loc = tur.model_transform.location;
-                allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), tur.attack_range + 4.0));
+                allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), tur.vision_range));
             }
         }
         for bar in &config.map.barracks {
             if bar.team == hero_team {
                 let loc = bar.model_transform.location;
-                allied_sources.push((Vec3::new(loc.0, loc.1, loc.2), 20.0));
+                allied_sources.push((
+                    Vec3::new(loc.0, loc.1, loc.2),
+                    config.map.fow_barracks_vision_range,
+                ));
             }
         }
 
         Self {
             terrain_y,
+            ground_terrain_y,
+            bridge_deck_y,
             blocker_top_y,
+            low_cover_top_y,
+            under_bridge_blocker_top_y,
             explored: vec![false; total],
             visible_now: vec![false; total],
+            min_visible_y: vec![f32::INFINITY; total],
+            under_bridge_visible: vec![false; total],
             allied_sources,
         }
     }
@@ -7078,12 +7318,80 @@ impl SharedFogOfWar {
     }
 
     #[inline]
+    pub fn hero_eye_height(config: &GameConfig, stance: Stance, hero_scale: f32) -> f32 {
+        let base = if stance == Stance::Crouch {
+            config.map.fow_crouch_eye_height
+        } else {
+            config.map.fow_stand_eye_height
+        };
+        base * hero_scale
+    }
+
+    #[inline]
+    pub fn hero_visible_height(config: &GameConfig, stance: Stance, hero_scale: f32) -> f32 {
+        let base = if stance == Stance::Crouch {
+            config.map.fow_crouch_visible_height
+        } else {
+            config.map.fow_stand_visible_height
+        };
+        base * hero_scale
+    }
+
+    /// محاسبه ارتفاع واقعی ناظر با تشخیص دقیق حضور در زیر پل (جلوگیری از پرش ارتفاع ناظر به عرشه پل بالایی)
+    #[inline]
+    pub fn effective_observer_y(&self, config: &GameConfig, origin: Vec3) -> (f32, bool) {
+        let Some((gx, gz)) = Self::world_to_cell(config, origin.x, origin.z) else {
+            return (origin.y, false);
+        };
+        let idx = gz * FOW_GRID_W + gx;
+        let bridge_y = self.bridge_deck_y[idx];
+        if bridge_y.is_finite()
+            && origin.y <= bridge_y - config.map.high_ground_occlusion_min_diff
+        {
+            (origin.y.max(self.ground_terrain_y[idx]), true)
+        } else {
+            (origin.y.max(self.terrain_y[idx]), false)
+        }
+    }
+
+    #[inline]
     pub fn is_world_point_visible(&self, config: &GameConfig, wx: f32, wz: f32) -> bool {
         if let Some((gx, gz)) = Self::world_to_cell(config, wx, wz) {
             self.visible_now[gz * FOW_GRID_W + gx]
         } else {
             false
         }
+    }
+
+    /// بررسی دید سه‌بعدی با تفکیک زیر پل/روی پل و سایه پروجکتیو سنگرهای کم‌ارتفاع (ایستاده در برابر نشسته)
+    #[inline]
+    pub fn is_world_entity_visible(
+        &self,
+        config: &GameConfig,
+        feet_pos: Vec3,
+        visible_height: f32,
+    ) -> bool {
+        let Some((gx, gz)) = Self::world_to_cell(config, feet_pos.x, feet_pos.z) else {
+            return false;
+        };
+        let idx = gz * FOW_GRID_W + gx;
+        let bridge_y = self.bridge_deck_y[idx];
+        if bridge_y.is_finite()
+            && feet_pos.y <= bridge_y - config.map.high_ground_occlusion_min_diff
+        {
+            return self.under_bridge_visible[idx];
+        }
+        if self.visible_now[idx] {
+            return true;
+        }
+        let min_vis_y = self.min_visible_y[idx];
+        min_vis_y.is_finite() && (feet_pos.y + visible_height) > min_vis_y
+    }
+
+    /// بررسی دید سه‌بعدی برای نقاط و پرتابه‌ها (گلوله، نارنجک، کوریر، افکت‌ها)
+    #[inline]
+    pub fn is_world_pos_visible(&self, config: &GameConfig, pos: Vec3) -> bool {
+        self.is_world_entity_visible(config, pos, 0.0)
     }
 
     fn reveal_from_source(
@@ -7093,20 +7401,48 @@ impl SharedFogOfWar {
         vision_range: f32,
         ray_count: usize,
     ) {
-        let origin_y = origin.y.max(
-            Self::world_to_cell(config, origin.x, origin.z)
-                .map(|(gx, gz)| self.terrain_y[gz * FOW_GRID_W + gx])
-                .unwrap_or(origin.y),
+        self.reveal_from_source_with_eye(
+            config,
+            origin,
+            config.map.fow_stand_eye_height,
+            vision_range,
+            ray_count,
         );
+    }
+
+    fn reveal_from_source_with_eye(
+        &mut self,
+        config: &GameConfig,
+        origin: Vec3,
+        eye_height: f32,
+        vision_range: f32,
+        ray_count: usize,
+    ) {
+        if vision_range <= 0.0 {
+            return;
+        }
+        let (origin_y, _) = self.effective_observer_y(config, origin);
+        let eye_y = origin_y + eye_height;
 
         let observer_in_pit = is_point_inside_roshan_pit(&config.map.roshan_pit, origin.x, origin.z);
-        let step_size = 1.5_f32;
+        let step_size = config.map.fow_ray_step_size;
         let steps = (vision_range / step_size).ceil() as usize;
+        let min_diff = config.map.high_ground_occlusion_min_diff;
+        let blocker_min_dist = config.map.fow_blocker_min_dist;
+        let ground_eps = config.map.fow_low_cover_ground_epsilon;
 
-        for r_i in 0..ray_count {
-            let angle = (r_i as f32) * (std::f32::consts::PI * 2.0 / ray_count as f32);
+        // محاسبه تعداد اشعه بدون حفره بر اساس محیط دید و ابعاد سلول (حذف چشمک‌زدن دشمن در لبه دید سرباز/تاور/کوریر)
+        let cell_w = config.map.map_dimensions.0 / FOW_GRID_W as f32;
+        let cell_h = config.map.map_dimensions.1 / FOW_GRID_H as f32;
+        let min_cell = cell_w.min(cell_h).max(0.25);
+        let required_rays = ((std::f32::consts::TAU * vision_range) / (min_cell * 0.65)).ceil() as usize;
+        let effective_ray_count = ray_count.max(required_rays).clamp(32, 360);
+
+        for r_i in 0..effective_ray_count {
+            let angle = (r_i as f32) * (std::f32::consts::TAU / effective_ray_count as f32);
             let dx = angle.cos();
             let dz = angle.sin();
+            let mut max_slope = f32::NEG_INFINITY;
 
             for s_i in 0..=steps {
                 let dist = s_i as f32 * step_size;
@@ -7124,54 +7460,145 @@ impl SharedFogOfWar {
                 };
                 let idx = gz * FOW_GRID_W + gx;
 
-                let cell_y = self.terrain_y[idx];
-                if cell_y - origin_y >= config.map.high_ground_occlusion_min_diff {
-                    break;
-                }
+                let bridge_y = self.bridge_deck_y[idx];
+                let observer_below_bridge =
+                    bridge_y.is_finite() && origin_y <= bridge_y - min_diff;
 
-                self.visible_now[idx] = true;
-                self.explored[idx] = true;
+                if observer_below_bridge {
+                    // ناظر در زیر پل است: فقط بستر زیر پل را می‌بیند و هرگز عرشه بالای پل را روشن نمی‌کند
+                    let floor_y = self.ground_terrain_y[idx];
+                    if floor_y - origin_y >= min_diff {
+                        break;
+                    }
+                    self.under_bridge_visible[idx] = true;
+                    if self.under_bridge_blocker_top_y[idx] >= origin_y + min_diff
+                        && dist > blocker_min_dist
+                    {
+                        break;
+                    }
+                } else {
+                    let cell_y = self.terrain_y[idx];
+                    if cell_y - origin_y >= min_diff {
+                        break;
+                    }
 
-                if self.blocker_top_y[idx] >= origin_y + config.map.high_ground_occlusion_min_diff
-                    && dist > 1.8
-                    && !(origin_y >= -0.35 && cell_y < -0.35)
-                {
-                    break;
+                    // محاسبه خط دید پروجکتیو واقعی از روی سنگرهای کم‌ارتفاع (مثل sandbag.glb)
+                    let cover_y = self.low_cover_top_y[idx];
+                    let surface_y = if cover_y.is_finite() {
+                        cell_y.max(cover_y)
+                    } else {
+                        cell_y
+                    };
+                    let shadow_y = if max_slope.is_finite() {
+                        eye_y + max_slope * dist
+                    } else {
+                        f32::NEG_INFINITY
+                    };
+
+                    if shadow_y <= surface_y + ground_eps {
+                        self.visible_now[idx] = true;
+                        self.explored[idx] = true;
+                        self.min_visible_y[idx] = self.min_visible_y[idx].min(cell_y);
+                    } else {
+                        // زمین پشت سنگر در سایه واقعی قرار دارد؛ تنها اهدافی که بالاتر از shadow_y هستند (مثلاً ایستاده) دیده می‌شوند
+                        self.min_visible_y[idx] = self.min_visible_y[idx].min(shadow_y);
+                    }
+
+                    if cover_y.is_finite()
+                        && dist >= step_size * 0.5
+                        && cover_y > origin_y + ground_eps
+                    {
+                        let slope = (cover_y - eye_y) / dist;
+                        if slope > max_slope {
+                            max_slope = slope;
+                        }
+                    }
+
+                    if self.blocker_top_y[idx] >= origin_y + min_diff && dist > blocker_min_dist {
+                        break;
+                    }
                 }
             }
         }
     }
 
-    pub fn update_for_hero(&mut self, config: &GameConfig, hero_pos: Vec3, hero: &HeroDef, hero_alive: bool, live_allied_structures: &[(Vec3, f32)], allied_creeps: &[Vec3], match_elapsed_secs: f32, weather: WeatherKind) {
-        self.visible_now.fill(false);
-
-        let struct_mult = config.effective_vision_multiplier(match_elapsed_secs, config.day_night.night_turret_vision_multiplier);
-        let creep_mult = config.effective_vision_multiplier(match_elapsed_secs, config.day_night.night_creep_vision_multiplier);
-
-        let hero_ground_y = hero_pos.y.max(
-            Self::world_to_cell(config, hero_pos.x, hero_pos.z)
-                .map(|(gx, gz)| self.terrain_y[gz * FOW_GRID_W + gx])
-                .unwrap_or(hero_pos.y),
+    pub fn update_for_hero(
+        &mut self,
+        config: &GameConfig,
+        hero_pos: Vec3,
+        hero: &HeroDef,
+        hero_alive: bool,
+        live_allied_structures: &[(Vec3, f32)],
+        allied_creeps: &[Vec3],
+        match_elapsed_secs: f32,
+        weather: WeatherKind,
+    ) {
+        self.update_for_hero_with_stance(
+            config,
+            hero_pos,
+            Stance::Run,
+            hero,
+            hero_alive,
+            live_allied_structures,
+            allied_creeps,
+            match_elapsed_secs,
+            weather,
         );
+    }
+
+    pub fn update_for_hero_with_stance(
+        &mut self,
+        config: &GameConfig,
+        hero_pos: Vec3,
+        hero_stance: Stance,
+        hero: &HeroDef,
+        hero_alive: bool,
+        live_allied_structures: &[(Vec3, f32)],
+        allied_creeps: &[Vec3],
+        match_elapsed_secs: f32,
+        weather: WeatherKind,
+    ) {
+        self.visible_now.fill(false);
+        self.min_visible_y.fill(f32::INFINITY);
+        self.under_bridge_visible.fill(false);
+
+        let struct_mult = config.effective_vision_multiplier(
+            match_elapsed_secs,
+            config.day_night.night_turret_vision_multiplier,
+        );
+        let creep_mult = config.effective_vision_multiplier(
+            match_elapsed_secs,
+            config.day_night.night_creep_vision_multiplier,
+        );
+
+        let (hero_ground_y, hero_under_bridge) = self.effective_observer_y(config, hero_pos);
 
         let base_hero_vision = config.hero_effective_vision(hero, match_elapsed_secs, weather);
         let hero_range = base_hero_vision
-            + if hero_ground_y >= config.map.high_ground_occlusion_min_diff {
+            + if !hero_under_bridge && hero_ground_y >= config.map.high_ground_occlusion_min_diff {
                 hero.high_ground_vision_bonus
             } else {
                 0.0
             };
 
         if hero_alive {
-            self.reveal_from_source(config, hero_pos, hero_range, 240);
+            let hero_eye = Self::hero_eye_height(config, hero_stance, hero.hero_scale);
+            self.reveal_from_source_with_eye(config, hero_pos, hero_eye, hero_range, 240);
         }
 
         for &(src_pos, src_range) in live_allied_structures {
-            self.reveal_from_source(config, src_pos, src_range * struct_mult, 72);
+            self.reveal_from_source_with_eye(
+                config,
+                src_pos,
+                config.map.fow_stand_eye_height,
+                src_range * struct_mult,
+                96,
+            );
         }
         let creep_range = config.creeps.vision_range * creep_mult;
+        let creep_eye = config.creeps.hitbox_height * 0.85;
         for &c_pos in allied_creeps {
-            self.reveal_from_source(config, c_pos, creep_range, 64);
+            self.reveal_from_source_with_eye(config, c_pos, creep_eye, creep_range, 96);
         }
     }
 
@@ -7210,6 +7637,10 @@ pub struct LaneCreepState {
     pub creep_type_id: Option<String>,
     pub camp_index: Option<usize>,
     pub is_aggroed: bool,
+    pub aggro_target_slot: Option<usize>,
+    pub hero_aggro_target_slot: Option<usize>,
+    pub hero_aggro_remaining_secs: f32,
+    pub hero_aggro_cooldown_secs: f32,
     pub home_pos: Vec3,
     pub lane: LaneId,
     pub waypoint_index: usize,
@@ -7386,6 +7817,7 @@ pub struct PlayerSlotState {
     pub hero_stamina_regen_per_sec: f32,
     pub hero_slide_stamina_cost: f32,
     pub hero_jump_over_stamina_cost: f32,
+    pub stamina_exhausted: bool,
     pub space_hold_secs: Option<f32>,
     pub wall_climb_mountain_index: Option<usize>,
     pub wall_climb_last_dir: i8,
@@ -7477,6 +7909,9 @@ pub struct PlayerSlotState {
     pub popup_throttle_remaining: f32,
     pub recent_hero_damagers: Vec<(usize, f32)>,
     pub last_attacked_enemy_hero_at: f32,
+    pub attack_reveal_to_dawn_remaining: f32,
+    pub attack_reveal_to_dusk_remaining: f32,
+    pub attack_reveal_to_neutral_remaining: f32,
     pub last_ping_at_secs: f32,
     pub last_chat_at_secs: f32,
     pub traversal: SharedTraversalState,
@@ -7531,6 +7966,7 @@ pub struct AuthoritativeWorldState {
     pub hero_stamina_regen_per_sec: f32,
     pub hero_slide_stamina_cost: f32,
     pub hero_jump_over_stamina_cost: f32,
+    pub stamina_exhausted: bool,
     pub space_hold_secs: Option<f32>,
     pub wall_climb_mountain_index: Option<usize>,
     pub wall_climb_last_dir: i8,
@@ -7612,6 +8048,12 @@ pub struct AuthoritativeWorldState {
     pub fountain_fire_cooldowns: Vec<f32>,
     pub allow_shadow_blade_during_teleport: bool,
     pub demo_reveal_full_map: bool,
+    pub dawn_los_visible_slots: Vec<bool>,
+    pub dusk_los_visible_slots: Vec<bool>,
+    pub dawn_los_visible_creeps: std::collections::HashSet<u64>,
+    pub dusk_los_visible_creeps: std::collections::HashSet<u64>,
+    pub dawn_los_visible_couriers: Vec<bool>,
+    pub dusk_los_visible_couriers: Vec<bool>,
     pub barracks: Vec<BarracksState>,
     pub ancients: Vec<AncientState>,
     pub chat_history: Vec<ChatMessageEntry>,
@@ -7748,6 +8190,7 @@ impl AuthoritativeWorldState {
             hero_stamina_regen_per_sec: hero.stamina_regen_per_sec,
             hero_slide_stamina_cost: hero.slide_stamina_cost,
             hero_jump_over_stamina_cost: hero.jump_over_stamina_cost,
+            stamina_exhausted: false,
             space_hold_secs: None,
             wall_climb_mountain_index: None,
             wall_climb_last_dir: 1,
@@ -7844,6 +8287,12 @@ impl AuthoritativeWorldState {
             fountain_fire_cooldowns: vec![0.0; config.map.fountains.len()],
             allow_shadow_blade_during_teleport: config.gameplay_rules.allow_shadow_blade_during_teleport,
             demo_reveal_full_map: false,
+            dawn_los_visible_slots: Vec::new(),
+            dusk_los_visible_slots: Vec::new(),
+            dawn_los_visible_creeps: std::collections::HashSet::new(),
+            dusk_los_visible_creeps: std::collections::HashSet::new(),
+            dawn_los_visible_couriers: Vec::new(),
+            dusk_los_visible_couriers: Vec::new(),
             turrets: config
                 .map
                 .turrets
@@ -8005,6 +8454,7 @@ impl AuthoritativeWorldState {
         std::mem::swap(&mut self.hero_stamina_regen_per_sec, &mut p.hero_stamina_regen_per_sec);
         std::mem::swap(&mut self.hero_slide_stamina_cost, &mut p.hero_slide_stamina_cost);
         std::mem::swap(&mut self.hero_jump_over_stamina_cost, &mut p.hero_jump_over_stamina_cost);
+        std::mem::swap(&mut self.stamina_exhausted, &mut p.stamina_exhausted);
         std::mem::swap(&mut self.space_hold_secs, &mut p.space_hold_secs);
         std::mem::swap(&mut self.wall_climb_mountain_index, &mut p.wall_climb_mountain_index);
         std::mem::swap(&mut self.wall_climb_last_dir, &mut p.wall_climb_last_dir);
@@ -8498,6 +8948,7 @@ impl AuthoritativeWorldState {
                 hero_stamina_regen_per_sec: hero.stamina_regen_per_sec,
                 hero_slide_stamina_cost: hero.slide_stamina_cost,
                 hero_jump_over_stamina_cost: hero.jump_over_stamina_cost,
+                stamina_exhausted: false,
                 space_hold_secs: None,
                 wall_climb_mountain_index: None,
                 wall_climb_last_dir: 1,
@@ -8589,6 +9040,9 @@ impl AuthoritativeWorldState {
                 popup_throttle_remaining: 0.0,
                 recent_hero_damagers: Vec::new(),
                 last_attacked_enemy_hero_at: -999.0,
+                attack_reveal_to_dawn_remaining: 0.0,
+                attack_reveal_to_dusk_remaining: 0.0,
+                attack_reveal_to_neutral_remaining: 0.0,
                 last_ping_at_secs: -999.0,
                 last_chat_at_secs: -999.0,
                 traversal: SharedTraversalState {
@@ -8691,6 +9145,7 @@ impl AuthoritativeWorldState {
                 hero_stamina_regen_per_sec: hero.stamina_regen_per_sec,
                 hero_slide_stamina_cost: hero.slide_stamina_cost,
                 hero_jump_over_stamina_cost: hero.jump_over_stamina_cost,
+                stamina_exhausted: false,
                 space_hold_secs: None,
                 wall_climb_mountain_index: None,
                 wall_climb_last_dir: 1,
@@ -8782,6 +9237,9 @@ impl AuthoritativeWorldState {
                 popup_throttle_remaining: 0.0,
                 recent_hero_damagers: Vec::new(),
                 last_attacked_enemy_hero_at: -999.0,
+                attack_reveal_to_dawn_remaining: 0.0,
+                attack_reveal_to_dusk_remaining: 0.0,
+                attack_reveal_to_neutral_remaining: 0.0,
                 last_ping_at_secs: -999.0,
                 last_chat_at_secs: -999.0,
                 traversal: SharedTraversalState {
@@ -8803,6 +9261,49 @@ impl AuthoritativeWorldState {
                 },
             });
         self.env_stats_initialized = false;
+    }
+
+    #[inline]
+    pub fn is_slot_los_visible_to_team(&self, viewer_team: TeamId, slot_index: usize) -> bool {
+        match viewer_team {
+            TeamId::Dawn => self
+                .dawn_los_visible_slots
+                .get(slot_index)
+                .copied()
+                .unwrap_or(false),
+            TeamId::Dusk => self
+                .dusk_los_visible_slots
+                .get(slot_index)
+                .copied()
+                .unwrap_or(false),
+            TeamId::Neutral => false,
+        }
+    }
+
+    #[inline]
+    pub fn is_creep_los_visible_to_team(&self, viewer_team: TeamId, creep_id: u64) -> bool {
+        match viewer_team {
+            TeamId::Dawn => self.dawn_los_visible_creeps.contains(&creep_id),
+            TeamId::Dusk => self.dusk_los_visible_creeps.contains(&creep_id),
+            TeamId::Neutral => false,
+        }
+    }
+
+    #[inline]
+    pub fn is_courier_los_visible_to_team(&self, viewer_team: TeamId, slot_index: usize) -> bool {
+        match viewer_team {
+            TeamId::Dawn => self
+                .dawn_los_visible_couriers
+                .get(slot_index)
+                .copied()
+                .unwrap_or(false),
+            TeamId::Dusk => self
+                .dusk_los_visible_couriers
+                .get(slot_index)
+                .copied()
+                .unwrap_or(false),
+            TeamId::Neutral => false,
+        }
     }
 
     pub fn build_snapshot_for_slot(&mut self, config: &GameConfig, items_cfg: &ItemsConfig, slot_index: usize) -> ServerWorldSnapshot {
@@ -8919,26 +9420,25 @@ impl AuthoritativeWorldState {
         let mut snap = self.build_snapshot(config, items_cfg);
         snap.scoreboard_heroes = scoreboard_heroes;
 
-        // فیلتر مه جنگ برای پرتابه‌ها، نارنجک‌ها، استخر سمی، پرتوها و هدف تاورهای دشمن
+        // فیلتر مه جنگ سه‌بعدی برای پرتابه‌ها، نارنجک‌ها، استخر سمی، پرتوها و هدف تاورهای دشمن
+        let reveal_all = self.demo_reveal_full_map;
         snap.bullets
-            .retain(|b| self.fog_of_war.is_world_point_visible(config, b.translation.x, b.translation.z));
+            .retain(|b| reveal_all || self.fog_of_war.is_world_pos_visible(config, b.translation));
         snap.grenades
-            .retain(|g| self.fog_of_war.is_world_point_visible(config, g.translation.x, g.translation.z));
+            .retain(|g| reveal_all || self.fog_of_war.is_world_pos_visible(config, g.translation));
         snap.toxic_pools
-            .retain(|tp| self.fog_of_war.is_world_point_visible(config, tp.pos.x, tp.pos.z));
+            .retain(|tp| reveal_all || self.fog_of_war.is_world_pos_visible(config, tp.pos));
         snap.electric_beams.retain(|eb| {
-            self.fog_of_war
-                .is_world_point_visible(config, eb.start_pos.x, eb.start_pos.z)
-                || self
-                    .fog_of_war
-                    .is_world_point_visible(config, eb.end_pos.x, eb.end_pos.z)
+            reveal_all
+                || self.fog_of_war.is_world_pos_visible(config, eb.start_pos)
+                || self.fog_of_war.is_world_pos_visible(config, eb.end_pos)
         });
         for t in &mut snap.turrets {
-            if t.team != viewer_team {
+            if t.team != viewer_team && !reveal_all {
                 let t_pos = self.turrets.get(t.index).map(|ts| ts.pos).unwrap_or(Vec3::ZERO);
-                let turret_vis = self.fog_of_war.is_world_point_visible(config, t_pos.x, t_pos.z);
+                let turret_vis = self.fog_of_war.is_world_pos_visible(config, t_pos);
                 let target_vis = t.aim_target_pos.is_some_and(|ap| {
-                    self.fog_of_war.is_world_point_visible(config, ap.x, ap.z)
+                    self.fog_of_war.is_world_pos_visible(config, ap)
                 });
                 if !turret_vis || !target_vis {
                     t.aim_target_pos = None;
@@ -8970,12 +9470,10 @@ impl AuthoritativeWorldState {
                 if (p_invis > 0.0 && !p_rev) || water_hidden_slots.contains(&p.slot_index) {
                     continue;
                 }
-                let origin_vis = self
-                    .fog_of_war
-                    .is_world_point_visible(config, tp.origin_pos.x, tp.origin_pos.z);
-                let dest_vis = self
-                    .fog_of_war
-                    .is_world_point_visible(config, tp.dest_pos.x, tp.dest_pos.z);
+                let origin_vis =
+                    reveal_all || self.fog_of_war.is_world_pos_visible(config, tp.origin_pos);
+                let dest_vis =
+                    reveal_all || self.fog_of_war.is_world_pos_visible(config, tp.dest_pos);
                 if !origin_vis && !dest_vis {
                     continue;
                 }
@@ -9012,7 +9510,9 @@ impl AuthoritativeWorldState {
         for p in &self.players {
             let hero_cfg = config.active_hero(p.hero_index);
             let is_vis = p.hero_team == viewer_team
-                || self.fog_of_war.is_world_point_visible(config, p.courier_pos.x, p.courier_pos.z);
+                || reveal_all
+                || (self.is_courier_los_visible_to_team(viewer_team, p.slot_index)
+                    && self.fog_of_war.is_world_pos_visible(config, p.courier_pos));
             if !is_vis {
                 continue;
             }
@@ -9044,12 +9544,17 @@ impl AuthoritativeWorldState {
                 && p.sonar_revealed_remaining <= 0.0;
             let hidden_by_water = water_hidden_slots.contains(&p.slot_index)
                 && p.sonar_revealed_remaining <= 0.0;
+            let target_vis_h =
+                SharedFogOfWar::hero_visible_height(config, p.effective_stance, p.hero_scale);
             let is_vis = !hidden_by_invis
                 && !hidden_by_water
                 && (p.hero_team == self.hero_team
                     || self.demo_reveal_full_map
                     || p.sonar_revealed_remaining > 0.0
-                    || self.fog_of_war.is_world_point_visible(config, p.soldier_pos.x, p.soldier_pos.z));
+                    || (self.is_slot_los_visible_to_team(viewer_team, p.slot_index)
+                        && self
+                            .fog_of_war
+                            .is_world_entity_visible(config, p.soldier_pos, target_vis_h)));
             // Server Authority: اگر دشمن در مه جنگ باشد، مختصات و اطلاعات او اصلاً به کلاینت ارسال نمی‌شود!
             if !is_vis {
                 continue;
@@ -9183,8 +9688,11 @@ impl AuthoritativeWorldState {
             .creeps
             .iter()
             .filter_map(|c| {
+                let c_vis_h = resolve_creep_stats(config, c.creep_type_id.as_deref()).hitbox_height;
                 let is_vis = c.team == self.hero_team
-                    || self.fog_of_war.is_world_point_visible(config, c.pos.x, c.pos.z);
+                    || reveal_all
+                    || (self.is_creep_los_visible_to_team(viewer_team, c.id)
+                        && self.fog_of_war.is_world_entity_visible(config, c.pos, c_vis_h));
                 if !is_vis {
                     return None;
                 }
@@ -9284,19 +9792,20 @@ impl AuthoritativeWorldState {
                 | GameplayFxEvent::HeroKillFeed { .. }
                 | GameplayFxEvent::CreepDenied { .. } => true,
                 GameplayFxEvent::ShotFired { muzzle_pos, .. } => {
-                    fow.is_world_point_visible(config, muzzle_pos.x, muzzle_pos.z)
+                    self.demo_reveal_full_map || fow.is_world_pos_visible(config, *muzzle_pos)
                 }
                 GameplayFxEvent::BulletTrailSegment { start, end, .. } => {
-                    fow.is_world_point_visible(config, start.x, start.z)
-                        || fow.is_world_point_visible(config, end.x, end.z)
+                    self.demo_reveal_full_map
+                        || fow.is_world_pos_visible(config, *start)
+                        || fow.is_world_pos_visible(config, *end)
                 }
                 GameplayFxEvent::BulletImpact { impact_pos, .. } => {
-                    fow.is_world_point_visible(config, impact_pos.x, impact_pos.z)
+                    self.demo_reveal_full_map || fow.is_world_pos_visible(config, *impact_pos)
                 }
                 GameplayFxEvent::GrenadeExploded { pos, .. }
                 | GameplayFxEvent::SlideDust { pos }
                 | GameplayFxEvent::WaterSplash { pos, .. } => {
-                    fow.is_world_point_visible(config, pos.x, pos.z)
+                    self.demo_reveal_full_map || fow.is_world_pos_visible(config, *pos)
                 }
                 // این دو رویداد صرفاً از طریق pending_private_fx برای خود بازیکن ارسال می‌شوند
                 GameplayFxEvent::HeroLeveledUp { .. }
@@ -9313,10 +9822,11 @@ impl AuthoritativeWorldState {
                     let t_vis = self
                         .turrets
                         .get(*turret_index)
-                        .is_some_and(|t| fow.is_world_point_visible(config, t.pos.x, t.pos.z));
-                    t_team_match
+                        .is_some_and(|t| fow.is_world_pos_visible(config, t.pos));
+                    self.demo_reveal_full_map
+                        || t_team_match
                         || t_vis
-                        || fow.is_world_point_visible(config, target_pos.x, target_pos.z)
+                        || fow.is_world_pos_visible(config, *target_pos)
                 }
                 GameplayFxEvent::TeleportStarted {
                     slot_index: tp_slot,
@@ -9334,8 +9844,9 @@ impl AuthoritativeWorldState {
                         .is_some_and(|p| p.hero_team == viewer_team);
                     is_ally
                         || (!is_slot_hidden(*tp_slot)
-                            && (fow.is_world_point_visible(config, origin_pos.x, origin_pos.z)
-                                || fow.is_world_point_visible(config, dest_pos.x, dest_pos.z)))
+                            && (self.demo_reveal_full_map
+                                || fow.is_world_pos_visible(config, *origin_pos)
+                                || fow.is_world_pos_visible(config, *dest_pos)))
                 }
                 GameplayFxEvent::TeleportCanceled {
                     slot_index: tp_slot,
@@ -9347,7 +9858,8 @@ impl AuthoritativeWorldState {
                         .is_some_and(|p| p.hero_team == viewer_team);
                     is_ally
                         || (!is_slot_hidden(*tp_slot)
-                            && fow.is_world_point_visible(config, origin_pos.x, origin_pos.z))
+                            && (self.demo_reveal_full_map
+                                || fow.is_world_pos_visible(config, *origin_pos)))
                 }
                 GameplayFxEvent::ShadowBladeActivated {
                     slot_index: sb_slot,
@@ -9361,7 +9873,9 @@ impl AuthoritativeWorldState {
                         .players
                         .get(*sb_slot)
                         .is_some_and(|p| p.hero_team == viewer_team);
-                    is_ally || fow.is_world_point_visible(config, pos.x, pos.z)
+                    is_ally
+                        || self.demo_reveal_full_map
+                        || fow.is_world_pos_visible(config, *pos)
                 }
                 GameplayFxEvent::CombatPopup { pos, .. }
                 | GameplayFxEvent::TacticalPulse { pos, .. }
@@ -9369,7 +9883,7 @@ impl AuthoritativeWorldState {
                 | GameplayFxEvent::EvadeMiss { pos }
                 | GameplayFxEvent::LifestealHeal { pos, .. }
                 | GameplayFxEvent::ReflectHitPulse { pos, .. } => {
-                    self.demo_reveal_full_map || fow.is_world_point_visible(config, pos.x, pos.z)
+                    self.demo_reveal_full_map || fow.is_world_pos_visible(config, *pos)
                 }
             };
             if keep {
@@ -9395,6 +9909,7 @@ impl AuthoritativeWorldState {
         self.hero_stamina_regen_per_sec = hero.stamina_regen_per_sec;
         self.hero_slide_stamina_cost = hero.slide_stamina_cost;
         self.hero_jump_over_stamina_cost = hero.jump_over_stamina_cost;
+        self.stamina_exhausted = false;
         self.space_hold_secs = None;
         self.hero_armor = hero.armor;
         self.hero_scale = hero.hero_scale;
@@ -10084,6 +10599,59 @@ pub fn enemy_fountain_damage_for_pos(config: &GameConfig, hero_team: TeamId, pos
     best_dps
 }
 
+/// مکانیک Dota 2 Attack-Reveal: با شلیک به هر واحد دشمن یا کمپ جنگلی، مکان مهاجم برای مدت مشخصی برای آن تیم/کمپ لو می‌رود
+fn mark_attacker_revealed_to_team(
+    world: &mut AuthoritativeWorldState,
+    attacker_slot_opt: Option<usize>,
+    victim_team: TeamId,
+    config: &GameConfig,
+) {
+    let Some(attacker_slot) = attacker_slot_opt else {
+        return;
+    };
+    let dur = config.combat.attack_reveal_duration_secs;
+    if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == attacker_slot) {
+        if attacker.hero_team == victim_team {
+            return;
+        }
+        match victim_team {
+            TeamId::Dawn => {
+                attacker.attack_reveal_to_dawn_remaining =
+                    attacker.attack_reveal_to_dawn_remaining.max(dur);
+            }
+            TeamId::Dusk => {
+                attacker.attack_reveal_to_dusk_remaining =
+                    attacker.attack_reveal_to_dusk_remaining.max(dur);
+            }
+            TeamId::Neutral => {
+                attacker.attack_reveal_to_neutral_remaining =
+                    attacker.attack_reveal_to_neutral_remaining.max(dur);
+            }
+        }
+    }
+}
+
+/// بیدار کردن کل سربازان کمپ جنگلی به‌طور هم‌زمان و ثبت هدف مهاجم + فعال‌سازی Attack-Reveal
+fn aggro_creep_and_camp_on_hit(
+    world: &mut AuthoritativeWorldState,
+    hit_creep_idx: usize,
+    attacker_slot_opt: Option<usize>,
+    config: &GameConfig,
+) {
+    let victim_team = world.creeps[hit_creep_idx].team;
+    mark_attacker_revealed_to_team(world, attacker_slot_opt, victim_team, config);
+    if let Some(hit_camp_idx) = world.creeps[hit_creep_idx].camp_index {
+        for c in &mut world.creeps {
+            if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
+                c.is_aggroed = true;
+                if let Some(a_slot) = attacker_slot_opt {
+                    c.aggro_target_slot = Some(a_slot);
+                }
+            }
+        }
+    }
+}
+
 fn record_hero_damage_on_victim(
     world: &mut AuthoritativeWorldState,
     victim_idx: usize,
@@ -10096,13 +10664,37 @@ fn record_hero_damage_on_victim(
     let now = world.match_elapsed_secs;
     let window = config.combat.hero_assist_window_secs;
     let victim_team = world.players[victim_idx].hero_team;
-    if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == attacker_slot) {
+    let attacker_pos = if let Some(attacker) = world.players.iter_mut().find(|p| p.slot_index == attacker_slot) {
         if attacker.hero_team == victim_team {
             return;
         }
         attacker.last_attacked_enemy_hero_at = now;
+        attacker.soldier_pos
     } else {
         return;
+    };
+    mark_attacker_revealed_to_team(world, attacker_slot_opt, victim_team, config);
+
+    // سیستم Creep Aggro مشابه Dota 2: سربازهای لاین تیم آسیب‌دیده در شعاع aggro هدفشان مهاجم می‌شود
+    let aggro_r_sq = config.combat.creep_hero_aggro_radius * config.combat.creep_hero_aggro_radius;
+    let max_y_diff = config.map.high_ground_occlusion_min_diff * 2.5;
+    for c in &mut world.creeps {
+        if c.is_dead || c.team != victim_team || c.camp_index.is_some() {
+            continue;
+        }
+        if c.hero_aggro_cooldown_secs > 0.0 {
+            continue;
+        }
+        if (c.pos.y - attacker_pos.y).abs() > max_y_diff {
+            continue;
+        }
+        let d_xz_sq = Vec2::new(c.pos.x - attacker_pos.x, c.pos.z - attacker_pos.z).length_squared();
+        if d_xz_sq <= aggro_r_sq {
+            c.hero_aggro_target_slot = Some(attacker_slot);
+            c.hero_aggro_remaining_secs = config.combat.creep_hero_aggro_duration_secs;
+            c.hero_aggro_cooldown_secs = config.combat.creep_hero_aggro_duration_secs
+                + config.combat.creep_hero_aggro_cooldown_secs;
+        }
     }
     let damagers = &mut world.players[victim_idx].recent_hero_damagers;
     damagers.retain(|&(_, ts)| (now - ts) <= window);
@@ -10757,6 +11349,18 @@ fn shared_authoritative_drive_system(
     }
     let dt = time.delta_secs();
     world.step_pause_system(dt, &config);
+    for p in &mut world.players {
+        if p.is_dead {
+            p.attack_reveal_to_dawn_remaining = 0.0;
+            p.attack_reveal_to_dusk_remaining = 0.0;
+            p.attack_reveal_to_neutral_remaining = 0.0;
+        } else {
+            p.attack_reveal_to_dawn_remaining = (p.attack_reveal_to_dawn_remaining - dt).max(0.0);
+            p.attack_reveal_to_dusk_remaining = (p.attack_reveal_to_dusk_remaining - dt).max(0.0);
+            p.attack_reveal_to_neutral_remaining =
+                (p.attack_reveal_to_neutral_remaining - dt).max(0.0);
+        }
+    }
     if world.winning_team.is_some() || world.pause_phase != PausePhase::Running {
         for (_, _, mut controller) in &mut soldier_query {
             controller.translation = None;
@@ -10897,6 +11501,7 @@ fn shared_authoritative_drive_system(
         &physics_world,
         &mut world,
         &target_query,
+        &obstacle_query,
         &elev_query,
     );
 
@@ -11024,6 +11629,7 @@ fn shared_drive_single_player(
             world.is_dead = false;
             world.hero_hp = world.hero_max_hp;
             world.hero_stamina = world.hero_max_stamina;
+            world.stamina_exhausted = false;
             world.space_hold_secs = None;
             world.wall_climb_mountain_index = None;
             world.wall_climb_last_dir = 1;
@@ -11071,7 +11677,11 @@ fn shared_drive_single_player(
         };
         let effective_hp_regen = (world.hero_hp_regen_per_sec + fountain_bonus) * cryo_heal_mult;
         world.hero_hp = (world.hero_hp + effective_hp_regen * dt).min(world.hero_max_hp);
-        world.hero_stamina = (world.hero_stamina + world.hero_stamina_regen_per_sec * dt).min(world.hero_max_stamina);
+        let mut stamina_drained_this_tick = false;
+        let hero_stamina_resume_min = config.active_hero(world.hero_index).stamina_exhausted_resume_min;
+        if world.stamina_exhausted && world.hero_stamina >= hero_stamina_resume_min {
+            world.stamina_exhausted = false;
+        }
 
         if input.switch_weapon_just_pressed
             && !world.traversal.is_active
@@ -11213,6 +11823,11 @@ fn shared_drive_single_player(
 
         world.effective_stance = if input.shift_held {
             Stance::Walk
+        } else if world.base_stance == Stance::Run
+            && (world.stamina_exhausted || world.hero_stamina <= 0.0)
+        {
+            // در صورت تمام شدن استامینا هنگام دویدن، به‌صورت خودکار به راه رفتن تبدیل می‌شود
+            Stance::Walk
         } else {
             world.base_stance
         };
@@ -11289,7 +11904,11 @@ fn shared_drive_single_player(
                 if e_slot == world.active_slot || e_team == world.hero_team || e_dead || !water_visible {
                     continue;
                 }
-                if !world.fog_of_war.is_world_point_visible(config, e_pos.x, e_pos.z) {
+                let e_vis_h = SharedFogOfWar::hero_visible_height(config, e_stance, e_scale);
+                if !world.demo_reveal_full_map
+                    && !(world.is_slot_los_visible_to_team(world.hero_team, e_slot)
+                        && world.fog_of_war.is_world_entity_visible(config, e_pos, e_vis_h))
+                {
                     continue;
                 }
                 let e_rad =
@@ -11332,10 +11951,14 @@ fn shared_drive_single_player(
                 if !is_enemy && !is_deniable {
                     continue;
                 }
-                if is_enemy && !world.fog_of_war.is_world_point_visible(config, c.pos.x, c.pos.z) {
+                let c_stats = resolve_creep_stats(config, c.creep_type_id.as_deref());
+                if is_enemy
+                    && !world.demo_reveal_full_map
+                    && !(world.is_creep_los_visible_to_team(world.hero_team, c.id)
+                        && world.fog_of_war.is_world_entity_visible(config, c.pos, c_stats.hitbox_height))
+                {
                     continue;
                 }
-                let c_stats = resolve_creep_stats(config, c.creep_type_id.as_deref());
                 let c_rad = c_stats.collider_radius * config.combat.aim_lock_radius_multiplier;
                 if let Some(toi) = segment_hits_hero_capsule(
                     input.aim_ray_origin,
@@ -11366,7 +11989,10 @@ fn shared_drive_single_player(
                 if p.hero_team == world.hero_team || p.courier_is_dead {
                     continue;
                 }
-                if !world.fog_of_war.is_world_point_visible(config, p.courier_pos.x, p.courier_pos.z) {
+                if !world.demo_reveal_full_map
+                    && !(world.is_courier_los_visible_to_team(world.hero_team, p.slot_index)
+                        && world.fog_of_war.is_world_pos_visible(config, p.courier_pos))
+                {
                     continue;
                 }
                 let h_cfg = config.active_hero(p.hero_index);
@@ -11544,6 +12170,7 @@ fn shared_drive_single_player(
             soldier_tf,
             controller,
             dt,
+            &mut stamina_drained_this_tick,
         );
         if !is_wall_climbing {
         step_traversal_custom(
@@ -11581,13 +12208,23 @@ fn shared_drive_single_player(
             let shallow_mult = hero_cfg.shallow_water_speed_multiplier;
             let deep_mult = hero_cfg.deep_water_speed_multiplier;
 
+            let can_swim_move = !world.stamina_exhausted && world.hero_stamina > 0.0;
             if is_deep_water && !world.traversal.is_active && world.wall_climb_mountain_index.is_none() {
-                if world.is_moving {
+                if world.is_moving && can_swim_move {
+                    let swim_drain = hero_cfg.swim_stamina_drain_per_sec * dt;
+                    if swim_drain > 0.0 {
+                        world.hero_stamina = (world.hero_stamina - swim_drain).max(0.0);
+                        stamina_drained_this_tick = true;
+                        if world.hero_stamina <= 0.0 {
+                            world.stamina_exhausted = true;
+                        }
+                    }
                     world.current_locomotion = "swimming".to_string();
                     world.firing_anim_remaining = None;
                     // در عمق زیاد آب، هیرو به سمت جهت حرکت خود می‌چرخد
                     world.soldier_facing_dir = world.move_input.normalize();
                 } else {
+                    // با اتمام استامینا در آب عمیق، هیرو در حالت شناور باقی می‌ماند و حرکت نمی‌کند
                     world.current_locomotion = "treading_water".to_string();
                 }
             }
@@ -11623,12 +12260,25 @@ fn shared_drive_single_player(
                     shallow_mult
                 };
                 let water_speed = base_speed * depth_mult;
-                world.current_move_speed = water_speed;
-                if world.is_moving {
+                if !is_deep_water && world.is_moving && world.effective_stance == Stance::Run {
+                    let run_drain = hero_cfg.run_stamina_drain_per_sec * dt;
+                    if run_drain > 0.0 {
+                        world.hero_stamina = (world.hero_stamina - run_drain).max(0.0);
+                        stamina_drained_this_tick = true;
+                        if world.hero_stamina <= 0.0 {
+                            world.stamina_exhausted = true;
+                        }
+                    }
+                }
+                let allow_water_move = if is_deep_water { can_swim_move } else { true };
+                world.current_move_speed = if allow_water_move { water_speed } else { 0.0 };
+                if world.is_moving && allow_water_move {
                     let desired_delta =
                         world.move_input.normalize() * water_speed * dt + flow_drift;
                     controller.translation =
                         Some(Vec3::new(desired_delta.x, grav_y, desired_delta.z));
+                } else if is_deep_water && !can_swim_move {
+                    controller.translation = Some(Vec3::new(0.0, grav_y, 0.0));
                 } else {
                     controller.translation = Some(Vec3::new(flow_drift.x, grav_y, flow_drift.z));
                 }
@@ -11662,6 +12312,16 @@ fn shared_drive_single_player(
                 Stance::Walk => config.soldier.walk_speed,
                 Stance::Crouch => config.soldier.crouch_speed,
             } * hero_move_mult;
+            if world.is_moving && world.effective_stance == Stance::Run {
+                let run_drain = config.active_hero(world.hero_index).run_stamina_drain_per_sec * dt;
+                if run_drain > 0.0 {
+                    world.hero_stamina = (world.hero_stamina - run_drain).max(0.0);
+                    stamina_drained_this_tick = true;
+                    if world.hero_stamina <= 0.0 {
+                        world.stamina_exhausted = true;
+                    }
+                }
+            }
             world.current_move_speed = speed;
             if world.is_moving {
                 let desired_delta = world.move_input.normalize() * speed * dt;
@@ -11669,6 +12329,15 @@ fn shared_drive_single_player(
             } else {
                 controller.translation = Some(Vec3::new(0.0, grav_y, 0.0));
             }
+            }
+        }
+
+        // احیای استامینا فقط در حالت‌هایی که مصرف فعال نداریم (ایستاده، راه رفتن، نشستن، شناور، توقف روی صخره)
+        if !stamina_drained_this_tick && !world.traversal.is_active {
+            world.hero_stamina = (world.hero_stamina + world.hero_stamina_regen_per_sec * dt)
+                .min(world.hero_max_stamina);
+            if world.stamina_exhausted && world.hero_stamina >= hero_stamina_resume_min {
+                world.stamina_exhausted = false;
             }
         }
     }
@@ -11719,8 +12388,10 @@ fn step_wall_climb_custom(
     soldier_tf: &mut Transform,
     controller: &mut CustomCharacterController,
     dt: f32,
+    stamina_drained_this_tick: &mut bool,
 ) -> bool {
-    let wc = &config.active_hero(world.hero_index).wall_climb;
+    let hero_cfg = config.active_hero(world.hero_index);
+    let wc = &hero_cfg.wall_climb;
 
     if let Some(mtn_idx) = world.wall_climb_mountain_index {
         let Some(mtn) = config.map.mountains.get(mtn_idx) else {
@@ -11752,16 +12423,28 @@ fn step_wall_climb_custom(
         let mut cur_y = world.soldier_pos.y;
         let move_up = input.move_input.z < -0.15;
         let move_down = input.move_input.z > 0.15;
+        let can_climb_move = !world.stamina_exhausted && world.hero_stamina > 0.0;
 
-        if move_up {
-            cur_y += wc.climb_up_speed * dt;
-            world.wall_climb_last_dir = 1;
-            world.current_locomotion = "climbing_up_wall".to_string();
-        } else if move_down {
-            cur_y -= wc.climb_down_speed * dt;
-            world.wall_climb_last_dir = -1;
-            world.current_locomotion = "climbing_down_wall".to_string();
+        if (move_up || move_down) && can_climb_move {
+            let climb_drain = hero_cfg.climb_stamina_drain_per_sec * dt;
+            if climb_drain > 0.0 {
+                world.hero_stamina = (world.hero_stamina - climb_drain).max(0.0);
+                *stamina_drained_this_tick = true;
+                if world.hero_stamina <= 0.0 {
+                    world.stamina_exhausted = true;
+                }
+            }
+            if move_up {
+                cur_y += wc.climb_up_speed * dt;
+                world.wall_climb_last_dir = 1;
+                world.current_locomotion = "climbing_up_wall".to_string();
+            } else {
+                cur_y -= wc.climb_down_speed * dt;
+                world.wall_climb_last_dir = -1;
+                world.current_locomotion = "climbing_down_wall".to_string();
+            }
         } else {
+            // با اتمام استامینا روی صخره، هیرو سر جای خود می‌ماند و حرکت نمی‌کند تا استامینا برگردد
             world.current_locomotion = if world.wall_climb_last_dir >= 0 {
                 "climbing_up_wall_paused".to_string()
             } else {
@@ -11769,7 +12452,7 @@ fn step_wall_climb_custom(
             };
         }
 
-        if cur_y >= wc.top_exit_y - wc.top_ledge_trigger_below && move_up {
+        if cur_y >= wc.top_exit_y - wc.top_ledge_trigger_below && move_up && can_climb_move {
             world.wall_climb_mountain_index = None;
             let into_plateau = -wall_normal;
             let start_pos = Vec3::new(
@@ -13799,13 +14482,7 @@ fn apply_aoe_explosion(
                 items_cfg,
             );
             world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
-            if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
-                for c in &mut world.creeps {
-                    if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
-                        c.is_aggroed = true;
-                    }
-                }
-            }
+            aggro_creep_and_camp_on_hit(world, c_idx, owner_slot, config);
             if world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead {
                 world.creeps[c_idx].is_dead = true;
                 world.creeps[c_idx].anim_state = CreepAnimState::Die;
@@ -14633,13 +15310,7 @@ fn shared_authoritative_react_system(
                 &items_cfg,
             );
             world.creeps[c_idx].hp = (world.creeps[c_idx].hp - effective_dmg).max(0.0);
-            if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
-                for c in &mut world.creeps {
-                    if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
-                        c.is_aggroed = true;
-                    }
-                }
-            }
+            aggro_creep_and_camp_on_hit(&mut world, c_idx, bullet.owner_slot, &config);
 
             let creep_killed = world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead;
             if creep_killed {
@@ -15300,13 +15971,7 @@ fn shared_authoritative_react_system(
                 &items_cfg,
             );
             world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
-            if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
-                for c in &mut world.creeps {
-                    if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
-                        c.is_aggroed = true;
-                    }
-                }
-            }
+            aggro_creep_and_camp_on_hit(&mut world, c_idx, Some(owner_slot), &config);
             if world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead {
                 world.creeps[c_idx].is_dead = true;
                 world.creeps[c_idx].anim_state = CreepAnimState::Die;
@@ -15569,13 +16234,7 @@ fn shared_authoritative_react_system(
                     &items_cfg,
                 );
                 world.creeps[c_idx].hp = (world.creeps[c_idx].hp - eff_dmg).max(0.0);
-                if let Some(hit_camp_idx) = world.creeps[c_idx].camp_index {
-                    for c in &mut world.creeps {
-                        if c.camp_index == Some(hit_camp_idx) && !c.is_dead {
-                            c.is_aggroed = true;
-                        }
-                    }
-                }
+                aggro_creep_and_camp_on_hit(&mut world, c_idx, pool.owner_slot, &config);
                 if world.creeps[c_idx].hp <= 0.0 && !world.creeps[c_idx].is_dead {
                     world.creeps[c_idx].is_dead = true;
                     world.creeps[c_idx].anim_state = CreepAnimState::Die;
@@ -15683,13 +16342,40 @@ fn shared_authoritative_react_system(
             )
         })
         .collect();
-    let all_hero_vision: Vec<(usize, TeamId, Vec3, f32)> = world
+    let all_hero_vision: Vec<(usize, TeamId, Vec3, Stance, f32, f32, f32)> = world
         .players
         .iter()
         .filter(|p| !p.is_dead)
         .map(|p| {
             let h = config.active_hero(p.hero_index);
-            (p.slot_index, p.hero_team, p.soldier_pos, config.hero_effective_vision(h, world.match_elapsed_secs, world.current_weather))
+            (
+                p.slot_index,
+                p.hero_team,
+                p.soldier_pos,
+                p.effective_stance,
+                p.hero_scale,
+                config.hero_effective_vision(h, world.match_elapsed_secs, world.current_weather),
+                h.high_ground_vision_bonus,
+            )
+        })
+        .collect();
+    let attack_revealed_enemies: Vec<(TeamId, Vec3, Stance, f32, bool, bool)> = world
+        .players
+        .iter()
+        .filter(|p| {
+            !p.is_dead
+                && !(p.invisibility_remaining > 0.0 && !p.is_revealed_by_turret)
+                && (p.attack_reveal_to_dawn_remaining > 0.0 || p.attack_reveal_to_dusk_remaining > 0.0)
+        })
+        .map(|p| {
+            (
+                p.hero_team,
+                p.soldier_pos,
+                p.effective_stance,
+                p.hero_scale,
+                p.attack_reveal_to_dawn_remaining > 0.0,
+                p.attack_reveal_to_dusk_remaining > 0.0,
+            )
         })
         .collect();
 
@@ -15731,7 +16417,13 @@ fn shared_authoritative_react_system(
                         || e_team == world.hero_team
                         || e_dead
                         || !water_visible
-                        || !world.fog_of_war.is_world_point_visible(&config, e_pos.x, e_pos.z)
+                        || (!world.demo_reveal_full_map
+                            && !(world.is_slot_los_visible_to_team(world.hero_team, e_slot)
+                                && world.fog_of_war.is_world_entity_visible(
+                                    &config,
+                                    e_pos,
+                                    SharedFogOfWar::hero_visible_height(&config, e_stance, e_scale),
+                                )))
                     {
                         continue;
                     }
@@ -15771,7 +16463,12 @@ fn shared_authoritative_react_system(
                     if !is_enemy && !is_deniable {
                         continue;
                     }
-                    if is_enemy && !world.fog_of_war.is_world_point_visible(&config, c.pos.x, c.pos.z) {
+                    let c_vis_h = resolve_creep_stats(&config, c.creep_type_id.as_deref()).hitbox_height;
+                    if is_enemy
+                        && !world.demo_reveal_full_map
+                        && !(world.is_creep_los_visible_to_team(world.hero_team, c.id)
+                            && world.fog_of_war.is_world_entity_visible(&config, c.pos, c_vis_h))
+                    {
                         continue;
                     }
                     if let Some(toi) = segment_hits_hero_capsule(
@@ -15820,39 +16517,92 @@ fn shared_authoritative_react_system(
             let mut live_allied_structures: Vec<(Vec3, f32)> = Vec::new();
             for ftn in &config.map.fountains {
                 if ftn.team == my_team {
-                    live_allied_structures.push((ftn.model_transform.location_vec(), 24.0));
+                    live_allied_structures.push((
+                        ftn.model_transform.location_vec(),
+                        config.map.fow_fountain_vision_range,
+                    ));
                 }
             }
             for a in &world.ancients {
                 if !a.is_dead && a.team == my_team {
-                    live_allied_structures.push((a.pos, 26.0));
+                    live_allied_structures.push((a.pos, config.map.fow_ancient_vision_range));
                 }
             }
             for t in &world.turrets {
                 if !t.is_dead && t.team == my_team {
-                    let rng = config
-                        .map
-                        .turrets
-                        .get(t.index)
-                        .map(|td| td.attack_range + 4.0)
-                        .unwrap_or(24.0);
-                    live_allied_structures.push((t.pos, rng));
+                    if let Some(td) = config.map.turrets.get(t.index) {
+                        live_allied_structures.push((t.pos, td.vision_range));
+                    }
                 }
             }
             for b in &world.barracks {
                 if !b.is_dead && b.team == my_team {
-                    live_allied_structures.push((b.pos, 20.0));
+                    live_allied_structures.push((b.pos, config.map.fow_barracks_vision_range));
                 }
             }
-            world
-                .fog_of_war
-                .update_for_hero(&config, hero_pos, hero, hero_alive, &live_allied_structures, &allied_creep_positions, elapsed_secs, cur_weather);
+            let hero_stance = world.effective_stance;
+            world.fog_of_war.update_for_hero_with_stance(
+                &config,
+                hero_pos,
+                hero_stance,
+                hero,
+                hero_alive,
+                &live_allied_structures,
+                &allied_creep_positions,
+                elapsed_secs,
+                cur_weather,
+            );
             for (c_pos, c_range) in allied_courier_vision {
-                world.fog_of_war.reveal_from_source(&config, c_pos, c_range * courier_mult, 48);
+                world.fog_of_war.reveal_from_source_with_eye(
+                    &config,
+                    c_pos,
+                    0.0,
+                    c_range * courier_mult,
+                    72,
+                );
             }
-            for &(ally_slot, ally_team, ally_pos, ally_range) in &all_hero_vision {
+            for &(ally_slot, ally_team, ally_pos, ally_stance, ally_scale, ally_base_range, ally_hg_bonus) in &all_hero_vision {
                 if ally_team == my_team && ally_slot != world.active_slot {
-                    world.fog_of_war.reveal_from_source(&config, ally_pos, ally_range, 144);
+                    let (ally_ground_y, ally_under_bridge) =
+                        world.fog_of_war.effective_observer_y(&config, ally_pos);
+                    let ally_range = ally_base_range
+                        + if !ally_under_bridge
+                            && ally_ground_y >= config.map.high_ground_occlusion_min_diff
+                        {
+                            ally_hg_bonus
+                        } else {
+                            0.0
+                        };
+                    let ally_eye = SharedFogOfWar::hero_eye_height(&config, ally_stance, ally_scale);
+                    world.fog_of_war.reveal_from_source_with_eye(
+                        &config,
+                        ally_pos,
+                        ally_eye,
+                        ally_range,
+                        160,
+                    );
+                }
+            }
+            for &(enemy_team, enemy_pos, enemy_stance, enemy_scale, rev_dawn, rev_dusk) in
+                &attack_revealed_enemies
+            {
+                if enemy_team == my_team {
+                    continue;
+                }
+                let revealed_to_us = match my_team {
+                    TeamId::Dawn => rev_dawn,
+                    TeamId::Dusk => rev_dusk,
+                    TeamId::Neutral => false,
+                };
+                if revealed_to_us {
+                    let e_eye = SharedFogOfWar::hero_eye_height(&config, enemy_stance, enemy_scale);
+                    world.fog_of_war.reveal_from_source_with_eye(
+                        &config,
+                        enemy_pos,
+                        e_eye,
+                        config.combat.attack_reveal_vision_radius,
+                        48,
+                    );
                 }
             }
         }
@@ -15864,11 +16614,13 @@ fn shared_authoritative_react_system(
         }
     }
 
+    recompute_team_3d_los_visibility(&config, &physics_world, &mut world);
+
     for idx in 0..world.targets.len() {
         let t_pos = world.targets[idx].base_pos;
         if world.players.is_empty() {
             world.targets_visible[idx] =
-                world.fog_of_war.is_world_point_visible(&config, t_pos.x, t_pos.z);
+                world.demo_reveal_full_map || world.fog_of_war.is_world_pos_visible(&config, t_pos);
         } else {
             world.targets_visible[idx] = true;
         }
@@ -15876,6 +16628,226 @@ fn shared_authoritative_react_system(
 
     if let Some(ref mut active_input) = world.active_input {
         active_input.consume_just_pressed();
+    }
+}
+
+/// محاسبه دقیق و یکپارچه خط دید فیزیکی سه‌بعدی برای هر دو تیم (هیروها، سربازان، تاورها، سازه‌ها و کوریرها)
+/// تا قانون میدان دید برای همه موجودیت‌ها کاملاً یکسان و بدون نشت سلولی پشت سنگرهای کم‌ارتفاع باشد
+fn recompute_team_3d_los_visibility(
+    config: &GameConfig,
+    physics_world: &CustomPhysicsWorld,
+    world: &mut AuthoritativeWorldState,
+) {
+    let p_len = world.players.len();
+    world.dawn_los_visible_slots.clear();
+    world.dawn_los_visible_slots.resize(p_len, false);
+    world.dusk_los_visible_slots.clear();
+    world.dusk_los_visible_slots.resize(p_len, false);
+    world.dawn_los_visible_couriers.clear();
+    world.dawn_los_visible_couriers.resize(p_len, false);
+    world.dusk_los_visible_couriers.clear();
+    world.dusk_los_visible_couriers.resize(p_len, false);
+    world.dawn_los_visible_creeps.clear();
+    world.dusk_los_visible_creeps.clear();
+
+    if p_len == 0 {
+        return;
+    }
+
+    let elapsed = world.match_elapsed_secs;
+    let weather = world.current_weather;
+    let struct_mult = config.effective_vision_multiplier(elapsed, config.day_night.night_turret_vision_multiplier);
+    let creep_mult = config.effective_vision_multiplier(elapsed, config.day_night.night_creep_vision_multiplier);
+    let courier_mult = config.effective_vision_multiplier(elapsed, config.day_night.night_courier_vision_multiplier);
+    let struct_eye = config.map.fow_stand_eye_height;
+
+    // (feet_pos, eye_height, base_range, high_ground_bonus, clear_radius)
+    let mut dawn_obs: Vec<(Vec3, f32, f32, f32, f32)> = Vec::with_capacity(32);
+    let mut dusk_obs: Vec<(Vec3, f32, f32, f32, f32)> = Vec::with_capacity(32);
+
+    for p in &world.players {
+        let h = config.active_hero(p.hero_index);
+        if !p.is_dead {
+            let eye = SharedFogOfWar::hero_eye_height(config, p.effective_stance, p.hero_scale);
+            let rng = config.hero_effective_vision(h, elapsed, weather);
+            let item = (p.soldier_pos, eye, rng, h.high_ground_vision_bonus, 0.0);
+            match p.hero_team {
+                TeamId::Dawn => dawn_obs.push(item),
+                TeamId::Dusk => dusk_obs.push(item),
+                TeamId::Neutral => {}
+            }
+        }
+        if !p.courier_is_dead {
+            let c_rng = h.courier.vision_range * courier_mult;
+            let item = (p.courier_pos, 0.0, c_rng, 0.0, 0.0);
+            match p.hero_team {
+                TeamId::Dawn => dawn_obs.push(item),
+                TeamId::Dusk => dusk_obs.push(item),
+                TeamId::Neutral => {}
+            }
+        }
+    }
+
+    for c in &world.creeps {
+        if c.is_dead || c.team == TeamId::Neutral {
+            continue;
+        }
+        let c_stats = resolve_creep_stats(config, c.creep_type_id.as_deref());
+        let item = (
+            c.pos,
+            c_stats.hitbox_height * 0.85,
+            c_stats.vision_range * creep_mult,
+            0.0,
+            0.0,
+        );
+        match c.team {
+            TeamId::Dawn => dawn_obs.push(item),
+            TeamId::Dusk => dusk_obs.push(item),
+            TeamId::Neutral => {}
+        }
+    }
+
+    for ftn in &config.map.fountains {
+        let pos = ftn.model_transform.location_vec();
+        let item = (
+            pos,
+            struct_eye,
+            config.map.fow_fountain_vision_range * struct_mult,
+            0.0,
+            ftn.outer_radius + 0.45,
+        );
+        match ftn.team {
+            TeamId::Dawn => dawn_obs.push(item),
+            TeamId::Dusk => dusk_obs.push(item),
+            TeamId::Neutral => {}
+        }
+    }
+    for (i, a) in world.ancients.iter().enumerate() {
+        if a.is_dead {
+            continue;
+        }
+        let ad = &config.map.ancients[i];
+        let s = ad.model_transform.scale_vec();
+        let rad = (ad.base_size.0 * s.x).max(ad.base_size.2 * s.z) * 0.5 + 0.6;
+        let item = (
+            a.pos,
+            struct_eye,
+            config.map.fow_ancient_vision_range * struct_mult,
+            0.0,
+            rad,
+        );
+        match a.team {
+            TeamId::Dawn => dawn_obs.push(item),
+            TeamId::Dusk => dusk_obs.push(item),
+            TeamId::Neutral => {}
+        }
+    }
+    for t in &world.turrets {
+        if t.is_dead {
+            continue;
+        }
+        let Some(td) = config.map.turrets.get(t.index) else {
+            continue;
+        };
+        let s = td.model_transform.scale_vec();
+        let rad = td.base_radius * s.x.max(s.z) + 0.45;
+        let ground_y = sample_terrain_top_y(config, t.pos.x, t.pos.z).max(t.pos.y);
+        let item = (
+            Vec3::new(t.pos.x, ground_y, t.pos.z),
+            struct_eye,
+            td.vision_range * struct_mult,
+            0.0,
+            rad,
+        );
+        match t.team {
+            TeamId::Dawn => dawn_obs.push(item),
+            TeamId::Dusk => dusk_obs.push(item),
+            TeamId::Neutral => {}
+        }
+    }
+    for (i, b) in world.barracks.iter().enumerate() {
+        if b.is_dead {
+            continue;
+        }
+        let bd = &config.map.barracks[i];
+        let s = bd.model_transform.scale_vec();
+        let rad = (bd.size.0 * s.x).max(bd.size.2 * s.z) * 0.5 + 0.6;
+        let item = (
+            b.pos,
+            struct_eye,
+            config.map.fow_barracks_vision_range * struct_mult,
+            0.0,
+            rad,
+        );
+        match b.team {
+            TeamId::Dawn => dawn_obs.push(item),
+            TeamId::Dusk => dusk_obs.push(item),
+            TeamId::Neutral => {}
+        }
+    }
+
+    let can_any_observer_see = |observers: &[(Vec3, f32, f32, f32, f32)],
+                                target_pos: Vec3,
+                                target_vis_h: f32|
+     -> bool {
+        for &(obs_pos, obs_eye, base_rng, hg_bonus, clear_r) in observers {
+            let to_xz = Vec2::new(target_pos.x - obs_pos.x, target_pos.z - obs_pos.z);
+            let max_r = base_rng + hg_bonus + clear_r;
+            if to_xz.length_squared() > max_r * max_r {
+                continue;
+            }
+            let start_pos = if clear_r > 0.0 {
+                let d = to_xz.length();
+                if d > clear_r {
+                    let dir = to_xz / d;
+                    Vec3::new(obs_pos.x + dir.x * clear_r, obs_pos.y, obs_pos.z + dir.y * clear_r)
+                } else {
+                    obs_pos
+                }
+            } else {
+                obs_pos
+            };
+            if can_observer_see_target_3d(
+                physics_world,
+                config,
+                start_pos,
+                obs_eye,
+                target_pos,
+                target_vis_h,
+                base_rng,
+                hg_bonus,
+            ) {
+                return true;
+            }
+        }
+        false
+    };
+
+    for p in &world.players {
+        let slot = p.slot_index;
+        let target_vis_h =
+            SharedFogOfWar::hero_visible_height(config, p.effective_stance, p.hero_scale);
+        world.dawn_los_visible_slots[slot] = p.hero_team == TeamId::Dawn
+            || (!p.is_dead && p.attack_reveal_to_dawn_remaining > 0.0)
+            || can_any_observer_see(&dawn_obs, p.soldier_pos, target_vis_h);
+        world.dusk_los_visible_slots[slot] = p.hero_team == TeamId::Dusk
+            || (!p.is_dead && p.attack_reveal_to_dusk_remaining > 0.0)
+            || can_any_observer_see(&dusk_obs, p.soldier_pos, target_vis_h);
+
+        world.dawn_los_visible_couriers[slot] = p.hero_team == TeamId::Dawn
+            || (!p.courier_is_dead && can_any_observer_see(&dawn_obs, p.courier_pos, 0.0));
+        world.dusk_los_visible_couriers[slot] = p.hero_team == TeamId::Dusk
+            || (!p.courier_is_dead && can_any_observer_see(&dusk_obs, p.courier_pos, 0.0));
+    }
+
+    for c in &world.creeps {
+        let c_vis_h = resolve_creep_stats(config, c.creep_type_id.as_deref()).hitbox_height;
+        if c.team == TeamId::Dawn || can_any_observer_see(&dawn_obs, c.pos, c_vis_h) {
+            world.dawn_los_visible_creeps.insert(c.id);
+        }
+        if c.team == TeamId::Dusk || can_any_observer_see(&dusk_obs, c.pos, c_vis_h) {
+            world.dusk_los_visible_creeps.insert(c.id);
+        }
     }
 }
 
@@ -16206,15 +17178,259 @@ fn nearest_point_on_lane_xz(lane: &LanePathDef, p_xz: Vec2) -> (Vec2, usize, f32
     (best_pt, best_seg, best_dist_sq.sqrt())
 }
 
-/// هدایت هوشمند و سبک (Zero-Allocation) برای لغزش روان روی لبه‌های مورب و منحنی پرتگاه و جلوگیری از گیر کردن
+/// استخراج پارامترهای جعبه چرخیده (OBB) یک مانع برای مسیریابی و جلوگیری از عبور سربازان از روی موانع
+#[inline]
+fn creep_obstacle_obb_2d(obs: &ObstacleDef) -> Option<(Vec2, Vec2, Quat, Quat, f32, f32)> {
+    if obs.size.0 <= 1e-4 || obs.size.1 <= 1e-4 || obs.size.2 <= 1e-4 {
+        return None;
+    }
+    let loc = obs.model_transform.location;
+    let scl = obs.model_transform.scale;
+    let hx = obs.size.0 * 0.5 * scl.0.abs();
+    let hy = obs.size.1 * 0.5 * scl.1.abs();
+    let hz = obs.size.2 * 0.5 * scl.2.abs();
+    if hx <= 1e-4 || hy <= 1e-4 || hz <= 1e-4 {
+        return None;
+    }
+    let rot_y = obs.model_transform.rotation.1.to_radians();
+    let rot = Quat::from_rotation_y(rot_y);
+    let inv_rot = Quat::from_rotation_y(-rot_y);
+    Some((
+        Vec2::new(loc.0, loc.2),
+        Vec2::new(hx, hz),
+        rot,
+        inv_rot,
+        loc.1 - hy,
+        loc.1 + hy,
+    ))
+}
+
+/// بررسی برخورد نقطه (x, y, z) سرباز با هر یک از موانع نقشه (با در نظر گرفتن ارتفاع و شعاع بدنه سرباز)
+#[inline]
+fn is_creep_blocked_by_obstacle(
+    config: &GameConfig,
+    x: f32,
+    y: f32,
+    z: f32,
+    hitbox_height: f32,
+    clearance_radius: f32,
+) -> bool {
+    let r_sq = clearance_radius * clearance_radius;
+    for obs in &config.obstacles {
+        let Some((center, half, _rot, inv_rot, min_y, max_y)) = creep_obstacle_obb_2d(obs) else {
+            continue;
+        };
+        if y + hitbox_height < min_y || y > max_y + 0.25 {
+            continue;
+        }
+        let local = inv_rot * Vec3::new(x - center.x, 0.0, z - center.y);
+        let cx = local.x.clamp(-half.x, half.x);
+        let cz = local.z.clamp(-half.y, half.y);
+        let dx = local.x - cx;
+        let dz = local.z - cz;
+        if dx * dx + dz * dz < r_sq {
+            return true;
+        }
+    }
+    false
+}
+
+/// بررسی ایمن‌بودن نقطه برای حرکت سرباز (هم بیرون از پرتگاه رودخانه و هم بیرون از تمام موانع مسیر)
+#[inline]
+fn is_creep_walkable_xz(
+    config: &GameConfig,
+    x: f32,
+    y: f32,
+    z: f32,
+    hitbox_height: f32,
+    river_margin: f32,
+    obs_radius: f32,
+) -> bool {
+    is_creep_safe_ground_xz(config, x, z, river_margin)
+        && !is_creep_blocked_by_obstacle(config, x, y, z, hitbox_height, obs_radius)
+}
+
+/// هدایت پیش‌نگرانه (Corner Steering) برای دور زدن نرم موانع روی مسیر لاین بدون گیر کردن یا نوسان چپ‌و‌راست
+fn steer_dir_around_obstacles(
+    config: &GameConfig,
+    creep_id: u64,
+    cur_pos: Vec3,
+    desired_dir: Vec3,
+    goal_xz_opt: Option<Vec2>,
+    hitbox_height: f32,
+    river_margin: f32,
+    obs_radius: f32,
+) -> Vec3 {
+    let dir2 = Vec2::new(desired_dir.x, desired_dir.z).normalize_or_zero();
+    if dir2.length_squared() < 1e-6 {
+        return desired_dir;
+    }
+
+    let lookahead = config.creeps.obstacle_avoid_lookahead_dist;
+    let cur_xz = Vec2::new(cur_pos.x, cur_pos.z);
+    let target_xz = goal_xz_opt.unwrap_or(cur_xz + dir2 * (lookahead * 2.0));
+
+    // یافتن نزدیک‌ترین مانعی که مسیر پیش‌رو را در فاصله lookahead مسدود کرده است
+    let mut blocking_obs: Option<(f32, Vec2, Vec2, Quat, Quat)> = None;
+    const SAMPLES: usize = 6;
+    for obs in &config.obstacles {
+        let Some((center, half, rot, inv_rot, min_y, max_y)) = creep_obstacle_obb_2d(obs) else {
+            continue;
+        };
+        if cur_pos.y + hitbox_height < min_y || cur_pos.y > max_y + 0.25 {
+            continue;
+        }
+        // غربالگری سریع فاصله افقی
+        let max_r = half.length() + obs_radius + lookahead;
+        if cur_xz.distance_squared(center) > max_r * max_r {
+            continue;
+        }
+        let r_sq = obs_radius * obs_radius;
+        for s in 1..=SAMPLES {
+            let d = lookahead * (s as f32 / SAMPLES as f32);
+            let p = cur_xz + dir2 * d;
+            let local = inv_rot * Vec3::new(p.x - center.x, 0.0, p.y - center.y);
+            let cx = local.x.clamp(-half.x, half.x);
+            let cz = local.z.clamp(-half.y, half.y);
+            let dx = local.x - cx;
+            let dz = local.z - cz;
+            if dx * dx + dz * dz < r_sq {
+                if blocking_obs.map_or(true, |(best_d, ..)| d < best_d) {
+                    blocking_obs = Some((d, center, half, rot, inv_rot));
+                }
+                break;
+            }
+        }
+    }
+
+    let Some((hit_dist, center, half, rot, _inv_rot)) = blocking_obs else {
+        return desired_dir;
+    };
+
+    let corner_pad = obs_radius + 0.45;
+    let local_corners = [
+        Vec3::new(half.x + corner_pad, 0.0, half.y + corner_pad),
+        Vec3::new(half.x + corner_pad, 0.0, -(half.y + corner_pad)),
+        Vec3::new(-(half.x + corner_pad), 0.0, half.y + corner_pad),
+        Vec3::new(-(half.x + corner_pad), 0.0, -(half.y + corner_pad)),
+    ];
+
+    let tie_sign = if (creep_id & 1) == 0 { 1.0_f32 } else { -1.0_f32 };
+    let perp_dir = Vec2::new(-dir2.y, dir2.x);
+    let mut best_corner: Option<(Vec2, f32)> = None;
+
+    for lc in local_corners {
+        let wc3 = Vec3::new(center.x, 0.0, center.y) + rot * lc;
+        let wc = Vec2::new(wc3.x, wc3.z);
+        if !is_creep_walkable_xz(
+            config,
+            wc.x,
+            cur_pos.y,
+            wc.y,
+            hitbox_height,
+            river_margin,
+            obs_radius * 0.9,
+        ) {
+            continue;
+        }
+        let to_c = wc - cur_xz;
+        let dist_to_c = to_c.length();
+        if dist_to_c < 0.25 {
+            continue;
+        }
+        // جلوگیری از انتخاب گوشه‌ای که کاملاً پشت سر سرباز است
+        if (to_c / dist_to_c).dot(dir2) < -0.35 {
+            continue;
+        }
+        let side_bias = if perp_dir.dot(to_c / dist_to_c) * tie_sign >= 0.0 {
+            -0.25
+        } else {
+            0.25
+        };
+        let score = dist_to_c + wc.distance(target_xz) + side_bias;
+        if best_corner.map_or(true, |(_, bs)| score < bs) {
+            best_corner = Some((wc, score));
+        }
+    }
+
+    if let Some((corner, _)) = best_corner {
+        let to_corner = (corner - cur_xz).normalize_or_zero();
+        if to_corner.length_squared() > 1e-6 {
+            let urgency = (1.0 - (hit_dist / lookahead).clamp(0.0, 1.0)) * 0.65 + 0.35;
+            let blended = (dir2 + to_corner * (config.creeps.obstacle_avoid_steer_strength * urgency))
+                .normalize_or_zero();
+            if blended.length_squared() > 1e-6 {
+                return Vec3::new(blended.x, 0.0, blended.y);
+            }
+        }
+    }
+
+    desired_dir
+}
+
+/// برطرف‌کردن قطعی هرگونه نفوذ سرباز به داخل OBB موانع پس از حرکت یا هل‌دادن فیزیکی
+fn resolve_creep_obstacle_penetration(
+    config: &GameConfig,
+    cur_pos: Vec3,
+    hitbox_height: f32,
+    river_margin: f32,
+    obs_radius: f32,
+) -> (f32, f32) {
+    let mut px = cur_pos.x;
+    let mut pz = cur_pos.z;
+    let r_sq = obs_radius * obs_radius;
+
+    for obs in &config.obstacles {
+        let Some((center, half, rot, inv_rot, min_y, max_y)) = creep_obstacle_obb_2d(obs) else {
+            continue;
+        };
+        if cur_pos.y + hitbox_height < min_y || cur_pos.y > max_y + 0.25 {
+            continue;
+        }
+        let local = inv_rot * Vec3::new(px - center.x, 0.0, pz - center.y);
+        let cx = local.x.clamp(-half.x, half.x);
+        let cz = local.z.clamp(-half.y, half.y);
+        let dx = local.x - cx;
+        let dz = local.z - cz;
+        let d_sq = dx * dx + dz * dz;
+        if d_sq < r_sq {
+            let new_local = if d_sq > 1e-6 {
+                let d = d_sq.sqrt();
+                Vec3::new(cx + (dx / d) * obs_radius, 0.0, cz + (dz / d) * obs_radius)
+            } else {
+                // مرکز سرباز داخل جعبه است: خروج از نزدیک‌ترین وجه
+                let pen_x = half.x - local.x.abs();
+                let pen_z = half.y - local.z.abs();
+                if pen_x < pen_z {
+                    let s = if local.x >= 0.0 { 1.0 } else { -1.0 };
+                    Vec3::new(s * (half.x + obs_radius), 0.0, local.z)
+                } else {
+                    let s = if local.z >= 0.0 { 1.0 } else { -1.0 };
+                    Vec3::new(local.x, 0.0, s * (half.y + obs_radius))
+                }
+            };
+            let world_out = Vec3::new(center.x, 0.0, center.y) + rot * new_local;
+            if is_creep_safe_ground_xz(config, world_out.x, world_out.z, river_margin) {
+                px = world_out.x;
+                pz = world_out.z;
+            }
+        }
+    }
+    (px, pz)
+}
+
+/// هدایت هوشمند و سبک (Zero-Allocation) برای لغزش روان روی لبه‌های پرتگاه و دور زدن موانع مسیر بدون گیر کردن
 #[inline]
 fn steer_creep_step_avoiding_river(
     config: &GameConfig,
     cur_x: f32,
+    cur_y: f32,
     cur_z: f32,
     desired_dir: Vec3,
     step_dist: f32,
+    hitbox_height: f32,
     margin: f32,
+    obs_radius: f32,
 ) -> (f32, f32, Vec3, bool) {
     let dir2 = Vec2::new(desired_dir.x, desired_dir.z).normalize_or_zero();
     if dir2.length_squared() < 1e-6 || step_dist <= 1e-6 {
@@ -16224,20 +17440,24 @@ fn steer_creep_step_avoiding_river(
     let lookahead = config.creeps.cliff_lookahead_dist.max(step_dist * 2.0);
     let direct_x = cur_x + dir2.x * step_dist;
     let direct_z = cur_z + dir2.y * step_dist;
-    let direct_step_ok = is_creep_safe_ground_xz(config, direct_x, direct_z, margin);
-    let direct_look_ok = is_creep_safe_ground_xz(
+    let direct_step_ok =
+        is_creep_walkable_xz(config, direct_x, cur_y, direct_z, hitbox_height, margin, obs_radius);
+    let direct_look_ok = is_creep_walkable_xz(
         config,
         cur_x + dir2.x * lookahead,
+        cur_y,
         cur_z + dir2.y * lookahead,
+        hitbox_height,
         margin,
+        obs_radius,
     );
 
-    // مسیر سریع: ۹۵٪ تیک‌ها که مانعی جلو نیست تنها با ۲ چک ساده برمی‌گردد
+    // مسیر سریع: در تیک‌هایی که مانع یا پرتگاهی جلو نیست تنها با ۲ چک ساده برمی‌گردد
     if direct_step_ok && direct_look_ok {
         return (direct_x, direct_z, Vec3::new(dir2.x, 0.0, dir2.y), true);
     }
 
-    // جستجوی زاویه‌ای سبک برای لغزش نرم در امتداد لبه پرتگاه یا پل (تا ±۱۳۵ درجه)
+    // جستجوی زاویه‌ای سبک برای لغزش نرم در امتداد لبه پرتگاه، پل یا مانع (تا ±۱۳۵ درجه)
     const ANGLES_DEG: [f32; 14] = [
         18.0, -18.0, 36.0, -36.0, 55.0, -55.0, 75.0, -75.0, 95.0, -95.0, 115.0, -115.0, 135.0,
         -135.0,
@@ -16253,20 +17473,26 @@ fn steer_creep_step_avoiding_river(
         let cand = Vec2::new(dir2.x * c - dir2.y * s, dir2.x * s + dir2.y * c);
         let nx = cur_x + cand.x * step_dist;
         let nz = cur_z + cand.y * step_dist;
-        if !is_creep_safe_ground_xz(config, nx, nz, margin) {
+        if !is_creep_walkable_xz(config, nx, cur_y, nz, hitbox_height, margin, obs_radius) {
             continue;
         }
-        let look_ok = is_creep_safe_ground_xz(
+        let look_ok = is_creep_walkable_xz(
             config,
             cur_x + cand.x * lookahead,
+            cur_y,
             cur_z + cand.y * lookahead,
+            hitbox_height,
             margin,
+            obs_radius,
         );
-        let half_look_ok = is_creep_safe_ground_xz(
+        let half_look_ok = is_creep_walkable_xz(
             config,
             cur_x + cand.x * (lookahead * 0.5),
+            cur_y,
             cur_z + cand.y * (lookahead * 0.5),
+            hitbox_height,
             margin,
+            obs_radius,
         );
         let align = cand.dot(dir2);
         let score = align + if look_ok { 0.65 } else if half_look_ok { 0.25 } else { -0.25 };
@@ -16286,17 +17512,20 @@ fn steer_creep_step_avoiding_river(
     }
 }
 
-/// محافظ ساده برای هل‌دادن‌های فیزیکی (تاور و جداسازی سربازان) تا هیچ‌گاه سربازی به داخل دره پرتاب نشود
+/// محافظ ساده برای هل‌دادن‌های فیزیکی (تاور و جداسازی سربازان) تا سرباز به داخل دره یا مانع پرتاب نشود
 #[inline]
 fn move_creep_xz_with_river_barrier(
     config: &GameConfig,
     cur_x: f32,
+    cur_y: f32,
     cur_z: f32,
     next_x: f32,
     next_z: f32,
+    hitbox_height: f32,
     margin: f32,
+    obs_radius: f32,
 ) -> (f32, f32, bool) {
-    if is_creep_safe_ground_xz(config, next_x, next_z, margin) {
+    if is_creep_walkable_xz(config, next_x, cur_y, next_z, hitbox_height, margin, obs_radius) {
         return (next_x, next_z, true);
     }
     let delta = Vec2::new(next_x - cur_x, next_z - cur_z);
@@ -16307,10 +17536,13 @@ fn move_creep_xz_with_river_barrier(
     let (sx, sz, _, ok) = steer_creep_step_avoiding_river(
         config,
         cur_x,
+        cur_y,
         cur_z,
         Vec3::new(delta.x / dist, 0.0, delta.y / dist),
         dist,
+        hitbox_height,
         margin,
+        obs_radius,
     );
     (sx, sz, ok)
 }
@@ -16322,6 +17554,7 @@ fn step_lane_creeps_system(
     physics_world: &CustomPhysicsWorld,
     world: &mut AuthoritativeWorldState,
     target_query: &Query<&PhysicsTarget>,
+    obstacle_query: &Query<(&PhysicsObstacle, &Transform), Without<PhysicsSoldier>>,
     elev_query: &Query<&ElevationSurface>,
 ) {
     world.match_elapsed_secs += dt;
@@ -16371,6 +17604,10 @@ fn step_lane_creeps_system(
                         creep_type_id: None,
                         camp_index: None,
                         is_aggroed: true,
+                        aggro_target_slot: None,
+                        hero_aggro_target_slot: None,
+                        hero_aggro_remaining_secs: 0.0,
+                        hero_aggro_cooldown_secs: 0.0,
                         home_pos: spawn_pos,
                         lane: lane_def.lane,
                         waypoint_index: next_wp_idx,
@@ -16432,6 +17669,10 @@ fn step_lane_creeps_system(
                     creep_type_id: Some(tid.clone()),
                     camp_index: Some(camp_idx),
                     is_aggroed: false,
+                    aggro_target_slot: None,
+                    hero_aggro_target_slot: None,
+                    hero_aggro_remaining_secs: 0.0,
+                    hero_aggro_cooldown_secs: 0.0,
                     home_pos: spawn_pos,
                     lane: LaneId::Mid,
                     waypoint_index: 0,
@@ -16466,7 +17707,7 @@ fn step_lane_creeps_system(
         .iter()
         .map(|c| (c.id, c.team, c.pos, c.is_dead, c.is_aggroed))
         .collect();
-    let hero_snap: Vec<(TeamId, Vec3, bool, bool, bool)> = world
+    let hero_snap: Vec<(usize, TeamId, Vec3, Stance, f32, bool, bool, bool, bool, bool, bool)> = world
         .players
         .iter()
         .map(|p| {
@@ -16488,11 +17729,17 @@ fn step_lane_creeps_system(
                 world.current_weather,
             );
             (
+                p.slot_index,
                 p.hero_team,
                 p.soldier_pos,
+                p.effective_stance,
+                p.hero_scale,
                 p.is_dead || hidden_invis,
                 water_vis_dawn,
                 water_vis_dusk,
+                p.attack_reveal_to_dawn_remaining > 0.0,
+                p.attack_reveal_to_dusk_remaining > 0.0,
+                p.attack_reveal_to_neutral_remaining > 0.0,
             )
         })
         .collect();
@@ -16556,6 +17803,13 @@ fn step_lane_creeps_system(
             (world.creeps[idx].hero_block_hesitation_timer - dt).max(0.0);
         world.creeps[idx].hero_block_cooldown_timer =
             (world.creeps[idx].hero_block_cooldown_timer - dt).max(0.0);
+        world.creeps[idx].hero_aggro_remaining_secs =
+            (world.creeps[idx].hero_aggro_remaining_secs - dt).max(0.0);
+        world.creeps[idx].hero_aggro_cooldown_secs =
+            (world.creeps[idx].hero_aggro_cooldown_secs - dt).max(0.0);
+        if world.creeps[idx].hero_aggro_remaining_secs <= 0.0 {
+            world.creeps[idx].hero_aggro_target_slot = None;
+        }
 
         let my_id = world.creeps[idx].id;
         let my_team = world.creeps[idx].team;
@@ -16565,11 +17819,13 @@ fn step_lane_creeps_system(
         let my_lane = world.creeps[idx].lane;
         let c_stats = resolve_creep_stats(config, world.creeps[idx].creep_type_id.as_deref());
         let safety_margin = c_stats.collider_radius + config.creeps.river_barrier_margin;
+        let obs_radius = c_stats.collider_radius + config.creeps.obstacle_avoid_margin;
         let is_neutral = my_team == TeamId::Neutral;
         let dist_to_home = my_pos.distance(my_home);
         let leashed_back = is_neutral && dist_to_home > config.neutral_camps.aggro_leash_radius;
         if leashed_back {
             world.creeps[idx].is_aggroed = false;
+            world.creeps[idx].aggro_target_slot = None;
         }
         if config.gameplay_rules.neutral_camps_regen_on_leash
             && is_neutral
@@ -16588,9 +17844,52 @@ fn step_lane_creeps_system(
                 world.match_elapsed_secs,
                 config.day_night.night_creep_vision_multiplier,
             );
-        let mut best_target: Option<(Vec3, f32)> = None;
-        if can_attack_now {
+        // (primary_aim_pos, upper_aim_pos, dist, is_structure)
+        let mut best_target: Option<(Vec3, Vec3, f32, bool)> = None;
+        let mut hero_aggro_locked = false;
+
+        // اولویت ۰ (قانون Creep Aggro مشابه Dota 2): اگر هیروی دشمن اخیراً به هیروی هم‌تیمی شلیک کرده باشد،
+        // سربازهای لاین موقتاً اولویت حمله را روی آن هیرو می‌گذارند (تا زمان مرگ، نامرئی‌شدن، شیرجه در آب یا فرار خارج از شعاع تعقیب)
+        if !is_neutral {
+            if let Some(aggro_slot) = world.creeps[idx].hero_aggro_target_slot {
+                let mut valid_aggro = false;
+                for &(h_slot, h_team, h_pos, h_stance, h_scale, h_dead, h_water_vis_dawn, h_water_vis_dusk, _, _, _) in &hero_snap {
+                    if h_slot != aggro_slot {
+                        continue;
+                    }
+                    let water_visible = match my_team {
+                        TeamId::Dawn => h_water_vis_dawn,
+                        TeamId::Dusk => h_water_vis_dusk,
+                        TeamId::Neutral => false,
+                    };
+                    if h_team == my_team || h_dead || !water_visible {
+                        break;
+                    }
+                    let d = my_pos.distance(h_pos);
+                    if d <= config.combat.creep_hero_aggro_max_chase_dist {
+                        let h_vis_h = SharedFogOfWar::hero_visible_height(config, h_stance, h_scale);
+                        let aim_y = if h_stance == Stance::Crouch {
+                            config.combat.hero_crouch_aim_chest_height * h_scale
+                        } else {
+                            config.combat.hero_stand_aim_chest_height * h_scale
+                        };
+                        let upper_y = (h_vis_h - 0.10).max(aim_y);
+                        best_target = Some((h_pos + Vec3::Y * aim_y, h_pos + Vec3::Y * upper_y, d, false));
+                        hero_aggro_locked = true;
+                        valid_aggro = true;
+                    }
+                    break;
+                }
+                if !valid_aggro {
+                    world.creeps[idx].hero_aggro_target_slot = None;
+                    world.creeps[idx].hero_aggro_remaining_secs = 0.0;
+                }
+            }
+        }
+
+        if can_attack_now && !hero_aggro_locked {
             let vision_sq = eff_creep_vision * eff_creep_vision;
+            let creep_eye_h = c_stats.hitbox_height * 0.85;
             for &(other_id, other_team, other_pos, other_dead, other_aggroed) in &creep_snap {
                 if other_id == my_id || other_team == my_team || other_dead {
                     continue;
@@ -16604,21 +17903,26 @@ fn step_lane_creeps_system(
                 }
                 let d = my_pos.distance(other_pos);
                 if d <= eff_creep_vision
-                    && best_target.map_or(true, |(_, bd)| d < bd)
-                    && can_observer_see_point_with_range(
+                    && best_target.map_or(true, |(_, _, bd, _)| d < bd)
+                    && can_observer_see_target_3d(
                         physics_world,
                         config,
                         my_pos,
+                        creep_eye_h,
                         other_pos,
-                        c_stats.aim_chest_height,
+                        c_stats.hitbox_height,
                         eff_creep_vision,
                         0.0,
                     )
                 {
-                    best_target = Some((other_pos + Vec3::Y * c_stats.aim_chest_height, d));
+                    let primary = other_pos + Vec3::Y * c_stats.aim_chest_height;
+                    let upper = other_pos
+                        + Vec3::Y * (c_stats.hitbox_height - 0.12).max(c_stats.aim_chest_height);
+                    best_target = Some((primary, upper, d, false));
                 }
             }
-            for &(h_team, h_pos, h_dead, h_water_vis_dawn, h_water_vis_dusk) in &hero_snap {
+            let my_aggro_slot = world.creeps[idx].aggro_target_slot;
+            for &(h_slot, h_team, h_pos, h_stance, h_scale, h_dead, h_water_vis_dawn, h_water_vis_dusk, h_rev_dawn, h_rev_dusk, h_rev_neutral) in &hero_snap {
                 let water_visible = match my_team {
                     TeamId::Dawn => h_water_vis_dawn,
                     TeamId::Dusk => h_water_vis_dusk,
@@ -16628,19 +17932,39 @@ fn step_lane_creeps_system(
                     continue;
                 }
                 let d = my_pos.distance(h_pos);
-                if d <= eff_creep_vision
-                    && best_target.map_or(true, |(_, bd)| d < bd)
-                    && can_observer_see_point_with_range(
-                        physics_world,
-                        config,
-                        my_pos,
-                        h_pos,
-                        c_stats.aim_chest_height,
-                        eff_creep_vision,
-                        0.0,
-                    )
-                {
-                    best_target = Some((h_pos + Vec3::Y * c_stats.aim_chest_height, d));
+                let h_vis_h = SharedFogOfWar::hero_visible_height(config, h_stance, h_scale);
+                let attack_revealed = match my_team {
+                    TeamId::Dawn => h_rev_dawn,
+                    TeamId::Dusk => h_rev_dusk,
+                    TeamId::Neutral => h_rev_neutral || my_aggro_slot == Some(h_slot),
+                };
+                // اگر هیرو به این تیم یا کمپ شلیک کرده باشد، مکان او لو می‌رود و کل کمپ/سربازان او را تعقیب می‌کنند
+                let can_detect = if is_neutral && attack_revealed {
+                    let max_chase = config.neutral_camps.aggro_leash_radius + eff_creep_vision;
+                    d <= max_chase
+                } else if attack_revealed && d <= eff_creep_vision * 1.5 {
+                    true
+                } else {
+                    d <= eff_creep_vision
+                        && can_observer_see_target_3d(
+                            physics_world,
+                            config,
+                            my_pos,
+                            creep_eye_h,
+                            h_pos,
+                            h_vis_h,
+                            eff_creep_vision,
+                            0.0,
+                        )
+                };
+                if can_detect && best_target.map_or(true, |(_, _, bd, _)| d < bd) {
+                    let aim_y = if h_stance == Stance::Crouch {
+                        config.combat.hero_crouch_aim_chest_height * h_scale
+                    } else {
+                        config.combat.hero_stand_aim_chest_height * h_scale
+                    };
+                    let upper_y = (h_vis_h - 0.10).max(aim_y);
+                    best_target = Some((h_pos + Vec3::Y * aim_y, h_pos + Vec3::Y * upper_y, d, false));
                 }
             }
             if !is_neutral {
@@ -16650,7 +17974,7 @@ fn step_lane_creeps_system(
                     }
                     let edge_dist = (my_pos.distance(t_pos) - t_rad).max(0.0);
                     if edge_dist <= eff_creep_vision
-                        && best_target.map_or(true, |(_, bd)| edge_dist < bd)
+                        && best_target.map_or(true, |(_, _, bd, _)| edge_dist < bd)
                     {
                         let to_tur = Vec3::new(my_pos.x - t_pos.x, 0.0, my_pos.z - t_pos.z).normalize_or_zero();
                         let tur_ground_y = sample_terrain_top_y(config, t_pos.x, t_pos.z).max(t_pos.y);
@@ -16664,20 +17988,21 @@ fn step_lane_creeps_system(
                             eff_creep_vision,
                             0.0,
                         ) {
-                            best_target = Some((Vec3::new(t_pos.x, t_pos.y + t_height * 0.5, t_pos.z), edge_dist));
+                            let p = Vec3::new(t_pos.x, t_pos.y + t_height * 0.5, t_pos.z);
+                            best_target = Some((p, p, edge_dist, true));
                         }
                     }
                 }
             }
         }
-            if !is_neutral {
+            if !is_neutral && !hero_aggro_locked {
                 for &(b_team, b_pos, b_rad, b_height, b_dead, b_invuln) in &barracks_snap {
                     if b_team == my_team || b_dead || b_invuln {
                         continue;
                     }
                     let edge_dist = (my_pos.distance(b_pos) - b_rad).max(0.0);
                     if edge_dist <= eff_creep_vision
-                        && best_target.map_or(true, |(_, bd)| edge_dist < bd)
+                        && best_target.map_or(true, |(_, _, bd, _)| edge_dist < bd)
                     {
                         let to_bar = Vec3::new(my_pos.x - b_pos.x, 0.0, my_pos.z - b_pos.z).normalize_or_zero();
                         let bar_ground_y = sample_terrain_top_y(config, b_pos.x, b_pos.z).max(b_pos.y);
@@ -16691,19 +18016,20 @@ fn step_lane_creeps_system(
                             eff_creep_vision,
                             0.0,
                         ) {
-                            best_target = Some((Vec3::new(b_pos.x, b_pos.y + b_height * 0.5, b_pos.z), edge_dist));
+                            let p = Vec3::new(b_pos.x, b_pos.y + b_height * 0.5, b_pos.z);
+                            best_target = Some((p, p, edge_dist, true));
                         }
                     }
                 }
             }
-            if !is_neutral {
+            if !is_neutral && !hero_aggro_locked {
                 for &(cour_team, cour_pos, cour_dead) in &courier_snap {
                     if cour_team == my_team || cour_dead {
                         continue;
                     }
                     let d_xz = Vec2::new(my_pos.x, my_pos.z).distance(Vec2::new(cour_pos.x, cour_pos.z));
                     if d_xz <= eff_creep_vision
-                        && best_target.map_or(true, |(_, bd)| d_xz < bd)
+                        && best_target.map_or(true, |(_, _, bd, _)| d_xz < bd)
                         && can_observer_see_point_with_range(
                             physics_world,
                             config,
@@ -16714,18 +18040,18 @@ fn step_lane_creeps_system(
                             0.0,
                         )
                     {
-                        best_target = Some((cour_pos, d_xz));
+                        best_target = Some((cour_pos, cour_pos, d_xz, false));
                     }
                 }
             }
-            if !is_neutral {
+            if !is_neutral && !hero_aggro_locked {
                 for &(a_team, a_pos, a_rad, _a_height, a_dead, a_invuln) in &ancient_snap {
                     if a_team == my_team || a_dead || a_invuln {
                         continue;
                     }
                     let edge_dist = (my_pos.distance(a_pos) - a_rad).max(0.0);
                     if edge_dist <= eff_creep_vision
-                        && best_target.map_or(true, |(_, bd)| edge_dist < bd)
+                        && best_target.map_or(true, |(_, _, bd, _)| edge_dist < bd)
                     {
                         let to_anc = Vec3::new(my_pos.x - a_pos.x, 0.0, my_pos.z - a_pos.z).normalize_or_zero();
                         let anc_ground_y = sample_terrain_top_y(config, a_pos.x, a_pos.z).max(a_pos.y);
@@ -16739,25 +18065,61 @@ fn step_lane_creeps_system(
                             eff_creep_vision,
                             0.0,
                         ) {
-                            best_target = Some((Vec3::new(a_pos.x, a_pos.y + 1.5, a_pos.z), edge_dist));
+                            let p = Vec3::new(a_pos.x, a_pos.y + 1.5, a_pos.z);
+                            best_target = Some((p, p, edge_dist, true));
                         }
                     }
                 }
             }
         if is_neutral && best_target.is_none() && my_pos.distance(my_home) <= 0.5 {
             world.creeps[idx].is_aggroed = false;
+            world.creeps[idx].aggro_target_slot = None;
         }
 
         let mut moved = false;
         let mut fired_or_aiming = false;
 
-        if let Some((target_pos, dist)) = best_target {
+        if let Some((target_pos, upper_target_pos, dist, target_is_structure)) = best_target {
             let to_target = Vec3::new(target_pos.x - my_pos.x, 0.0, target_pos.z - my_pos.z);
             if to_target.length_squared() > 0.0001 {
                 world.creeps[idx].facing_dir = to_target.normalize();
             }
 
-            if dist <= c_stats.attack_range {
+            let muzzle_pos = my_pos
+                + Vec3::Y * c_stats.muzzle_offset_y
+                + world.creeps[idx].facing_dir * c_stats.muzzle_forward;
+
+            // بررسی خط آتش واقعی لوله تفنگ: اگر شلیک به سینه به سنگر می‌خورد، به بالاتنه‌ی آشکار هدف نشانه می‌گیرد
+            // و اگر لوله تفنگ همچنان پشت سنگر گیر باشد، سرباز به جای شلیک بی‌اثر به سنگر، آن را دور می‌زند
+            let clear_aim_opt = if dist <= c_stats.attack_range {
+                if target_is_structure {
+                    Some(target_pos)
+                } else {
+                    let is_shot_clear = |aim_pt: Vec3| -> bool {
+                        let v = aim_pt - muzzle_pos;
+                        let len = v.length();
+                        if len <= 1e-4 {
+                            return true;
+                        }
+                        physics_world
+                            .cast_ray(muzzle_pos, v / len, len, query_groups, |ent| {
+                                target_query.get(ent).is_err()
+                            })
+                            .is_none()
+                    };
+                    if is_shot_clear(target_pos) {
+                        Some(target_pos)
+                    } else if is_shot_clear(upper_target_pos) {
+                        Some(upper_target_pos)
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(aim_target) = clear_aim_opt {
                 fired_or_aiming = true;
                 if world.creeps[idx].fire_cooldown <= 0.0 {
                     let (_, _, time_dmg_bonus, time_fr_mult) = lane_creep_time_scaling(
@@ -16778,10 +18140,6 @@ fn step_lane_creeps_system(
                     world.creeps[idx].fire_anim_timer =
                         (eff_fire_rate * 0.45).min(0.35);
 
-                    let muzzle_pos = my_pos
-                        + Vec3::Y * c_stats.muzzle_offset_y
-                        + world.creeps[idx].facing_dir * c_stats.muzzle_forward;
-                    let aim_target = target_pos;
                     let shot_dir = (aim_target - muzzle_pos).normalize_or_zero();
                     let b_id = world.next_entity_id;
                     world.next_entity_id += 1;
@@ -16819,15 +18177,27 @@ fn step_lane_creeps_system(
                 let step_dist = c_stats.move_speed
                     * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team)
                     * dt;
-                let cur_x = world.creeps[idx].pos.x;
-                let cur_z = world.creeps[idx].pos.z;
+                let cur_pos = world.creeps[idx].pos;
+                let avoid_dir = steer_dir_around_obstacles(
+                    config,
+                    my_id,
+                    cur_pos,
+                    world.creeps[idx].facing_dir,
+                    Some(Vec2::new(target_pos.x, target_pos.z)),
+                    c_stats.hitbox_height,
+                    safety_margin,
+                    obs_radius,
+                );
                 let (nx, nz, steered_dir, did_move) = steer_creep_step_avoiding_river(
                     config,
-                    cur_x,
-                    cur_z,
-                    world.creeps[idx].facing_dir,
+                    cur_pos.x,
+                    cur_pos.y,
+                    cur_pos.z,
+                    avoid_dir,
                     step_dist,
+                    c_stats.hitbox_height,
                     safety_margin,
+                    obs_radius,
                 );
                 world.creeps[idx].pos.x = nx;
                 world.creeps[idx].pos.z = nz;
@@ -16844,15 +18214,27 @@ fn step_lane_creeps_system(
                 let step_dist = c_stats.move_speed
                     * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team)
                     * dt;
-                let cur_x = world.creeps[idx].pos.x;
-                let cur_z = world.creeps[idx].pos.z;
+                let cur_pos = world.creeps[idx].pos;
+                let avoid_dir = steer_dir_around_obstacles(
+                    config,
+                    my_id,
+                    cur_pos,
+                    dir,
+                    Some(Vec2::new(my_home.x, my_home.z)),
+                    c_stats.hitbox_height,
+                    safety_margin,
+                    obs_radius,
+                );
                 let (nx, nz, steered_dir, did_move) = steer_creep_step_avoiding_river(
                     config,
-                    cur_x,
-                    cur_z,
-                    dir,
+                    cur_pos.x,
+                    cur_pos.y,
+                    cur_pos.z,
+                    avoid_dir,
                     step_dist,
+                    c_stats.hitbox_height,
                     safety_margin,
+                    obs_radius,
                 );
                 world.creeps[idx].pos.x = nx;
                 world.creeps[idx].pos.z = nz;
@@ -16929,11 +18311,25 @@ fn step_lane_creeps_system(
                     let to_wp = Vec3::new(wp_pos.x - my_pos.x, 0.0, wp_pos.z - my_pos.z);
                     let dist_wp = to_wp.length();
 
-                    // اگر Waypoint دقیقاً روی مرکز یک تاور باشد، شعاع رسیدن به Waypoint از شعاع تاور بزرگ‌تر می‌شود تا سرباز پشت تاور گیر نکند
+                    // اگر Waypoint روی مرکز یک تاور یا مانع باشد، شعاع رسیدن به Waypoint بزرگ‌تر می‌شود تا سرباز پشت آن گیر نکند
                     let mut reach_dist = config.creeps.waypoint_reach_dist;
                     for &(_t_team, t_pos, t_rad, _t_h, t_dead) in &turret_snap {
                         if !t_dead && Vec2::new(wp_pos.x - t_pos.x, wp_pos.z - t_pos.z).length() <= t_rad + 2.0 {
                             reach_dist = reach_dist.max(t_rad + c_stats.collider_radius + 1.5);
+                        }
+                    }
+                    for obs in &config.obstacles {
+                        let Some((center, half, _rot, inv_rot, min_y, max_y)) =
+                            creep_obstacle_obb_2d(obs)
+                        else {
+                            continue;
+                        };
+                        if wp_pos.y + c_stats.hitbox_height < min_y || wp_pos.y > max_y + 0.5 {
+                            continue;
+                        }
+                        let local = inv_rot * Vec3::new(wp_pos.x - center.x, 0.0, wp_pos.z - center.y);
+                        if local.x.abs() <= half.x + obs_radius && local.z.abs() <= half.y + obs_radius {
+                            reach_dist = reach_dist.max(half.length() + obs_radius + 1.2);
                         }
                     }
 
@@ -17066,15 +18462,28 @@ fn step_lane_creeps_system(
                         let step_dist = c_stats.move_speed
                             * creep_toxic_slow_at(&world.toxic_pools, world.creeps[idx].pos, world.creeps[idx].team)
                             * dt;
-                        let cur_x = world.creeps[idx].pos.x;
-                        let cur_z = world.creeps[idx].pos.z;
+                        let cur_pos = world.creeps[idx].pos;
+                        let goal_xz = Vec2::new(my_pos.x + to_wp.x, my_pos.z + to_wp.z);
+                        let avoid_dir = steer_dir_around_obstacles(
+                            config,
+                            my_id,
+                            cur_pos,
+                            dir,
+                            Some(goal_xz),
+                            c_stats.hitbox_height,
+                            safety_margin,
+                            obs_radius,
+                        );
                         let (nx, nz, steered_dir, did_move) = steer_creep_step_avoiding_river(
                             config,
-                            cur_x,
-                            cur_z,
-                            dir,
+                            cur_pos.x,
+                            cur_pos.y,
+                            cur_pos.z,
+                            avoid_dir,
                             step_dist,
+                            c_stats.hitbox_height,
                             safety_margin,
+                            obs_radius,
                         );
                         world.creeps[idx].pos.x = nx;
                         world.creeps[idx].pos.z = nz;
@@ -17097,7 +18506,7 @@ fn step_lane_creeps_system(
             18.0,
             query_groups,
             |ent| {
-                if target_query.get(ent).is_ok() {
+                if target_query.get(ent).is_ok() || obstacle_query.get(ent).is_ok() {
                     return false;
                 }
                 if inside_canyon {
@@ -17140,10 +18549,13 @@ fn step_lane_creeps_system(
                 let (px, pz, _) = move_creep_xz_with_river_barrier(
                     config,
                     world.creeps[idx].pos.x,
+                    world.creeps[idx].pos.y,
                     world.creeps[idx].pos.z,
                     t_pos.x + push.x * min_d,
                     t_pos.z + push.y * min_d,
+                    c_stats.hitbox_height,
                     safety_margin,
+                    obs_radius,
                 );
                 world.creeps[idx].pos.x = px;
                 world.creeps[idx].pos.z = pz;
@@ -17155,10 +18567,13 @@ fn step_lane_creeps_system(
                     let (sx, sz, _) = move_creep_xz_with_river_barrier(
                         config,
                         world.creeps[idx].pos.x,
+                        world.creeps[idx].pos.y,
                         world.creeps[idx].pos.z,
                         world.creeps[idx].pos.x + slide.x,
                         world.creeps[idx].pos.z + slide.y,
+                        c_stats.hitbox_height,
                         safety_margin,
+                        obs_radius,
                     );
                     world.creeps[idx].pos.x = sx;
                     world.creeps[idx].pos.z = sz;
@@ -17184,15 +18599,29 @@ fn step_lane_creeps_system(
                 let (cx, cz, _) = move_creep_xz_with_river_barrier(
                     config,
                     world.creeps[idx].pos.x,
+                    world.creeps[idx].pos.y,
                     world.creeps[idx].pos.z,
                     h_pos.x + push.x * min_d,
                     h_pos.z + push.y * min_d,
+                    c_stats.hitbox_height,
                     safety_margin,
+                    obs_radius,
                 );
                 world.creeps[idx].pos.x = cx;
                 world.creeps[idx].pos.z = cz;
             }
         }
+
+        // جلوگیری قطعی از نفوذ سرباز به داخل موانع مسیر (OBB Push-Out)
+        let (ox, oz) = resolve_creep_obstacle_penetration(
+            config,
+            world.creeps[idx].pos,
+            c_stats.hitbox_height,
+            safety_margin,
+            obs_radius,
+        );
+        world.creeps[idx].pos.x = ox;
+        world.creeps[idx].pos.z = oz;
 
         world.creeps[idx].anim_state = if fired_or_aiming {
             if is_neutral || world.creeps[idx].fire_anim_timer > 0.0 {
@@ -17232,14 +18661,19 @@ fn step_lane_creeps_system(
                     Vec2::new(1.0, 0.0)
                 };
                 let sep_margin = config.creeps.collider_radius + config.creeps.river_barrier_margin;
+                let sep_obs_r = config.creeps.collider_radius + config.creeps.obstacle_avoid_margin;
+                let sep_h = config.creeps.hitbox_height;
                 let half_push = (min_creep_dist - dist) * 0.5;
                 let (nix, niz, _) = move_creep_xz_with_river_barrier(
                     config,
                     world.creeps[i].pos.x,
+                    world.creeps[i].pos.y,
                     world.creeps[i].pos.z,
                     world.creeps[i].pos.x - push_dir.x * half_push,
                     world.creeps[i].pos.z - push_dir.y * half_push,
+                    sep_h,
                     sep_margin,
+                    sep_obs_r,
                 );
                 world.creeps[i].pos.x = nix;
                 world.creeps[i].pos.z = niz;
@@ -17247,10 +18681,13 @@ fn step_lane_creeps_system(
                 let (njx, njz, _) = move_creep_xz_with_river_barrier(
                     config,
                     world.creeps[j].pos.x,
+                    world.creeps[j].pos.y,
                     world.creeps[j].pos.z,
                     world.creeps[j].pos.x + push_dir.x * half_push,
                     world.creeps[j].pos.z + push_dir.y * half_push,
+                    sep_h,
                     sep_margin,
+                    sep_obs_r,
                 );
                 world.creeps[j].pos.x = njx;
                 world.creeps[j].pos.z = njz;
@@ -17258,13 +18695,14 @@ fn step_lane_creeps_system(
         }
     }
 
-    // ۵. تضمین عدم نفوذ سرباز به داخل هیرو پس از جداسازی سربازان از یکدیگر
+    // ۵. تضمین عدم نفوذ سرباز به داخل هیرو و موانع پس از جداسازی سربازان از یکدیگر
     for i in 0..c_len {
         if world.creeps[i].is_dead {
             continue;
         }
         let c_stats = resolve_creep_stats(config, world.creeps[i].creep_type_id.as_deref());
         let safety_margin = c_stats.collider_radius + config.creeps.river_barrier_margin;
+        let obs_radius = c_stats.collider_radius + config.creeps.obstacle_avoid_margin;
         for &(_h_team, h_pos, h_rad) in &hero_body_snap {
             if (world.creeps[i].pos.y - h_pos.y).abs() > 1.8 {
                 continue;
@@ -17277,15 +18715,27 @@ fn step_lane_creeps_system(
                 let (cx, cz, _) = move_creep_xz_with_river_barrier(
                     config,
                     world.creeps[i].pos.x,
+                    world.creeps[i].pos.y,
                     world.creeps[i].pos.z,
                     h_pos.x + push.x * min_d,
                     h_pos.z + push.y * min_d,
+                    c_stats.hitbox_height,
                     safety_margin,
+                    obs_radius,
                 );
                 world.creeps[i].pos.x = cx;
                 world.creeps[i].pos.z = cz;
             }
         }
+        let (ox, oz) = resolve_creep_obstacle_penetration(
+            config,
+            world.creeps[i].pos,
+            c_stats.hitbox_height,
+            safety_margin,
+            obs_radius,
+        );
+        world.creeps[i].pos.x = ox;
+        world.creeps[i].pos.z = oz;
     }
 }
 
@@ -17309,7 +18759,7 @@ fn step_turrets_system(
         .map(|c| (c.team, c.pos, c.is_dead, c.camp_index.is_none()))
         .collect();
 
-    let hero_snap: Vec<(TeamId, Vec3, bool, bool, bool, f32)> = world
+    let hero_snap: Vec<(TeamId, Vec3, Stance, f32, bool, bool, bool, f32, bool, bool)> = world
         .players
         .iter()
         .map(|p| {
@@ -17333,10 +18783,14 @@ fn step_turrets_system(
             (
                 p.hero_team,
                 p.soldier_pos,
+                p.effective_stance,
+                p.hero_scale,
                 p.is_dead || hidden_invis,
                 water_vis_dawn,
                 water_vis_dusk,
                 p.last_attacked_enemy_hero_at,
+                p.attack_reveal_to_dawn_remaining > 0.0,
+                p.attack_reveal_to_dusk_remaining > 0.0,
             )
         })
         .collect();
@@ -17393,8 +18847,14 @@ fn step_turrets_system(
         // اولویت ۰: هیروی دشمنی که اخیراً به هیروی هم‌تیمی زیر تاور آسیب زده (Tower-Dive Aggro)
         let aggro_window = config.combat.turret_hero_aggro_window_secs;
         let mut best_aggro_hero: Option<(Vec3, f32)> = None;
+        let turret_eye_h = config.map.fow_stand_eye_height;
+        let eff_turret_vision = t_def.vision_range
+            * config.effective_vision_multiplier(
+                world.match_elapsed_secs,
+                config.day_night.night_turret_vision_multiplier,
+            );
         if config.gameplay_rules.turret_prioritize_hero_on_ally_attack {
-        for &(h_team, h_pos, h_dead, h_water_vis_dawn, h_water_vis_dusk, h_last_atk_hero) in &hero_snap {
+        for &(h_team, h_pos, h_stance, h_scale, h_dead, h_water_vis_dawn, h_water_vis_dusk, h_last_atk_hero, h_rev_dawn, h_rev_dusk) in &hero_snap {
             let water_visible = match my_team {
                 TeamId::Dawn => h_water_vis_dawn,
                 TeamId::Dusk => h_water_vis_dusk,
@@ -17407,27 +18867,36 @@ fn step_turrets_system(
             {
                 continue;
             }
+            let attack_revealed = match my_team {
+                TeamId::Dawn => h_rev_dawn,
+                TeamId::Dusk => h_rev_dusk,
+                TeamId::Neutral => false,
+            };
             let d = my_pos.distance(h_pos);
             let to_h = Vec3::new(h_pos.x - my_pos.x, 0.0, h_pos.z - my_pos.z).normalize_or_zero();
             let turret_ground_y = sample_terrain_top_y(config, my_pos.x, my_pos.z).max(my_pos.y);
             let ray_start = Vec3::new(my_pos.x, turret_ground_y, my_pos.z) + to_h * (t_world_radius + 0.45);
+            let h_vis_h = SharedFogOfWar::hero_visible_height(config, h_stance, h_scale);
             if d <= t_def.attack_range
                 && best_aggro_hero.map_or(true, |(_, bd)| d < bd)
-                && can_observer_see_point_with_range(
-                    physics_world,
-                    config,
-                    ray_start,
-                    h_pos,
-                    1.65,
-                    t_def.vision_range
-                        * config.effective_vision_multiplier(
-                            world.match_elapsed_secs,
-                            config.day_night.night_turret_vision_multiplier,
-                        ),
-                    0.0,
-                )
+                && (attack_revealed
+                    || can_observer_see_target_3d(
+                        physics_world,
+                        config,
+                        ray_start,
+                        turret_eye_h,
+                        h_pos,
+                        h_vis_h,
+                        eff_turret_vision,
+                        0.0,
+                    ))
             {
-                best_aggro_hero = Some((h_pos + Vec3::Y * config.combat.hero_stand_aim_chest_height, d));
+                let aim_y = if h_stance == Stance::Crouch {
+                    config.combat.hero_crouch_aim_chest_height * h_scale
+                } else {
+                    config.combat.hero_stand_aim_chest_height * h_scale
+                };
+                best_aggro_hero = Some((h_pos + Vec3::Y * aim_y, d));
             }
         }
         }
@@ -17444,17 +18913,14 @@ fn step_turrets_system(
             let ray_start = Vec3::new(my_pos.x, turret_ground_y, my_pos.z) + to_c * (t_world_radius + 0.45);
             if d <= t_def.attack_range
                 && best_creep.map_or(true, |(_, bd)| d < bd)
-                && can_observer_see_point_with_range(
+                && can_observer_see_target_3d(
                     physics_world,
                     config,
                     ray_start,
+                    turret_eye_h,
                     c_pos,
-                    1.65,
-                    t_def.vision_range
-                        * config.effective_vision_multiplier(
-                            world.match_elapsed_secs,
-                            config.day_night.night_turret_vision_multiplier,
-                        ),
+                    config.creeps.hitbox_height,
+                    eff_turret_vision,
                     0.0,
                 )
             {
@@ -17464,7 +18930,7 @@ fn step_turrets_system(
 
         let mut best_hero: Option<(Vec3, f32)> = None;
         if best_aggro_hero.is_none() && best_creep.is_none() {
-            for &(h_team, h_pos, h_dead, h_water_vis_dawn, h_water_vis_dusk, _) in &hero_snap {
+            for &(h_team, h_pos, h_stance, h_scale, h_dead, h_water_vis_dawn, h_water_vis_dusk, _, h_rev_dawn, h_rev_dusk) in &hero_snap {
                 let water_visible = match my_team {
                     TeamId::Dawn => h_water_vis_dawn,
                     TeamId::Dusk => h_water_vis_dusk,
@@ -17473,27 +18939,36 @@ fn step_turrets_system(
                 if h_team == my_team || h_dead || !water_visible {
                     continue;
                 }
+                let attack_revealed = match my_team {
+                    TeamId::Dawn => h_rev_dawn,
+                    TeamId::Dusk => h_rev_dusk,
+                    TeamId::Neutral => false,
+                };
                 let d = my_pos.distance(h_pos);
                 let to_h = Vec3::new(h_pos.x - my_pos.x, 0.0, h_pos.z - my_pos.z).normalize_or_zero();
                 let turret_ground_y = sample_terrain_top_y(config, my_pos.x, my_pos.z).max(my_pos.y);
                 let ray_start = Vec3::new(my_pos.x, turret_ground_y, my_pos.z) + to_h * (t_world_radius + 0.45);
+                let h_vis_h = SharedFogOfWar::hero_visible_height(config, h_stance, h_scale);
                 if d <= t_def.attack_range
                     && best_hero.map_or(true, |(_, bd)| d < bd)
-                    && can_observer_see_point_with_range(
-                        physics_world,
-                        config,
-                        ray_start,
-                        h_pos,
-                        1.65,
-                        t_def.vision_range
-                            * config.effective_vision_multiplier(
-                                world.match_elapsed_secs,
-                                config.day_night.night_turret_vision_multiplier,
-                            ),
-                        0.0,
-                    )
+                    && (attack_revealed
+                        || can_observer_see_target_3d(
+                            physics_world,
+                            config,
+                            ray_start,
+                            turret_eye_h,
+                            h_pos,
+                            h_vis_h,
+                            eff_turret_vision,
+                            0.0,
+                        ))
                 {
-                    best_hero = Some((h_pos + Vec3::Y * config.combat.hero_stand_aim_chest_height, d));
+                    let aim_y = if h_stance == Stance::Crouch {
+                        config.combat.hero_crouch_aim_chest_height * h_scale
+                    } else {
+                        config.combat.hero_stand_aim_chest_height * h_scale
+                    };
+                    best_hero = Some((h_pos + Vec3::Y * aim_y, d));
                 }
             }
         }
@@ -17830,6 +19305,7 @@ pub fn step_weather_and_environment_system(
             if first_init && !p.is_dead {
                 p.hero_hp = p.hero_max_hp;
                 p.hero_stamina = p.hero_max_stamina;
+            p.stamina_exhausted = false;
                 p.beam_charge = p.hero_weapon.beam_max_charge;
             }
         }

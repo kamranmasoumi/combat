@@ -512,12 +512,20 @@ impl GameConfig {
     pub fn validate_canyon_mountain_align(&self) {
         let align = &self.physics.canyon_mountain_align;
         assert!(
-            !align.id_prefix.trim().is_empty(),
-            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.id_prefix خالی است"
+            !align.west_id_prefix.trim().is_empty(),
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.west_id_prefix خالی است"
         );
         assert!(
-            align.target_edge_offset.is_finite(),
-            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.target_edge_offset نامعتبر است"
+            !align.east_id_prefix.trim().is_empty(),
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.east_id_prefix خالی است"
+        );
+        assert!(
+            align.west_target_edge_offset.is_finite(),
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.west_target_edge_offset نامعتبر است"
+        );
+        assert!(
+            align.east_target_edge_offset.is_finite(),
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.east_target_edge_offset نامعتبر است"
         );
         assert!(
             align.gradient_sample_eps > 0.0 && align.gradient_sample_eps <= 5.0,
@@ -528,8 +536,12 @@ impl GameConfig {
             "خطای بحرانی کانفیگ: physics.canyon_mountain_align.max_snap_iterations باید بین ۱ تا ۶۴ باشد"
         );
         assert!(
-            align.yaw_offset_deg.is_finite(),
-            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.yaw_offset_deg نامعتبر است"
+            align.west_yaw_offset_deg.is_finite(),
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.west_yaw_offset_deg نامعتبر است"
+        );
+        assert!(
+            align.east_yaw_offset_deg.is_finite(),
+            "خطای بحرانی کانفیگ: physics.canyon_mountain_align.east_yaw_offset_deg نامعتبر است"
         );
     }
 
@@ -1977,12 +1989,15 @@ pub struct PhysicsConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CanyonMountainAlignConfig {
     pub enabled: bool,
-    pub id_prefix: String,
-    pub target_edge_offset: f32,
+    pub west_id_prefix: String,
+    pub east_id_prefix: String,
+    pub west_target_edge_offset: f32,
+    pub east_target_edge_offset: f32,
     pub gradient_sample_eps: f32,
     pub max_snap_iterations: usize,
     pub align_yaw_to_canyon_normal: bool,
-    pub yaw_offset_deg: f32,
+    pub west_yaw_offset_deg: f32,
+    pub east_yaw_offset_deg: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -4283,16 +4298,20 @@ pub fn align_canyon_mountains_to_rim(
     let inv_2eps = 0.5 / eps;
 
     for mtn in mountains.iter_mut() {
-        if !mtn.id.starts_with(&align.id_prefix) {
+        let (target_edge_offset, yaw_offset_deg) = if mtn.id.starts_with(&align.west_id_prefix) {
+            (align.west_target_edge_offset, align.west_yaw_offset_deg)
+        } else if mtn.id.starts_with(&align.east_id_prefix) {
+            (align.east_target_edge_offset, align.east_yaw_offset_deg)
+        } else {
             continue;
-        }
+        };
 
         let mut x = mtn.model_transform.location.0;
         let mut z = mtn.model_transform.location.2;
 
         for _ in 0..align.max_snap_iterations {
             let cur_edge = canyon_edge_distance(canyon, x, z);
-            let err = align.target_edge_offset - cur_edge;
+            let err = target_edge_offset - cur_edge;
             if err.abs() < 1e-3 {
                 break;
             }
@@ -4320,7 +4339,7 @@ pub fn align_canyon_mountains_to_rim(
             let gz = canyon_edge_distance(canyon, x, z + eps)
                 - canyon_edge_distance(canyon, x, z - eps);
             if gx * gx + gz * gz > 1e-8 {
-                let mut yaw = gx.atan2(gz).to_degrees() + align.yaw_offset_deg;
+                let mut yaw = gx.atan2(gz).to_degrees() + yaw_offset_deg;
                 while yaw > 180.0 {
                     yaw -= 360.0;
                 }

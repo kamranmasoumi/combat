@@ -2477,97 +2477,339 @@ pub fn build_canyon_terrain_and_river_meshes(
     let rows = nz + 1;
     let v_count = cols * rows;
 
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(v_count);
-    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(v_count);
-    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(v_count);
-    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(v_count);
-    let mut heights: Vec<f32> = Vec::with_capacity(v_count);
-
-    let eps = 0.75_f32;
+    // پیش‌محاسبه فاصله دقیق لبه دره (canyon_edge_distance > 0 یعنی داخل دره) در تمام گره‌های شبکه
+    let mut edge_dists: Vec<f32> = Vec::with_capacity(v_count);
+    let mut grid_heights: Vec<f32> = Vec::with_capacity(v_count);
     for iz in 0..rows {
         let z = min_z + (iz as f32) * dz;
         for ix in 0..cols {
             let x = min_x + (ix as f32) * dx;
-            let y = moba_shared::canyon_sample_height(canyon, x, z);
-            heights.push(y);
-            positions.push([x, y, z]);
-
-            let hx0 = moba_shared::canyon_sample_height(canyon, x - eps, z);
-            let hx1 = moba_shared::canyon_sample_height(canyon, x + eps, z);
-            let hz0 = moba_shared::canyon_sample_height(canyon, x, z - eps);
-            let hz1 = moba_shared::canyon_sample_height(canyon, x, z + eps);
-            let n = Vec3::new(hx0 - hx1, 2.0 * eps, hz0 - hz1).normalize();
-            normals.push([n.x, n.y, n.z]);
-            uvs.push([ix as f32 / nx as f32, iz as f32 / nz as f32]);
-
-            let signed_side = moba_shared::canyon_river_side_signed(canyon, x, z);
-            // smooth transition: 0.0 = left (grass), 1.0 = right (autumn)
-            let autumn_t = ((-signed_side / biome.river_transition_width) * 0.5 + 0.5).clamp(0.0, 1.0);
-            let n_scale = biome.ground_noise_scale;
-            let patch_n = biome_fbm_2d(x * n_scale, z * n_scale);
-            let detail_n = biome_fbm_2d(x * n_scale * 2.7 + 19.3, z * n_scale * 2.7 - 11.7);
-
-            let srgb_col = if y > 0.25 {
-                let peak_t = ((y - 0.25) / 6.5).clamp(0.0, 1.0);
-                Color::srgb(
-                    0.34 + 0.14 * peak_t,
-                    0.32 + 0.12 * peak_t,
-                    0.29 + 0.10 * peak_t,
-                )
-            } else if y > -0.35 {
-                let lp = biome.left_ground_primary_rgb;
-                let ls = biome.left_ground_secondary_rgb;
-                let lh = biome.left_ground_highlight_rgb;
-                let left_r = lp.0 * (1.0 - patch_n) + ls.0 * patch_n;
-                let left_g = lp.1 * (1.0 - patch_n) + ls.1 * patch_n;
-                let left_b = lp.2 * (1.0 - patch_n) + ls.2 * patch_n;
-                let hl_w = (detail_n - 0.52).max(0.0) * 1.45;
-                let left_rgb = (
-                    (left_r + (lh.0 - left_r) * hl_w).clamp(0.0, 1.0),
-                    (left_g + (lh.1 - left_g) * hl_w).clamp(0.0, 1.0),
-                    (left_b + (lh.2 - left_b) * hl_w).clamp(0.0, 1.0),
-                );
-
-                let rp = biome.right_ground_primary_rgb;
-                let rs = biome.right_ground_secondary_rgb;
-                let rh = biome.right_ground_highlight_rgb;
-                let right_r = rp.0 * (1.0 - patch_n) + rs.0 * patch_n;
-                let right_g = rp.1 * (1.0 - patch_n) + rs.1 * patch_n;
-                let right_b = rp.2 * (1.0 - patch_n) + rs.2 * patch_n;
-                let right_rgb = (
-                    (right_r + (rh.0 - right_r) * hl_w).clamp(0.0, 1.0),
-                    (right_g + (rh.1 - right_g) * hl_w).clamp(0.0, 1.0),
-                    (right_b + (rh.2 - right_b) * hl_w).clamp(0.0, 1.0),
-                );
-
-                Color::srgb(
-                    left_rgb.0 * (1.0 - autumn_t) + right_rgb.0 * autumn_t,
-                    left_rgb.1 * (1.0 - autumn_t) + right_rgb.1 * autumn_t,
-                    left_rgb.2 * (1.0 - autumn_t) + right_rgb.2 * autumn_t,
-                )
-            } else if y > canyon.water_y {
-                let rock_t = ((-0.35 - y) / (0.35 - canyon.water_y).abs()).clamp(0.0, 1.0);
-                let warm_shift = autumn_t * 0.06;
-                Color::srgb(
-                    (0.38 - 0.14 * rock_t + warm_shift).clamp(0.0, 1.0),
-                    (0.35 - 0.10 * rock_t - warm_shift * 0.25).clamp(0.0, 1.0),
-                    (0.30 - 0.05 * rock_t - warm_shift * 0.5).clamp(0.0, 1.0),
-                )
-            } else {
-                Color::srgb(0.14, 0.26, 0.24)
-            };
-            colors.push(srgb_col.to_linear().to_f32_array());
+            edge_dists.push(moba_shared::canyon_edge_distance(canyon, x, z));
+            grid_heights.push(moba_shared::canyon_sample_height(canyon, x, z));
         }
     }
 
-    let mut indices: Vec<u32> = Vec::with_capacity(nx * nz * 6);
+    let sample_ground_color = |x: f32, z: f32| -> [f32; 4] {
+        let signed_side = moba_shared::canyon_river_side_signed(canyon, x, z);
+        let autumn_t = ((-signed_side / biome.river_transition_width) * 0.5 + 0.5).clamp(0.0, 1.0);
+        let n_scale = biome.ground_noise_scale;
+        let patch_n = biome_fbm_2d(x * n_scale, z * n_scale);
+        let detail_n = biome_fbm_2d(x * n_scale * 2.7 + 19.3, z * n_scale * 2.7 - 11.7);
+
+        let lp = biome.left_ground_primary_rgb;
+        let ls = biome.left_ground_secondary_rgb;
+        let lh = biome.left_ground_highlight_rgb;
+        let left_r = lp.0 * (1.0 - patch_n) + ls.0 * patch_n;
+        let left_g = lp.1 * (1.0 - patch_n) + ls.1 * patch_n;
+        let left_b = lp.2 * (1.0 - patch_n) + ls.2 * patch_n;
+        let hl_w = (detail_n - 0.52).max(0.0) * 1.45;
+        let left_rgb = (
+            (left_r + (lh.0 - left_r) * hl_w).clamp(0.0, 1.0),
+            (left_g + (lh.1 - left_g) * hl_w).clamp(0.0, 1.0),
+            (left_b + (lh.2 - left_b) * hl_w).clamp(0.0, 1.0),
+        );
+
+        let rp = biome.right_ground_primary_rgb;
+        let rs = biome.right_ground_secondary_rgb;
+        let rh = biome.right_ground_highlight_rgb;
+        let right_r = rp.0 * (1.0 - patch_n) + rs.0 * patch_n;
+        let right_g = rp.1 * (1.0 - patch_n) + rs.1 * patch_n;
+        let right_b = rp.2 * (1.0 - patch_n) + rs.2 * patch_n;
+        let right_rgb = (
+            (right_r + (rh.0 - right_r) * hl_w).clamp(0.0, 1.0),
+            (right_g + (rh.1 - right_g) * hl_w).clamp(0.0, 1.0),
+            (right_b + (rh.2 - right_b) * hl_w).clamp(0.0, 1.0),
+        );
+
+        Color::srgb(
+            left_rgb.0 * (1.0 - autumn_t) + right_rgb.0 * autumn_t,
+            left_rgb.1 * (1.0 - autumn_t) + right_rgb.1 * autumn_t,
+            left_rgb.2 * (1.0 - autumn_t) + right_rgb.2 * autumn_t,
+        )
+        .to_linear()
+        .to_f32_array()
+    };
+
+    let sample_cliff_color = |x: f32, y: f32, z: f32| -> [f32; 4] {
+        let signed_side = moba_shared::canyon_river_side_signed(canyon, x, z);
+        let autumn_t = ((-signed_side / biome.river_transition_width) * 0.5 + 0.5).clamp(0.0, 1.0);
+        let rock_t = ((-y) / canyon.water_y.abs().max(1.0)).clamp(0.0, 1.0);
+        let warm_shift = autumn_t * 0.06;
+        let detail = biome_fbm_2d(x * 0.14 + y * 0.18, z * 0.14 - y * 0.12) * 0.07 - 0.035;
+        Color::srgb(
+            (0.39 - 0.15 * rock_t + warm_shift + detail).clamp(0.0, 1.0),
+            (0.36 - 0.11 * rock_t - warm_shift * 0.25 + detail).clamp(0.0, 1.0),
+            (0.31 - 0.06 * rock_t - warm_shift * 0.5 + detail).clamp(0.0, 1.0),
+        )
+        .to_linear()
+        .to_f32_array()
+    };
+
+    let bed_color = Color::srgb(0.14, 0.26, 0.24).to_linear().to_f32_array();
+    let sample_bed_y = |x: f32, z: f32| -> f32 {
+        let bed_ripple = 0.25 * (x * 0.22).sin() * (z * 0.22).cos();
+        canyon.floor_depth + bed_ripple
+    };
+
+    // یافتن نقطه دقیق منحنی صفر (canyon_edge_distance == 0.0) روی هر یال با ۴ مرحله Bisection
+    let find_exact_contour_point = |a: Vec2, da: f32, b: Vec2, db: f32| -> Vec2 {
+        let mut lo_p = a;
+        let mut hi_p = b;
+        let mut lo_d = da;
+        let mut hi_d = db;
+        // گام اول: درون‌یابی خطی
+        let denom = hi_d - lo_d;
+        let t0 = if denom.abs() > 1e-6 {
+            (-lo_d / denom).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let mut mid_p = lo_p.lerp(hi_p, t0);
+        for _ in 0..4 {
+            let md = moba_shared::canyon_edge_distance(canyon, mid_p.x, mid_p.y);
+            if (lo_d <= 0.0) == (md <= 0.0) {
+                lo_p = mid_p;
+                lo_d = md;
+            } else {
+                hi_p = mid_p;
+                hi_d = md;
+            }
+            mid_p = (lo_p + hi_p) * 0.5;
+        }
+        mid_p
+    };
+
+    // محاسبه نرمال نرم و پیوسته دیواره دره رو به داخل رودخانه (بدون شکستگی پله‌ای)
+    let sample_cliff_normal = |x: f32, z: f32| -> [f32; 3] {
+        let g_eps = 0.40_f32;
+        let gx = moba_shared::canyon_edge_distance(canyon, x + g_eps, z)
+            - moba_shared::canyon_edge_distance(canyon, x - g_eps, z);
+        let gz = moba_shared::canyon_edge_distance(canyon, x, z + g_eps)
+            - moba_shared::canyon_edge_distance(canyon, x, z - g_eps);
+        let n = Vec3::new(gx, 0.14, gz).normalize_or_zero();
+        if n == Vec3::ZERO {
+            [0.0, 1.0, 0.0]
+        } else {
+            [n.x, n.y, n.z]
+        }
+    };
+
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(v_count * 2);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(v_count * 2);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(v_count * 2);
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(v_count * 2);
+    let mut indices: Vec<u32> = Vec::with_capacity(nx * nz * 8);
+
+    let push_vert = |positions: &mut Vec<[f32; 3]>,
+                     normals: &mut Vec<[f32; 3]>,
+                     uvs: &mut Vec<[f32; 2]>,
+                     colors: &mut Vec<[f32; 4]>,
+                     pos: [f32; 3],
+                     norm: [f32; 3],
+                     col: [f32; 4]|
+     -> u32 {
+        let idx = positions.len() as u32;
+        positions.push(pos);
+        normals.push(norm);
+        let u = ((pos[0] - min_x) / (max_x - min_x)).clamp(0.0, 1.0);
+        let v = ((pos[2] - min_z) / (max_z - min_z)).clamp(0.0, 1.0);
+        uvs.push([u, v]);
+        colors.push(col);
+        idx
+    };
+
+    // مثلث‌بندی دقیق یک سلول مرزی با Marching Squares (برش دقیق منحنی لبه دره + ساخت دیواره منحنی صاف)
+    let emit_cell_exact = |positions: &mut Vec<[f32; 3]>,
+                           normals: &mut Vec<[f32; 3]>,
+                           uvs: &mut Vec<[f32; 2]>,
+                           colors: &mut Vec<[f32; 4]>,
+                           indices: &mut Vec<u32>,
+                           x0: f32,
+                           z0: f32,
+                           x1: f32,
+                           z1: f32| {
+        // ترتیب CCW از دید بالا (+Y): (x0,z0) -> (x0,z1) -> (x1,z1) -> (x1,z0)
+        let c = [
+            Vec2::new(x0, z0),
+            Vec2::new(x0, z1),
+            Vec2::new(x1, z1),
+            Vec2::new(x1, z0),
+        ];
+        let d = [
+            moba_shared::canyon_edge_distance(canyon, c[0].x, c[0].y),
+            moba_shared::canyon_edge_distance(canyon, c[1].x, c[1].y),
+            moba_shared::canyon_edge_distance(canyon, c[2].x, c[2].y),
+            moba_shared::canyon_edge_distance(canyon, c[3].x, c[3].y),
+        ];
+        let inside = [d[0] > 0.0, d[1] > 0.0, d[2] > 0.0, d[3] > 0.0];
+        let in_count = inside.iter().filter(|&&b| b).count();
+
+        if in_count == 0 {
+            // سلول کاملاً روی فلات بالا (y = 0)
+            let v0 = push_vert(positions, normals, uvs, colors, [c[0].x, 0.0, c[0].y], [0.0, 1.0, 0.0], sample_ground_color(c[0].x, c[0].y));
+            let v1 = push_vert(positions, normals, uvs, colors, [c[1].x, 0.0, c[1].y], [0.0, 1.0, 0.0], sample_ground_color(c[1].x, c[1].y));
+            let v2 = push_vert(positions, normals, uvs, colors, [c[2].x, 0.0, c[2].y], [0.0, 1.0, 0.0], sample_ground_color(c[2].x, c[2].y));
+            let v3 = push_vert(positions, normals, uvs, colors, [c[3].x, 0.0, c[3].y], [0.0, 1.0, 0.0], sample_ground_color(c[3].x, c[3].y));
+            indices.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
+            return;
+        }
+        if in_count == 4 {
+            // سلول کاملاً در بستر دره
+            let v0 = push_vert(positions, normals, uvs, colors, [c[0].x, sample_bed_y(c[0].x, c[0].y), c[0].y], [0.0, 1.0, 0.0], bed_color);
+            let v1 = push_vert(positions, normals, uvs, colors, [c[1].x, sample_bed_y(c[1].x, c[1].y), c[1].y], [0.0, 1.0, 0.0], bed_color);
+            let v2 = push_vert(positions, normals, uvs, colors, [c[2].x, sample_bed_y(c[2].x, c[2].y), c[2].y], [0.0, 1.0, 0.0], bed_color);
+            let v3 = push_vert(positions, normals, uvs, colors, [c[3].x, sample_bed_y(c[3].x, c[3].y), c[3].y], [0.0, 1.0, 0.0], bed_color);
+            indices.extend_from_slice(&[v0, v1, v2, v0, v2, v3]);
+            return;
+        }
+
+        // جمع‌آوری چندضلعی بیرون (فلات) و درون (بستر دره) و نقاط عبور دقیق منحنی
+        let mut out_poly: Vec<Vec2> = Vec::with_capacity(6);
+        let mut in_poly: Vec<Vec2> = Vec::with_capacity(6);
+        let mut crossings: Vec<Vec2> = Vec::with_capacity(4);
+
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            if !inside[i] {
+                out_poly.push(c[i]);
+            } else {
+                in_poly.push(c[i]);
+            }
+            if inside[i] != inside[j] {
+                let cp = find_exact_contour_point(c[i], d[i], c[j], d[j]);
+                out_poly.push(cp);
+                in_poly.push(cp);
+                crossings.push(cp);
+            }
+        }
+
+
+        // ۱. مثلث‌بندی بخش فلات بالای سلول (دقیقاً بریده‌شده روی منحنی گرد لبه دره)
+        if out_poly.len() >= 3 {
+            let mut ov: Vec<u32> = Vec::with_capacity(out_poly.len());
+            for p in &out_poly {
+                ov.push(push_vert(
+                    positions,
+                    normals,
+                    uvs,
+                    colors,
+                    [p.x, 0.0, p.y],
+                    [0.0, 1.0, 0.0],
+                    sample_ground_color(p.x, p.y),
+                ));
+            }
+            for k in 1..(ov.len() - 1) {
+                indices.extend_from_slice(&[ov[0], ov[k], ov[k + 1]]);
+            }
+        }
+
+        // ۲. مثلث‌بندی بخش بستر رودخانه سلول
+        if in_poly.len() >= 3 {
+            let mut iv: Vec<u32> = Vec::with_capacity(in_poly.len());
+            for p in &in_poly {
+                iv.push(push_vert(
+                    positions,
+                    normals,
+                    uvs,
+                    colors,
+                    [p.x, sample_bed_y(p.x, p.y), p.y],
+                    [0.0, 1.0, 0.0],
+                    bed_color,
+                ));
+            }
+            for k in 1..(iv.len() - 1) {
+                indices.extend_from_slice(&[iv[0], iv[k], iv[k + 1]]);
+            }
+        }
+
+        // ۳. ساخت دیواره عمودی صاف و منحنی دقیقاً منطبق بر منحنی فیزیکی لبه دره (بدون هیچ پله‌پله شدن)
+        if crossings.len() >= 2 {
+            let mut pa = crossings[0];
+            let mut pb = crossings[1];
+            let mid = (pa + pb) * 0.5;
+            let mid_n = Vec3::from_array(sample_cliff_normal(mid.x, mid.y));
+            let top_a = Vec3::new(pa.x, 0.0, pa.y);
+            let top_b = Vec3::new(pb.x, 0.0, pb.y);
+            let bot_a = Vec3::new(pa.x, sample_bed_y(pa.x, pa.y), pa.y);
+            // اطمینان قطعی از جهت روبه‌داخل رودخانه (CCW) تا هیچ دیواره‌ای پشت‌ورو نشود
+            if (bot_a - top_a).cross(top_b - top_a).dot(mid_n) < 0.0 {
+                std::mem::swap(&mut pa, &mut pb);
+            }
+
+            let na = sample_cliff_normal(pa.x, pa.y);
+            let nb = sample_cliff_normal(pb.x, pb.y);
+            let y_mid = canyon.water_y.clamp(canyon.floor_depth + 1.0, -1.0);
+            let y_ba = sample_bed_y(pa.x, pa.y);
+            let y_bb = sample_bed_y(pb.x, pb.y);
+
+            // دو نوار عمودی (بالای آب + زیر آب) برای سایه‌زنی و گرادیان سنگی طبیعی
+            let ta = push_vert(positions, normals, uvs, colors, [pa.x, 0.0, pa.y], na, sample_cliff_color(pa.x, 0.0, pa.y));
+            let tb = push_vert(positions, normals, uvs, colors, [pb.x, 0.0, pb.y], nb, sample_cliff_color(pb.x, 0.0, pb.y));
+            let ma = push_vert(positions, normals, uvs, colors, [pa.x, y_mid, pa.y], na, sample_cliff_color(pa.x, y_mid, pa.y));
+            let mb = push_vert(positions, normals, uvs, colors, [pb.x, y_mid, pb.y], nb, sample_cliff_color(pb.x, y_mid, pb.y));
+            let ba = push_vert(positions, normals, uvs, colors, [pa.x, y_ba, pa.y], na, bed_color);
+            let bb = push_vert(positions, normals, uvs, colors, [pb.x, y_bb, pb.y], nb, bed_color);
+
+            indices.extend_from_slice(&[ta, ma, tb, tb, ma, mb]);
+            indices.extend_from_slice(&[ma, ba, mb, mb, ba, bb]);
+        }
+    };
+
+    // اشتراک‌گذاری رئوس برای سلول‌های کاملاً غیرمرزی جهت سبکی حافظه + برش دقیق منحنی برای سلول‌های مرزی دره
+    let mut flat_vert_map = vec![u32::MAX; v_count];
     for iz in 0..nz {
+        let z0 = min_z + (iz as f32) * dz;
+        let z1 = z0 + dz;
         for ix in 0..nx {
-            let i00 = (iz * cols + ix) as u32;
-            let i10 = i00 + 1;
-            let i01 = ((iz + 1) * cols + ix) as u32;
-            let i11 = i01 + 1;
-            indices.extend_from_slice(&[i00, i01, i10, i10, i01, i11]);
+            let x0 = min_x + (ix as f32) * dx;
+            let x1 = x0 + dx;
+            let idx00 = iz * cols + ix;
+            let idx10 = idx00 + 1;
+            let idx01 = (iz + 1) * cols + ix;
+            let idx11 = idx01 + 1;
+
+            let in00 = edge_dists[idx00] > 0.0;
+            let in10 = edge_dists[idx10] > 0.0;
+            let in01 = edge_dists[idx01] > 0.0;
+            let in11 = edge_dists[idx11] > 0.0;
+
+            if in00 == in10 && in10 == in01 && in01 == in11 {
+                // سلول همگن (کاملاً فلات یا کاملاً کف رودخانه) -> اشتراک رئوس سریع
+                for &vidx in &[idx00, idx10, idx01, idx11] {
+                    if flat_vert_map[vidx] == u32::MAX {
+                        let vx = min_x + ((vidx % cols) as f32) * dx;
+                        let vz = min_z + ((vidx / cols) as f32) * dz;
+                        let vy = grid_heights[vidx];
+                        let col = if edge_dists[vidx] > 0.0 {
+                            bed_color
+                        } else {
+                            sample_ground_color(vx, vz)
+                        };
+                        flat_vert_map[vidx] = push_vert(
+                            &mut positions,
+                            &mut normals,
+                            &mut uvs,
+                            &mut colors,
+                            [vx, vy, vz],
+                            [0.0, 1.0, 0.0],
+                            col,
+                        );
+                    }
+                }
+                let v00 = flat_vert_map[idx00];
+                let v10 = flat_vert_map[idx10];
+                let v01 = flat_vert_map[idx01];
+                let v11 = flat_vert_map[idx11];
+                indices.extend_from_slice(&[v00, v01, v10, v10, v01, v11]);
+            } else {
+                // سلول مرزی لبه دره: زیرتقسیم ۲×۲ برای منحنی کاملاً گرد و یکدست و رفع کامل حالت زینی
+                let xm = (x0 + x1) * 0.5;
+                let zm = (z0 + z1) * 0.5;
+                emit_cell_exact(&mut positions, &mut normals, &mut uvs, &mut colors, &mut indices, x0, z0, xm, zm);
+                emit_cell_exact(&mut positions, &mut normals, &mut uvs, &mut colors, &mut indices, xm, z0, x1, zm);
+                emit_cell_exact(&mut positions, &mut normals, &mut uvs, &mut colors, &mut indices, x0, zm, xm, z1);
+                emit_cell_exact(&mut positions, &mut normals, &mut uvs, &mut colors, &mut indices, xm, zm, x1, z1);
+            }
         }
     }
 
@@ -2591,10 +2833,10 @@ pub fn build_canyon_terrain_and_river_meshes(
             let idx10 = idx00 + 1;
             let idx01 = (iz + 1) * cols + ix;
             let idx11 = idx01 + 1;
-            let min_h = heights[idx00]
-                .min(heights[idx10])
-                .min(heights[idx01])
-                .min(heights[idx11]);
+            let min_h = grid_heights[idx00]
+                .min(grid_heights[idx10])
+                .min(grid_heights[idx01])
+                .min(grid_heights[idx11]);
             if min_h >= water_y + 0.40 {
                 continue;
             }

@@ -5017,11 +5017,12 @@ impl CustomPhysicsWorld {
             }
         }
 
-        // قفل لبه دره و لبه‌های پل/لاین روی دره در فاز افقی (قبل از بررسی زمین)
-        if config.map.canyon.enabled && (center.y - center_y_offset) >= -0.35 {
+        // قفل قطعی لبه دره و لبه‌های پل/لاین روی دره در فاز افقی (پوشش کامل پیچ‌های تند شمال‌غربی و سراسر دره)
+        if config.map.canyon.enabled && (current_center.y - center_y_offset) >= -0.35 {
             let was_on_bridge = is_on_bridge_or_lane(config, current_center.x, current_center.z);
             let now_on_bridge = is_on_bridge_or_lane(config, center.x, center.z);
             if !now_on_bridge {
+                let start_edge_d = canyon_edge_distance(&config.map.canyon, current_center.x, current_center.z);
                 let edge_d = canyon_edge_distance(&config.map.canyon, center.x, center.z);
                 if edge_d > -radius {
                     if was_on_bridge {
@@ -5029,16 +5030,31 @@ impl CustomPhysicsWorld {
                         let (cx, cz) = clamp_to_bridge_or_lane(config, center.x, center.z);
                         center.x = cx;
                         center.z = cz;
-                    } else if edge_d < 2.2 {
-                        let eps = 0.8_f32;
-                        let gx = canyon_edge_distance(&config.map.canyon, center.x + eps, center.z)
-                            - canyon_edge_distance(&config.map.canyon, center.x - eps, center.z);
-                        let gz = canyon_edge_distance(&config.map.canyon, center.x, center.z + eps)
-                            - canyon_edge_distance(&config.map.canyon, center.x, center.z - eps);
-                        let outward_dir = -Vec3::new(gx, 0.0, gz).normalize_or_zero();
-                        if outward_dir != Vec3::ZERO {
-                            let push = (edge_d + radius).clamp(0.0, 2.5);
+                    } else if start_edge_d <= 0.35 || edge_d < 4.5 {
+                        // بیرون راندن تکرارشونده از لبه دره با گام دقیق (رفع سقوط در پیچ‌های تند شمال‌غربی)
+                        let eps = 0.35_f32;
+                        for _ in 0..4 {
+                            let cur_ed = canyon_edge_distance(&config.map.canyon, center.x, center.z);
+                            if cur_ed <= -radius {
+                                break;
+                            }
+                            let gx = canyon_edge_distance(&config.map.canyon, center.x + eps, center.z)
+                                - canyon_edge_distance(&config.map.canyon, center.x - eps, center.z);
+                            let gz = canyon_edge_distance(&config.map.canyon, center.x, center.z + eps)
+                                - canyon_edge_distance(&config.map.canyon, center.x, center.z - eps);
+                            let outward_dir = -Vec3::new(gx, 0.0, gz).normalize_or_zero();
+                            if outward_dir == Vec3::ZERO {
+                                break;
+                            }
+                            let push = (cur_ed + radius + 0.02).clamp(0.02, 2.5);
                             center += outward_dir * push;
+                        }
+                        // تضمین نهایی: اگر به دلیل پیچ تند لبه همچنان داخل دره ماندیم، به موقعیت امن قبلی روی لبه برمی‌گردیم
+                        if canyon_edge_distance(&config.map.canyon, center.x, center.z) > -radius
+                            && start_edge_d <= -radius + 0.15
+                        {
+                            center.x = current_center.x;
+                            center.z = current_center.z;
                         }
                     }
                 }
@@ -11164,7 +11180,7 @@ fn sync_static_colliders_to_world_system(
             translation: tf.translation,
             rotation: rot,
             inv_rotation: rot.inverse(),
-            collider: *collider,
+            collider: collider.clone(),
             bounding_radius: collider.bounding_sphere_radius(),
             material: *mat,
             groups: *groups,
@@ -12358,22 +12374,33 @@ fn find_nearest_climbable_mountain(config: &GameConfig, attach_dist: f32, pos: V
         let hz = mtn.size.2 * 0.5 * tf.scale.z.abs();
         let inv_rot = tf.rotation.inverse();
         let local = inv_rot * (pos - tf.translation);
-        // فقط دیوار جلویی مکعب (-Z در فضای محلی کوه) قابل کوهنوردی است؛ دیواره‌های کناری قابل بالا رفتن نیستند
-        if local.x.abs() > hx || local.z > -hz + 0.35 {
+        // هر دو وجه روبرویی مکعب (-Z و +Z در فضای محلی کوه) قابل کوهنوردی هستند تا با چرخاندن مدل در کانفیگ نیز کار کند؛ دیواره‌های کناری (±X) خیر
+        if local.x.abs() > hx {
             continue;
         }
         let cx = local.x.clamp(-hx, hx);
-        let cz = -hz;
-        let dx = local.x - cx;
-        let dz = local.z - cz;
-        let dist = (dx * dx + dz * dz).sqrt();
-        if dist <= attach_dist {
-            let local_normal = Vec3::new(0.0, 0.0, -1.0);
-            let world_normal = (tf.rotation * local_normal).xz().normalize_or_zero();
-            let world_normal3 = Vec3::new(world_normal.x, 0.0, world_normal.y);
-            let wall_pt = tf.translation + tf.rotation * Vec3::new(cx, 0.0, cz);
-            if best.as_ref().is_none_or(|b| dist < b.0) {
-                best = Some((dist, idx, wall_pt, world_normal3));
+        for (cz, local_normal) in [
+            (-hz, Vec3::new(0.0, 0.0, -1.0)),
+            (hz, Vec3::new(0.0, 0.0, 1.0)),
+        ] {
+            let on_this_face = if cz < 0.0 {
+                local.z <= -hz + 0.35
+            } else {
+                local.z >= hz - 0.35
+            };
+            if !on_this_face {
+                continue;
+            }
+            let dx = local.x - cx;
+            let dz = local.z - cz;
+            let dist = (dx * dx + dz * dz).sqrt();
+            if dist <= attach_dist {
+                let world_normal = (tf.rotation * local_normal).xz().normalize_or_zero();
+                let world_normal3 = Vec3::new(world_normal.x, 0.0, world_normal.y);
+                let wall_pt = tf.translation + tf.rotation * Vec3::new(cx, 0.0, cz);
+                if best.as_ref().is_none_or(|b| dist < b.0) {
+                    best = Some((dist, idx, wall_pt, world_normal3));
+                }
             }
         }
     }
@@ -12414,8 +12441,11 @@ fn step_wall_climb_custom(
         let inv_rot = tf.rotation.inverse();
         let local = inv_rot * (world.soldier_pos - tf.translation);
         let cx = local.x.clamp(-hx, hx);
-        let cz = -hz;
-        let local_normal = Vec3::new(0.0, 0.0, -1.0);
+        let (cz, local_normal) = if local.z >= 0.0 {
+            (hz, Vec3::new(0.0, 0.0, 1.0))
+        } else {
+            (-hz, Vec3::new(0.0, 0.0, -1.0))
+        };
         let wall_normal_xz = (tf.rotation * local_normal).xz().normalize_or_zero();
         let wall_normal = Vec3::new(wall_normal_xz.x, 0.0, wall_normal_xz.y);
         let wall_pt = tf.translation + tf.rotation * Vec3::new(cx, 0.0, cz);

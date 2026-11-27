@@ -462,11 +462,26 @@ pub struct SpectatorConfig {
     pub watch_hero_icon_size_px: f32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HeroSelectPreviewConfig {
+    pub stage_origin: (f32, f32, f32),
+    pub camera_offset: (f32, f32, f32),
+    pub look_at_height_ratio: f32,
+    pub camera_fov_deg: f32,
+    pub gameplay_fov_deg: f32,
+    pub initial_yaw_deg: f32,
+    pub auto_rotate_speed_rad: f32,
+    pub drag_rotate_sensitivity: f32,
+    pub roster_icon_size_px: f32,
+    pub backdrop_alpha: f32,
+}
+
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
     pub gameplay_rules: GameplayRulesConfig,
     pub main_menu: MainMenuConfig,
     pub spectator: SpectatorConfig,
+    pub hero_select_preview: HeroSelectPreviewConfig,
     pub weather: WeatherConfig,
     pub day_night: DayNightConfig,
     pub telemetry: TelemetryConfig,
@@ -993,8 +1008,37 @@ impl GameConfig {
             "cursor_lead_deadzone_ratio باید بین [0.0, 1.0) باشد"
         );
         assert!(self.camera.cursor_lead_lerp_speed > 0.0, "cursor_lead_lerp_speed باید بزرگ‌تر از صفر باشد");
-        assert!(self.camera.edge_pan_margin_px > 0.0, "edge_pan_margin_px باید بزرگ‌تر از صفر باشد");
-        assert!(self.camera.edge_pan_speed > 0.0, "edge_pan_speed باید بزرگ‌تر از صفر باشد");
+        assert!(
+            self.camera.cursor_lead_max_distance_down_z >= self.camera.cursor_lead_max_distance_z
+                && self.camera.cursor_lead_max_distance_down_z.is_finite(),
+            "cursor_lead_max_distance_down_z نامعتبر است"
+        );
+        assert!(
+            self.camera.cursor_lead_scale_min >= 0.0
+                && self.camera.cursor_lead_scale_max > self.camera.cursor_lead_scale_min,
+            "محدوده cursor_lead_scale نامعتبر است"
+        );
+        assert!(
+            self.camera.cursor_sensitivity_min > 0.0
+                && self.camera.cursor_sensitivity_max > self.camera.cursor_sensitivity_min
+                && self.camera.cursor_sensitivity_default >= self.camera.cursor_sensitivity_min
+                && self.camera.cursor_sensitivity_default <= self.camera.cursor_sensitivity_max,
+            "محدوده cursor_sensitivity نامعتبر است"
+        );
+        assert!(
+            self.camera.edge_pan_margin_min_px > 0.0
+                && self.camera.edge_pan_margin_max_px > self.camera.edge_pan_margin_min_px
+                && self.camera.edge_pan_margin_px >= self.camera.edge_pan_margin_min_px
+                && self.camera.edge_pan_margin_px <= self.camera.edge_pan_margin_max_px,
+            "محدوده edge_pan_margin_px نامعتبر است"
+        );
+        assert!(
+            self.camera.edge_pan_speed_min > 0.0
+                && self.camera.edge_pan_speed_max > self.camera.edge_pan_speed_min
+                && self.camera.edge_pan_speed >= self.camera.edge_pan_speed_min
+                && self.camera.edge_pan_speed <= self.camera.edge_pan_speed_max,
+            "محدوده edge_pan_speed نامعتبر است"
+        );
         assert!(self.camera.occlusion_fade_speed > 0.0, "occlusion_fade_speed باید بزرگ‌تر از صفر باشد");
         assert!(self.camera.occlusion_edge_emissive >= 0.0, "occlusion_edge_emissive نباید منفی باشد");
         assert!(self.camera.occlusion_edge_power > 0.0, "occlusion_edge_power باید بزرگ‌تر از صفر باشد");
@@ -1345,6 +1389,51 @@ impl GameConfig {
         assert!(
             mm.history_item_slot_gap_px.is_finite() && mm.history_item_slot_gap_px >= 0.0,
             "main_menu.history_item_slot_gap_px نامعتبر است"
+        );
+
+        let hs = &self.hero_select_preview;
+        assert!(
+            hs.stage_origin.0.is_finite()
+                && hs.stage_origin.1.is_finite()
+                && hs.stage_origin.2.is_finite(),
+            "hero_select_preview.stage_origin نامعتبر است"
+        );
+        assert!(
+            hs.camera_offset.0.is_finite()
+                && hs.camera_offset.1.is_finite()
+                && hs.camera_offset.2.is_finite()
+                && hs.camera_offset.2 > 1.0,
+            "hero_select_preview.camera_offset نامعتبر است"
+        );
+        assert!(
+            hs.look_at_height_ratio.is_finite() && hs.look_at_height_ratio > 0.2,
+            "hero_select_preview.look_at_height_ratio نامعتبر است"
+        );
+        assert!(
+            hs.camera_fov_deg.is_finite() && hs.camera_fov_deg >= 15.0 && hs.camera_fov_deg <= 75.0,
+            "hero_select_preview.camera_fov_deg باید بین 15 تا 75 درجه باشد"
+        );
+        assert!(
+            hs.gameplay_fov_deg.is_finite()
+                && hs.gameplay_fov_deg >= 25.0
+                && hs.gameplay_fov_deg <= 90.0,
+            "hero_select_preview.gameplay_fov_deg باید بین 25 تا 90 درجه باشد"
+        );
+        assert!(
+            hs.initial_yaw_deg.is_finite() && hs.auto_rotate_speed_rad.is_finite(),
+            "hero_select_preview زاویه یا سرعت چرخش نامعتبر است"
+        );
+        assert!(
+            hs.drag_rotate_sensitivity.is_finite() && hs.drag_rotate_sensitivity > 0.0,
+            "hero_select_preview.drag_rotate_sensitivity باید مثبت باشد"
+        );
+        assert!(
+            hs.roster_icon_size_px.is_finite() && hs.roster_icon_size_px >= 20.0,
+            "hero_select_preview.roster_icon_size_px باید حداقل 20 پیکسل باشد"
+        );
+        assert!(
+            hs.backdrop_alpha.is_finite() && (0.0..=1.0).contains(&hs.backdrop_alpha),
+            "hero_select_preview.backdrop_alpha باید بین 0 تا 1 باشد"
         );
 
         let sp = &self.spectator;
@@ -2022,10 +2111,20 @@ pub struct CameraConfig {
     pub look_at_shake_factor: f32,
     pub cursor_lead_max_distance_x: f32,
     pub cursor_lead_max_distance_z: f32,
+    pub cursor_lead_max_distance_down_z: f32,
     pub cursor_lead_deadzone_ratio: f32,
     pub cursor_lead_lerp_speed: f32,
+    pub cursor_lead_scale_min: f32,
+    pub cursor_lead_scale_max: f32,
+    pub cursor_sensitivity_default: f32,
+    pub cursor_sensitivity_min: f32,
+    pub cursor_sensitivity_max: f32,
     pub edge_pan_margin_px: f32,
+    pub edge_pan_margin_min_px: f32,
+    pub edge_pan_margin_max_px: f32,
     pub edge_pan_speed: f32,
+    pub edge_pan_speed_min: f32,
+    pub edge_pan_speed_max: f32,
     pub occlusion_fade_speed: f32,
     pub occlusion_edge_color_rgb: (f32, f32, f32),
     pub occlusion_edge_emissive: f32,

@@ -408,7 +408,9 @@ impl Plugin for ShopPlugin {
                     sell_confirm_modal_system,
                     settings_modal_interaction_system,
                     audio_mixer_slider_interaction_system,
+                    camera_cursor_settings_interaction_system,
                     rebuild_settings_modal_system,
+                    rebuild_camera_cursor_settings_ui_system,
                     inventory_shortcut_trigger_system,
                     hud_inventory_drag_and_drop_system,
                     courier_hud_and_hotkey_system,
@@ -1669,12 +1671,14 @@ fn spawn_shop_and_inventory_ui(
             backdrop
                 .spawn((
                     Node {
-                        width: px(600.0),
+                        width: px(640.0),
+                        max_height: percent(90.0),
                         padding: UiRect::all(px(18.0)),
                         flex_direction: FlexDirection::Column,
-                        row_gap: px(14.0),
+                        row_gap: px(12.0),
                         border: UiRect::all(px(2.0)),
                         border_radius: BorderRadius::all(px(12.0)),
+                        overflow: Overflow::scroll_y(),
                         ..default()
                     },
                     BorderColor::all(Color::srgb(0.45, 0.68, 0.92)),
@@ -1780,6 +1784,30 @@ fn spawn_shop_and_inventory_ui(
                         },
                         BorderColor::all(Color::srgba(0.28, 0.40, 0.54, 0.75)),
                         BackgroundColor(Color::srgba(0.06, 0.09, 0.14, 0.90)),
+                    ));
+
+                    card.spawn((
+                        Text::new("CAMERA & CURSOR CONTROLS"),
+                        TextFont {
+                            font_size: FontSize::Px(15.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.42, 0.94, 0.78)),
+                    ));
+
+                    card.spawn((
+                        SettingsCameraContainer,
+                        Node {
+                            width: percent(100),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(7.0),
+                            padding: UiRect::all(px(10.0)),
+                            border: UiRect::all(px(1.0)),
+                            border_radius: BorderRadius::all(px(8.0)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(0.26, 0.48, 0.56, 0.78)),
+                        BackgroundColor(Color::srgba(0.05, 0.09, 0.14, 0.92)),
                     ));
 
                     card.spawn((
@@ -4545,6 +4573,7 @@ fn settings_modal_interaction_system(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut settings_ui: ResMut<SettingsUiState>,
+    mut cam_cursor_settings: ResMut<UserCameraCursorSettings>,
     mut shortcuts: ResMut<InventoryShortcutsState>,
     mut vertical_aim_key: ResMut<VerticalAimKeyState>,
     mut p: SettingsInteractionParams,
@@ -4574,6 +4603,7 @@ fn settings_modal_interaction_system(
         settings_ui.listening_vertical_aim = false;
         settings_ui.status_message = None;
         settings_ui.dirty = true;
+        cam_cursor_settings.dirty = true;
     }
     for _ in &p.close_btn_q {
         settings_ui.is_open = false;
@@ -7046,5 +7076,450 @@ fn safe_despawn(commands: &mut Commands, entity: Entity) {
         if let Ok(em) = world.get_entity_mut(entity) {
             em.despawn();
         }
+    });
+}
+
+
+// ============================================================================
+//  CAMERA & CURSOR CONTROLS (USER SETTINGS MODAL SECTION)
+// ============================================================================
+
+#[derive(Resource, Debug, Clone)]
+pub struct UserCameraCursorSettings {
+    pub cursor_sensitivity: f32,
+    pub edge_pan_enabled: bool,
+    pub edge_pan_speed: f32,
+    pub edge_pan_margin_px: f32,
+    pub cursor_lead_scale: f32,
+    pub dirty: bool,
+}
+
+impl UserCameraCursorSettings {
+    pub fn from_config(config: &GameConfig) -> Self {
+        Self {
+            cursor_sensitivity: config.camera.cursor_sensitivity_default,
+            edge_pan_enabled: true,
+            edge_pan_speed: config.camera.edge_pan_speed,
+            edge_pan_margin_px: config.camera.edge_pan_margin_px,
+            cursor_lead_scale: 1.0_f32.clamp(
+                config.camera.cursor_lead_scale_min,
+                config.camera.cursor_lead_scale_max,
+            ),
+            dirty: true,
+        }
+    }
+}
+
+#[derive(Component)]
+struct SettingsCameraContainer;
+
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+enum CamSettingKind {
+    CursorSensitivity,
+    EdgePanSpeed,
+    EdgePanMargin,
+    CursorLeadScale,
+}
+
+#[derive(Component, Clone, Copy)]
+struct CamSettingSliderTrack {
+    kind: CamSettingKind,
+}
+
+#[derive(Component, Clone, Copy)]
+struct CamSettingStepBtn {
+    kind: CamSettingKind,
+    delta_frac: f32,
+}
+
+#[derive(Component)]
+struct CamSettingEdgePanToggleBtn;
+
+#[derive(Component)]
+struct CamSettingResetBtn;
+
+fn spawn_cam_slider_row(
+    parent: &mut ChildSpawnerCommands,
+    label: &str,
+    value_text: String,
+    kind: CamSettingKind,
+    norm_01: f32,
+    accent: Color,
+) {
+    let frac = norm_01.clamp(0.0, 1.0);
+    parent
+        .spawn(Node {
+            width: percent(100),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(8.0),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Node {
+                    width: px(165.0),
+                    ..default()
+                },
+                Text::new(label),
+                TextFont {
+                    font_size: FontSize::Px(11.5),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.84, 0.90, 0.96)),
+            ));
+
+            row.spawn((
+                UiButton,
+                Hovered::default(),
+                CamSettingStepBtn {
+                    kind,
+                    delta_frac: -0.05,
+                },
+                Node {
+                    width: px(24.0),
+                    height: px(22.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(px(1.0)),
+                    border_radius: BorderRadius::all(px(5.0)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.35, 0.50, 0.68, 0.85)),
+                BackgroundColor(Color::srgba(0.10, 0.15, 0.23, 0.95)),
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("-"),
+                    TextFont {
+                        font_size: FontSize::Px(13.0),
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+            });
+
+            row.spawn((
+                UiButton,
+                Hovered::default(),
+                RelativeCursorPosition::default(),
+                CamSettingSliderTrack { kind },
+                Node {
+                    flex_grow: 1.0,
+                    height: px(14.0),
+                    border: UiRect::all(px(1.0)),
+                    border_radius: BorderRadius::all(px(7.0)),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+                BorderColor::all(accent.with_alpha(0.75)),
+                BackgroundColor(Color::srgba(0.08, 0.12, 0.18, 0.95)),
+            ))
+            .with_children(|track| {
+                track.spawn((
+                    Node {
+                        width: percent(frac * 100.0),
+                        height: percent(100),
+                        ..default()
+                    },
+                    BackgroundColor(accent),
+                ));
+            });
+
+            row.spawn((
+                UiButton,
+                Hovered::default(),
+                CamSettingStepBtn {
+                    kind,
+                    delta_frac: 0.05,
+                },
+                Node {
+                    width: px(24.0),
+                    height: px(22.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    border: UiRect::all(px(1.0)),
+                    border_radius: BorderRadius::all(px(5.0)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.35, 0.50, 0.68, 0.85)),
+                BackgroundColor(Color::srgba(0.10, 0.15, 0.23, 0.95)),
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("+"),
+                    TextFont {
+                        font_size: FontSize::Px(13.0),
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+            });
+
+            row.spawn((
+                Node {
+                    width: px(78.0),
+                    justify_content: JustifyContent::FlexEnd,
+                    ..default()
+                },
+                Text::new(value_text),
+                TextFont {
+                    font_size: FontSize::Px(11.5),
+                    ..default()
+                },
+                TextColor(accent),
+            ));
+        });
+}
+
+fn apply_cam_setting_norm(
+    cfg: &GameConfig,
+    st: &mut UserCameraCursorSettings,
+    kind: CamSettingKind,
+    norm_01: f32,
+) {
+    let f = norm_01.clamp(0.0, 1.0);
+    let c = &cfg.camera;
+    match kind {
+        CamSettingKind::CursorSensitivity => {
+            st.cursor_sensitivity =
+                c.cursor_sensitivity_min + (c.cursor_sensitivity_max - c.cursor_sensitivity_min) * f;
+        }
+        CamSettingKind::EdgePanSpeed => {
+            st.edge_pan_speed =
+                c.edge_pan_speed_min + (c.edge_pan_speed_max - c.edge_pan_speed_min) * f;
+        }
+        CamSettingKind::EdgePanMargin => {
+            st.edge_pan_margin_px =
+                c.edge_pan_margin_min_px + (c.edge_pan_margin_max_px - c.edge_pan_margin_min_px) * f;
+        }
+        CamSettingKind::CursorLeadScale => {
+            st.cursor_lead_scale =
+                c.cursor_lead_scale_min + (c.cursor_lead_scale_max - c.cursor_lead_scale_min) * f;
+        }
+    }
+    st.dirty = true;
+}
+
+fn read_cam_setting_norm(cfg: &GameConfig, st: &UserCameraCursorSettings, kind: CamSettingKind) -> f32 {
+    let c = &cfg.camera;
+    match kind {
+        CamSettingKind::CursorSensitivity => {
+            ((st.cursor_sensitivity - c.cursor_sensitivity_min)
+                / (c.cursor_sensitivity_max - c.cursor_sensitivity_min).max(0.001))
+                .clamp(0.0, 1.0)
+        }
+        CamSettingKind::EdgePanSpeed => {
+            ((st.edge_pan_speed - c.edge_pan_speed_min)
+                / (c.edge_pan_speed_max - c.edge_pan_speed_min).max(0.001))
+                .clamp(0.0, 1.0)
+        }
+        CamSettingKind::EdgePanMargin => {
+            ((st.edge_pan_margin_px - c.edge_pan_margin_min_px)
+                / (c.edge_pan_margin_max_px - c.edge_pan_margin_min_px).max(0.001))
+                .clamp(0.0, 1.0)
+        }
+        CamSettingKind::CursorLeadScale => {
+            ((st.cursor_lead_scale - c.cursor_lead_scale_min)
+                / (c.cursor_lead_scale_max - c.cursor_lead_scale_min).max(0.001))
+                .clamp(0.0, 1.0)
+        }
+    }
+}
+
+fn camera_cursor_settings_interaction_system(
+    config: Res<GameConfig>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    settings_ui: Res<SettingsUiState>,
+    mut cam_st: ResMut<UserCameraCursorSettings>,
+    track_q: Query<(&CamSettingSliderTrack, &Hovered, &RelativeCursorPosition)>,
+    step_q: Query<(&CamSettingStepBtn, &Hovered)>,
+    toggle_q: Query<&Hovered, With<CamSettingEdgePanToggleBtn>>,
+    reset_q: Query<&Hovered, With<CamSettingResetBtn>>,
+) {
+    if !settings_ui.is_open {
+        return;
+    }
+
+    let left_pressed = mouse.pressed(MouseButton::Left);
+    let left_just = mouse.just_pressed(MouseButton::Left);
+
+    if left_pressed {
+        for (track, hovered, rel) in &track_q {
+            if hovered.get() {
+                if let Some(norm) = rel.normalized {
+                    let frac = (norm.x + 0.5).clamp(0.0, 1.0);
+                    apply_cam_setting_norm(&config, &mut cam_st, track.kind, frac);
+                }
+            }
+        }
+    }
+
+    if left_just {
+        for (btn, hovered) in &step_q {
+            if hovered.get() {
+                let cur = read_cam_setting_norm(&config, &cam_st, btn.kind);
+                apply_cam_setting_norm(&config, &mut cam_st, btn.kind, cur + btn.delta_frac);
+            }
+        }
+        for hovered in &toggle_q {
+            if hovered.get() {
+                cam_st.edge_pan_enabled = !cam_st.edge_pan_enabled;
+                cam_st.dirty = true;
+            }
+        }
+        for hovered in &reset_q {
+            if hovered.get() {
+                *cam_st = UserCameraCursorSettings::from_config(&config);
+            }
+        }
+    }
+}
+
+fn rebuild_camera_cursor_settings_ui_system(
+    mut commands: Commands,
+    config: Res<GameConfig>,
+    settings_ui: Res<SettingsUiState>,
+    mut cam_st: ResMut<UserCameraCursorSettings>,
+    cont_q: Query<(Entity, Option<&Children>), With<SettingsCameraContainer>>,
+) {
+    if !settings_ui.is_open || !cam_st.dirty {
+        return;
+    }
+    cam_st.dirty = false;
+
+    let Ok((c_ent, c_ch)) = cont_q.single() else {
+        return;
+    };
+    clear_children(&mut commands, c_ch);
+
+    let sens_norm = read_cam_setting_norm(&config, &cam_st, CamSettingKind::CursorSensitivity);
+    let speed_norm = read_cam_setting_norm(&config, &cam_st, CamSettingKind::EdgePanSpeed);
+    let margin_norm = read_cam_setting_norm(&config, &cam_st, CamSettingKind::EdgePanMargin);
+    let lead_norm = read_cam_setting_norm(&config, &cam_st, CamSettingKind::CursorLeadScale);
+
+    commands.entity(c_ent).with_children(|cc| {
+        spawn_cam_slider_row(
+            cc,
+            "CURSOR SPEED",
+            format!("{:.2}x", cam_st.cursor_sensitivity),
+            CamSettingKind::CursorSensitivity,
+            sens_norm,
+            Color::srgb(0.98, 0.78, 0.24),
+        );
+
+        // Edge-Pan Enable Toggle Row
+        cc.spawn(Node {
+            width: percent(100),
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new("EDGE-SCROLL CAMERA (FREE CAM)"),
+                TextFont {
+                    font_size: FontSize::Px(11.5),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.84, 0.90, 0.96)),
+            ));
+            let (lbl, bg, bd) = if cam_st.edge_pan_enabled {
+                (
+                    "ENABLED",
+                    Color::srgba(0.10, 0.42, 0.26, 0.95),
+                    Color::srgb(0.28, 0.92, 0.58),
+                )
+            } else {
+                (
+                    "DISABLED",
+                    Color::srgba(0.32, 0.10, 0.12, 0.95),
+                    Color::srgb(0.92, 0.34, 0.36),
+                )
+            };
+            row.spawn((
+                UiButton,
+                Hovered::default(),
+                CamSettingEdgePanToggleBtn,
+                Node {
+                    padding: UiRect::axes(px(12.0), px(4.0)),
+                    border: UiRect::all(px(1.2)),
+                    border_radius: BorderRadius::all(px(6.0)),
+                    ..default()
+                },
+                BorderColor::all(bd),
+                BackgroundColor(bg),
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new(lbl),
+                    TextFont {
+                        font_size: FontSize::Px(11.0),
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                ));
+            });
+        });
+
+        spawn_cam_slider_row(
+            cc,
+            "EDGE-PAN SPEED",
+            format!("{:.0} u/s", cam_st.edge_pan_speed),
+            CamSettingKind::EdgePanSpeed,
+            speed_norm,
+            Color::srgb(0.24, 0.84, 0.98),
+        );
+
+        spawn_cam_slider_row(
+            cc,
+            "EDGE-PAN SENSITIVITY",
+            format!("{:.0} px", cam_st.edge_pan_margin_px),
+            CamSettingKind::EdgePanMargin,
+            margin_norm,
+            Color::srgb(0.32, 0.92, 0.72),
+        );
+
+        spawn_cam_slider_row(
+            cc,
+            "CURSOR CAMERA REACH",
+            format!("{:.0}%", cam_st.cursor_lead_scale * 100.0),
+            CamSettingKind::CursorLeadScale,
+            lead_norm,
+            Color::srgb(0.76, 0.58, 0.98),
+        );
+
+        cc.spawn(Node {
+            width: percent(100),
+            justify_content: JustifyContent::FlexEnd,
+            margin: UiRect::top(px(4.0)),
+            ..default()
+        })
+        .with_children(|rrow| {
+            rrow.spawn((
+                UiButton,
+                Hovered::default(),
+                CamSettingResetBtn,
+                Node {
+                    padding: UiRect::axes(px(10.0), px(4.0)),
+                    border: UiRect::all(px(1.0)),
+                    border_radius: BorderRadius::all(px(6.0)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.45, 0.65, 0.85, 0.85)),
+                BackgroundColor(Color::srgba(0.10, 0.16, 0.24, 0.95)),
+            ))
+            .with_children(|btn| {
+                btn.spawn((
+                    Text::new("RESET CAMERA & CURSOR"),
+                    TextFont {
+                        font_size: FontSize::Px(10.5),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.86, 0.94, 1.0)),
+                ));
+            });
+        });
     });
 }

@@ -1,6 +1,6 @@
 use bevy::animation::AnimatedBy;
 use bevy::input::keyboard::{Key, KeyboardInput};
-use bevy::input::mouse::MouseWheel;
+use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::input::ButtonState;
 use bevy::asset::RenderAssetUsages;
 use bevy::gltf::GltfMaterialName;
@@ -62,7 +62,7 @@ use pregame_ui::{AppScreenState, PendingMatchConnection, PreGamePlugin, PreGameS
 use vfx_client::{build_canyon_terrain_and_river_meshes, build_curved_waterfall_mesh, BulletVfxRegistry, ClientVfxEvent, FlameBeamMaterial, FlameBeamUniforms, MobaVfxPlugin, TeleportPortalMaterial, TeleportPortalUniforms, ToxicPoolMaterial, ToxicPoolUniforms, VfxEventQueue, WaterSurfaceMaterial, WaterUniforms, WeatherVfxState};
 mod shop_client;
 use audio_client::{ActiveBeamAudio, AudioEventQueue, AudioFrameContext, ClientAudioEvent, MobaAudioPlugin};
-use shop_client::{spawn_item_icon_badge, CourierControlState, InventoryDragDropBridge, ItemIconCache, SettingsUiState, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, TeleportPreviewState, VerticalAimKeyState, WorldDropTarget};
+use shop_client::{spawn_item_icon_badge, CourierControlState, InventoryDragDropBridge, ItemIconCache, SettingsUiState, UserCameraCursorSettings, ShopContextSnapshot, ShopOutgoingQueue, ShopPlugin, ShopUiState, TeleportPreviewState, VerticalAimKeyState, WorldDropTarget};
 
 
 #[cfg(not(debug_assertions))]
@@ -328,12 +328,14 @@ fn main() {
             ticket_sent: false,
         })
         .insert_resource(ClientSpectatorState::default())
+        .insert_resource(UserCameraCursorSettings::from_config(&config))
         .insert_resource(CameraControlState {
             free_look_target: None,
             camera_unlocked: false,
             current_cursor_lead: Vec3::ZERO,
             is_pointer_over_minimap: false,
             is_dragging_minimap: false,
+            virtual_cursor_pos: None,
         })
         .add_plugins(MobaVfxPlugin)
         .add_plugins(MaterialPlugin::<OcclusionEdgeMaterial>::default())
@@ -793,6 +795,7 @@ struct CameraControlState {
     current_cursor_lead: Vec3,
     is_pointer_over_minimap: bool,
     is_dragging_minimap: bool,
+    virtual_cursor_pos: Option<Vec2>,
 }
 
 #[derive(Component)]
@@ -2521,7 +2524,7 @@ fn setup_scene(
     spawn_telemetry_hud_ui(&mut commands);
     spawn_ingame_exit_button_ui(&mut commands);
     spawn_spectator_hud_ui(&mut commands, &config);
-    spawn_match_overlay_ui(&mut commands, &config);
+    spawn_match_overlay_ui(&mut commands, &config, &asset_server);
 
     let shared_fx = SharedFxAssets {
         bullet_mesh: meshes.add(Cone {
@@ -4028,7 +4031,7 @@ fn client_sample_input_system(
     let mut has_aim_ray = false;
 
     if let (Ok(window), Ok((camera, camera_tf))) = (window_query.single(), camera_query.single()) {
-        if let Some(cursor_pos) = window.cursor_position() {
+        if let Some(cursor_pos) = camera_control.virtual_cursor_pos.or_else(|| window.cursor_position()) {
             if let Ok(ray) = camera.viewport_to_world(camera_tf, cursor_pos) {
                 aim_ray_origin = ray.origin;
                 aim_ray_dir = *ray.direction;
@@ -5584,6 +5587,9 @@ fn cursor_reticle_system(
     settings_ui: Res<SettingsUiState>,
     demo_session: Res<demo_client::ActiveDemoSession>,
     spectator: Res<ClientSpectatorState>,
+    cam_settings: Res<UserCameraCursorSettings>,
+    mut mouse_motion: MessageReader<MouseMotion>,
+    mut camera_control: ResMut<CameraControlState>,
     mut window_query: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
     mut root_query: Query<(&mut ReticleRoot, &mut Node, &mut Visibility)>,
     mut outer_query: Query<
@@ -5649,17 +5655,43 @@ fn cursor_reticle_system(
     };
 
     if ui_cursor_needed {
+        mouse_motion.clear();
+        camera_control.virtual_cursor_pos = window.cursor_position();
         if *root_vis != Visibility::Hidden {
             *root_vis = Visibility::Hidden;
         }
         return;
     }
 
-    let Some(cursor_pos) = window.cursor_position() else {
-        if *root_vis != Visibility::Hidden {
-            *root_vis = Visibility::Hidden;
+    let mut raw_delta = Vec2::ZERO;
+    for ev in mouse_motion.read() {
+        raw_delta += ev.delta;
+    }
+    let win_w = window.width().max(1.0);
+    let win_h = window.height().max(1.0);
+    let cursor_pos = if (cam_settings.cursor_sensitivity - 1.0).abs() < 0.01 {
+        let pos = window.cursor_position();
+        camera_control.virtual_cursor_pos = pos;
+        match pos {
+            Some(p) => p,
+            None => {
+                if *root_vis != Visibility::Hidden {
+                    *root_vis = Visibility::Hidden;
+                }
+                return;
+            }
         }
-        return;
+    } else {
+        let base = camera_control
+            .virtual_cursor_pos
+            .or_else(|| window.cursor_position())
+            .unwrap_or(Vec2::new(win_w * 0.5, win_h * 0.5));
+        let next = Vec2::new(
+            (base.x + raw_delta.x * cam_settings.cursor_sensitivity).clamp(0.0, win_w),
+            (base.y + raw_delta.y * cam_settings.cursor_sensitivity).clamp(0.0, win_h),
+        );
+        camera_control.virtual_cursor_pos = Some(next);
+        next
     };
 
     if *root_vis != Visibility::Visible {
@@ -5786,6 +5818,7 @@ struct CameraFollowExtraParams<'w, 's> {
     settings_ui: Res<'w, SettingsUiState>,
     latest_couriers: Res<'w, LatestCouriers>,
     latest_remotes: Res<'w, LatestRemotePlayers>,
+    cam_settings: Res<'w, UserCameraCursorSettings>,
     spectator: ResMut<'w, ClientSpectatorState>,
     mouse_wheel: MessageReader<'w, 's, MouseWheel>,
     courier_ctrl: ResMut<'w, CourierControlState>,
@@ -6057,8 +6090,9 @@ fn camera_follow_system(
         *last_mid_cursor = None;
     }
 
-    // جابجایی دوربین با بردن نشانه‌گر موس به لبه‌های صفحه هنگام آزاد بودن دوربین (مشابه Dota 2)
+    // جابجایی دوربین با بردن نشانه‌گر موس به لبه‌های صفحه هنگام آزاد بودن دوربین (قابل تنظیم در Settings)
     if ex.camera_control.camera_unlocked
+        && ex.cam_settings.edge_pan_enabled
         && !ex.chat_state.is_open
         && !ex.shop_ui.is_open
         && !ex.settings_ui.is_open
@@ -6066,10 +6100,10 @@ fn camera_follow_system(
         && !mouse_button.pressed(MouseButton::Middle)
     {
         if let Ok(window) = window_query.single() {
-            if let Some(cursor) = window.cursor_position() {
+            if let Some(cursor) = ex.camera_control.virtual_cursor_pos.or_else(|| window.cursor_position()) {
                 let win_w = window.width().max(1.0);
                 let win_h = window.height().max(1.0);
-                let margin = config.camera.edge_pan_margin_px;
+                let margin = ex.cam_settings.edge_pan_margin_px;
                 let mut edge_dir = Vec2::ZERO;
                 if cursor.x <= margin {
                     edge_dir.x -= 1.0;
@@ -6086,9 +6120,10 @@ fn camera_follow_system(
                     let base = ex.camera_control
                         .free_look_target
                         .unwrap_or(soldier_tf.translation);
-                    let next_x = (base.x + dir_n.x * config.camera.edge_pan_speed * dt)
+                    let pan_speed = ex.cam_settings.edge_pan_speed;
+                    let next_x = (base.x + dir_n.x * pan_speed * dt)
                         .clamp(-half_x, half_x);
-                    let next_z = (base.z + dir_n.y * config.camera.edge_pan_speed * dt)
+                    let next_z = (base.z + dir_n.y * pan_speed * dt)
                         .clamp(-half_z, half_z);
                     ex.camera_control.free_look_target = Some(Vec3::new(next_x, base.y, next_z));
                 }
@@ -6117,22 +6152,32 @@ fn camera_follow_system(
         && ex.pause_state.0.phase == PausePhase::Running
     {
         if let Ok(window) = window_query.single() {
-            if let Some(cursor) = window.cursor_position() {
+            if let Some(cursor) = ex.camera_control.virtual_cursor_pos.or_else(|| window.cursor_position()) {
                 let win_w = window.width().max(1.0);
                 let win_h = window.height().max(1.0);
                 let nx = ((cursor.x / win_w) - 0.5) * 2.0;
                 let ny = ((cursor.y / win_h) - 0.5) * 2.0;
                 let vec2 = Vec2::new(nx, ny);
                 let mag = vec2.length().min(1.0);
-                let dz = config.camera.cursor_lead_deadzone_ratio;
-                if mag > dz && mag > 1e-4 {
+                let dz = if ny > 0.0 {
+                    config.camera.cursor_lead_deadzone_ratio * 0.65
+                } else {
+                    config.camera.cursor_lead_deadzone_ratio
+                };
+                let reach_scale = ex.cam_settings.cursor_lead_scale;
+                if mag > dz && mag > 1e-4 && reach_scale > 0.001 {
                     let t = ((mag - dz) / (1.0 - dz)).clamp(0.0, 1.0);
                     let smooth = t * t * (3.0 - 2.0 * t);
                     let dir = vec2 / mag;
+                    let max_z = if dir.y > 0.0 {
+                        config.camera.cursor_lead_max_distance_down_z
+                    } else {
+                        config.camera.cursor_lead_max_distance_z
+                    };
                     desired_lead = Vec3::new(
-                        dir.x * smooth * config.camera.cursor_lead_max_distance_x,
+                        dir.x * smooth * config.camera.cursor_lead_max_distance_x * reach_scale,
                         0.0,
-                        dir.y * smooth * config.camera.cursor_lead_max_distance_z,
+                        dir.y * smooth * max_z * reach_scale,
                     );
                 }
             }
@@ -9379,7 +9424,7 @@ fn weapon_kind_short_badge(wk: WeaponKind) -> (&'static str, Color) {
 }
 
 #[allow(deprecated)]
-fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
+fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig, asset_server: &AssetServer) {
     commands
         .spawn((
             MatchOverlayRoot,
@@ -9554,8 +9599,11 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
                     .with_children(|list| {
                         list.spawn(Node {
                             width: percent(100),
+                            flex_grow: 1.0,
+                            min_height: px(0.0),
                             flex_direction: FlexDirection::Column,
-                            row_gap: px(8.0),
+                            row_gap: px(7.0),
+                            overflow: Overflow::scroll_y(),
                             ..default()
                         })
                         .with_children(|cards| {
@@ -9565,6 +9613,8 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
                                 TextColor(Color::srgb(0.55, 0.80, 0.98)),
                             ));
 
+                            let icon_sz = config.hero_select_preview.roster_icon_size_px;
+                            let icon_rad = config.main_menu.hero_icon_border_radius_px;
                             for (idx, hero) in config.heroes.iter().enumerate() {
                                 let (w_tag, w_col) = weapon_kind_short_badge(hero.weapon.weapon_kind);
                                 let team_col = if hero.team == TeamId::Dawn {
@@ -9572,13 +9622,14 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
                                 } else {
                                     Color::srgb(0.95, 0.34, 0.34)
                                 };
+                                let portrait_handle: Handle<Image> = asset_server.load(hero.portrait_path.clone());
                                 cards.spawn((
                                     UiButton,
-            Hovered::default(),
+                                    Hovered::default(),
                                     HeroPickButton { hero_index: idx },
                                     Node {
                                         width: percent(100),
-                                        padding: UiRect::all(px(10.0)),
+                                        padding: UiRect::all(px(8.0)),
                                         border: UiRect::all(px(1.5)),
                                         border_radius: BorderRadius::all(px(8.0)),
                                         flex_direction: FlexDirection::Row,
@@ -9600,31 +9651,33 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
                                     .with_children(|left| {
                                         left.spawn((
                                             Node {
-                                                width: px(5.0),
-                                                height: px(36.0),
-                                                border_radius: BorderRadius::all(px(3.0)),
+                                                width: px(4.0),
+                                                height: px(icon_sz),
+                                                border_radius: BorderRadius::all(px(2.0)),
                                                 ..default()
                                             },
                                             BackgroundColor(team_col),
                                         ));
                                         left.spawn((
                                             Node {
-                                                width: px(38.0),
-                                                height: px(32.0),
-                                                justify_content: JustifyContent::Center,
-                                                align_items: AlignItems::Center,
-                                                border: UiRect::all(px(1.2)),
-                                                border_radius: BorderRadius::all(px(6.0)),
+                                                width: px(icon_sz),
+                                                height: px(icon_sz),
+                                                border: UiRect::all(px(1.5)),
+                                                border_radius: BorderRadius::all(px(icon_rad)),
+                                                overflow: Overflow::clip(),
                                                 ..default()
                                             },
-                                            BorderColor::all(w_col),
-                                            BackgroundColor(w_col.with_alpha(0.18)),
+                                            BorderColor::all(w_col.with_alpha(0.85)),
+                                            BackgroundColor(Color::srgba(0.06, 0.09, 0.14, 0.95)),
                                         ))
                                         .with_children(|ic| {
                                             ic.spawn((
-                                                Text::new(w_tag),
-                                                TextFont { font_size: FontSize::Px(11.5), ..default() },
-                                                TextColor(w_col),
+                                                ImageNode::new(portrait_handle),
+                                                Node {
+                                                    width: percent(100),
+                                                    height: percent(100),
+                                                    ..default()
+                                                },
                                             ));
                                         });
                                         left.spawn(Node {
@@ -9634,16 +9687,16 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
                                         })
                                         .with_children(|info| {
                                             info.spawn((
-                                                Text::new(hero.display_name.clone()),
-                                                TextFont { font_size: FontSize::Px(14.5), ..default() },
+                                                Text::new(format!("{} [{}]", hero.display_name, w_tag)),
+                                                TextFont { font_size: FontSize::Px(13.5), ..default() },
                                                 TextColor(Color::srgb(0.95, 0.98, 1.0)),
                                             ));
                                             info.spawn((
                                                 Text::new(format!(
-                                                    "HP {:.0}  •  DMG {:.0}  •  RNG {:.0}m",
+                                                    "HP {:.0} | DMG {:.0} | RNG {:.0}m",
                                                     hero.max_hp, hero.weapon.damage, hero.weapon.max_range
                                                 )),
-                                                TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                                TextFont { font_size: FontSize::Px(11.0), ..default() },
                                                 TextColor(Color::srgb(0.68, 0.78, 0.88)),
                                             ));
                                         });
@@ -9681,6 +9734,39 @@ fn spawn_match_overlay_ui(commands: &mut Commands, config: &GameConfig) {
                                 Text::new("LOCK IN HERO"),
                                 TextFont { font_size: FontSize::Px(16.0), ..default() },
                                 TextColor(Color::WHITE),
+                            ));
+                        });
+                    });
+
+                    cols.spawn((
+                        Node {
+                            flex_grow: 1.0,
+                            height: percent(100),
+                            flex_direction: FlexDirection::Column,
+                            justify_content: JustifyContent::FlexEnd,
+                            align_items: AlignItems::Center,
+                            padding: UiRect::bottom(px(10.0)),
+                            ..default()
+                        },
+                        Pickable::IGNORE,
+                    ))
+                    .with_children(|stage| {
+                        stage.spawn((
+                            Node {
+                                padding: UiRect::axes(px(14.0), px(6.0)),
+                                border: UiRect::all(px(1.0)),
+                                border_radius: BorderRadius::all(px(16.0)),
+                                ..default()
+                            },
+                            BorderColor::all(Color::srgba(0.32, 0.68, 0.92, 0.45)),
+                            BackgroundColor(Color::srgba(0.04, 0.08, 0.14, 0.72)),
+                            Pickable::IGNORE,
+                        ))
+                        .with_children(|pill| {
+                            pill.spawn((
+                                Text::new("HOLD LEFT MOUSE & DRAG TO ROTATE HERO 360"),
+                                TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                TextColor(Color::srgb(0.72, 0.86, 0.98)),
                             ));
                         });
                     });
@@ -9883,25 +9969,49 @@ struct ShowcaseAssetsParams<'w, 's> {
     anim_player_query: Query<'w, 's, (Entity, &'static mut AnimationPlayer, Option<&'static AnimationGraphHandle>)>,
 }
 
+#[derive(Component)]
+struct HeroSelectStageProp;
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn hero_preview_system(
     mut commands: Commands,
     time: Res<Time>,
     config: Res<GameConfig>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut mouse_motion: MessageReader<MouseMotion>,
+    window_q: Query<&Window, With<PrimaryWindow>>,
     mut match_flow: ResMut<ClientMatchFlow>,
-    mut camera_query: Query<&mut Transform, With<MobaCamera>>,
+    mut camera_query: Query<(&mut Transform, &mut Projection), With<MobaCamera>>,
     mut preview_query: Query<(Entity, &mut Transform, &HeroPreviewRoot), Without<MobaCamera>>,
     battle_query: Query<(Entity, &BattleShowcaseHero), (Without<MobaCamera>, Without<HeroPreviewRoot>)>,
+    stage_prop_q: Query<Entity, With<HeroSelectStageProp>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut sc: ShowcaseAssetsParams,
     mut spawned_battle_sig: Local<Option<String>>,
+    mut preview_yaw_rad: Local<f32>,
 ) {
     let phase = match_flow.current_phase();
     let now = time.elapsed_secs();
+    let hs_cfg = &config.hero_select_preview;
 
     if phase != MatchPhase::HeroSelect {
+        mouse_motion.clear();
         for (ent, _, _) in &preview_query {
             safe_despawn(&mut commands, ent);
         }
+        for ent in &stage_prop_q {
+            safe_despawn(&mut commands, ent);
+        }
         match_flow.spawned_preview_hero_index = None;
+        if let Ok((_, mut proj)) = camera_query.single_mut() {
+            if let Projection::Perspective(ref mut persp) = *proj {
+                let target_fov = hs_cfg.gameplay_fov_deg.to_radians();
+                if (persp.fov - target_fov).abs() > 1e-4 {
+                    persp.fov = target_fov;
+                }
+            }
+        }
     }
 
     if phase != MatchPhase::BattleLoading {
@@ -9912,17 +10022,85 @@ fn hero_preview_system(
     }
 
     if phase == MatchPhase::HeroSelect {
-        let preview_origin = Vec3::new(0.0, 2.4, 0.0);
-        if let Ok(mut cam_tf) = camera_query.single_mut() {
-            let cam_pos = preview_origin + Vec3::new(0.0, 1.55, 4.1);
-            *cam_tf = Transform::from_translation(cam_pos).looking_at(preview_origin + Vec3::Y * 0.95, Vec3::Y);
+        let preview_origin = Vec3::new(
+            hs_cfg.stage_origin.0,
+            hs_cfg.stage_origin.1,
+            hs_cfg.stage_origin.2,
+        );
+        let hero = config.active_hero(match_flow.preview_hero_index);
+
+        // Telephoto portrait framing (eliminates wide-angle facial distortion & steep downward tilt)
+        if let Ok((mut cam_tf, mut proj)) = camera_query.single_mut() {
+            if let Projection::Perspective(ref mut persp) = *proj {
+                let target_fov = hs_cfg.camera_fov_deg.to_radians();
+                if (persp.fov - target_fov).abs() > 1e-4 {
+                    persp.fov = target_fov;
+                }
+            }
+            let cam_pos = preview_origin
+                + Vec3::new(
+                    hs_cfg.camera_offset.0,
+                    hs_cfg.camera_offset.1,
+                    hs_cfg.camera_offset.2,
+                );
+            let look_target =
+                preview_origin + Vec3::Y * (hs_cfg.look_at_height_ratio * hero.hero_scale);
+            *cam_tf = Transform::from_translation(cam_pos).looking_at(look_target, Vec3::Y);
         }
 
-        let hero = config.active_hero(match_flow.preview_hero_index);
+        // Studio Key + Rim lighting and sleek showcase pedestal ring (spawned once during HeroSelect)
+        if stage_prop_q.is_empty() {
+            commands.spawn((
+                HeroSelectStageProp,
+                PointLight {
+                    color: Color::srgb(1.0, 0.96, 0.90),
+                    intensity: 420_000.0,
+                    range: 20.0,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform::from_translation(preview_origin + Vec3::new(2.6, 3.2, 4.4)),
+            ));
+            commands.spawn((
+                HeroSelectStageProp,
+                PointLight {
+                    color: Color::srgb(0.32, 0.78, 1.0),
+                    intensity: 260_000.0,
+                    range: 18.0,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
+                Transform::from_translation(preview_origin + Vec3::new(-3.2, 2.8, -2.6)),
+            ));
+            commands.spawn((
+                HeroSelectStageProp,
+                Mesh3d(meshes.add(Cylinder::new(1.55, 0.14))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.05, 0.08, 0.13),
+                    metallic: 0.75,
+                    perceptual_roughness: 0.28,
+                    ..default()
+                })),
+                Transform::from_translation(preview_origin + Vec3::new(0.0, -0.07, 0.0)),
+            ));
+            commands.spawn((
+                HeroSelectStageProp,
+                Mesh3d(meshes.add(Torus::new(1.48, 1.58))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.18, 0.82, 0.98),
+                    emissive: LinearRgba::rgb(0.35, 1.95, 2.60),
+                    unlit: true,
+                    ..default()
+                })),
+                Transform::from_translation(preview_origin + Vec3::new(0.0, 0.01, 0.0)),
+            ));
+        }
+
         if match_flow.spawned_preview_hero_index != Some(match_flow.preview_hero_index) {
             for (ent, _, _) in &preview_query {
                 safe_despawn(&mut commands, ent);
             }
+            *preview_yaw_rad = hs_cfg.initial_yaw_deg.to_radians();
             let gltf_scene = sc.asset_server.load(format!("{}#Scene0", hero.model_path));
             commands.spawn((
                 HeroPreviewRoot {
@@ -9930,10 +10108,30 @@ fn hero_preview_system(
                 },
                 WorldAssetRoot(gltf_scene),
                 Transform::from_translation(preview_origin)
+                    .with_rotation(Quat::from_rotation_y(*preview_yaw_rad))
                     .with_scale(Vec3::splat(hero.hero_scale)),
             ));
             match_flow.spawned_preview_hero_index = Some(match_flow.preview_hero_index);
             return;
+        }
+
+        // Interactive 360-deg mouse drag rotation when dragging in the open center stage
+        let mut drag_dx = 0.0_f32;
+        for ev in mouse_motion.read() {
+            drag_dx += ev.delta.x;
+        }
+        let pointer_in_center = window_q
+            .single()
+            .ok()
+            .and_then(|w| {
+                w.cursor_position()
+                    .map(|p| p.x > 395.0 && p.x < (w.width() - 455.0))
+            })
+            .unwrap_or(false);
+        if mouse.pressed(MouseButton::Left) && pointer_in_center && drag_dx.abs() > 0.01 {
+            *preview_yaw_rad += drag_dx * hs_cfg.drag_rotate_sensitivity;
+        } else if hs_cfg.auto_rotate_speed_rad.abs() > 1e-5 {
+            *preview_yaw_rad += hs_cfg.auto_rotate_speed_rad * time.delta_secs();
         }
 
         let cached_opt = sc.hero_anim_cache.ensure_loaded(
@@ -9945,7 +10143,7 @@ fn hero_preview_system(
         );
 
         for (root_ent, mut tf, prev_root) in &mut preview_query {
-            tf.rotate_y(0.50 * time.delta_secs());
+            tf.rotation = Quat::from_rotation_y(*preview_yaw_rad);
             for desc in sc.children_query.iter_descendants(root_ent) {
                 if let Some(assets) = cached_opt {
                     let idle_node = assets.get_or_fallback("idle", "rifle_aiming_idle");
@@ -9990,7 +10188,7 @@ fn hero_preview_system(
     if phase == MatchPhase::BattleLoading {
         let Some(snap) = match_flow.snapshot.as_ref() else { return };
         let stage_origin = Vec3::new(0.0, 2.4, 0.0);
-        if let Ok(mut cam_tf) = camera_query.single_mut() {
+        if let Ok((mut cam_tf, _)) = camera_query.single_mut() {
             let sway = (now * 0.45).sin() * 1.1;
             let cam_pos = stage_origin + Vec3::new(sway, 2.35, 8.6);
             *cam_tf = Transform::from_translation(cam_pos).looking_at(stage_origin + Vec3::Y * 0.95, Vec3::Y);
@@ -10240,7 +10438,7 @@ fn match_overlay_ui_system(
             root_node.display = Display::Flex;
         }
         let target_bg = match phase {
-            MatchPhase::HeroSelect => Color::srgba(0.02, 0.04, 0.07, 0.36),
+            MatchPhase::HeroSelect => Color::srgba(0.02, 0.04, 0.07, config.hero_select_preview.backdrop_alpha),
             MatchPhase::BattleLoading => Color::srgba(0.02, 0.04, 0.07, 0.28),
             _ => Color::srgba(0.03, 0.05, 0.08, 0.94),
         };

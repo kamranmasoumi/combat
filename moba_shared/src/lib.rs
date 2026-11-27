@@ -445,10 +445,28 @@ pub struct GameplayRulesConfig {
     pub allow_beam_deny: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpectatorConfig {
+    pub max_spectators_per_match: usize,
+    pub ranked_live_delay_secs: f32,
+    pub custom_lobby_live_delay_secs: f32,
+    pub snapshot_record_hz: f32,
+    pub max_history_secs: f32,
+    pub playback_speeds: Vec<f32>,
+    pub seek_step_secs: f32,
+    pub free_camera_pan_speed: f32,
+    pub free_camera_edge_scroll_margin_px: f32,
+    pub free_camera_min_zoom: f32,
+    pub free_camera_max_zoom: f32,
+    pub watch_refresh_interval_secs: f32,
+    pub watch_hero_icon_size_px: f32,
+}
+
 #[derive(Resource, Serialize, Deserialize, Clone, Debug)]
 pub struct GameConfig {
     pub gameplay_rules: GameplayRulesConfig,
     pub main_menu: MainMenuConfig,
+    pub spectator: SpectatorConfig,
     pub weather: WeatherConfig,
     pub day_night: DayNightConfig,
     pub telemetry: TelemetryConfig,
@@ -1327,6 +1345,60 @@ impl GameConfig {
         assert!(
             mm.history_item_slot_gap_px.is_finite() && mm.history_item_slot_gap_px >= 0.0,
             "main_menu.history_item_slot_gap_px نامعتبر است"
+        );
+
+        let sp = &self.spectator;
+        assert!(
+            sp.max_spectators_per_match >= 1 && sp.max_spectators_per_match <= 100,
+            "spectator.max_spectators_per_match باید بین 1 تا 100 باشد"
+        );
+        assert!(
+            sp.ranked_live_delay_secs.is_finite() && sp.ranked_live_delay_secs >= 0.0,
+            "spectator.ranked_live_delay_secs نامعتبر است"
+        );
+        assert!(
+            sp.custom_lobby_live_delay_secs.is_finite() && sp.custom_lobby_live_delay_secs >= 0.0,
+            "spectator.custom_lobby_live_delay_secs نامعتبر است"
+        );
+        assert!(
+            sp.snapshot_record_hz.is_finite() && sp.snapshot_record_hz >= 2.0 && sp.snapshot_record_hz <= 60.0,
+            "spectator.snapshot_record_hz باید بین 2 تا 60 هرتز باشد"
+        );
+        assert!(
+            sp.max_history_secs.is_finite() && sp.max_history_secs >= 60.0,
+            "spectator.max_history_secs باید حداقل 60 ثانیه باشد"
+        );
+        assert!(
+            !sp.playback_speeds.is_empty()
+                && sp.playback_speeds.iter().all(|&v| v.is_finite() && v > 0.0 && v <= 8.0),
+            "spectator.playback_speeds نمی‌تواند خالی یا نامعتبر باشد"
+        );
+        assert!(
+            sp.seek_step_secs.is_finite() && sp.seek_step_secs > 0.0,
+            "spectator.seek_step_secs باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            sp.free_camera_pan_speed.is_finite() && sp.free_camera_pan_speed > 0.0,
+            "spectator.free_camera_pan_speed باید بزرگ‌تر از صفر باشد"
+        );
+        assert!(
+            sp.free_camera_edge_scroll_margin_px.is_finite() && sp.free_camera_edge_scroll_margin_px >= 0.0,
+            "spectator.free_camera_edge_scroll_margin_px نامعتبر است"
+        );
+        assert!(
+            sp.free_camera_min_zoom.is_finite()
+                && sp.free_camera_max_zoom.is_finite()
+                && sp.free_camera_min_zoom > 2.0
+                && sp.free_camera_max_zoom > sp.free_camera_min_zoom,
+            "بازه زوم دوربین آزاد تماشاگر نامعتبر است"
+        );
+        assert!(
+            sp.watch_refresh_interval_secs.is_finite() && sp.watch_refresh_interval_secs >= 2.0,
+            "spectator.watch_refresh_interval_secs باید حداقل 2 ثانیه باشد"
+        );
+        assert!(
+            sp.watch_hero_icon_size_px.is_finite() && sp.watch_hero_icon_size_px >= 16.0,
+            "spectator.watch_hero_icon_size_px باید حداقل 16 پیکسل باشد"
         );
         for (i, slot) in mm.squad_slots.iter().enumerate() {
             assert!(slot.scale.is_finite() && slot.scale > 0.0, "main_menu.squad_slots[{}].scale نامعتبر است", i);
@@ -3547,6 +3619,37 @@ pub enum ClientLobbyMessage {
     ActivateShadowBlade { inv_index: usize },
     ActivateItem { inv_index: usize },
     DemoCommand(crate::demo_shared::DemoCommand),
+    SpectatorSetFogMode { mode: SpectatorFogMode },
+    SpectatorSetSpeed { speed: f32 },
+    SpectatorTogglePause,
+    SpectatorSeekTo { target_time_secs: f32 },
+    SpectatorJumpLive,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpectatorFogMode {
+    AllVision,
+    TeamDawn,
+    TeamDusk,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpectatorCameraMode {
+    FreeCamera,
+    HeroChase,
+    Directed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SpectatorPlaybackSnapshot {
+    pub fog_mode: SpectatorFogMode,
+    pub playback_speed: f32,
+    pub is_paused: bool,
+    pub current_time_secs: f32,
+    pub min_time_secs: f32,
+    pub max_live_time_secs: f32,
+    pub delay_secs: f32,
+    pub spectator_count: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -4182,6 +4285,7 @@ pub struct ServerWorldSnapshot {
     pub recent_pings: Vec<PingEntry>,
     pub pause: PauseSnapshot,
     pub fx_events: Vec<GameplayFxEvent>,
+    pub spectator_state: Option<SpectatorPlaybackSnapshot>,
 }
 
 // -----------------------------------------------------------------------------
@@ -9514,6 +9618,271 @@ impl AuthoritativeWorldState {
         }
     }
 
+    pub fn build_spectator_snapshot(
+        &mut self,
+        config: &GameConfig,
+        items_cfg: &ItemsConfig,
+        fog_mode: SpectatorFogMode,
+    ) -> ServerWorldSnapshot {
+        if self.players.is_empty() {
+            return self.build_snapshot(config, items_cfg);
+        }
+
+        let view_slot = match fog_mode {
+            SpectatorFogMode::AllVision => 0,
+            SpectatorFogMode::TeamDawn => self
+                .players
+                .iter()
+                .find(|p| p.hero_team == TeamId::Dawn)
+                .map(|p| p.slot_index)
+                .unwrap_or(0),
+            SpectatorFogMode::TeamDusk => self
+                .players
+                .iter()
+                .find(|p| p.hero_team == TeamId::Dusk)
+                .map(|p| p.slot_index)
+                .unwrap_or(0),
+        };
+
+        let prev_reveal = self.demo_reveal_full_map;
+        if fog_mode == SpectatorFogMode::AllVision {
+            self.demo_reveal_full_map = true;
+        }
+        let mut snap = self.build_snapshot_for_slot(config, items_cfg, view_slot);
+        self.demo_reveal_full_map = prev_reveal;
+
+        if fog_mode == SpectatorFogMode::AllVision {
+            let expected_len = (FOW_GRID_W * FOW_GRID_H).div_ceil(8);
+            if snap.fog_visible_mask.len() != expected_len {
+                snap.fog_visible_mask.resize(expected_len, 0xFF);
+            }
+            snap.fog_visible_mask.fill(0xFF);
+        }
+
+        // در حالت تماشاگر، خود view_slot نیز باید در other_players حضور داشته باشد تا تمام هیروها (از جمله اسلات ۰) رندر شوند
+        if let Some(p) = self.players.get(view_slot) {
+            if !snap.other_players.iter().any(|rp| rp.slot_index == p.slot_index) {
+                let trav_anim = if p.traversal.is_active {
+                    Some(p.traversal.anim_name.clone())
+                } else {
+                    None
+                };
+                let in_deep_water_loco = p.current_locomotion == "swimming"
+                    || p.current_locomotion == "treading_water";
+                let is_climb_loco = p.current_locomotion.starts_with("climbing_");
+                let upper_anim = if p.grenade_elapsed_and_duration.is_some() {
+                    Some("toss_grenade".to_string())
+                } else if p.reload_remaining.is_some() {
+                    Some("reloading".to_string())
+                } else if in_deep_water_loco || is_climb_loco {
+                    None
+                } else if p.active_weapon == ActiveWeaponSlot::Pistol {
+                    Some("pistol_run".to_string())
+                } else {
+                    Some("rifle_aiming_idle".to_string())
+                };
+                snap.other_players.push(RemotePlayerSnapshot {
+                    slot_index: p.slot_index,
+                    team: p.hero_team,
+                    hero_id: p.hero_id.clone(),
+                    display_name: p.hero_display_name.clone(),
+                    model_path: p.hero_model_path.clone(),
+                    hero_scale: p.hero_scale,
+                    weapon_kind: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                        p.hero_pistol.weapon_kind
+                    } else {
+                        p.hero_weapon.weapon_kind
+                    },
+                    pos: p.soldier_pos,
+                    facing_dir: p.soldier_facing_dir,
+                    current_locomotion: p.current_locomotion.clone(),
+                    traversal_anim: trav_anim,
+                    upper_anim,
+                    death_anim: p.death_anim_name.clone(),
+                    is_dead: p.is_dead,
+                    hp: p.hero_hp,
+                    max_hp: p.hero_max_hp,
+                    stamina: p.hero_stamina,
+                    max_stamina: p.hero_max_stamina,
+                    active_weapon: p.active_weapon,
+                    ammo_in_mag: p.ammo_in_mag,
+                    grenade_charges: p.grenade_charges,
+                    grenade_max_charges: p.hero_grenade.max_charges,
+                    grenade_throw_duration_secs: p.hero_grenade.throw_duration_secs,
+                    magazine_size: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                        p.hero_pistol.magazine_size
+                    } else {
+                        p.hero_weapon.magazine_size
+                    },
+                    level: p.hero_level,
+                    armor: p.hero_armor,
+                    move_speed: p.current_move_speed,
+                    weapon_damage: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                        p.hero_pistol.damage
+                    } else {
+                        p.hero_weapon.damage
+                    },
+                    fire_rate_secs: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                        p.hero_pistol.fire_rate_secs
+                    } else {
+                        p.hero_weapon.fire_rate_secs
+                    },
+                    weapon_max_range: if p.active_weapon == ActiveWeaponSlot::Pistol {
+                        p.hero_pistol.max_range
+                    } else {
+                        p.hero_weapon.max_range
+                    },
+                    inventory: p.inventory.clone(),
+                    tp_slot: p.tp_slot.clone(),
+                    is_invisible: p.invisibility_remaining > 0.0,
+                    is_reflect_armor_active: p.reflect_armor_remaining > 0.0,
+                    is_bullet_immune: p.bullet_immunity_remaining > 0.0,
+                    is_cryo_debuffed: p.cryo_debuff_remaining > 0.0,
+                    is_null_muted: p.null_mute_remaining > 0.0,
+                    is_sonar_revealed: p.sonar_revealed_remaining > 0.0,
+                    is_visible: true,
+                });
+                snap.other_players.sort_by_key(|rp| rp.slot_index);
+            }
+        }
+
+        // در حالت تماشاگر (مشابه Dota 2)، نوار بالا و جدول امتیازات اطلاعات کامل همه هیروها را نشان می‌دهد
+        snap.top_bar_heroes = self
+            .players
+            .iter()
+            .map(|p| {
+                let portrait = config.active_hero(p.hero_index).portrait_path.clone();
+                TopBarHeroInfo {
+                    slot_index: p.slot_index,
+                    team: p.hero_team,
+                    hero_id: p.hero_id.clone(),
+                    display_name: p.hero_display_name.clone(),
+                    portrait_path: portrait,
+                    is_dead: p.is_dead,
+                    is_disconnected: p.is_disconnected,
+                    respawn_remaining: if p.is_dead {
+                        p.respawn_remaining.max(0.0)
+                    } else {
+                        0.0
+                    },
+                    hp_ratio: Some((p.hero_hp / p.hero_max_hp.max(1.0)).clamp(0.0, 1.0)),
+                }
+            })
+            .collect();
+
+        snap.scoreboard_heroes = self
+            .players
+            .iter()
+            .map(|p| {
+                let portrait = config.active_hero(p.hero_index).portrait_path.clone();
+                let cur_base =
+                    config.combat.xp_thresholds_per_level[(p.hero_level as usize - 1).min(24)];
+                let xp_into_level = p.hero_xp.saturating_sub(cur_base);
+                let xp_for_next_level = if p.hero_level >= 25 {
+                    0
+                } else {
+                    let next_base = config.combat.xp_thresholds_per_level[p.hero_level as usize];
+                    next_base.saturating_sub(cur_base)
+                };
+                ScoreboardHeroInfo {
+                    slot_index: p.slot_index,
+                    team: p.hero_team,
+                    hero_id: p.hero_id.clone(),
+                    display_name: p.hero_display_name.clone(),
+                    portrait_path: portrait,
+                    is_local_player: false,
+                    is_dead: p.is_dead,
+                    is_disconnected: p.is_disconnected,
+                    respawn_remaining: if p.is_dead {
+                        p.respawn_remaining.max(0.0)
+                    } else {
+                        0.0
+                    },
+                    level: p.hero_level,
+                    kills: p.kills,
+                    deaths: p.deaths,
+                    assists: p.assists,
+                    xp_info: Some(ScoreboardXpInfo {
+                        xp: p.hero_xp,
+                        xp_into_level,
+                        xp_for_next_level,
+                    }),
+                    gold: Some(p.hero_gold),
+                    inventory: Some(p.inventory.clone()),
+                }
+            })
+            .collect();
+
+        // تماشاگر فقط پیام‌های عمومی (All Chat) را می‌بیند تا چت خصوصی تیم‌ها لو نرود
+        let max_vis = config.chat.max_visible_messages;
+        let all_chat: Vec<ChatMessageEntry> = self
+            .chat_history
+            .iter()
+            .filter(|c| c.all_chat)
+            .cloned()
+            .collect();
+        let start_idx = all_chat.len().saturating_sub(max_vis);
+        snap.recent_chat = all_chat[start_idx..].to_vec();
+        snap.pause.can_you_unpause = false;
+
+        snap
+    }
+
+    /// بسته‌بندی سریع بیت‌مسک مه جنگ یک تیم بدون بازسازی کامل اسنپ‌شات (بسیار سبک برای ضبط تاریخچه تماشاگر)
+    pub fn pack_team_fog_mask(&self, team: TeamId) -> Vec<u8> {
+        if let Some(p) = self.players.iter().find(|p| p.hero_team == team) {
+            p.fog_of_war.pack_visible_mask()
+        } else {
+            vec![0u8; (FOW_GRID_W * FOW_GRID_H).div_ceil(8)]
+        }
+    }
+
+    /// اعمال سریع حالت مه جنگ تماشاگر روی یک اسنپ‌شات پایه AllVision با هزینه ناچیز O(entities)
+    pub fn apply_spectator_fog_mode(
+        snap: &mut ServerWorldSnapshot,
+        config: &GameConfig,
+        fog_mode: SpectatorFogMode,
+        dawn_mask: &[u8],
+        dusk_mask: &[u8],
+    ) {
+        let (viewer_team, mask) = match fog_mode {
+            SpectatorFogMode::AllVision => {
+                let expected_len = (FOW_GRID_W * FOW_GRID_H).div_ceil(8);
+                if snap.fog_visible_mask.len() != expected_len {
+                    snap.fog_visible_mask.resize(expected_len, 0xFF);
+                }
+                snap.fog_visible_mask.fill(0xFF);
+                return;
+            }
+            SpectatorFogMode::TeamDawn => (TeamId::Dawn, dawn_mask),
+            SpectatorFogMode::TeamDusk => (TeamId::Dusk, dusk_mask),
+        };
+
+        snap.fog_visible_mask.clear();
+        snap.fog_visible_mask.extend_from_slice(mask);
+
+        let is_pos_vis = |pos: Vec3| -> bool {
+            let Some((gx, gz)) = SharedFogOfWar::world_to_cell(config, pos.x, pos.z) else {
+                return false;
+            };
+            let idx = gz * FOW_GRID_W + gx;
+            let b = mask.get(idx / 8).copied().unwrap_or(0);
+            ((b >> (idx % 8)) & 1) != 0
+        };
+
+        snap.other_players
+            .retain(|rp| rp.team == viewer_team || is_pos_vis(rp.pos));
+        snap.creeps
+            .retain(|c| c.team == viewer_team || is_pos_vis(c.pos));
+        snap.couriers
+            .retain(|c| c.team == viewer_team || is_pos_vis(c.pos));
+        snap.bullets.retain(|b| is_pos_vis(b.translation));
+        snap.grenades.retain(|g| is_pos_vis(g.translation));
+        snap.toxic_pools.retain(|tp| is_pos_vis(tp.pos));
+        snap.electric_beams
+            .retain(|eb| is_pos_vis(eb.start_pos) || is_pos_vis(eb.end_pos));
+    }
+
     pub fn build_snapshot_for_slot(&mut self, config: &GameConfig, items_cfg: &ItemsConfig, slot_index: usize) -> ServerWorldSnapshot {
         if self.players.is_empty() {
             return self.build_snapshot(config, items_cfg);
@@ -10624,6 +10993,7 @@ impl AuthoritativeWorldState {
                 })
                 .collect(),
             fx_events: Vec::new(),
+            spectator_state: None,
         }
     }
 

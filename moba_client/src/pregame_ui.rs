@@ -1,7 +1,7 @@
 use crate::backend_client::{
     clear_persisted_session, load_persisted_session, sanitize_ascii_msg, ActiveMatchInfo,
     BackendAsyncEvent, BackendClient, FriendsSnapshot, LobbyDetail, LobbySummary,
-    LobbyInviteInfo, MatchHistoryItemSlot, MatchHistoryResponse, PartyInviteInfo, PartyState, PlayerProfile,
+    LiveMatchEntry, LobbyInviteInfo, MatchHistoryItemSlot, MatchHistoryResponse, PartyInviteInfo, PartyState, PlayerProfile,
     PlayerSearchResult,
 };
 use bevy::animation::RepeatAnimation;
@@ -44,8 +44,24 @@ pub enum PreGameTab {
     FindingMatch,
     LobbyBrowser,
     LobbyRoom,
+    WatchLive,
     MatchHistory,
     DemoHero,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchModeFilter {
+    All,
+    Ranked,
+    Custom,
+    FriendsLive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchSortBy {
+    HighestMmr,
+    MostViewers,
+    LongestDuration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +91,7 @@ pub enum FocusedInput {
     LobbySearch,
     FriendSearch,
     PartyChat,
+    WatchSearch,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +168,16 @@ pub struct PreGameSessionState {
     pub history: Option<MatchHistoryResponse>,
     pub selected_history_idx: usize,
     pub history_filter: HistoryFilter,
+    // Watch Live / Spectate Browser state
+    pub live_matches: Vec<LiveMatchEntry>,
+    pub watch_loading: bool,
+    pub watch_refresh_timer: f32,
+    pub watch_selected_room_id: Option<String>,
+    pub watch_search_input: String,
+    pub watch_hero_filter: i32,
+    pub watch_rank_filter: String,
+    pub watch_mode_filter: WatchModeFilter,
+    pub watch_sort: WatchSortBy,
     pub confirm_modal: Option<ConfirmAction>,
     pub ui_dirty: bool,
 }
@@ -220,6 +247,15 @@ impl Default for PreGameSessionState {
             history: None,
             selected_history_idx: 0,
             history_filter: HistoryFilter::All,
+            live_matches: Vec::new(),
+            watch_loading: false,
+            watch_refresh_timer: 0.0,
+            watch_selected_room_id: None,
+            watch_search_input: String::new(),
+            watch_hero_filter: 0,
+            watch_rank_filter: "ALL".to_string(),
+            watch_mode_filter: WatchModeFilter::All,
+            watch_sort: WatchSortBy::HighestMmr,
             confirm_modal: None,
             ui_dirty: true,
         }
@@ -363,6 +399,14 @@ enum PreGameBtnAction {
     ConfirmModalCancel,
     FocusField(FocusedInput),
     LaunchDemoHero(String),
+    RefreshLiveMatches,
+    SelectLiveMatch(String),
+    WatchLiveMatch(String),
+    SetWatchHeroFilter(i32),
+    SetWatchRankFilter(String),
+    SetWatchModeFilter(WatchModeFilter),
+    SetWatchSort(WatchSortBy),
+    ClearWatchFilters,
 }
 
 // =============================================================================
@@ -1173,6 +1217,16 @@ fn poll_backend_events_system(
     mut next_screen: ResMut<NextState<AppScreenState>>,
 ) {
     let dt = time.delta_secs();
+    if state.tab == PreGameTab::WatchLive && !state.watch_loading {
+        if let Some(tok) = state.access_token.clone() {
+            state.watch_refresh_timer -= dt;
+            if state.watch_refresh_timer <= 0.0 {
+                state.watch_refresh_timer = config.spectator.watch_refresh_interval_secs;
+                backend.fetch_live_matches(tok);
+            }
+        }
+    }
+
     if state.toast_timer > 0.0 {
         state.toast_timer = (state.toast_timer - dt).max(0.0);
         if state.toast_timer == 0.0 && !state.toast_message.is_empty() {
@@ -1345,6 +1399,27 @@ fn poll_backend_events_system(
                     "You left the match. You may queue again.",
                     notif_dur,
                 );
+            }
+            BackendAsyncEvent::LiveMatchesLoaded(matches) => {
+                state.watch_loading = false;
+                state.is_loading = false;
+                let keep_sel = state
+                    .watch_selected_room_id
+                    .as_ref()
+                    .is_some_and(|rid| matches.iter().any(|m| &m.room_id == rid));
+                if !keep_sel {
+                    state.watch_selected_room_id = matches.first().map(|m| m.room_id.clone());
+                }
+                state.live_matches = matches;
+                state.ui_dirty = true;
+            }
+            BackendAsyncEvent::SpectateReady(info) => {
+                state.is_loading = false;
+                state.server_starting = false;
+                pending_conn.0 = Some(info);
+                backend.stop_matchmaking();
+                backend.disconnect_lobby_ws();
+                next_screen.set(AppScreenState::InGame);
             }
             BackendAsyncEvent::HistoryLoaded(hist) => {
                 state.is_loading = false;
@@ -1812,7 +1887,7 @@ fn handle_pregame_keyboard_system(
                     FocusedInput::LobbyTitle => 32,
                     FocusedInput::LobbyPassword | FocusedInput::JoinPassword => 24,
                     FocusedInput::LobbyChat | FocusedInput::PartyChat => 110,
-                    FocusedInput::FriendSearch | FocusedInput::LobbySearch => 32,
+                    FocusedInput::FriendSearch | FocusedInput::LobbySearch | FocusedInput::WatchSearch => 32,
                     FocusedInput::None => 0,
                 };
                 let only_digits = state.focused == FocusedInput::Otp;
@@ -1943,6 +2018,7 @@ fn active_input_mut(state: &mut PreGameSessionState) -> &mut String {
         FocusedInput::FriendSearch => &mut state.friend_search_input,
         FocusedInput::LobbySearch => &mut state.lobby_search_input,
         FocusedInput::PartyChat => &mut state.party_chat_input,
+        FocusedInput::WatchSearch => &mut state.watch_search_input,
         FocusedInput::None => &mut state.email_input,
     }
 }
@@ -2092,6 +2168,61 @@ fn handle_pregame_buttons_system(
             backend.disconnect_lobby_ws();
             pending_demo.0 = Some(hero_id);
         }
+        PreGameBtnAction::RefreshLiveMatches => {
+            if let Some(tok) = state.access_token.clone() {
+                state.watch_loading = true;
+                state.watch_refresh_timer = config.spectator.watch_refresh_interval_secs;
+                backend.fetch_live_matches(tok);
+                state.ui_dirty = true;
+            }
+        }
+        PreGameBtnAction::SelectLiveMatch(room_id) => {
+            state.watch_selected_room_id = Some(room_id);
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::WatchLiveMatch(room_id) => {
+            if state.active_match.is_some() {
+                push_notification(
+                    &mut state,
+                    "error",
+                    "ACTIVE MATCH",
+                    "Reconnect or abandon your active match before spectating.",
+                    notif_dur,
+                );
+                return;
+            }
+            if let Some(tok) = state.access_token.clone() {
+                state.is_loading = true;
+                state.loading_label = "CONNECTING AS SPECTATOR".to_string();
+                backend.request_spectate_match(tok, room_id);
+                state.ui_dirty = true;
+            }
+        }
+        PreGameBtnAction::SetWatchHeroFilter(hid) => {
+            state.watch_hero_filter = if state.watch_hero_filter == hid { 0 } else { hid };
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::SetWatchRankFilter(rank) => {
+            state.watch_rank_filter = rank;
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::SetWatchModeFilter(mf) => {
+            state.watch_mode_filter = mf;
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::SetWatchSort(sort) => {
+            state.watch_sort = sort;
+            state.ui_dirty = true;
+        }
+        PreGameBtnAction::ClearWatchFilters => {
+            state.watch_search_input.clear();
+            state.watch_hero_filter = 0;
+            state.watch_rank_filter = "ALL".to_string();
+            state.watch_mode_filter = WatchModeFilter::All;
+            state.watch_sort = WatchSortBy::HighestMmr;
+            state.focused = FocusedInput::None;
+            state.ui_dirty = true;
+        }
         PreGameBtnAction::SwitchAuthMode(mode) => {
             state.auth_mode = mode;
             state.focused = if mode == AuthMode::Register {
@@ -2206,6 +2337,12 @@ fn handle_pregame_buttons_system(
                     state.is_loading = true;
                     state.loading_label = "CONNECTING TO LOBBY SERVER".to_string();
                     backend.connect_lobby_ws(tok);
+                }
+                PreGameTab::WatchLive => {
+                    state.tab = PreGameTab::WatchLive;
+                    state.watch_loading = true;
+                    state.watch_refresh_timer = config.spectator.watch_refresh_interval_secs;
+                    backend.fetch_live_matches(tok);
                 }
                 PreGameTab::MatchHistory => {
                     state.tab = PreGameTab::MatchHistory;
@@ -2996,6 +3133,9 @@ fn rebuild_pregame_ui_system(
             PreGameTab::FindingMatch => spawn_finding_match_screen(parent, &state, &config),
             PreGameTab::LobbyBrowser => spawn_lobby_browser_screen(parent, &state, &config),
             PreGameTab::LobbyRoom => spawn_lobby_room_screen(parent, &state, &config),
+            PreGameTab::WatchLive => {
+                spawn_watch_live_screen(parent, &state, &config, &hero_portraits)
+            }
             PreGameTab::MatchHistory => spawn_history_screen(
                 parent,
                 &state,
@@ -3366,6 +3506,12 @@ fn spawn_top_nav_bar(
                     "LOBBY",
                     matches!(state.tab, PreGameTab::LobbyBrowser | PreGameTab::LobbyRoom),
                     PreGameBtnAction::SwitchTab(PreGameTab::LobbyBrowser),
+                );
+                spawn_nav_pill(
+                    tabs,
+                    "WATCH LIVE",
+                    state.tab == PreGameTab::WatchLive,
+                    PreGameBtnAction::SwitchTab(PreGameTab::WatchLive),
                 );
                 spawn_nav_pill(
                     tabs,
@@ -8464,6 +8610,900 @@ fn spawn_demo_hero_screen(
                         );
                     });
                 }
+            });
+        });
+}
+
+// =============================================================================
+// صفحه WATCH LIVE — تماشای آنلاین بازی‌ها (مشابه Dota 2 Live Watch)
+// =============================================================================
+
+fn spawn_watch_live_screen(
+    parent: &mut ChildSpawnerCommands,
+    state: &PreGameSessionState,
+    config: &GameConfig,
+    hero_portraits: &MenuHeroPortraitCache,
+) {
+    let gold = Color::srgb(0.98, 0.82, 0.30);
+    let emerald = Color::srgb(0.28, 0.96, 0.60);
+    let crimson = Color::srgb(0.96, 0.38, 0.38);
+    let amber = Color::srgb(0.98, 0.64, 0.28);
+    let cyan = Color::srgb(0.34, 0.90, 0.98);
+    let sp = &config.spectator;
+    let mm = &config.main_menu;
+
+    let q_lower = state.watch_search_input.trim().to_lowercase();
+    let rank_filter = state.watch_rank_filter.as_str();
+
+    let mut filtered: Vec<&LiveMatchEntry> = state
+        .live_matches
+        .iter()
+        .filter(|m| {
+            match state.watch_mode_filter {
+                WatchModeFilter::All => {}
+                WatchModeFilter::Ranked => {
+                    if m.is_custom_lobby {
+                        return false;
+                    }
+                }
+                WatchModeFilter::Custom => {
+                    if !m.is_custom_lobby {
+                        return false;
+                    }
+                }
+                WatchModeFilter::FriendsLive => {
+                    if !m.has_friend {
+                        return false;
+                    }
+                }
+            }
+            if rank_filter != "ALL" && !m.rank_tier.eq_ignore_ascii_case(rank_filter) {
+                return false;
+            }
+            if state.watch_hero_filter > 0
+                && !m.players.iter().any(|p| p.hero_id == state.watch_hero_filter)
+            {
+                return false;
+            }
+            if !q_lower.is_empty() {
+                let in_room = m.room_id.to_lowercase().contains(&q_lower);
+                let in_player = m
+                    .players
+                    .iter()
+                    .any(|p| p.username.to_lowercase().contains(&q_lower));
+                let in_hero = m.players.iter().any(|p| {
+                    resolve_hero_def(config, p.hero_id)
+                        .is_some_and(|h| h.display_name.to_lowercase().contains(&q_lower))
+                });
+                if !(in_room || in_player || in_hero) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    match state.watch_sort {
+        WatchSortBy::HighestMmr => filtered.sort_by(|a, b| {
+            b.avg_mmr
+                .cmp(&a.avg_mmr)
+                .then_with(|| b.spectator_count.cmp(&a.spectator_count))
+        }),
+        WatchSortBy::MostViewers => filtered.sort_by(|a, b| {
+            b.spectator_count
+                .cmp(&a.spectator_count)
+                .then_with(|| b.avg_mmr.cmp(&a.avg_mmr))
+        }),
+        WatchSortBy::LongestDuration => filtered.sort_by(|a, b| {
+            b.duration_sec
+                .cmp(&a.duration_sec)
+                .then_with(|| b.avg_mmr.cmp(&a.avg_mmr))
+        }),
+    }
+
+    let selected_match = state
+        .watch_selected_room_id
+        .as_ref()
+        .and_then(|rid| filtered.iter().find(|m| &m.room_id == rid).copied())
+        .or_else(|| filtered.first().copied());
+
+    let total_viewers: usize = state.live_matches.iter().map(|m| m.spectator_count).sum();
+
+    parent
+        .spawn(Node {
+            width: Val::Percent(100.0),
+            flex_grow: 1.0,
+            min_height: Val::Px(0.0),
+            padding: UiRect::axes(Val::Px(22.0), Val::Px(12.0)),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(10.0),
+            ..default()
+        })
+        .with_children(|wrap| {
+            // =================================================================
+            // ۱. نوار بالای WATCH LIVE + جستجو و فیلترهای پیشرفته (هیرو، رنک، مود، مرتب‌سازی)
+            // =================================================================
+            wrap.spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    flex_shrink: 0.0,
+                    padding: UiRect::axes(Val::Px(16.0), Val::Px(10.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(8.0),
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.025, 0.088, 0.104, 0.94)),
+                BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.68)),
+            ))
+            .with_children(|hdr| {
+                // ردیف ۱: عنوان + جستجو + مود + مرتب‌سازی + دکمه بروزرسانی
+                hdr.spawn(Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(10.0),
+                    ..default()
+                })
+                .with_children(|row1| {
+                    row1.spawn(Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(2.0),
+                        ..default()
+                    })
+                    .with_children(|title| {
+                        title.spawn((
+                            Text::new("WATCH LIVE // BROADCAST HUB"),
+                            TextFont { font_size: FontSize::Px(18.0), ..default() },
+                            TextColor(gold),
+                        ));
+                        title.spawn((
+                            Text::new(format!(
+                                "{} LIVE MATCHES  |  {} TOTAL VIEWERS  |  FREE CAM + REWIND + 3-MODE FOW",
+                                state.live_matches.len(),
+                                total_viewers
+                            )),
+                            TextFont { font_size: FontSize::Px(9.5), ..default() },
+                            TextColor(Color::srgb(0.68, 0.86, 0.86)),
+                        ));
+                    });
+
+                    // فیلد جستجو بر اساس نام بازیکن، هیرو یا کد اتاق
+                    let search_focused = state.focused == FocusedInput::WatchSearch;
+                    row1.spawn((
+                        UiButton,
+                        Hovered::default(),
+                        Node {
+                            width: Val::Px(240.0),
+                            height: Val::Px(32.0),
+                            padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                            align_items: AlignItems::Center,
+                            border: UiRect::all(Val::Px(1.5)),
+                            border_radius: BorderRadius::all(Val::Px(4.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba(0.02, 0.06, 0.08, 0.95)),
+                        BorderColor::all(if search_focused {
+                            gold
+                        } else {
+                            Color::srgba(0.26, 0.64, 0.66, 0.65)
+                        }),
+                        PreGameBtnAction::FocusField(FocusedInput::WatchSearch),
+                    ))
+                    .with_children(|sb| {
+                        let txt = if state.watch_search_input.is_empty() {
+                            if search_focused {
+                                "|".to_string()
+                            } else {
+                                "Search player, hero, or room...".to_string()
+                            }
+                        } else if search_focused {
+                            format!("{}|", state.watch_search_input)
+                        } else {
+                            state.watch_search_input.clone()
+                        };
+                        sb.spawn((
+                            Text::new(txt),
+                            TextFont { font_size: FontSize::Px(11.5), ..default() },
+                            TextColor(if state.watch_search_input.is_empty() {
+                                Color::srgb(0.52, 0.70, 0.72)
+                            } else {
+                                Color::WHITE
+                            }),
+                        ));
+                    });
+
+                    // دکمه‌های مود + مرتب‌سازی + Refresh
+                    row1.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(5.0),
+                        ..default()
+                    })
+                    .with_children(|btns| {
+                        for (mf, lbl) in [
+                            (WatchModeFilter::All, "ALL"),
+                            (WatchModeFilter::Ranked, "RANKED"),
+                            (WatchModeFilter::Custom, "CUSTOM"),
+                            (WatchModeFilter::FriendsLive, "FRIENDS"),
+                        ] {
+                            let active = state.watch_mode_filter == mf;
+                            spawn_sized_button(
+                                btns,
+                                lbl,
+                                PreGameBtnAction::SetWatchModeFilter(mf),
+                                if active {
+                                    Color::srgb(0.09, 0.40, 0.36)
+                                } else {
+                                    Color::srgba(0.04, 0.12, 0.14, 0.90)
+                                },
+                                if active {
+                                    Color::srgb(0.32, 0.96, 0.84)
+                                } else {
+                                    Color::srgba(0.24, 0.50, 0.52, 0.55)
+                                },
+                                68.0,
+                                28.0,
+                            );
+                        }
+                        spawn_sized_button(
+                            btns,
+                            "RESET",
+                            PreGameBtnAction::ClearWatchFilters,
+                            Color::srgba(0.18, 0.12, 0.10, 0.90),
+                            amber.with_alpha(0.75),
+                            62.0,
+                            28.0,
+                        );
+                        spawn_sized_button(
+                            btns,
+                            if state.watch_loading { "SYNC..." } else { "REFRESH" },
+                            PreGameBtnAction::RefreshLiveMatches,
+                            Color::srgba(0.06, 0.24, 0.28, 0.94),
+                            cyan,
+                            78.0,
+                            28.0,
+                        );
+                    });
+                });
+
+                // ردیف ۲: فیلتر هیرو (با آیکون‌های WebP) + فیلتر رنک + مرتب‌سازی
+                hdr.spawn(Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(10.0),
+                    ..default()
+                })
+                .with_children(|row2| {
+                    // انتخابگر هیرو با عکس آیکون
+                    row2.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(5.0),
+                        ..default()
+                    })
+                    .with_children(|hstrip| {
+                        hstrip.spawn((
+                            Text::new("HERO:"),
+                            TextFont { font_size: FontSize::Px(9.5), ..default() },
+                            TextColor(Color::srgb(0.62, 0.82, 0.82)),
+                        ));
+                        spawn_sized_button(
+                            hstrip,
+                            "ALL",
+                            PreGameBtnAction::SetWatchHeroFilter(0),
+                            if state.watch_hero_filter == 0 {
+                                Color::srgb(0.42, 0.30, 0.08)
+                            } else {
+                                Color::srgba(0.04, 0.12, 0.14, 0.90)
+                            },
+                            if state.watch_hero_filter == 0 {
+                                gold
+                            } else {
+                                Color::srgba(0.24, 0.50, 0.52, 0.55)
+                            },
+                            40.0,
+                            28.0,
+                        );
+                        for (idx, hero) in config.heroes.iter().enumerate() {
+                            let hid = (idx + 1) as i32;
+                            let active = state.watch_hero_filter == hid;
+                            hstrip
+                                .spawn((
+                                    UiButton,
+                                    Hovered::default(),
+                                    Node {
+                                        padding: UiRect::all(Val::Px(1.0)),
+                                        border_radius: BorderRadius::all(Val::Px(
+                                            mm.hero_icon_border_radius_px,
+                                        )),
+                                        ..default()
+                                    },
+                                    PreGameBtnAction::SetWatchHeroFilter(hid),
+                                ))
+                                .with_children(|btn| {
+                                    spawn_hero_portrait_frame(
+                                        btn,
+                                        Some(hero),
+                                        hero_portraits,
+                                        sp.watch_hero_icon_size_px,
+                                        mm.hero_icon_border_radius_px,
+                                        if active {
+                                            gold
+                                        } else {
+                                            Color::srgba(0.26, 0.56, 0.58, 0.60)
+                                        },
+                                        if active { 2.2 } else { 1.2 },
+                                        None,
+                                    );
+                                });
+                        }
+                    });
+
+                    // فیلتر رنک + مرتب‌سازی
+                    row2.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(4.0),
+                        ..default()
+                    })
+                    .with_children(|ranks| {
+                        ranks.spawn((
+                            Text::new("RANK:"),
+                            TextFont { font_size: FontSize::Px(9.5), ..default() },
+                            TextColor(Color::srgb(0.62, 0.82, 0.82)),
+                        ));
+                        for r_lbl in ["ALL", "BRONZE", "SILVER", "GOLD", "PLATINUM", "DIAMOND", "MASTER"] {
+                            let active = rank_filter.eq_ignore_ascii_case(r_lbl);
+                            spawn_sized_button(
+                                ranks,
+                                r_lbl,
+                                PreGameBtnAction::SetWatchRankFilter(r_lbl.to_string()),
+                                if active {
+                                    Color::srgb(0.42, 0.30, 0.08)
+                                } else {
+                                    Color::srgba(0.04, 0.12, 0.14, 0.90)
+                                },
+                                if active {
+                                    gold
+                                } else {
+                                    Color::srgba(0.24, 0.50, 0.52, 0.45)
+                                },
+                                if r_lbl == "ALL" { 38.0 } else { 62.0 },
+                                24.0,
+                            );
+                        }
+                        ranks.spawn((
+                            Text::new("  SORT:"),
+                            TextFont { font_size: FontSize::Px(9.5), ..default() },
+                            TextColor(Color::srgb(0.62, 0.82, 0.82)),
+                        ));
+                        for (sb, lbl) in [
+                            (WatchSortBy::HighestMmr, "MMR"),
+                            (WatchSortBy::MostViewers, "VIEWERS"),
+                            (WatchSortBy::LongestDuration, "TIME"),
+                        ] {
+                            let active = state.watch_sort == sb;
+                            spawn_sized_button(
+                                ranks,
+                                lbl,
+                                PreGameBtnAction::SetWatchSort(sb),
+                                if active {
+                                    Color::srgb(0.08, 0.34, 0.38)
+                                } else {
+                                    Color::srgba(0.04, 0.12, 0.14, 0.90)
+                                },
+                                if active {
+                                    cyan
+                                } else {
+                                    Color::srgba(0.24, 0.50, 0.52, 0.45)
+                                },
+                                56.0,
+                                24.0,
+                            );
+                        }
+                    });
+                });
+            });
+
+            // =================================================================
+            // ۲. بخش دو ستونه: چپ لیست بازی‌های زنده (55%) | راست پیش‌نمایش و دکمه WATCH LIVE (45%)
+            // =================================================================
+            wrap.spawn(Node {
+                width: Val::Percent(100.0),
+                flex_grow: 1.0,
+                min_height: Val::Px(0.0),
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(14.0),
+                ..default()
+            })
+            .with_children(|cols| {
+                // ستون چپ: لیست بازی‌های آنلاین
+                cols.spawn((
+                    Node {
+                        width: Val::Percent(55.0),
+                        height: Val::Percent(100.0),
+                        padding: UiRect::all(Val::Px(10.0)),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(8.0),
+                        border: UiRect::all(Val::Px(1.5)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.02, 0.070, 0.084, 0.90)),
+                    BorderColor::all(Color::srgba(0.24, 0.62, 0.60, 0.58)),
+                ))
+                .with_children(|list_panel| {
+                    if filtered.is_empty() {
+                        list_panel
+                            .spawn(Node {
+                                width: Val::Percent(100.0),
+                                flex_grow: 1.0,
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(8.0),
+                                ..default()
+                            })
+                            .with_children(|empty| {
+                                empty.spawn((
+                                    Text::new(if state.watch_loading {
+                                        "SCANNING LIVE GAME SERVERS..."
+                                    } else {
+                                        "NO LIVE MATCHES FOUND FOR CURRENT FILTERS"
+                                    }),
+                                    TextFont { font_size: FontSize::Px(14.0), ..default() },
+                                    TextColor(Color::srgb(0.68, 0.84, 0.84)),
+                                ));
+                                empty.spawn((
+                                    Text::new("Start a match or adjust Hero / Rank / Search filters, then click REFRESH."),
+                                    TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                    TextColor(Color::srgb(0.52, 0.68, 0.70)),
+                                ));
+                            });
+                    } else {
+                        list_panel
+                            .spawn((
+                                Node {
+                                    width: Val::Percent(100.0),
+                                    flex_grow: 1.0,
+                                    min_height: Val::Px(0.0),
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: Val::Px(8.0),
+                                    overflow: Overflow::scroll_y(),
+                                    ..default()
+                                },
+                                ScrollPosition::default(),
+                                RelativeCursorPosition::default(),
+                                PreGameScrollableList,
+                            ))
+                            .with_children(|scroll| {
+                                for m in &filtered {
+                                    let is_sel = selected_match
+                                        .is_some_and(|sm| sm.room_id == m.room_id);
+                                    let dur_str = format!(
+                                        "{:02}:{:02}",
+                                        m.duration_sec / 60,
+                                        m.duration_sec % 60
+                                    );
+                                    let mode_lbl = if m.is_custom_lobby {
+                                        "CUSTOM"
+                                    } else {
+                                        "RANKED"
+                                    };
+                                    let alpha_p: Vec<_> =
+                                        m.players.iter().filter(|p| p.team_id == 1).collect();
+                                    let omega_p: Vec<_> =
+                                        m.players.iter().filter(|p| p.team_id != 1).collect();
+
+                                    scroll
+                                        .spawn((
+                                            UiButton,
+                                            Hovered::default(),
+                                            Node {
+                                                width: Val::Percent(100.0),
+                                                flex_shrink: 0.0,
+                                                padding: UiRect::axes(Val::Px(12.0), Val::Px(9.0)),
+                                                flex_direction: FlexDirection::Column,
+                                                row_gap: Val::Px(7.0),
+                                                border: UiRect {
+                                                    left: Val::Px(4.0),
+                                                    right: Val::Px(if is_sel { 1.5 } else { 1.0 }),
+                                                    top: Val::Px(if is_sel { 1.5 } else { 1.0 }),
+                                                    bottom: Val::Px(if is_sel { 1.5 } else { 1.0 }),
+                                                },
+                                                border_radius: BorderRadius::all(Val::Px(5.0)),
+                                                ..default()
+                                            },
+                                            BackgroundColor(if is_sel {
+                                                Color::srgba(0.14, 0.14, 0.05, 0.94)
+                                            } else {
+                                                Color::srgba(0.032, 0.102, 0.122, 0.88)
+                                            }),
+                                            BorderColor::all(if is_sel {
+                                                gold
+                                            } else {
+                                                cyan.with_alpha(0.55)
+                                            }),
+                                            PreGameBtnAction::SelectLiveMatch(m.room_id.clone()),
+                                        ))
+                                        .with_children(|card| {
+                                            // سطر بالای کارت: رنک و MMR + مود + دوست + زمان و تماشاگران
+                                            card.spawn(Node {
+                                                width: Val::Percent(100.0),
+                                                flex_direction: FlexDirection::Row,
+                                                justify_content: JustifyContent::SpaceBetween,
+                                                align_items: AlignItems::Center,
+                                                ..default()
+                                            })
+                                            .with_children(|top| {
+                                                top.spawn(Node {
+                                                    flex_direction: FlexDirection::Row,
+                                                    align_items: AlignItems::Center,
+                                                    column_gap: Val::Px(8.0),
+                                                    ..default()
+                                                })
+                                                .with_children(|l| {
+                                                    l.spawn((
+                                                        Text::new(format!(
+                                                            "{}  ({} AVG MMR)",
+                                                            m.rank_tier.to_uppercase(),
+                                                            m.avg_mmr
+                                                        )),
+                                                        TextFont {
+                                                            font_size: FontSize::Px(12.0),
+                                                            ..default()
+                                                        },
+                                                        TextColor(gold),
+                                                    ));
+                                                    l.spawn((
+                                                        Text::new(format!("[{}]", mode_lbl)),
+                                                        TextFont {
+                                                            font_size: FontSize::Px(10.0),
+                                                            ..default()
+                                                        },
+                                                        TextColor(cyan),
+                                                    ));
+                                                    if m.has_friend {
+                                                        l.spawn((
+                                                            Text::new("[FRIEND LIVE]"),
+                                                            TextFont {
+                                                                font_size: FontSize::Px(10.0),
+                                                                ..default()
+                                                            },
+                                                            TextColor(emerald),
+                                                        ));
+                                                    }
+                                                });
+
+                                                top.spawn((
+                                                    Text::new(format!(
+                                                        "LIVE {}  |  {} WATCHING",
+                                                        dur_str, m.spectator_count
+                                                    )),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(10.5),
+                                                        ..default()
+                                                    },
+                                                    TextColor(Color::srgb(0.84, 0.94, 0.94)),
+                                                ));
+                                            });
+
+                                            // سطر پایین کارت: آیکون هیروهای تیم آلفا در برابر امگا + نتیجه کیل
+                                            card.spawn(Node {
+                                                width: Val::Percent(100.0),
+                                                flex_direction: FlexDirection::Row,
+                                                justify_content: JustifyContent::SpaceBetween,
+                                                align_items: AlignItems::Center,
+                                                ..default()
+                                            })
+                                            .with_children(|vs| {
+                                                vs.spawn(Node {
+                                                    flex_direction: FlexDirection::Row,
+                                                    align_items: AlignItems::Center,
+                                                    column_gap: Val::Px(4.0),
+                                                    ..default()
+                                                })
+                                                .with_children(|t1| {
+                                                    for p in &alpha_p {
+                                                        spawn_hero_portrait_frame(
+                                                            t1,
+                                                            resolve_hero_def(config, p.hero_id),
+                                                            hero_portraits,
+                                                            sp.watch_hero_icon_size_px,
+                                                            mm.hero_icon_border_radius_px,
+                                                            emerald.with_alpha(0.85),
+                                                            1.4,
+                                                            None,
+                                                        );
+                                                    }
+                                                });
+
+                                                vs.spawn((
+                                                    Text::new(format!(
+                                                        "{}  -  {}",
+                                                        m.dawn_kills, m.dusk_kills
+                                                    )),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(15.0),
+                                                        ..default()
+                                                    },
+                                                    TextColor(Color::WHITE),
+                                                ));
+
+                                                vs.spawn(Node {
+                                                    flex_direction: FlexDirection::Row,
+                                                    align_items: AlignItems::Center,
+                                                    column_gap: Val::Px(4.0),
+                                                    ..default()
+                                                })
+                                                .with_children(|t2| {
+                                                    for p in &omega_p {
+                                                        spawn_hero_portrait_frame(
+                                                            t2,
+                                                            resolve_hero_def(config, p.hero_id),
+                                                            hero_portraits,
+                                                            sp.watch_hero_icon_size_px,
+                                                            mm.hero_icon_border_radius_px,
+                                                            amber.with_alpha(0.85),
+                                                            1.4,
+                                                            None,
+                                                        );
+                                                    }
+                                                });
+                                            });
+                                        });
+                                }
+                            });
+                    }
+                });
+
+                // ستون راست: پیش‌نمایش کامل مسابقه انتخاب‌شده + دکمه WATCH LIVE
+                cols.spawn(Node {
+                    width: Val::Percent(45.0),
+                    height: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::SpaceBetween,
+                    row_gap: Val::Px(10.0),
+                    ..default()
+                })
+                .with_children(|right_col| {
+                    right_col
+                        .spawn((
+                            Node {
+                                width: Val::Percent(100.0),
+                                flex_grow: 1.0,
+                                min_height: Val::Px(0.0),
+                                padding: UiRect::all(Val::Px(14.0)),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(10.0),
+                                border: UiRect::all(Val::Px(1.5)),
+                                border_radius: BorderRadius::all(Val::Px(6.0)),
+                                overflow: Overflow::clip(),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.025, 0.082, 0.098, 0.94)),
+                            BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.68)),
+                        ))
+                        .with_children(|det| {
+                            if let Some(m) = selected_match {
+                                let dur_str = format!(
+                                    "{:02}:{:02}",
+                                    m.duration_sec / 60,
+                                    m.duration_sec % 60
+                                );
+                                let delay_str = if m.is_custom_lobby {
+                                    format!("{:.0}s DELAY (CUSTOM)", sp.custom_lobby_live_delay_secs)
+                                } else {
+                                    format!("{:.0}s ANTI-GHOST DELAY", sp.ranked_live_delay_secs)
+                                };
+
+                                det.spawn(Node {
+                                    width: Val::Percent(100.0),
+                                    flex_shrink: 0.0,
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: Val::Px(3.0),
+                                    ..default()
+                                })
+                                .with_children(|hdr| {
+                                    hdr.spawn((
+                                        Text::new(format!(
+                                            "{}  |  {} AVG MMR",
+                                            mm.default_map_name, m.avg_mmr
+                                        )),
+                                        TextFont { font_size: FontSize::Px(16.0), ..default() },
+                                        TextColor(Color::WHITE),
+                                    ));
+                                    hdr.spawn((
+                                        Text::new(format!(
+                                            "ROOM {}  |  LIVE {}  |  {} VIEWERS  |  {}",
+                                            m.room_id, dur_str, m.spectator_count, delay_str
+                                        )),
+                                        TextFont { font_size: FontSize::Px(10.0), ..default() },
+                                        TextColor(cyan),
+                                    ));
+                                });
+
+                                // لیست بازیکنان دو تیم
+                                det.spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        flex_grow: 1.0,
+                                        min_height: Val::Px(0.0),
+                                        flex_direction: FlexDirection::Column,
+                                        row_gap: Val::Px(6.0),
+                                        overflow: Overflow::scroll_y(),
+                                        ..default()
+                                    },
+                                    ScrollPosition::default(),
+                                    RelativeCursorPosition::default(),
+                                    PreGameScrollableList,
+                                ))
+                                .with_children(|roster| {
+                                    for (t_id, t_name, t_col) in [
+                                        (1, "TEAM ALPHA (DAWN)", emerald),
+                                        (2, "TEAM OMEGA (DUSK)", amber),
+                                    ] {
+                                        roster.spawn((
+                                            Text::new(t_name),
+                                            TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                            TextColor(t_col),
+                                        ));
+                                        for p in m.players.iter().filter(|p| {
+                                            if t_id == 1 {
+                                                p.team_id == 1
+                                            } else {
+                                                p.team_id != 1
+                                            }
+                                        }) {
+                                            let hero_def = resolve_hero_def(config, p.hero_id);
+                                            let hero_lbl =
+                                                resolve_hero_display_name(config, p.hero_id);
+                                            let fr_tag = if p.is_friend { " [FRIEND]" } else { "" };
+                                            roster
+                                                .spawn((
+                                                    Node {
+                                                        width: Val::Percent(100.0),
+                                                        flex_shrink: 0.0,
+                                                        padding: UiRect::axes(
+                                                            Val::Px(8.0),
+                                                            Val::Px(5.0),
+                                                        ),
+                                                        flex_direction: FlexDirection::Row,
+                                                        justify_content:
+                                                            JustifyContent::SpaceBetween,
+                                                        align_items: AlignItems::Center,
+                                                        border: UiRect::all(Val::Px(1.0)),
+                                                        border_radius: BorderRadius::all(
+                                                            Val::Px(4.0),
+                                                        ),
+                                                        ..default()
+                                                    },
+                                                    BackgroundColor(Color::srgba(
+                                                        0.032, 0.098, 0.118, 0.86,
+                                                    )),
+                                                    BorderColor::all(t_col.with_alpha(0.35)),
+                                                ))
+                                                .with_children(|prow| {
+                                                    prow.spawn(Node {
+                                                        flex_direction: FlexDirection::Row,
+                                                        align_items: AlignItems::Center,
+                                                        column_gap: Val::Px(8.0),
+                                                        ..default()
+                                                    })
+                                                    .with_children(|l| {
+                                                        spawn_hero_portrait_frame(
+                                                            l,
+                                                            hero_def,
+                                                            hero_portraits,
+                                                            mm.history_player_row_icon_size_px,
+                                                            mm.hero_icon_border_radius_px,
+                                                            t_col,
+                                                            1.4,
+                                                            None,
+                                                        );
+                                                        l.spawn(Node {
+                                                            flex_direction: FlexDirection::Column,
+                                                            row_gap: Val::Px(1.0),
+                                                            ..default()
+                                                        })
+                                                        .with_children(|info| {
+                                                            info.spawn((
+                                                                Text::new(format!(
+                                                                    "{}{}",
+                                                                    p.username, fr_tag
+                                                                )),
+                                                                TextFont {
+                                                                    font_size: FontSize::Px(11.5),
+                                                                    ..default()
+                                                                },
+                                                                TextColor(if p.is_friend {
+                                                                    emerald
+                                                                } else {
+                                                                    Color::WHITE
+                                                                }),
+                                                            ));
+                                                            info.spawn((
+                                                                Text::new(format!(
+                                                                    "{}  |  {} ({} MMR)",
+                                                                    hero_lbl, p.rank_tier, p.mmr
+                                                                )),
+                                                                TextFont {
+                                                                    font_size: FontSize::Px(9.5),
+                                                                    ..default()
+                                                                },
+                                                                TextColor(Color::srgb(
+                                                                    0.70, 0.84, 0.84,
+                                                                )),
+                                                            ));
+                                                        });
+                                                    });
+
+                                                    spawn_kda_colored_row(
+                                                        prow, p.kills, p.deaths, p.assists, 11.5,
+                                                    );
+                                                });
+                                        }
+                                    }
+                                });
+
+                                // دکمه بزرگ ورود به عنوان تماشاگر (WATCH LIVE)
+                                if m.can_spectate {
+                                    spawn_sized_button(
+                                        det,
+                                        "WATCH LIVE MATCH",
+                                        PreGameBtnAction::WatchLiveMatch(m.room_id.clone()),
+                                        Color::srgba(0.64, 0.46, 0.10, 0.96),
+                                        gold,
+                                        320.0,
+                                        46.0,
+                                    );
+                                } else {
+                                    det.spawn((
+                                        Text::new("You are an active player in this match - use RECONNECT from PLAY tab."),
+                                        TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                        TextColor(crimson),
+                                    ));
+                                }
+                            } else {
+                                det.spawn((
+                                    Text::new("BROADCAST PREVIEW"),
+                                    TextFont { font_size: FontSize::Px(16.0), ..default() },
+                                    TextColor(Color::WHITE),
+                                ));
+                                det.spawn((
+                                    Text::new("Select a live match from the left list to inspect rosters and spectate."),
+                                    TextFont { font_size: FontSize::Px(12.5), ..default() },
+                                    TextColor(Color::srgb(0.68, 0.80, 0.80)),
+                                ));
+                            }
+                        });
+
+                    right_col
+                        .spawn(Node {
+                            width: Val::Percent(100.0),
+                            flex_shrink: 0.0,
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::FlexEnd,
+                            ..default()
+                        })
+                        .with_children(|b| {
+                            spawn_sized_button(
+                                b,
+                                "BACK TO MENU",
+                                PreGameBtnAction::SwitchTab(PreGameTab::Hub),
+                                Color::srgba(0.05, 0.16, 0.18, 0.94),
+                                Color::srgb(0.30, 0.86, 0.78),
+                                210.0,
+                                46.0,
+                            );
+                        });
+                });
             });
         });
 }

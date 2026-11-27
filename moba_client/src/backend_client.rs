@@ -24,7 +24,49 @@ pub struct ActiveMatchInfo {
     pub team_id: i32,
     pub slot_index: usize,
     pub participant_status: String,
+    #[serde(default)]
+    pub is_spectator: bool,
     pub game_link: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct LiveMatchPlayerInfo {
+    pub user_id: String,
+    pub username: String,
+    pub team_id: i32,
+    pub slot_index: usize,
+    pub hero_id: i32,
+    pub level: i32,
+    pub kills: i32,
+    pub deaths: i32,
+    pub assists: i32,
+    pub mmr: i32,
+    pub rank_tier: String,
+    #[serde(default)]
+    pub is_friend: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
+pub struct LiveMatchEntry {
+    pub room_id: String,
+    pub server_addr: String,
+    pub port: u16,
+    pub is_custom_lobby: bool,
+    pub max_players: usize,
+    pub avg_mmr: i32,
+    pub rank_tier: String,
+    pub duration_sec: i32,
+    pub dawn_kills: i32,
+    pub dusk_kills: i32,
+    pub spectator_count: usize,
+    #[serde(default)]
+    pub has_friend: bool,
+    #[serde(default)]
+    pub can_spectate: bool,
+    #[serde(default)]
+    pub players: Vec<LiveMatchPlayerInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +390,8 @@ pub enum BackendAsyncEvent {
         abandoned_count: i32,
     },
     HistoryLoaded(MatchHistoryResponse),
+    LiveMatchesLoaded(Vec<LiveMatchEntry>),
+    SpectateReady(ActiveMatchInfo),
     HttpError(String),
     // WebSocket Matchmaking Events
     QueueStatus {
@@ -839,6 +883,85 @@ impl BackendClient {
                     Err(e) => {
                         let _ = tx.send(BackendAsyncEvent::HttpError(format!(
                             "Failed to load match history: {}",
+                            e
+                        )));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(BackendAsyncEvent::HttpError(extract_ureq_error(e)));
+                }
+            }
+        });
+    }
+
+    pub fn fetch_live_matches(&self, access_token: String) {
+        let url = format!("{}/api/v1/match/live/", self.http_base);
+        let tx = self.tx.clone();
+        let timeout = self.http_timeout();
+        thread::spawn(move || {
+            match ureq::get(&url)
+                .set("Authorization", &format!("Bearer {}", access_token))
+                .timeout(timeout)
+                .call()
+            {
+                Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                    Ok(v) => {
+                        let matches: Vec<LiveMatchEntry> = v
+                            .get("matches")
+                            .cloned()
+                            .and_then(|arr| ureq::serde_json::from_value(arr).ok())
+                            .unwrap_or_default();
+                        let _ = tx.send(BackendAsyncEvent::LiveMatchesLoaded(matches));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BackendAsyncEvent::HttpError(format!(
+                            "Failed to parse live matches: {}",
+                            e
+                        )));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(BackendAsyncEvent::HttpError(extract_ureq_error(e)));
+                }
+            }
+        });
+    }
+
+    pub fn request_spectate_match(&self, access_token: String, room_id: String) {
+        let url = format!("{}/api/v1/match/spectate/", self.http_base);
+        let tx = self.tx.clone();
+        let timeout = self.http_timeout();
+        thread::spawn(move || {
+            let body = serde_json::json!({ "room_id": room_id });
+            match ureq::post(&url)
+                .set("Authorization", &format!("Bearer {}", access_token))
+                .timeout(timeout)
+                .send_json(body)
+            {
+                Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                    Ok(v) => {
+                        if let Some(spec_val) = v.get("spectate").cloned() {
+                            match ureq::serde_json::from_value::<ActiveMatchInfo>(spec_val) {
+                                Ok(mut info) => {
+                                    info.is_spectator = true;
+                                    let _ = tx.send(BackendAsyncEvent::SpectateReady(info));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(BackendAsyncEvent::HttpError(format!(
+                                        "Invalid spectate payload: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        } else {
+                            let _ = tx.send(BackendAsyncEvent::HttpError(
+                                "Missing spectate payload from server.".to_string(),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BackendAsyncEvent::HttpError(format!(
+                            "Failed to parse spectate response: {}",
                             e
                         )));
                     }
@@ -1653,6 +1776,7 @@ fn parse_match_found_payload(v: &serde_json::Value) -> Option<ActiveMatchInfo> {
         team_id,
         slot_index,
         participant_status: "connected".to_string(),
+        is_spectator: false,
         game_link,
     })
 }

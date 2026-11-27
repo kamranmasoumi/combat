@@ -1,3 +1,4 @@
+import uuid
 import asyncio
 import contextvars
 import json
@@ -578,6 +579,220 @@ def store_ticket_in_redis(ticket_id: str, room_id: str, user_id: str, username: 
         print(f"[REDIS ERROR] Failed to store ticket ticket:{ticket_id}: {exc}", flush=True)
 
 
+def store_spectator_ticket_in_redis(
+    ticket_id: str,
+    room_id: str,
+    user_id: str,
+    username: str,
+    is_custom_lobby: bool,
+) -> None:
+    """
+    ذخیره تیکت مهمان/تماشاگر (Spectator) در Redis برای احراز هویت امن در moba_server.
+    فیلد role="spectator" به صورت Server-Authoritative تعیین می‌کند کلاینت فقط تماشاگر است.
+    """
+    payload = json.dumps(
+        {
+            "room_id": room_id,
+            "user_id": user_id,
+            "username": username,
+            "role": "spectator",
+            "is_custom_lobby": "true" if is_custom_lobby else "false",
+        }
+    )
+    try:
+        _get_shared_redis().setex(f"ticket:{ticket_id}", 7200, payload)
+    except Exception as exc:
+        print(f"[REDIS ERROR] Failed to store spectator ticket ticket:{ticket_id}: {exc}", flush=True)
+
+
+def set_room_spectator_count_in_redis(room_id: str, count: int) -> None:
+    try:
+        _get_shared_redis().setex(f"spec_count:{room_id}", 300, str(max(0, int(count))))
+    except Exception:
+        pass
+
+
+def get_room_spectator_count_from_redis(room_id: str) -> int:
+    try:
+        val = _get_shared_redis().get(f"spec_count:{room_id}")
+        if val is not None:
+            return max(0, int(val))
+    except Exception:
+        pass
+    return 0
+
+
+def list_live_matches_for_watch(viewer: Player, client_ip: Optional[str] = None) -> list:
+    """
+    برگرداندن لیست بازی‌های آنلاینِ در حال اجرا (STATUS_RUNNING) همراه با اطلاعات کامل
+    تیم‌ها، هیروها، میانگین MMR، رنک، تعداد تماشاگران و وضعیت دوستان برای صفحه WATCH LIVE.
+    """
+    _cleanup_finished_processes()
+    now = timezone.now()
+    rooms = list(
+        GameMatchRoom.objects.filter(status=GameMatchRoom.STATUS_RUNNING)
+        .order_by("-created_at")[:60]
+    )
+    if not rooms:
+        return []
+
+    friend_ids = set()
+    try:
+        for fr in Friendship.objects.filter(
+            Q(from_player=viewer) | Q(to_player=viewer),
+            status=Friendship.STATUS_ACCEPTED,
+        ).values_list("from_player_id", "to_player_id"):
+            if fr[0] != viewer.id:
+                friend_ids.add(fr[0])
+            if fr[1] != viewer.id:
+                friend_ids.add(fr[1])
+    except Exception:
+        pass
+
+    room_ids = [r.id for r in rooms]
+    all_parts = (
+        MatchParticipant.objects.select_related("player")
+        .filter(match_room_id__in=room_ids)
+        .order_by("team_id", "slot_index")
+    )
+    parts_by_room = {}
+    for p in all_parts:
+        parts_by_room.setdefault(p.match_room_id, []).append(p)
+
+    live_list = []
+    for room in rooms:
+        port = room.server_port
+        unit_name = get_game_server_unit_name(port, room.room_id, room.max_players)
+        port_bound = is_udp_port_bound(port)
+        recently_created = (now - room.created_at) < timedelta(seconds=20)
+        unit_active = is_systemd_unit_active(unit_name) if recently_created else False
+        if not (port_bound or (unit_active and recently_created)):
+            continue
+
+        r_parts = parts_by_room.get(room.id, [])
+        if not r_parts:
+            continue
+
+        mmrs = [p.player.mmr for p in r_parts]
+        avg_mmr = int(round(sum(mmrs) / max(1, len(mmrs))))
+        rank_tier = compute_rank_tier_from_mmr(avg_mmr)
+        elapsed_sec = max(0, int((now - room.created_at).total_seconds()))
+        dawn_kills = sum(p.kills for p in r_parts if p.team_id == 1)
+        dusk_kills = sum(p.kills for p in r_parts if p.team_id != 1)
+        has_friend = any(p.player_id in friend_ids for p in r_parts)
+        is_participant = any(
+            p.player_id == viewer.id
+            and p.status not in (MatchParticipant.STATUS_ABANDONED, MatchParticipant.STATUS_COMPLETED)
+            for p in r_parts
+        )
+
+        players_payload = []
+        for p in r_parts:
+            players_payload.append(
+                {
+                    "user_id": p.player.user_id,
+                    "username": p.player.username,
+                    "team_id": p.team_id,
+                    "slot_index": p.slot_index,
+                    "hero_id": p.hero_id,
+                    "level": p.level,
+                    "kills": p.kills,
+                    "deaths": p.deaths,
+                    "assists": p.assists,
+                    "mmr": p.player.mmr,
+                    "rank_tier": p.player.rank_tier,
+                    "is_friend": p.player_id in friend_ids,
+                }
+            )
+
+        effective_host = room.server_host
+        if effective_host in ("127.0.0.1", "localhost"):
+            effective_host = resolve_game_server_host(client_ip)
+
+        live_list.append(
+            {
+                "room_id": room.room_id,
+                "server_addr": f"{effective_host}:{room.server_port}",
+                "port": room.server_port,
+                "is_custom_lobby": getattr(room, "is_custom_lobby", False),
+                "max_players": room.max_players,
+                "avg_mmr": avg_mmr,
+                "rank_tier": rank_tier,
+                "duration_sec": elapsed_sec,
+                "dawn_kills": dawn_kills,
+                "dusk_kills": dusk_kills,
+                "spectator_count": get_room_spectator_count_from_redis(room.room_id),
+                "has_friend": has_friend,
+                "can_spectate": not is_participant,
+                "players": players_payload,
+            }
+        )
+
+    return live_list
+
+
+def issue_spectator_ticket_for_room(
+    viewer: Player, room_id: str, client_ip: Optional[str] = None
+) -> dict:
+    """
+    صدور تیکت مهمان (Spectator) برای ورود به یک بازی آنلاین در حال اجرا.
+    از نظر امنیتی اجازه نمی‌دهد بازیکنی که خودش عضو فعال همان مسابقه است به عنوان تماشاگر وارد شود.
+    """
+    room = GameMatchRoom.objects.filter(
+        room_id=room_id, status=GameMatchRoom.STATUS_RUNNING
+    ).first()
+    if not room:
+        return {"error": "Live match not found or already ended.", "status_code": 404}
+
+    if MatchParticipant.objects.filter(match_room=room, player=viewer).exclude(
+        status__in=[MatchParticipant.STATUS_ABANDONED, MatchParticipant.STATUS_COMPLETED]
+    ).exists():
+        return {
+            "error": "You are an active player in this match and cannot spectate it.",
+            "status_code": 403,
+        }
+
+    port = room.server_port
+    now = timezone.now()
+    unit_name = get_game_server_unit_name(port, room.room_id, room.max_players)
+    port_bound = is_udp_port_bound(port)
+    recently_created = (now - room.created_at) < timedelta(seconds=20)
+    unit_active = is_systemd_unit_active(unit_name) if recently_created else False
+    if not (port_bound or (unit_active and recently_created)):
+        return {"error": "Match server is no longer live.", "status_code": 410}
+
+    is_custom = bool(getattr(room, "is_custom_lobby", False))
+    ticket_id = f"spec_{uuid.uuid4().hex[:20]}"
+    store_spectator_ticket_in_redis(
+        ticket_id=ticket_id,
+        room_id=room.room_id,
+        user_id=viewer.user_id,
+        username=viewer.username,
+        is_custom_lobby=is_custom,
+    )
+
+    effective_host = room.server_host
+    if effective_host in ("127.0.0.1", "localhost"):
+        effective_host = resolve_game_server_host(client_ip)
+    server_addr = f"{effective_host}:{room.server_port}"
+    game_link = f"moba://{server_addr}/{room.room_id}/{ticket_id}"
+
+    return {
+        "status_code": 200,
+        "room_id": room.room_id,
+        "port": room.server_port,
+        "server_addr": server_addr,
+        "ticket_id": ticket_id,
+        "player_count": room.max_players,
+        "team_id": 0,
+        "slot_index": 0,
+        "participant_status": "spectator",
+        "is_spectator": True,
+        "is_custom_lobby": is_custom,
+        "game_link": game_link,
+    }
+
+
 def delete_ticket_from_redis(ticket_id: str) -> None:
     """
     حذف تیکت بازیکن از Redis پس از ترک نهایی بازی (Abandon) یا اتمام مسابقه
@@ -857,6 +1072,13 @@ def update_player_connection_state_from_server(data: dict) -> dict:
     ticket_id = str(data.get("ticket_id", "")).strip()
     slot_index = data.get("slot_index", None)
     raw_status = str(data.get("status", "")).strip().lower()
+    if "spectator_count" in data and data.get("spectator_count") is not None and room_id:
+        try:
+            set_room_spectator_count_in_redis(room_id, int(data["spectator_count"]))
+        except (TypeError, ValueError):
+            pass
+        if raw_status == "spectator_count":
+            return {"status": "ok", "room_id": room_id, "spectator_count": get_room_spectator_count_from_redis(room_id)}
 
     if raw_status and raw_status not in (
         MatchParticipant.STATUS_CONNECTED,

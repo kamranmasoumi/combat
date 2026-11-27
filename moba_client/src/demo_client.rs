@@ -822,6 +822,7 @@ fn launch_embedded_demo_system(
         slot_index: 0,
         participant_status: "connected".to_string(),
         game_link: String::new(),
+        is_spectator: false,
     });
 
     next_screen.set(AppScreenState::InGame);

@@ -1,5 +1,6 @@
 use bevy::animation::AnimatedBy;
 use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::mouse::MouseWheel;
 use bevy::input::ButtonState;
 use bevy::asset::RenderAssetUsages;
 use bevy::gltf::GltfMaterialName;
@@ -34,13 +35,13 @@ use moba_shared::{
     apply_client_cli_overrides, ClientInputCommand, ClientLobbyMessage, CourierOrder, CourierSnapshot, CreepAnimState, CreepSnapshot,
     ClientPhysicsPredictionState, HeroSnapshot, MatchPhase, MatchStateSnapshot,
     resolve_teleport_destination_from_snapshots, ActiveTeleportSnapshot, ActiveWeaponSlot,
-    AncientSnapshot, BarracksKind, BarracksSnapshot, ChatMessageEntry, ChatMessageKind,
+    AncientSnapshot, BarracksSnapshot, ChatMessageEntry, ChatMessageKind,
     CustomPhysicsWorld, PausePhase, PauseSnapshot, soldier_collision_groups, ModelTransformConfig,
     RemotePlayerSnapshot, ServerLobbyPacket, TopBarHeroInfo, TurretSnapshot, SharedFogOfWar,
     WeaponKind, CHANNEL_RELIABLE_LOBBY,
     BulletVfxSource, FOW_GRID_H, FOW_GRID_W, ColliderDisabled, GameConfig,
     GameplayFxEvent, HeroKillRewardEntry, ItemsConfig, MapObjectId, MobaSharedPhysicsPlugin, PhysicsRole, PhysicsSoldier,
-    ScoreboardHeroInfo, ServerWorldSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
+    ScoreboardHeroInfo, ServerWorldSnapshot, SpectatorCameraMode, SpectatorFogMode, SpectatorPlaybackSnapshot, Stance, TeamId, UpperBodyAction, Velocity, CHANNEL_RELIABLE_FX,
     CHANNEL_UNRELIABLE_STATE,
 };
 use renet::RenetClient;
@@ -326,6 +327,7 @@ fn main() {
             active_ticket_id: None,
             ticket_sent: false,
         })
+        .insert_resource(ClientSpectatorState::default())
         .insert_resource(CameraControlState {
             free_look_target: None,
             camera_unlocked: false,
@@ -395,6 +397,7 @@ fn main() {
                     death_screen_overlay_system,
                     ingame_exit_button_system,
                     sync_hud_phase_visibility_system,
+                    spectator_controls_and_hud_system,
                 ),
             )
                 .run_if(in_state(AppScreenState::InGame)),
@@ -623,6 +626,7 @@ struct MountainVisualMarker {
 #[derive(Component)]
 struct NetworkBulletVisual {
     server_id: u64,
+    velocity: Vec3,
     visual_offset: Vec3,
     visual_offset_blend: f32,
 }
@@ -1230,6 +1234,9 @@ fn on_enter_ingame_connect_system(
     mut post_match: ResMut<PostMatchFlowState>,
     mut match_flow: ResMut<ClientMatchFlow>,
     mut match_result: ResMut<LatestMatchResult>,
+    mut spectator: ResMut<ClientSpectatorState>,
+    mut camera_control: ResMut<CameraControlState>,
+    mut tuner: ResMut<WeaponTuner>,
     mut cam_q: Query<&mut Camera, With<Camera3d>>,
 ) {
     post_match.started = false;
@@ -1255,6 +1262,44 @@ fn on_enter_ingame_connect_system(
         match_flow.active_ticket_id = Some(info.ticket_id);
         match_flow.ticket_sent = false;
         match_result.0 = None;
+        tuner.offset = Vec3::new(
+            config.weapon_tuner.initial_offset.0,
+            config.weapon_tuner.initial_offset.1,
+            config.weapon_tuner.initial_offset.2,
+        );
+        tuner.rotation = Vec3::new(
+            config.weapon_tuner.initial_rotation_deg.0,
+            config.weapon_tuner.initial_rotation_deg.1,
+            config.weapon_tuner.initial_rotation_deg.2,
+        );
+        tuner.scale = config.weapon_tuner.initial_scale;
+        spectator.is_spectator = info.is_spectator;
+        spectator.camera_mode = SpectatorCameraMode::FreeCamera;
+        spectator.chase_slot_index = None;
+        spectator.directed_focus_slot = None;
+        spectator.directed_switch_cooldown = 0.0;
+        let base_cam_dist = Vec3::new(
+            config.camera.offset.0,
+            config.camera.offset.1,
+            config.camera.offset.2,
+        )
+        .length()
+        .max(0.01);
+        spectator.zoom_distance = base_cam_dist.clamp(
+            config.spectator.free_camera_min_zoom,
+            config.spectator.free_camera_max_zoom,
+        );
+        spectator.playback = None;
+        spectator.last_fog_mode = None;
+        spectator.last_fog_mask.clear();
+        spectator.is_scrubbing_timeline = false;
+        if info.is_spectator {
+            camera_control.camera_unlocked = true;
+            camera_control.free_look_target = Some(Vec3::ZERO);
+        } else {
+            camera_control.camera_unlocked = false;
+            camera_control.free_look_target = None;
+        }
     }
 }
 
@@ -1305,12 +1350,29 @@ fn spawn_ingame_exit_button_ui(commands: &mut Commands) {
 }
 
 fn on_exit_ingame_system(
+    mut commands: Commands,
     mut net: ResMut<ClientNetwork>,
     mut audio_ctx: ResMut<AudioFrameContext>,
     mut audio_q: ResMut<AudioEventQueue>,
+    mut spectator: ResMut<ClientSpectatorState>,
+    mut remote_players: ResMut<LatestRemotePlayers>,
+    mut creeps: ResMut<LatestCreeps>,
+    mut couriers: ResMut<LatestCouriers>,
+    remote_vis_q: Query<Entity, With<RemotePlayerVisual>>,
     mut cam_q: Query<&mut Camera, With<Camera3d>>,
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
+    spectator.is_spectator = false;
+    spectator.playback = None;
+    spectator.last_fog_mode = None;
+    spectator.last_fog_mask.clear();
+    spectator.is_scrubbing_timeline = false;
+    remote_players.0.clear();
+    creeps.0.clear();
+    couriers.0.clear();
+    for ent in &remote_vis_q {
+        safe_despawn(&mut commands, ent);
+    }
     net.client.disconnect();
     net.transport.disconnect();
     audio_ctx.in_game = false;
@@ -1333,16 +1395,40 @@ fn on_exit_ingame_system(
 
 fn sync_hud_phase_visibility_system(
     match_flow: Res<ClientMatchFlow>,
-    mut hud_q: Query<&mut Visibility, Or<(With<MinimapRoot>, With<HeroHudRoot>)>>,
+    spectator: Res<ClientSpectatorState>,
+    mut minimap_q: Query<&mut Visibility, (With<MinimapRoot>, Without<HeroHudRoot>, Without<SoldierMarker>)>,
+    mut hero_hud_q: Query<&mut Visibility, (With<HeroHudRoot>, Without<MinimapRoot>, Without<SoldierMarker>)>,
+    mut soldier_q: Query<&mut Visibility, (With<SoldierMarker>, Without<MinimapRoot>, Without<HeroHudRoot>)>,
 ) {
-    let want = if match_flow.is_in_game() {
+    let in_game = match_flow.is_in_game();
+    let want_minimap = if in_game {
         Visibility::Visible
     } else {
         Visibility::Hidden
     };
-    for mut vis in &mut hud_q {
-        if *vis != want {
-            *vis = want;
+    for mut vis in &mut minimap_q {
+        if *vis != want_minimap {
+            *vis = want_minimap;
+        }
+    }
+    let want_hero_hud = if in_game {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut vis in &mut hero_hud_q {
+        if *vis != want_hero_hud {
+            *vis = want_hero_hud;
+        }
+    }
+    let want_soldier = if spectator.is_spectator {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for mut vis in &mut soldier_q {
+        if *vis != want_soldier {
+            *vis = want_soldier;
         }
     }
 }
@@ -1353,11 +1439,13 @@ fn ingame_exit_button_system(
     backend: Res<BackendClient>,
     pregame_state: Res<PreGameSessionState>,
     demo_session: Res<demo_client::ActiveDemoSession>,
+    spectator: Res<ClientSpectatorState>,
     match_result: Res<LatestMatchResult>,
     mut next_screen: ResMut<NextState<AppScreenState>>,
     mut exit_btn_q: Query<(&Hovered, &mut BackgroundColor), With<InGameExitMenuBtn>>,
 ) {
-    let mut want_exit = (match_result.0.is_some() || demo_session.is_active) && keys.just_pressed(KeyCode::Escape);
+    let mut want_exit = (match_result.0.is_some() || demo_session.is_active || spectator.is_spectator)
+        && keys.just_pressed(KeyCode::Escape);
     let left_clicked = mouse.just_pressed(MouseButton::Left);
     for (hovered, mut bg) in &mut exit_btn_q {
         if hovered.get() {
@@ -1370,7 +1458,7 @@ fn ingame_exit_button_system(
         }
     }
     if want_exit {
-        if !demo_session.is_active && match_result.0.is_none() {
+        if !demo_session.is_active && !spectator.is_spectator && match_result.0.is_none() {
             if let Some(ref tok) = pregame_state.access_token {
                 backend.disconnect_match(tok.clone());
             }
@@ -2432,6 +2520,7 @@ fn setup_scene(
     spawn_pause_overlay_ui(&mut commands);
     spawn_telemetry_hud_ui(&mut commands);
     spawn_ingame_exit_button_ui(&mut commands);
+    spawn_spectator_hud_ui(&mut commands, &config);
     spawn_match_overlay_ui(&mut commands, &config);
 
     let shared_fx = SharedFxAssets {
@@ -3502,6 +3591,7 @@ fn attach_weapon_to_left_hand(
     config: Res<GameConfig>,
     asset_server: Res<AssetServer>,
     match_flow: Res<ClientMatchFlow>,
+    spectator: Res<ClientSpectatorState>,
     render_state: Res<ClientRenderState>,
     hero_state: Res<LatestHeroSnapshot>,
     mut status: ResMut<WeaponAttachmentStatus>,
@@ -3512,6 +3602,14 @@ fn attach_weapon_to_left_hand(
     existing_weapon_q: Query<(Entity, &AttachedWeaponKind), With<WeaponRoot>>,
 ) {
     if !match_flow.is_in_game() {
+        return;
+    }
+    if spectator.is_spectator {
+        for (w_ent, _) in &existing_weapon_q {
+            safe_despawn(&mut commands, w_ent);
+        }
+        status.attached = false;
+        status.hand_entity = None;
         return;
     }
 
@@ -3598,7 +3696,7 @@ fn attach_weapon_to_left_hand(
                             rotation: Quat::IDENTITY,
                             scale: Vec3::splat(tuner.scale),
                         },
-                        Visibility::Visible,
+                        Visibility::Inherited,
                     ))
                     .with_children(|weapon| {
                         assert!(
@@ -3616,7 +3714,7 @@ fn attach_weapon_to_left_hand(
                         weapon.spawn((
                             MuzzlePoint,
                             Transform::from_xyz(m_off.0, m_off.1, m_off.2),
-                            Visibility::Visible,
+                            Visibility::Inherited,
                         ));
                     });
             });
@@ -3758,10 +3856,11 @@ fn weapon_live_calibration_system(
     time: Res<Time>,
     config: Res<GameConfig>,
     chat_state: Res<ChatUiState>,
+    spectator: Res<ClientSpectatorState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut tuner: ResMut<WeaponTuner>,
 ) {
-    if chat_state.is_open {
+    if chat_state.is_open || spectator.is_spectator {
         return;
     }
     let dt = time.delta_secs();
@@ -3838,6 +3937,7 @@ struct SampleInputExtraParams<'w, 's> {
 fn client_sample_input_system(
     match_flow: Res<ClientMatchFlow>,
     match_result: Res<LatestMatchResult>,
+    spectator: Res<ClientSpectatorState>,
     pause_state: Res<LatestPauseState>,
     chat_state: Res<ChatUiState>,
     mut shop_ui: ResMut<ShopUiState>,
@@ -3851,7 +3951,7 @@ fn client_sample_input_system(
     muzzle_query: Query<&GlobalTransform, With<MuzzlePoint>>,
     mut ex: SampleInputExtraParams,
 ) {
-    if !match_flow.is_in_game() || match_result.0.is_some() {
+    if !match_flow.is_in_game() || match_result.0.is_some() || spectator.is_spectator {
         return;
     }
     if chat_state.is_open || pause_state.0.phase != PausePhase::Running {
@@ -4045,10 +4145,11 @@ fn client_sample_input_system(
 
 fn client_flush_input_to_server_system(
     mut net: ResMut<ClientNetwork>,
+    spectator: Res<ClientSpectatorState>,
     mut prediction: ResMut<ClientPhysicsPredictionState>,
 ) {
     let net = &mut *net;
-    if net.client.is_connected() {
+    if net.client.is_connected() && !spectator.is_spectator {
         if let Some(ref mut cmd) = prediction.latest_input {
             let bytes = bincode::serialize(cmd)
                 .expect("خطای بحرانی کلاینت: سریالایز کردن ورودی شکست خورد");
@@ -4141,6 +4242,7 @@ fn client_receive_snapshot_and_sync_system(
 
     let mut latest_snapshot: Option<ServerWorldSnapshot> = None;
     let mut all_fx_events: Vec<GameplayFxEvent> = Vec::new();
+    let mut received_state_packets: u64 = 0;
 
     if net.client.is_connected() {
         while let Some(message) = net.client.receive_message(CHANNEL_RELIABLE_FX) {
@@ -4152,10 +4254,12 @@ fn client_receive_snapshot_and_sync_system(
         while let Some(message) = net.client.receive_message(CHANNEL_UNRELIABLE_STATE) {
             let snap: ServerWorldSnapshot = bincode::deserialize(&message)
                 .expect("خطای بحرانی کلاینت: پکت Snapshot دریافتی از سرور نامعتبر است");
+            received_state_packets += 1;
             latest_snapshot = Some(snap);
         }
     }
 
+    let received_snap_this_frame = latest_snapshot.is_some();
     if let Some(snap) = latest_snapshot {
         render_state.soldier_pos = snap.soldier_pos;
         render_state.soldier_facing_dir = snap.soldier_facing_dir;
@@ -4223,9 +4327,22 @@ fn client_receive_snapshot_and_sync_system(
                 );
             }
         }
+        if let Some(ref spec_pb) = snap.spectator_state {
+            hud_sync.spectator.is_spectator = true;
+            if hud_sync.spectator.last_fog_mode != Some(spec_pb.fog_mode) {
+                if let Some(ref mut fow_state) = fow {
+                    fow_state.shared.explored.fill(false);
+                }
+                hud_sync.spectator.last_fog_mode = Some(spec_pb.fog_mode);
+            }
+            hud_sync.spectator.playback = Some(spec_pb.clone());
+        }
         if let Some(ref mut fow_state) = fow {
-            fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
-            fow_state.target_dirty = true;
+            if hud_sync.spectator.last_fog_mask != snap.fog_visible_mask {
+                fow_state.shared.apply_visible_mask(&snap.fog_visible_mask);
+                fow_state.target_dirty = true;
+                hud_sync.spectator.last_fog_mask = snap.fog_visible_mask.clone();
+            }
         }
 
         prediction.traversal_active = snap.traversal_active;
@@ -4239,18 +4356,25 @@ fn client_receive_snapshot_and_sync_system(
         prediction.latest_move_speed_multiplier = Some(snap.hero.move_speed / config.soldier.run_speed.max(0.1));
         prediction.latest_authoritative_feet_pos = Some(snap.soldier_pos);
         hud_sync.pause_state.0 = snap.pause.clone();
-        if let Some(prev_tick) = hud_sync.telemetry.last_server_tick {
+        if hud_sync.spectator.is_spectator {
+            hud_sync.telemetry.in_expected_window = 0;
+            hud_sync.telemetry.in_lost_window = 0;
+            hud_sync.telemetry.packet_loss_in_pct = 0.0;
+            hud_sync.telemetry.min_tick_step = None;
+        } else if let Some(prev_tick) = hud_sync.telemetry.last_server_tick {
             if snap.tick > prev_tick {
                 let delta = snap.tick - prev_tick;
+                let received = received_state_packets.max(1);
+                let per_pkt_delta = (delta / received).max(1);
                 let step = match hud_sync.telemetry.min_tick_step {
-                    Some(s) => s.min(delta),
-                    None => delta,
+                    Some(s) => s.min(per_pkt_delta),
+                    None => per_pkt_delta,
                 };
                 hud_sync.telemetry.min_tick_step = Some(step.max(1));
                 let step_val = hud_sync.telemetry.min_tick_step.unwrap_or(1).max(1);
-                let expected = (delta / step_val).max(1);
+                let expected = (delta / step_val).max(received);
                 hud_sync.telemetry.in_expected_window += expected;
-                hud_sync.telemetry.in_lost_window += expected.saturating_sub(1);
+                hud_sync.telemetry.in_lost_window += expected.saturating_sub(received);
             }
         }
         hud_sync.telemetry.last_server_tick = Some(snap.tick);
@@ -4283,6 +4407,7 @@ fn client_receive_snapshot_and_sync_system(
                     vis.visual_offset_blend =
                         (vis.visual_offset_blend - time.delta_secs() * 14.0).max(0.0);
                 }
+                vis.velocity = b_snap.velocity;
                 tf.translation = b_snap.translation + vis.visual_offset * vis.visual_offset_blend;
                 tf.rotation = if matches!(
                     b_snap.vfx_source,
@@ -4337,6 +4462,7 @@ fn client_receive_snapshot_and_sync_system(
                     },
                     NetworkBulletVisual {
                         server_id: b_snap.id,
+                        velocity: b_snap.velocity,
                         visual_offset: vis_off,
                         visual_offset_blend: vis_blend,
                     },
@@ -4447,6 +4573,30 @@ fn client_receive_snapshot_and_sync_system(
             fx,
             &mut fx_res.aura_sync,
         );
+    }
+
+    if !received_snap_this_frame {
+        let spec_paused = hud_sync
+            .spectator
+            .playback
+            .as_ref()
+            .is_some_and(|p| p.is_paused);
+        let speed_mult = if hud_sync.spectator.is_spectator {
+            hud_sync
+                .spectator
+                .playback
+                .as_ref()
+                .map(|p| p.playback_speed)
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        if !spec_paused && hud_sync.pause_state.0.phase == PausePhase::Running {
+            let dt = time.delta_secs().min(0.05) * speed_mult;
+            for (_, vis, mut tf, _) in &mut bullet_query {
+                tf.translation += vis.velocity * dt;
+            }
+        }
     }
 
     if let (Ok(soldier_phys_tf), Ok(mut soldier_vis_tf)) = (
@@ -5281,6 +5431,7 @@ fn laser_sight_gizmo_system(
     time: Res<Time>,
     config: Res<GameConfig>,
     match_flow: Res<ClientMatchFlow>,
+    spectator: Res<ClientSpectatorState>,
     muzzle_query: Query<&GlobalTransform, With<MuzzlePoint>>,
     render_state: Res<ClientRenderState>,
     mut core_query: Query<
@@ -5334,6 +5485,7 @@ fn laser_sight_gizmo_system(
     >,
 ) {
     let hide_laser = !match_flow.is_in_game()
+        || spectator.is_spectator
         || render_state.is_dead
         || render_state.traversal_active
         || render_state.current_locomotion == "swimming";
@@ -5431,6 +5583,7 @@ fn cursor_reticle_system(
     shop_ui: Res<ShopUiState>,
     settings_ui: Res<SettingsUiState>,
     demo_session: Res<demo_client::ActiveDemoSession>,
+    spectator: Res<ClientSpectatorState>,
     mut window_query: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
     mut root_query: Query<(&mut ReticleRoot, &mut Node, &mut Visibility)>,
     mut outer_query: Query<
@@ -5482,7 +5635,8 @@ fn cursor_reticle_system(
         || shop_ui.pending_sell_slot.is_some()
         || shop_ui.is_pointer_over_hud_ui
         || shop_ui.is_dragging_item
-        || demo_session.is_pointer_over_panel;
+        || demo_session.is_pointer_over_panel
+        || spectator.is_spectator;
 
     if config.cursor_reticle.hide_os_cursor_in_game {
         if cursor_options.visible != ui_cursor_needed {
@@ -5625,12 +5779,15 @@ fn gameplay_fx_system(
 }
 
 #[derive(SystemParam)]
-struct CameraFollowExtraParams<'w> {
+struct CameraFollowExtraParams<'w, 's> {
     pause_state: Res<'w, LatestPauseState>,
     chat_state: Res<'w, ChatUiState>,
     shop_ui: Res<'w, ShopUiState>,
     settings_ui: Res<'w, SettingsUiState>,
     latest_couriers: Res<'w, LatestCouriers>,
+    latest_remotes: Res<'w, LatestRemotePlayers>,
+    spectator: ResMut<'w, ClientSpectatorState>,
+    mouse_wheel: MessageReader<'w, 's, MouseWheel>,
     courier_ctrl: ResMut<'w, CourierControlState>,
     inspected: ResMut<'w, InspectedUnit>,
     camera_control: ResMut<'w, CameraControlState>,
@@ -5664,6 +5821,186 @@ fn camera_follow_system(
     let now_secs = time.elapsed_secs();
     let half_x = config.map.map_dimensions.0 * 0.5;
     let half_z = config.map.map_dimensions.1 * 0.5;
+
+    if ex.spectator.is_spectator {
+        let mut wheel_delta = 0.0_f32;
+        for ev in ex.mouse_wheel.read() {
+            wheel_delta += ev.y;
+        }
+        if wheel_delta.abs() > 1e-4 {
+            ex.spectator.zoom_distance = (ex.spectator.zoom_distance - wheel_delta * 2.5).clamp(
+                config.spectator.free_camera_min_zoom,
+                config.spectator.free_camera_max_zoom,
+            );
+        }
+
+        let mut manual_pan = false;
+        let mut kb_dir = Vec2::ZERO;
+        if keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp) {
+            kb_dir.y -= 1.0;
+        }
+        if keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown) {
+            kb_dir.y += 1.0;
+        }
+        if keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft) {
+            kb_dir.x -= 1.0;
+        }
+        if keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight) {
+            kb_dir.x += 1.0;
+        }
+        if kb_dir != Vec2::ZERO {
+            let dir_n = kb_dir.normalize();
+            let base = ex.camera_control.free_look_target.unwrap_or(Vec3::ZERO);
+            let pan_speed = config.spectator.free_camera_pan_speed;
+            let next_x = (base.x + dir_n.x * pan_speed * dt).clamp(-half_x, half_x);
+            let next_z = (base.z + dir_n.y * pan_speed * dt).clamp(-half_z, half_z);
+            ex.camera_control.free_look_target = Some(Vec3::new(next_x, base.y, next_z));
+            manual_pan = true;
+        }
+
+        if mouse_button.pressed(MouseButton::Middle) {
+            if let Ok(window) = window_query.single() {
+                if let Some(cursor) = window.cursor_position() {
+                    if let Some(prev) = *last_mid_cursor {
+                        let delta = cursor - prev;
+                        if delta.length_squared() > 0.01 {
+                            let base = ex.camera_control.free_look_target.unwrap_or(Vec3::ZERO);
+                            let base_cam_dist = Vec3::new(
+                                config.camera.offset.0,
+                                config.camera.offset.1,
+                                config.camera.offset.2,
+                            )
+                            .length()
+                            .max(0.01);
+                            let pan_speed = 0.065 * (ex.spectator.zoom_distance / base_cam_dist);
+                            let next_x = (base.x - delta.x * pan_speed).clamp(-half_x, half_x);
+                            let next_z = (base.z - delta.y * pan_speed).clamp(-half_z, half_z);
+                            ex.camera_control.free_look_target = Some(Vec3::new(next_x, base.y, next_z));
+                            manual_pan = true;
+                        }
+                    }
+                    *last_mid_cursor = Some(cursor);
+                }
+            }
+        } else {
+            *last_mid_cursor = None;
+        }
+
+        if !ex.spectator.is_scrubbing_timeline
+            && !ex.camera_control.is_dragging_minimap
+            && !mouse_button.pressed(MouseButton::Middle)
+        {
+            if let Ok(window) = window_query.single() {
+                if let Some(cursor) = window.cursor_position() {
+                    let win_w = window.width().max(1.0);
+                    let win_h = window.height().max(1.0);
+                    let margin = config.spectator.free_camera_edge_scroll_margin_px;
+                    let mut edge_dir = Vec2::ZERO;
+                    if cursor.x <= margin {
+                        edge_dir.x -= 1.0;
+                    } else if cursor.x >= win_w - margin {
+                        edge_dir.x += 1.0;
+                    }
+                    if cursor.y <= margin {
+                        edge_dir.y -= 1.0;
+                    } else if cursor.y >= win_h - margin {
+                        edge_dir.y += 1.0;
+                    }
+                    if edge_dir != Vec2::ZERO {
+                        let dir_n = edge_dir.normalize();
+                        let base = ex.camera_control.free_look_target.unwrap_or(Vec3::ZERO);
+                        let pan_speed = config.spectator.free_camera_pan_speed;
+                        let next_x = (base.x + dir_n.x * pan_speed * dt).clamp(-half_x, half_x);
+                        let next_z = (base.z + dir_n.y * pan_speed * dt).clamp(-half_z, half_z);
+                        ex.camera_control.free_look_target = Some(Vec3::new(next_x, base.y, next_z));
+                        manual_pan = true;
+                    }
+                }
+            }
+        }
+
+        if manual_pan || ex.camera_control.is_dragging_minimap {
+            ex.spectator.camera_mode = SpectatorCameraMode::FreeCamera;
+        }
+
+        match ex.spectator.camera_mode {
+            SpectatorCameraMode::FreeCamera => {
+                if ex.camera_control.free_look_target.is_none() {
+                    ex.camera_control.free_look_target = Some(Vec3::ZERO);
+                }
+            }
+            SpectatorCameraMode::HeroChase => {
+                let target_hero = ex
+                    .spectator
+                    .chase_slot_index
+                    .and_then(|slot| ex.latest_remotes.0.iter().find(|r| r.slot_index == slot))
+                    .or_else(|| ex.latest_remotes.0.iter().find(|r| !r.is_dead))
+                    .or_else(|| ex.latest_remotes.0.first());
+                if let Some(rp) = target_hero {
+                    ex.spectator.chase_slot_index = Some(rp.slot_index);
+                    ex.camera_control.free_look_target = Some(rp.pos);
+                }
+            }
+            SpectatorCameraMode::Directed => {
+                ex.spectator.directed_switch_cooldown =
+                    (ex.spectator.directed_switch_cooldown - dt).max(0.0);
+                if ex.spectator.directed_switch_cooldown <= 0.0 || ex.spectator.directed_focus_slot.is_none() {
+                    let mut best_slot: Option<usize> = None;
+                    let mut best_score = f32::NEG_INFINITY;
+                    for rp in &ex.latest_remotes.0 {
+                        if rp.is_dead {
+                            continue;
+                        }
+                        let mut nearest_enemy_dist = 999.0_f32;
+                        for other in &ex.latest_remotes.0 {
+                            if other.team != rp.team && !other.is_dead {
+                                let d = rp.pos.distance(other.pos);
+                                if d < nearest_enemy_dist {
+                                    nearest_enemy_dist = d;
+                                }
+                            }
+                        }
+                        let hp_ratio = if rp.max_hp > 1.0 { rp.hp / rp.max_hp } else { 1.0 };
+                        let combat_score = (120.0 - nearest_enemy_dist.min(120.0)) + (1.0 - hp_ratio) * 35.0;
+                        if combat_score > best_score {
+                            best_score = combat_score;
+                            best_slot = Some(rp.slot_index);
+                        }
+                    }
+                    if best_slot.is_some() {
+                        ex.spectator.directed_focus_slot = best_slot;
+                        ex.spectator.directed_switch_cooldown = 4.0;
+                    }
+                }
+                if let Some(slot) = ex.spectator.directed_focus_slot {
+                    if let Some(rp) = ex.latest_remotes.0.iter().find(|r| r.slot_index == slot) {
+                        ex.camera_control.free_look_target = Some(rp.pos);
+                    }
+                }
+            }
+        }
+
+        let target_xz = ex.camera_control.free_look_target.unwrap_or(Vec3::ZERO);
+        let terrain_y = moba_shared::sample_camera_focus_y(&config, target_xz.x, target_xz.z);
+        let desired_focus = Vec3::new(target_xz.x, terrain_y, target_xz.z);
+        let cam_alpha = (1.0 - (-config.camera.follow_lerp_speed * dt).exp()).clamp(0.0, 1.0);
+        let cur_focus = match *smoothed_focus {
+            Some(prev) => prev.lerp(desired_focus, cam_alpha),
+            None => desired_focus,
+        };
+        *smoothed_focus = Some(cur_focus);
+        let base_offset = Vec3::new(
+            config.camera.offset.0,
+            config.camera.offset.1,
+            config.camera.offset.2,
+        );
+        let camera_offset = base_offset.normalize_or_zero() * ex.spectator.zoom_distance;
+        camera_tf.translation = cur_focus + camera_offset;
+        camera_tf.look_at(cur_focus, Vec3::Y);
+        return;
+    } else {
+        ex.mouse_wheel.clear();
+    }
 
     // دوبار زدن پشت‌سرهم F2: فعال‌سازی کنترل Courier و انتقال دوربین روی Courier
     if !ex.chat_state.is_open
@@ -9025,6 +9362,7 @@ struct SnapshotHudSyncParams<'w, 's> {
     bullet_vfx_registry: Res<'w, BulletVfxRegistry>,
     fixed_time: Res<'w, Time<Fixed>>,
     fixed_history: ResMut<'w, FixedSoldierTransformHistory>,
+    spectator: ResMut<'w, ClientSpectatorState>,
 }
 
 fn weapon_kind_short_badge(wk: WeaponKind) -> (&'static str, Color) {
@@ -9450,7 +9788,11 @@ fn client_lobby_sync_system(
         if let Ok(pkt) = bincode::deserialize::<ServerLobbyPacket>(&bytes) {
             match pkt {
                 ServerLobbyPacket::MatchState(msg) => {
-                    match_flow.your_slot = Some(msg.your_slot);
+                    match_flow.your_slot = if msg.your_slot == usize::MAX {
+                        None
+                    } else {
+                        Some(msg.your_slot)
+                    };
                     match_flow.snapshot = Some(msg.state);
                 }
                 ServerLobbyPacket::SyncConfigs {
@@ -10675,20 +11017,32 @@ fn sync_remote_players_system(
 
     let dt = time.delta_secs();
 
-    // Server Authority: اگر مختصات بازیکن دشمن در Snapshot نباشد (در مه جنگ است)، مدل آن را حذف کن
+    // Server Authority: حذف مدل‌های ناموجود در Snapshot و حذف هرگونه کلون تکراری برای یک slot_index
+    let mut seen_slots: HashSet<usize> = HashSet::new();
     for (root_ent, vis_comp, _, _) in &existing_query {
-        if !res.remote_players.0.iter().any(|rp| rp.slot_index == vis_comp.slot_index) {
+        if !res.remote_players.0.iter().any(|rp| rp.slot_index == vis_comp.slot_index)
+            || !seen_slots.insert(vis_comp.slot_index)
+        {
             safe_despawn(&mut commands, root_ent);
         }
     }
 
+    let mut processed_slots: HashSet<usize> = HashSet::new();
     for rp in &res.remote_players.0 {
+        if !processed_slots.insert(rp.slot_index) {
+            continue;
+        }
         let mut root_opt: Option<Entity> = None;
 
         for (root_ent, mut vis_comp, mut tf, mut vis) in &mut existing_query {
             if vis_comp.slot_index == rp.slot_index {
                 root_opt = Some(root_ent);
-                tf.translation = tf.translation.lerp(rp.pos, (18.0 * dt).clamp(0.0, 1.0));
+                if tf.translation.distance_squared(rp.pos) > 144.0 {
+                    tf.translation = rp.pos;
+                } else {
+                    let pos_alpha = (1.0 - (-18.0 * dt).exp()).clamp(0.0, 1.0);
+                    tf.translation = tf.translation.lerp(rp.pos, pos_alpha);
+                }
                 tf.scale = Vec3::splat(rp.hero_scale);
 
                 let flat_dir = Vec3::new(rp.facing_dir.x, 0.0, rp.facing_dir.z);
@@ -10696,7 +11050,8 @@ fn sync_remote_players_system(
                     let target_rot = Transform::IDENTITY
                         .looking_to(-flat_dir.normalize(), Vec3::Y)
                         .rotation;
-                    tf.rotation = tf.rotation.slerp(target_rot, (16.0 * dt).clamp(0.0, 1.0));
+                    let rot_alpha = (1.0 - (-14.0 * dt).exp()).clamp(0.0, 1.0);
+                    tf.rotation = tf.rotation.slerp(target_rot, rot_alpha);
                 }
 
                 *vis = if rp.is_visible {
@@ -11106,9 +11461,11 @@ fn spawn_overhead_bar(commands: &mut Commands, key_id: usize, ammo_total: u32, g
 fn update_overhead_hero_bars_system(
     mut commands: Commands,
     match_flow: Res<ClientMatchFlow>,
+    spectator: Res<ClientSpectatorState>,
     render_state: Res<ClientRenderState>,
     hero_hud: Res<LatestHeroSnapshot>,
     remote_players: Res<LatestRemotePlayers>,
+    remote_vis_q: Query<(&RemotePlayerVisual, &Transform)>,
     camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
     mut bars: OverheadBarQueries,
 ) {
@@ -11142,30 +11499,42 @@ fn update_overhead_hero_bars_system(
 
     let mut targets: Vec<BarTarget> = Vec::with_capacity(1 + remote_players.0.len());
 
-    // ۱. خود هیروی بازیکن (همیشه سبز، بالاتر از سر بر اساس hero_scale)
-    let h = &hero_hud.0;
-    targets.push(BarTarget {
-        key_id: usize::MAX,
-        world_head: render_state.soldier_pos + Vec3::Y * (3.15 * h.hero_scale),
-        visible: !render_state.is_dead,
-        is_ally: true,
-        hp: h.hp,
-        max_hp: h.max_hp,
-        stamina: h.stamina,
-        max_stamina: h.max_stamina,
-        ammo_rem: h.ammo_in_mag,
-        ammo_total: h.magazine_size,
-        grenade_rem: h.grenade_charges,
-        grenade_total: h.grenade_max_charges,
-    });
+    // ۱. خود هیروی بازیکن (فقط برای بازیکنان، نه تماشاگر!)
+    if !spectator.is_spectator {
+        let h = &hero_hud.0;
+        targets.push(BarTarget {
+            key_id: usize::MAX,
+            world_head: render_state.soldier_pos + Vec3::Y * (3.15 * h.hero_scale),
+            visible: !render_state.is_dead,
+            is_ally: true,
+            hp: h.hp,
+            max_hp: h.max_hp,
+            stamina: h.stamina,
+            max_stamina: h.max_stamina,
+            ammo_rem: h.ammo_in_mag,
+            ammo_total: h.magazine_size,
+            grenade_rem: h.grenade_charges,
+            grenade_total: h.grenade_max_charges,
+        });
+    }
 
-    // ۲. سایر هیروهای بازی (هم‌تیمی‌ها سبز، دشمنان قرمز)
+    let remote_pos_map: HashMap<usize, Vec3> = remote_vis_q
+        .iter()
+        .map(|(v, tf)| (v.slot_index, tf.translation))
+        .collect();
+
+    // ۲. سایر هیروهای بازی (با استفاده از موقعیت نرم‌شده ۶۰ FPS مدل ۳بعدی برای جلوگیری از پرش نوار سلامتی)
     for rp in &remote_players.0 {
+        let smooth_pos = remote_pos_map.get(&rp.slot_index).copied().unwrap_or(rp.pos);
         targets.push(BarTarget {
             key_id: rp.slot_index,
-            world_head: rp.pos + Vec3::Y * (3.15 * rp.hero_scale),
+            world_head: smooth_pos + Vec3::Y * (3.15 * rp.hero_scale),
             visible: rp.is_visible && !rp.is_dead,
-            is_ally: rp.team == my_team,
+            is_ally: if spectator.is_spectator {
+                rp.team == TeamId::Dawn
+            } else {
+                rp.team == my_team
+            },
             hp: rp.hp,
             max_hp: rp.max_hp,
             stamina: rp.stamina,
@@ -11404,7 +11773,12 @@ fn sync_lane_creeps_system(
         };
         seen_ids.insert(cs.id);
 
-        tf.translation = tf.translation.lerp(cs.pos, (16.0 * dt).clamp(0.0, 1.0));
+        if tf.translation.distance_squared(cs.pos) > 144.0 {
+            tf.translation = cs.pos;
+        } else {
+            let creep_alpha = (1.0 - (-18.0 * dt).exp()).clamp(0.0, 1.0);
+            tf.translation = tf.translation.lerp(cs.pos, creep_alpha);
+        }
         let c_scale = cs
             .creep_type_id
             .as_deref()
@@ -11419,7 +11793,8 @@ fn sync_lane_creeps_system(
             let target_rot = Transform::IDENTITY
                 .looking_to(-flat_dir.normalize(), Vec3::Y)
                 .rotation;
-            tf.rotation = tf.rotation.slerp(target_rot, (14.0 * dt).clamp(0.0, 1.0));
+            let rot_alpha = (1.0 - (-16.0 * dt).exp()).clamp(0.0, 1.0);
+            tf.rotation = tf.rotation.slerp(target_rot, rot_alpha);
         }
 
         *vis = if cs.is_visible {
@@ -11599,6 +11974,7 @@ fn update_overhead_creep_bars_system(
     match_flow: Res<ClientMatchFlow>,
     hero_hud: Res<LatestHeroSnapshot>,
     latest_creeps: Res<LatestCreeps>,
+    creep_vis_q: Query<(&CreepVisual, &Transform)>,
     camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
     mut bar_root_q: Query<(Entity, &OverheadCreepBarRoot, &mut Node)>,
     mut bar_fill_q: Query<
@@ -11620,6 +11996,10 @@ fn update_overhead_creep_bars_system(
     let my_team = hero_hud.0.team;
     let creep_map: HashMap<u64, &CreepSnapshot> =
         latest_creeps.0.iter().map(|c| (c.id, c)).collect();
+    let creep_pos_map: HashMap<u64, Vec3> = creep_vis_q
+        .iter()
+        .map(|(v, tf)| (v.creep_id, tf.translation))
+        .collect();
     let mut existing_bars: HashMap<u64, Entity> = HashMap::new();
 
     for (ent, root, mut node) in &mut bar_root_q {
@@ -11642,7 +12022,8 @@ fn update_overhead_creep_bars_system(
             .and_then(|tid| config.neutral_camps.creep_types.get(tid))
             .map(|ct| ct.hitbox_height)
             .unwrap_or(config.creeps.hitbox_height);
-        let world_head = cs.pos + Vec3::Y * (c_height + 0.45);
+        let smooth_pos = creep_pos_map.get(&cs.id).copied().unwrap_or(cs.pos);
+        let world_head = smooth_pos + Vec3::Y * (c_height + 0.45);
         if let Ok(sp) = camera.world_to_viewport(cam_gtf, world_head) {
             if node.display != Display::Flex {
                 node.display = Display::Flex;
@@ -13689,6 +14070,7 @@ fn end_of_match_overlay_system(
     time: Res<Time>,
     match_flow: Res<ClientMatchFlow>,
     match_result: Res<LatestMatchResult>,
+    spectator: Res<ClientSpectatorState>,
     hero_hud: Res<LatestHeroSnapshot>,
     top_bar: Res<LatestTopBarState>,
     mut post_match: ResMut<PostMatchFlowState>,
@@ -13737,7 +14119,22 @@ fn end_of_match_overlay_system(
     }
 
     if let Ok((mut t, mut col)) = title_q.single_mut() {
-        if is_victory {
+        if spectator.is_spectator {
+            match winner {
+                TeamId::Dawn => {
+                    **t = "DAWN VICTORY".to_string();
+                    *col = TextColor(Color::srgb(0.30, 0.92, 0.98));
+                }
+                TeamId::Dusk => {
+                    **t = "DUSK VICTORY".to_string();
+                    *col = TextColor(Color::srgb(0.98, 0.72, 0.26));
+                }
+                TeamId::Neutral => {
+                    **t = "MATCH ENDED".to_string();
+                    *col = TextColor(Color::srgb(0.86, 0.90, 0.96));
+                }
+            }
+        } else if is_victory {
             **t = "VICTORY".to_string();
             *col = TextColor(Color::srgb(0.30, 0.98, 0.65));
         } else {
@@ -13893,12 +14290,13 @@ fn spawn_chat_ui(commands: &mut Commands) {
 fn client_chat_input_system(
     config: Res<GameConfig>,
     match_flow: Res<ClientMatchFlow>,
+    spectator: Res<ClientSpectatorState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut key_events: MessageReader<KeyboardInput>,
     mut net: ResMut<ClientNetwork>,
     mut chat_state: ResMut<ChatUiState>,
 ) {
-    if !match_flow.is_in_game() {
+    if !match_flow.is_in_game() || spectator.is_spectator {
         key_events.clear();
         if chat_state.is_open {
             chat_state.is_open = false;
@@ -14343,6 +14741,7 @@ fn client_ping_input_system(
     config: Res<GameConfig>,
     match_flow: Res<ClientMatchFlow>,
     match_result: Res<LatestMatchResult>,
+    spectator: Res<ClientSpectatorState>,
     chat_state: Res<ChatUiState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
@@ -14352,7 +14751,7 @@ fn client_ping_input_system(
     camera_query: Query<(&Camera, &GlobalTransform), With<MobaCamera>>,
     mut net: ResMut<ClientNetwork>,
 ) {
-    if !match_flow.is_in_game() || match_result.0.is_some() || chat_state.is_open {
+    if !match_flow.is_in_game() || match_result.0.is_some() || chat_state.is_open || spectator.is_spectator {
         return;
     }
 
@@ -14611,11 +15010,12 @@ fn spawn_pause_overlay_ui(commands: &mut Commands) {
 fn client_pause_input_system(
     match_flow: Res<ClientMatchFlow>,
     match_result: Res<LatestMatchResult>,
+    spectator: Res<ClientSpectatorState>,
     chat_state: Res<ChatUiState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut net: ResMut<ClientNetwork>,
 ) {
-    if !match_flow.is_in_game() || match_result.0.is_some() || chat_state.is_open {
+    if !match_flow.is_in_game() || match_result.0.is_some() || chat_state.is_open || spectator.is_spectator {
         return;
     }
     if keyboard.just_pressed(KeyCode::F9) {
@@ -18153,9 +18553,9 @@ fn sync_biome_walkers_system(
         return;
     }
     if let Some(my_slot) = match_flow.your_slot {
-        if !render_state.is_dead {
+        if !render_state.is_dead && my_slot != usize::MAX {
             walkers.walkers.push(vfx_client::BiomeWalkerSnapshot {
-                id: 1_000_000 + my_slot as u64,
+                id: 1_000_000u64.saturating_add(my_slot as u64),
                 pos: render_state.soldier_pos,
             });
         }
@@ -18177,5 +18577,726 @@ fn sync_biome_walkers_system(
             id: 3_000_000 + creep.id,
             pos: creep.pos,
         });
+    }
+}
+
+
+// ============================================================================
+//  IN-GAME ONLINE SPECTATOR MODE (DOTA 2-STYLE BROADCAST DOCK, TIMELINE & FOW)
+// ============================================================================
+
+#[derive(Resource, Debug, Clone)]
+struct ClientSpectatorState {
+    is_spectator: bool,
+    camera_mode: SpectatorCameraMode,
+    chase_slot_index: Option<usize>,
+    directed_focus_slot: Option<usize>,
+    directed_switch_cooldown: f32,
+    zoom_distance: f32,
+    playback: Option<SpectatorPlaybackSnapshot>,
+    last_fog_mode: Option<SpectatorFogMode>,
+    last_fog_mask: Vec<u8>,
+    is_scrubbing_timeline: bool,
+}
+
+impl Default for ClientSpectatorState {
+    fn default() -> Self {
+        Self {
+            is_spectator: false,
+            camera_mode: SpectatorCameraMode::FreeCamera,
+            chase_slot_index: None,
+            directed_focus_slot: None,
+            directed_switch_cooldown: 0.0,
+            zoom_distance: 28.9,
+            playback: None,
+            last_fog_mode: None,
+            last_fog_mask: Vec::new(),
+            is_scrubbing_timeline: false,
+        }
+    }
+}
+
+#[derive(Component)]
+struct SpectatorHudRoot;
+
+#[derive(Component)]
+struct SpectatorLivePillText;
+
+#[derive(Component)]
+struct SpectatorStatusDot;
+
+#[derive(Component)]
+struct SpectatorCameraInfoText;
+
+#[derive(Component)]
+struct SpectatorTimelineTrack;
+
+#[derive(Component)]
+struct SpectatorTimelineFill;
+
+#[derive(Component)]
+struct SpectatorTimelineTimeText;
+
+#[derive(Component)]
+struct SpectatorTimelineLiveText;
+
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+enum SpectatorActionBtn {
+    RewindStep,
+    TogglePause,
+    ForwardStep,
+    JumpLive,
+    SetSpeed(f32),
+    SetFog(SpectatorFogMode),
+    SetCamera(SpectatorCameraMode),
+    CycleNextHero,
+}
+
+#[derive(Component)]
+struct SpectatorPauseBtnLabel;
+
+fn format_mm_ss(secs: f32) -> String {
+    let total = secs.max(0.0) as u32;
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+fn spawn_spectator_hud_ui(commands: &mut Commands, config: &GameConfig) {
+    let seek_secs = config.spectator.seek_step_secs.round() as i32;
+    let speeds = config.spectator.playback_speeds.clone();
+
+    commands
+        .spawn((
+            SpectatorHudRoot,
+            GlobalZIndex(205),
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(0.0),
+                left: px(0.0),
+                width: percent(100.0),
+                height: percent(100.0),
+                display: Display::None,
+                ..default()
+            },
+            Pickable::IGNORE,
+        ))
+        .with_children(|root| {
+            // Unified Dota 2-Style Top-Right Spectator Panel (positioned cleanly below the Ping/FPS telemetry box)
+            root.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(74.0),
+                    right: px(14.0),
+                    width: px(376.0),
+                    padding: UiRect::axes(px(12.0), px(10.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(7.0),
+                    border: UiRect::all(px(1.5)),
+                    border_radius: BorderRadius::all(px(10.0)),
+                    ..default()
+                },
+                BorderColor::all(Color::srgba(0.24, 0.76, 0.96, 0.78)),
+                BackgroundColor(Color::srgba(0.03, 0.06, 0.11, 0.92)),
+            ))
+            .with_children(|panel| {
+                // Header: Live status dot + Viewers + Delay
+                panel
+                    .spawn(Node {
+                        width: percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: px(7.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            SpectatorStatusDot,
+                            Node {
+                                width: px(9.0),
+                                height: px(9.0),
+                                border_radius: BorderRadius::all(px(5.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.96, 0.24, 0.28)),
+                        ));
+                        row.spawn((
+                            SpectatorLivePillText,
+                            Text::new("LIVE SPECTATE | VIEWERS: 1 | DELAY: 0s"),
+                            TextFont {
+                                font_size: FontSize::Px(11.5),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.94, 0.97, 1.0)),
+                        ));
+                    });
+
+                // Sub-header: Camera & Zoom Info
+                panel.spawn((
+                    SpectatorCameraInfoText,
+                    Text::new("CAM: FREE CAM | ZOOM: 1.00x"),
+                    TextFont {
+                        font_size: FontSize::Px(10.5),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.64, 0.80, 0.94)),
+                ));
+
+                // Timeline Scrubber Row
+                panel
+                    .spawn(Node {
+                        width: percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: px(8.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            SpectatorTimelineTimeText,
+                            Text::new("00:00"),
+                            TextFont {
+                                font_size: FontSize::Px(11.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.94, 0.96, 1.0)),
+                        ));
+
+                        row.spawn((
+                            SpectatorTimelineTrack,
+                            UiButton,
+                            Hovered::default(),
+                            RelativeCursorPosition::default(),
+                            Node {
+                                flex_grow: 1.0,
+                                height: px(12.0),
+                                border: UiRect::all(px(1.0)),
+                                border_radius: BorderRadius::all(px(6.0)),
+                                overflow: Overflow::clip(),
+                                ..default()
+                            },
+                            BorderColor::all(Color::srgba(0.32, 0.58, 0.80, 0.88)),
+                            BackgroundColor(Color::srgba(0.08, 0.13, 0.20, 0.96)),
+                        ))
+                        .with_children(|track| {
+                            track.spawn((
+                                SpectatorTimelineFill,
+                                Node {
+                                    width: percent(100.0),
+                                    height: percent(100.0),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.20, 0.80, 0.98)),
+                            ));
+                        });
+
+                        row.spawn((
+                            SpectatorTimelineLiveText,
+                            Text::new("LIVE 00:00"),
+                            TextFont {
+                                font_size: FontSize::Px(11.0),
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.45, 0.94, 0.65)),
+                        ));
+                    });
+
+                let spawn_chip = |parent: &mut ChildSpawnerCommands,
+                                  action: SpectatorActionBtn,
+                                  label: String,
+                                  is_pause_label: bool| {
+                    parent
+                        .spawn((
+                            UiButton,
+                            Hovered::default(),
+                            action,
+                            Node {
+                                flex_grow: 1.0,
+                                padding: UiRect::axes(px(6.0), px(5.0)),
+                                border: UiRect::all(px(1.0)),
+                                border_radius: BorderRadius::all(px(6.0)),
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                ..default()
+                            },
+                            BorderColor::all(Color::srgba(0.32, 0.44, 0.60, 0.85)),
+                            BackgroundColor(Color::srgba(0.09, 0.14, 0.22, 0.92)),
+                        ))
+                        .with_children(|btn| {
+                            if is_pause_label {
+                                btn.spawn((
+                                    SpectatorPauseBtnLabel,
+                                    Text::new(label),
+                                    TextFont {
+                                        font_size: FontSize::Px(10.5),
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                ));
+                            } else {
+                                btn.spawn((
+                                    Text::new(label),
+                                    TextFont {
+                                        font_size: FontSize::Px(10.5),
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                ));
+                            }
+                        });
+                };
+
+                // Row 1: Playback Transport (-10s, PAUSE/PLAY, +10s, LIVE)
+                panel
+                    .spawn(Node {
+                        width: percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        column_gap: px(5.0),
+                        ..default()
+                    })
+                    .with_children(|grp| {
+                        spawn_chip(grp, SpectatorActionBtn::RewindStep, format!("-{}s", seek_secs), false);
+                        spawn_chip(grp, SpectatorActionBtn::TogglePause, "PAUSE".to_string(), true);
+                        spawn_chip(grp, SpectatorActionBtn::ForwardStep, format!("+{}s", seek_secs), false);
+                        spawn_chip(grp, SpectatorActionBtn::JumpLive, "LIVE".to_string(), false);
+                    });
+
+                // Row 2: Playback Speeds (from config.spectator.playback_speeds)
+                panel
+                    .spawn(Node {
+                        width: percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        column_gap: px(4.0),
+                        ..default()
+                    })
+                    .with_children(|grp| {
+                        for spd in &speeds {
+                            let label = if (*spd - spd.round()).abs() < 0.01 {
+                                format!("{}x", spd.round() as i32)
+                            } else {
+                                format!("{:.2}", spd)
+                                    .trim_end_matches('0')
+                                    .trim_end_matches('.')
+                                    .to_string()
+                                    + "x"
+                            };
+                            spawn_chip(grp, SpectatorActionBtn::SetSpeed(*spd), label, false);
+                        }
+                    });
+
+                // Row 3: 3-Mode Fog of War (F1 / F2 / F3)
+                panel
+                    .spawn(Node {
+                        width: percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        column_gap: px(5.0),
+                        ..default()
+                    })
+                    .with_children(|grp| {
+                        spawn_chip(grp, SpectatorActionBtn::SetFog(SpectatorFogMode::AllVision), "ALL FOW (F1)".to_string(), false);
+                        spawn_chip(grp, SpectatorActionBtn::SetFog(SpectatorFogMode::TeamDawn), "DAWN (F2)".to_string(), false);
+                        spawn_chip(grp, SpectatorActionBtn::SetFog(SpectatorFogMode::TeamDusk), "DUSK (F3)".to_string(), false);
+                    });
+
+                // Row 4: Camera Modes (FREE / DIRECTED / HERO CHASE)
+                panel
+                    .spawn(Node {
+                        width: percent(100.0),
+                        flex_direction: FlexDirection::Row,
+                        column_gap: px(5.0),
+                        ..default()
+                    })
+                    .with_children(|grp| {
+                        spawn_chip(grp, SpectatorActionBtn::SetCamera(SpectatorCameraMode::FreeCamera), "FREE CAM".to_string(), false);
+                        spawn_chip(grp, SpectatorActionBtn::SetCamera(SpectatorCameraMode::Directed), "DIRECTED".to_string(), false);
+                        spawn_chip(grp, SpectatorActionBtn::CycleNextHero, "HERO (TAB)".to_string(), false);
+                    });
+
+                // Compact Hotkey Hint Footer
+                panel.spawn((
+                    Text::new("WASD/EDGE: PAN | SCROLL: ZOOM | SPACE: PAUSE | `: SCORE"),
+                    TextFont {
+                        font_size: FontSize::Px(9.5),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.52, 0.64, 0.78)),
+                ));
+            });
+        });
+}
+
+fn send_spectator_lobby_msg(net: &mut ClientNetwork, msg: &ClientLobbyMessage) {
+    if net.client.is_connected() {
+        if let Ok(bytes) = bincode::serialize(msg) {
+            net.client.send_message(CHANNEL_RELIABLE_LOBBY, bytes);
+        }
+    }
+}
+
+#[derive(SystemParam)]
+struct SpectatorHudQueries<'w, 's> {
+    root_q: Query<'w, 's, &'static mut Node, With<SpectatorHudRoot>>,
+    pill_text_q: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<SpectatorLivePillText>,
+            Without<SpectatorCameraInfoText>,
+            Without<SpectatorTimelineTimeText>,
+            Without<SpectatorTimelineLiveText>,
+            Without<SpectatorPauseBtnLabel>,
+        ),
+    >,
+    cam_text_q: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<SpectatorCameraInfoText>,
+            Without<SpectatorLivePillText>,
+            Without<SpectatorTimelineTimeText>,
+            Without<SpectatorTimelineLiveText>,
+            Without<SpectatorPauseBtnLabel>,
+        ),
+    >,
+    time_text_q: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<SpectatorTimelineTimeText>,
+            Without<SpectatorLivePillText>,
+            Without<SpectatorCameraInfoText>,
+            Without<SpectatorTimelineLiveText>,
+            Without<SpectatorPauseBtnLabel>,
+        ),
+    >,
+    live_text_q: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<SpectatorTimelineLiveText>,
+            Without<SpectatorLivePillText>,
+            Without<SpectatorCameraInfoText>,
+            Without<SpectatorTimelineTimeText>,
+            Without<SpectatorPauseBtnLabel>,
+        ),
+    >,
+    pause_label_q: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<SpectatorPauseBtnLabel>,
+            Without<SpectatorLivePillText>,
+            Without<SpectatorCameraInfoText>,
+            Without<SpectatorTimelineTimeText>,
+            Without<SpectatorTimelineLiveText>,
+        ),
+    >,
+    dot_q: Query<'w, 's, &'static mut BackgroundColor, (With<SpectatorStatusDot>, Without<SpectatorActionBtn>)>,
+    track_q: Query<'w, 's, (&'static Hovered, &'static RelativeCursorPosition), With<SpectatorTimelineTrack>>,
+    fill_q: Query<'w, 's, &'static mut Node, (With<SpectatorTimelineFill>, Without<SpectatorHudRoot>)>,
+    btn_q: Query<
+        'w,
+        's,
+        (&'static SpectatorActionBtn, &'static Hovered, &'static mut BackgroundColor, &'static mut BorderColor),
+        Without<SpectatorStatusDot>,
+    >,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spectator_controls_and_hud_system(
+    config: Res<GameConfig>,
+    match_flow: Res<ClientMatchFlow>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    remote_players: Res<LatestRemotePlayers>,
+    mut inspected: ResMut<InspectedUnit>,
+    mut net: ResMut<ClientNetwork>,
+    mut spectator: ResMut<ClientSpectatorState>,
+    mut q: SpectatorHudQueries,
+) {
+    let Ok(mut root_node) = q.root_q.single_mut() else {
+        return;
+    };
+
+    if !spectator.is_spectator || !match_flow.is_in_game() {
+        if root_node.display != Display::None {
+            root_node.display = Display::None;
+        }
+        spectator.is_scrubbing_timeline = false;
+        return;
+    }
+
+    if root_node.display != Display::Flex {
+        root_node.display = Display::Flex;
+    }
+
+    // Keep bottom-left Hero Info Capsule populated with the chased/directed/first hero while spectating
+    let preferred_slot = match spectator.camera_mode {
+        SpectatorCameraMode::HeroChase => spectator.chase_slot_index,
+        SpectatorCameraMode::Directed => spectator.directed_focus_slot,
+        SpectatorCameraMode::FreeCamera => None,
+    };
+    if let Some(slot) = preferred_slot {
+        if *inspected != InspectedUnit::RemoteHero(slot)
+            && remote_players.0.iter().any(|r| r.slot_index == slot)
+        {
+            *inspected = InspectedUnit::RemoteHero(slot);
+        }
+    } else if matches!(*inspected, InspectedUnit::OwnHero | InspectedUnit::OwnCourier) {
+        if let Some(first_rp) = remote_players.0.first() {
+            *inspected = InspectedUnit::RemoteHero(first_rp.slot_index);
+        }
+    }
+
+    let pb = spectator.playback.clone();
+    let cur_t = pb.as_ref().map(|p| p.current_time_secs).unwrap_or(0.0);
+    let min_t = pb.as_ref().map(|p| p.min_time_secs).unwrap_or(0.0);
+    let max_t = pb.as_ref().map(|p| p.max_live_time_secs).unwrap_or(0.0).max(min_t);
+    let is_paused = pb.as_ref().map(|p| p.is_paused).unwrap_or(false);
+    let cur_speed = pb.as_ref().map(|p| p.playback_speed).unwrap_or(1.0);
+    let cur_fog = pb
+        .as_ref()
+        .map(|p| p.fog_mode)
+        .unwrap_or(SpectatorFogMode::AllVision);
+    let delay_secs = pb.as_ref().map(|p| p.delay_secs).unwrap_or(0.0);
+    let viewers = pb.as_ref().map(|p| p.spectator_count).unwrap_or(1);
+    let is_at_live = !is_paused && (max_t - cur_t) <= 2.5;
+
+    // Keyboard hotkeys for spectator mode
+    if keys.just_pressed(KeyCode::Space) {
+        send_spectator_lobby_msg(&mut net, &ClientLobbyMessage::SpectatorTogglePause);
+    }
+    if keys.just_pressed(KeyCode::F1) {
+        send_spectator_lobby_msg(
+            &mut net,
+            &ClientLobbyMessage::SpectatorSetFogMode {
+                mode: SpectatorFogMode::AllVision,
+            },
+        );
+    }
+    if keys.just_pressed(KeyCode::F2) {
+        send_spectator_lobby_msg(
+            &mut net,
+            &ClientLobbyMessage::SpectatorSetFogMode {
+                mode: SpectatorFogMode::TeamDawn,
+            },
+        );
+    }
+    if keys.just_pressed(KeyCode::F3) {
+        send_spectator_lobby_msg(
+            &mut net,
+            &ClientLobbyMessage::SpectatorSetFogMode {
+                mode: SpectatorFogMode::TeamDusk,
+            },
+        );
+    }
+    if keys.just_pressed(KeyCode::Tab) {
+        if !remote_players.0.is_empty() {
+            let mut slots: Vec<usize> = remote_players.0.iter().map(|r| r.slot_index).collect();
+            slots.sort_unstable();
+            let next_slot = match spectator.chase_slot_index.and_then(|cur| slots.iter().position(|&s| s == cur)) {
+                Some(idx) => slots[(idx + 1) % slots.len()],
+                None => slots[0],
+            };
+            spectator.chase_slot_index = Some(next_slot);
+            spectator.camera_mode = SpectatorCameraMode::HeroChase;
+        }
+    }
+
+    // Timeline scrubbing
+    if !mouse.pressed(MouseButton::Left) {
+        spectator.is_scrubbing_timeline = false;
+    }
+    if let Ok((hovered, rel_pos)) = q.track_q.single() {
+        if hovered.get() && mouse.just_pressed(MouseButton::Left) {
+            spectator.is_scrubbing_timeline = true;
+        }
+        if spectator.is_scrubbing_timeline {
+            if let Some(norm) = rel_pos.normalized {
+                let frac = (norm.x + 0.5).clamp(0.0, 1.0);
+                let target_t = min_t + (max_t - min_t) * frac;
+                send_spectator_lobby_msg(
+                    &mut net,
+                    &ClientLobbyMessage::SpectatorSeekTo {
+                        target_time_secs: target_t,
+                    },
+                );
+            }
+        }
+    }
+
+    // Button interactions + visual highlights
+    let clicked = mouse.just_pressed(MouseButton::Left);
+    for (action, hovered, mut bg, mut border) in &mut q.btn_q {
+        let is_active = match *action {
+            SpectatorActionBtn::TogglePause => is_paused,
+            SpectatorActionBtn::JumpLive => is_at_live,
+            SpectatorActionBtn::SetSpeed(s) => (cur_speed - s).abs() < 0.02,
+            SpectatorActionBtn::SetFog(m) => cur_fog == m,
+            SpectatorActionBtn::SetCamera(cm) => spectator.camera_mode == cm,
+            SpectatorActionBtn::CycleNextHero => spectator.camera_mode == SpectatorCameraMode::HeroChase,
+            _ => false,
+        };
+
+        if is_active {
+            bg.0 = Color::srgba(0.14, 0.44, 0.64, 0.96);
+            *border = BorderColor::all(Color::srgb(0.32, 0.86, 1.0));
+        } else if hovered.get() {
+            bg.0 = Color::srgba(0.18, 0.26, 0.38, 0.96);
+            *border = BorderColor::all(Color::srgba(0.55, 0.78, 0.96, 0.95));
+        } else {
+            bg.0 = Color::srgba(0.09, 0.14, 0.22, 0.92);
+            *border = BorderColor::all(Color::srgba(0.32, 0.44, 0.60, 0.85));
+        }
+
+        if hovered.get() && clicked {
+            match *action {
+                SpectatorActionBtn::RewindStep => {
+                    let target_t = (cur_t - config.spectator.seek_step_secs).max(min_t);
+                    send_spectator_lobby_msg(
+                        &mut net,
+                        &ClientLobbyMessage::SpectatorSeekTo {
+                            target_time_secs: target_t,
+                        },
+                    );
+                }
+                SpectatorActionBtn::ForwardStep => {
+                    let target_t = (cur_t + config.spectator.seek_step_secs).min(max_t);
+                    send_spectator_lobby_msg(
+                        &mut net,
+                        &ClientLobbyMessage::SpectatorSeekTo {
+                            target_time_secs: target_t,
+                        },
+                    );
+                }
+                SpectatorActionBtn::TogglePause => {
+                    send_spectator_lobby_msg(&mut net, &ClientLobbyMessage::SpectatorTogglePause);
+                }
+                SpectatorActionBtn::JumpLive => {
+                    send_spectator_lobby_msg(&mut net, &ClientLobbyMessage::SpectatorJumpLive);
+                }
+                SpectatorActionBtn::SetSpeed(speed) => {
+                    send_spectator_lobby_msg(&mut net, &ClientLobbyMessage::SpectatorSetSpeed { speed });
+                }
+                SpectatorActionBtn::SetFog(mode) => {
+                    send_spectator_lobby_msg(&mut net, &ClientLobbyMessage::SpectatorSetFogMode { mode });
+                }
+                SpectatorActionBtn::SetCamera(cm) => {
+                    spectator.camera_mode = cm;
+                }
+                SpectatorActionBtn::CycleNextHero => {
+                    if !remote_players.0.is_empty() {
+                        let mut slots: Vec<usize> = remote_players.0.iter().map(|r| r.slot_index).collect();
+                        slots.sort_unstable();
+                        let next_slot = match spectator
+                            .chase_slot_index
+                            .and_then(|cur| slots.iter().position(|&s| s == cur))
+                        {
+                            Some(idx) => slots[(idx + 1) % slots.len()],
+                            None => slots[0],
+                        };
+                        spectator.chase_slot_index = Some(next_slot);
+                        spectator.camera_mode = SpectatorCameraMode::HeroChase;
+                    }
+                }
+            }
+        }
+    }
+
+    // Update UI text & progress bar only when values actually change (avoids 60 FPS UI text relayout)
+    if let Ok(mut fill_node) = q.fill_q.single_mut() {
+        let span = (max_t - min_t).max(0.01);
+        let pct = (((cur_t - min_t) / span).clamp(0.0, 1.0)) * 100.0;
+        let next_w = percent(pct);
+        if fill_node.width != next_w {
+            fill_node.width = next_w;
+        }
+    }
+    if let Ok(mut txt) = q.time_text_q.single_mut() {
+        let next = format_mm_ss(cur_t);
+        if **txt != next {
+            **txt = next;
+        }
+    }
+    if let Ok(mut txt) = q.live_text_q.single_mut() {
+        let next = format!("LIVE {}", format_mm_ss(max_t));
+        if **txt != next {
+            **txt = next;
+        }
+    }
+    if let Ok(mut txt) = q.pause_label_q.single_mut() {
+        let next = if is_paused { "PLAY" } else { "PAUSE" };
+        if txt.as_str() != next {
+            **txt = next.to_string();
+        }
+    }
+    if let Ok(mut dot_bg) = q.dot_q.single_mut() {
+        let next_col = if is_paused {
+            Color::srgb(0.32, 0.72, 0.98)
+        } else if is_at_live {
+            Color::srgb(0.96, 0.24, 0.28)
+        } else {
+            Color::srgb(0.98, 0.72, 0.20)
+        };
+        if dot_bg.0 != next_col {
+            dot_bg.0 = next_col;
+        }
+    }
+    if let Ok(mut txt) = q.pill_text_q.single_mut() {
+        let state_str = if is_paused {
+            "PAUSED"
+        } else if is_at_live {
+            "LIVE SPECTATE"
+        } else {
+            "REWIND"
+        };
+        let fog_str = match cur_fog {
+            SpectatorFogMode::AllVision => "ALL FOW",
+            SpectatorFogMode::TeamDawn => "DAWN FOW",
+            SpectatorFogMode::TeamDusk => "DUSK FOW",
+        };
+        let next = format!(
+            "{} | {} | {:.2}x | VIEWERS: {} | DELAY: {}s",
+            state_str,
+            fog_str,
+            cur_speed,
+            viewers,
+            delay_secs.round() as u32
+        );
+        if **txt != next {
+            **txt = next;
+        }
+    }
+    if let Ok(mut txt) = q.cam_text_q.single_mut() {
+        let cam_label = match spectator.camera_mode {
+            SpectatorCameraMode::FreeCamera => "FREE CAM".to_string(),
+            SpectatorCameraMode::Directed => "DIRECTED".to_string(),
+            SpectatorCameraMode::HeroChase => {
+                let hero_name = spectator
+                    .chase_slot_index
+                    .and_then(|slot| remote_players.0.iter().find(|r| r.slot_index == slot))
+                    .map(|r| r.display_name.clone())
+                    .unwrap_or_else(|| "HERO".to_string());
+                format!("CHASE: {}", hero_name)
+            }
+        };
+        let base_cam_dist = Vec3::new(
+            config.camera.offset.0,
+            config.camera.offset.1,
+            config.camera.offset.2,
+        )
+        .length()
+        .max(0.01);
+        let zoom_ratio = spectator.zoom_distance / base_cam_dist;
+        let next = format!(
+            "CAM: {} | ZOOM: {:.2}x ({:.1}m)",
+            cam_label, zoom_ratio, spectator.zoom_distance
+        );
+        if **txt != next {
+            **txt = next;
+        }
     }
 }

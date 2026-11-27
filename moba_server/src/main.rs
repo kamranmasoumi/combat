@@ -12,12 +12,13 @@ use moba_shared::{
     try_transfer_hero_item_to_courier, AuthoritativeMatchState,
     AuthoritativeWorldState, ClientInputCommand, ClientLobbyMessage, CustomPhysicsWorld,
     GameConfig, GameplayFxEvent, ItemsConfig, MatchPhase, MobaPhysicsSet, MobaSharedPhysicsPlugin,
-    PhysicsRole, PhysicsSoldier, ServerLobbyPacket, ServerMatchMessage, TeamId,
+    PhysicsRole, PhysicsSoldier, ServerLobbyPacket, ServerMatchMessage, ServerWorldSnapshot,
+    SpectatorFogMode, SpectatorPlaybackSnapshot, TeamId,
     CHANNEL_RELIABLE_FX, CHANNEL_RELIABLE_LOBBY, CHANNEL_UNRELIABLE_STATE,
 };
 use renet::{ClientId, RenetServer, ServerEvent};
 use renet_netcode::NetcodeServerTransport;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::thread;
@@ -55,12 +56,267 @@ struct ServerShutdownTracker {
     ever_had_client: bool,
 }
 
+#[derive(Clone, Debug)]
+struct SpectatorSession {
+    #[allow(dead_code)]
+    user_id: String,
+    username: String,
+    fog_mode: SpectatorFogMode,
+    playback_speed: f32,
+    is_paused: bool,
+    playback_time_secs: f32,
+    following_live: bool,
+    delay_secs: f32,
+    last_sent_frame_time: f32,
+    last_sent_fog_mode: SpectatorFogMode,
+    last_sent_paused: bool,
+    last_sent_speed: f32,
+    last_sent_viewers: usize,
+    heartbeat_accum: f32,
+}
+
+struct RecordedSpectatorFrame {
+    match_time_secs: f32,
+    base_snapshot: ServerWorldSnapshot,
+    dawn_fog_mask: Vec<u8>,
+    dusk_fog_mask: Vec<u8>,
+}
+
+enum SourceTvCommand {
+    RecordFrame {
+        match_time_secs: f32,
+        base_snapshot: ServerWorldSnapshot,
+        dawn_fog_mask: Vec<u8>,
+        dusk_fog_mask: Vec<u8>,
+    },
+    SpectatorJoin {
+        client_id: ClientId,
+        session: SpectatorSession,
+    },
+    SpectatorLeave {
+        client_id: ClientId,
+    },
+    SetFogMode {
+        client_id: ClientId,
+        mode: SpectatorFogMode,
+    },
+    SetSpeed {
+        client_id: ClientId,
+        speed: f32,
+    },
+    TogglePause {
+        client_id: ClientId,
+    },
+    SeekTo {
+        client_id: ClientId,
+        target_time_secs: f32,
+    },
+    JumpLive {
+        client_id: ClientId,
+    },
+    StepBroadcast {
+        dt: f32,
+        now_match_t: f32,
+    },
+}
+
+#[derive(Resource)]
+struct SourceTvRelay {
+    cmd_tx: std::sync::mpsc::SyncSender<SourceTvCommand>,
+    out_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(ClientId, Vec<u8>)>>,
+    record_accum: f32,
+    step_accum: f32,
+}
+
+impl SourceTvRelay {
+    fn spawn(config: GameConfig) -> Self {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<SourceTvCommand>(64);
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<(ClientId, Vec<u8>)>(256);
+
+        let _ = std::thread::Builder::new()
+            .name("sourcetv-relay".to_string())
+            .spawn(move || {
+                let mut frames: VecDeque<RecordedSpectatorFrame> = VecDeque::new();
+                let mut spectators: HashMap<ClientId, SpectatorSession> = HashMap::new();
+                let mut serialize_buf: Vec<u8> = Vec::with_capacity(65536);
+
+                while let Ok(cmd) = cmd_rx.recv() {
+                    match cmd {
+                        SourceTvCommand::RecordFrame {
+                            match_time_secs,
+                            base_snapshot,
+                            dawn_fog_mask,
+                            dusk_fog_mask,
+                        } => {
+                            frames.push_back(RecordedSpectatorFrame {
+                                match_time_secs,
+                                base_snapshot,
+                                dawn_fog_mask,
+                                dusk_fog_mask,
+                            });
+                            let min_keep_time = match_time_secs - config.spectator.max_history_secs;
+                            while frames.len() > 2
+                                && frames.front().is_some_and(|f| f.match_time_secs < min_keep_time)
+                            {
+                                frames.pop_front();
+                            }
+                        }
+                        SourceTvCommand::SpectatorJoin { client_id, session } => {
+                            spectators.insert(client_id, session);
+                        }
+                        SourceTvCommand::SpectatorLeave { client_id } => {
+                            spectators.remove(&client_id);
+                        }
+                        SourceTvCommand::SetFogMode { client_id, mode } => {
+                            if let Some(s) = spectators.get_mut(&client_id) {
+                                s.fog_mode = mode;
+                            }
+                        }
+                        SourceTvCommand::SetSpeed { client_id, speed } => {
+                            if let Some(s) = spectators.get_mut(&client_id) {
+                                s.playback_speed = speed;
+                                if speed < 1.0 {
+                                    s.following_live = false;
+                                }
+                            }
+                        }
+                        SourceTvCommand::TogglePause { client_id } => {
+                            if let Some(s) = spectators.get_mut(&client_id) {
+                                s.is_paused = !s.is_paused;
+                                if s.is_paused {
+                                    s.following_live = false;
+                                }
+                            }
+                        }
+                        SourceTvCommand::SeekTo {
+                            client_id,
+                            target_time_secs,
+                        } => {
+                            if let Some(s) = spectators.get_mut(&client_id) {
+                                s.playback_time_secs = target_time_secs.max(0.0);
+                                s.following_live = false;
+                            }
+                        }
+                        SourceTvCommand::JumpLive { client_id } => {
+                            if let Some(s) = spectators.get_mut(&client_id) {
+                                s.following_live = true;
+                                s.is_paused = false;
+                                s.playback_speed = 1.0;
+                            }
+                        }
+                        SourceTvCommand::StepBroadcast { dt, now_match_t } => {
+                            if spectators.is_empty() || frames.is_empty() {
+                                continue;
+                            }
+                            let min_t = frames.front().map(|f| f.match_time_secs).unwrap_or(0.0);
+                            let spec_count = spectators.len();
+                            let mut packet_cache: HashMap<(usize, u8, bool, u32), Vec<u8>> = HashMap::new();
+
+                            for (&spec_cid, spec) in spectators.iter_mut() {
+                                let max_live_t = (now_match_t - spec.delay_secs).max(min_t);
+                                if spec.following_live && !spec.is_paused {
+                                    spec.playback_time_secs = max_live_t;
+                                } else if !spec.is_paused {
+                                    spec.playback_time_secs =
+                                        (spec.playback_time_secs + dt * spec.playback_speed)
+                                            .clamp(min_t, max_live_t);
+                                    if spec.playback_time_secs >= max_live_t - 0.05
+                                        && spec.playback_speed >= 1.0
+                                    {
+                                        spec.following_live = true;
+                                    }
+                                } else {
+                                    spec.playback_time_secs =
+                                        spec.playback_time_secs.clamp(min_t, max_live_t);
+                                }
+
+                                let pos = frames
+                                    .partition_point(|f| f.match_time_secs <= spec.playback_time_secs);
+                                let frame_idx = pos.saturating_sub(1).min(frames.len() - 1);
+                                let frame = &frames[frame_idx];
+
+                                spec.heartbeat_accum += dt;
+                                let frame_changed =
+                                    (frame.match_time_secs - spec.last_sent_frame_time).abs() > 0.001;
+                                let state_changed = spec.fog_mode != spec.last_sent_fog_mode
+                                    || spec.is_paused != spec.last_sent_paused
+                                    || (spec.playback_speed - spec.last_sent_speed).abs() > 0.001
+                                    || spec_count != spec.last_sent_viewers;
+                                if !frame_changed && !state_changed && spec.heartbeat_accum < 0.5 {
+                                    continue;
+                                }
+                                spec.last_sent_frame_time = frame.match_time_secs;
+                                spec.last_sent_fog_mode = spec.fog_mode;
+                                spec.last_sent_paused = spec.is_paused;
+                                spec.last_sent_speed = spec.playback_speed;
+                                spec.last_sent_viewers = spec_count;
+                                spec.heartbeat_accum = 0.0;
+
+                                let fog_key: u8 = match spec.fog_mode {
+                                    SpectatorFogMode::AllVision => 0,
+                                    SpectatorFogMode::TeamDawn => 1,
+                                    SpectatorFogMode::TeamDusk => 2,
+                                };
+                                let cache_key = (
+                                    frame_idx,
+                                    fog_key,
+                                    spec.is_paused,
+                                    (spec.playback_speed * 100.0).round() as u32,
+                                );
+
+                                let bytes = if let Some(cached) = packet_cache.get(&cache_key) {
+                                    cached.clone()
+                                } else {
+                                    let mut snap = frame.base_snapshot.clone();
+                                    AuthoritativeWorldState::apply_spectator_fog_mode(
+                                        &mut snap,
+                                        &config,
+                                        spec.fog_mode,
+                                        &frame.dawn_fog_mask,
+                                        &frame.dusk_fog_mask,
+                                    );
+                                    snap.spectator_state = Some(SpectatorPlaybackSnapshot {
+                                        fog_mode: spec.fog_mode,
+                                        playback_speed: spec.playback_speed,
+                                        is_paused: spec.is_paused,
+                                        current_time_secs: frame.match_time_secs,
+                                        min_time_secs: min_t,
+                                        max_live_time_secs: max_live_t,
+                                        delay_secs: spec.delay_secs,
+                                        spectator_count: spec_count,
+                                    });
+                                    serialize_buf.clear();
+                                    if bincode::serialize_into(&mut serialize_buf, &snap).is_err() {
+                                        continue;
+                                    }
+                                    let out = serialize_buf.clone();
+                                    packet_cache.insert(cache_key, out.clone());
+                                    out
+                                };
+
+                                let _ = out_tx.try_send((spec_cid, bytes));
+                            }
+                        }
+                    }
+                }
+            });
+
+        Self {
+            cmd_tx,
+            out_rx: std::sync::Mutex::new(out_rx),
+            record_accum: 0.0,
+            step_accum: 0.0,
+        }
+    }
+}
+
 #[derive(Resource)]
 struct ServerAuthState {
     room_id: Option<String>,
     port: u16,
     pending_auth: HashMap<ClientId, Instant>,
     verified_clients: HashMap<ClientId, VerifiedTicketInfo>,
+    verified_spectators: HashMap<ClientId, SpectatorSession>,
     result_reported: bool,
 }
 
@@ -83,7 +339,7 @@ fn main() {
         .next()
         .expect("server_public_addr در config.ron نامعتبر است");
     config.network.server_public_addr = format!("{}:{}", pub_ip, cli_port);
-    config.network.max_clients = required_players;
+    config.network.max_clients = required_players + config.spectator.max_spectators_per_match;
 
     let tick_hz = config.network.server_tick_rate_hz;
     let substeps = config.physics.substeps;
@@ -106,6 +362,7 @@ fn main() {
             tick_rate_hz: tick_hz,
             substeps,
         })
+        .insert_resource(SourceTvRelay::spawn(config.clone()))
         .insert_resource(config)
         .insert_resource(items_config)
         .insert_resource(world_state)
@@ -115,6 +372,7 @@ fn main() {
             port: cli_port,
             pending_auth: HashMap::new(),
             verified_clients: HashMap::new(),
+            verified_spectators: HashMap::new(),
             result_reported: false,
         })
         .insert_resource(LobbyBroadcastTimer(Timer::from_seconds(
@@ -156,6 +414,8 @@ struct RedisTicketPayload {
     room_id: String,
     user_id: String,
     username: String,
+    role: String,
+    is_custom_lobby: bool,
 }
 
 fn verify_ticket_in_redis(redis_addr: &str, ticket_id: &str) -> Option<RedisTicketPayload> {
@@ -192,10 +452,16 @@ fn verify_ticket_in_redis(redis_addr: &str, ticket_id: &str) -> Option<RedisTick
     let room_id = extract_json_str(&json_str, "room_id")?;
     let user_id = extract_json_str(&json_str, "user_id")?;
     let username = extract_json_str(&json_str, "username").unwrap_or_else(|| user_id.clone());
+    let role = extract_json_str(&json_str, "role").unwrap_or_else(|| "player".to_string());
+    let is_custom_lobby = extract_json_str(&json_str, "is_custom_lobby")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     Some(RedisTicketPayload {
         room_id,
         user_id,
         username,
+        role,
+        is_custom_lobby,
     })
 }
 
@@ -363,6 +629,50 @@ fn notify_django_player_state(
     );
 }
 
+fn notify_django_spectator_count(
+    config: &GameConfig,
+    room_id: &str,
+    port: u16,
+    spectator_count: usize,
+) {
+    let body = format!(
+        "{{\"room_id\":\"{}\",\"port\":{},\"status\":\"spectator_count\",\"spectator_count\":{}}}",
+        escape_json_str(room_id),
+        port,
+        spectator_count
+    );
+    post_json_to_django_async(
+        &config.network.backend_http_url,
+        "/api/v1/match/player-state/",
+        body,
+    );
+}
+
+fn send_initial_configs_to_spectator(
+    client_id: ClientId,
+    config: &GameConfig,
+    items_config: &ItemsConfig,
+    net_server: &mut RenetServer,
+    match_state: &AuthoritativeMatchState,
+) {
+    let mut safe_cfg = config.clone();
+    safe_cfg.network.private_key = [0; 32];
+    let sync_pkt = ServerLobbyPacket::SyncConfigs {
+        game_config: safe_cfg,
+        items_config: items_config.clone(),
+    };
+    if let Ok(bytes) = bincode::serialize(&sync_pkt) {
+        net_server.send_message(client_id, CHANNEL_RELIABLE_LOBBY, bytes);
+    }
+    let msg = ServerLobbyPacket::MatchState(ServerMatchMessage {
+        your_slot: usize::MAX,
+        state: match_state.snapshot(),
+    });
+    if let Ok(bytes) = bincode::serialize(&msg) {
+        net_server.send_message(client_id, CHANNEL_RELIABLE_LOBBY, bytes);
+    }
+}
+
 fn send_initial_configs_and_sync_world(
     client_id: ClientId,
     config: &GameConfig,
@@ -396,6 +706,7 @@ fn server_network_receive_system(
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
     mut auth_state: ResMut<ServerAuthState>,
+    tv_relay: Res<SourceTvRelay>,
     mut scratch: ResMut<ServerScratchBuffers>,
 ) {
     let net_inner = &mut *net;
@@ -463,6 +774,23 @@ fn server_network_receive_system(
                         );
                     }
                 }
+                if let Some(spec) = auth_state.verified_spectators.remove(&client_id) {
+                    let _ = tv_relay.cmd_tx.try_send(SourceTvCommand::SpectatorLeave { client_id });
+                    println!(
+                        "[SPECTATOR LEFT] تماشاگر {} ({}) خارج شد (باقی‌مانده: {}).",
+                        spec.username,
+                        spec.user_id,
+                        auth_state.verified_spectators.len()
+                    );
+                    if let Some(ref rid) = auth_state.room_id {
+                        notify_django_spectator_count(
+                            &config,
+                            rid,
+                            auth_state.port,
+                            auth_state.verified_spectators.len(),
+                        );
+                    }
+                }
                 if let Some(slot_idx) = match_state.on_client_disconnected(client_id) {
                     if match_state.phase == MatchPhase::InGame {
                         world.set_slot_connected(slot_idx, false, &config);
@@ -490,18 +818,34 @@ fn server_network_receive_system(
     scratch.client_ids.clear();
     scratch.client_ids.extend(net_inner.server.clients_id());
     for &client_id in &scratch.client_ids {
+        let is_spectator = auth_state.verified_spectators.contains_key(&client_id);
         let is_authenticated = auth_state.room_id.is_none()
-            || auth_state.verified_clients.contains_key(&client_id);
+            || auth_state.verified_clients.contains_key(&client_id)
+            || is_spectator;
 
         while let Some(bytes) = net_inner
             .server
             .receive_message(client_id, CHANNEL_RELIABLE_LOBBY)
         {
             if let Ok(msg) = bincode::deserialize::<ClientLobbyMessage>(&bytes) {
+                if is_spectator
+                    && !matches!(
+                        msg,
+                        ClientLobbyMessage::SpectatorSetFogMode { .. }
+                            | ClientLobbyMessage::SpectatorSetSpeed { .. }
+                            | ClientLobbyMessage::SpectatorTogglePause
+                            | ClientLobbyMessage::SpectatorSeekTo { .. }
+                            | ClientLobbyMessage::SpectatorJumpLive
+                    )
+                {
+                    continue;
+                }
                 match msg {
                     ClientLobbyMessage::Authenticate { ticket_id } => {
                         if let Some(ref expected_room) = auth_state.room_id.clone() {
-                            if auth_state.verified_clients.contains_key(&client_id) {
+                            if auth_state.verified_clients.contains_key(&client_id)
+                                || auth_state.verified_spectators.contains_key(&client_id)
+                            {
                                 continue;
                             }
                             let ticket_opt =
@@ -512,6 +856,68 @@ fn server_network_receive_system(
                             });
 
                             if let (true, Some(t)) = (room_matches, ticket_opt) {
+                                if t.role.eq_ignore_ascii_case("spectator") {
+                                    if auth_state.verified_spectators.len()
+                                        >= config.spectator.max_spectators_per_match
+                                    {
+                                        println!(
+                                            "[SPECTATOR REJECTED] ظرفیت تماشاگران اتاق {} تکمیل است.",
+                                            expected_room
+                                        );
+                                        auth_state.pending_auth.remove(&client_id);
+                                        net_inner.server.disconnect(client_id);
+                                        continue;
+                                    }
+                                    let delay_secs = if t.is_custom_lobby {
+                                        config.spectator.custom_lobby_live_delay_secs
+                                    } else {
+                                        config.spectator.ranked_live_delay_secs
+                                    };
+                                    let initial_t = (world.match_elapsed_secs - delay_secs).max(0.0);
+                                    auth_state.pending_auth.remove(&client_id);
+                                    let new_session = SpectatorSession {
+                                        user_id: t.user_id.clone(),
+                                        username: t.username.clone(),
+                                        fog_mode: SpectatorFogMode::AllVision,
+                                        playback_speed: 1.0,
+                                        is_paused: false,
+                                        playback_time_secs: initial_t,
+                                        following_live: true,
+                                        delay_secs,
+                                        last_sent_frame_time: -1.0,
+                                        last_sent_fog_mode: SpectatorFogMode::AllVision,
+                                        last_sent_paused: false,
+                                        last_sent_speed: 1.0,
+                                        last_sent_viewers: 0,
+                                        heartbeat_accum: 1.0,
+                                    };
+                                    auth_state.verified_spectators.insert(client_id, new_session.clone());
+                                    let _ = tv_relay.cmd_tx.try_send(SourceTvCommand::SpectatorJoin {
+                                        client_id,
+                                        session: new_session,
+                                    });
+                                    send_initial_configs_to_spectator(
+                                        client_id,
+                                        &config,
+                                        &items_config,
+                                        &mut net_inner.server,
+                                        &match_state,
+                                    );
+                                    notify_django_spectator_count(
+                                        &config,
+                                        expected_room,
+                                        auth_state.port,
+                                        auth_state.verified_spectators.len(),
+                                    );
+                                    println!(
+                                        "[SPECTATOR OK] تماشاگر {} ({}) متصل شد (جمع: {}, تاخیر: {:.0}s).",
+                                        t.username,
+                                        t.user_id,
+                                        auth_state.verified_spectators.len(),
+                                        delay_secs
+                                    );
+                                    continue;
+                                }
                                 let stale_cids: Vec<ClientId> = auth_state
                                     .verified_clients
                                     .iter()
@@ -890,6 +1296,64 @@ fn server_network_receive_system(
                             }
                         }
                     }
+                    // دستورات کنترل پخش و مه جنگ مخصوص تماشاگر (Server-Authoritative)
+                    ClientLobbyMessage::SpectatorSetFogMode { mode } => {
+                        if let Some(spec) = auth_state.verified_spectators.get_mut(&client_id) {
+                            spec.fog_mode = mode;
+                            let _ = tv_relay.cmd_tx.try_send(SourceTvCommand::SetFogMode { client_id, mode });
+                        }
+                    }
+                    ClientLobbyMessage::SpectatorSetSpeed { speed } => {
+                        if let Some(spec) = auth_state.verified_spectators.get_mut(&client_id) {
+                            let valid_speed = config
+                                .spectator
+                                .playback_speeds
+                                .iter()
+                                .copied()
+                                .min_by(|a, b| {
+                                    (*a - speed)
+                                        .abs()
+                                        .partial_cmp(&(*b - speed).abs())
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                                .unwrap_or(1.0);
+                            spec.playback_speed = valid_speed;
+                            if valid_speed < 1.0 {
+                                spec.following_live = false;
+                            }
+                            let _ = tv_relay.cmd_tx.try_send(SourceTvCommand::SetSpeed {
+                                client_id,
+                                speed: valid_speed,
+                            });
+                        }
+                    }
+                    ClientLobbyMessage::SpectatorTogglePause => {
+                        if let Some(spec) = auth_state.verified_spectators.get_mut(&client_id) {
+                            spec.is_paused = !spec.is_paused;
+                            if spec.is_paused {
+                                spec.following_live = false;
+                            }
+                            let _ = tv_relay.cmd_tx.try_send(SourceTvCommand::TogglePause { client_id });
+                        }
+                    }
+                    ClientLobbyMessage::SpectatorSeekTo { target_time_secs } => {
+                        if let Some(spec) = auth_state.verified_spectators.get_mut(&client_id) {
+                            spec.playback_time_secs = target_time_secs.max(0.0);
+                            spec.following_live = false;
+                            let _ = tv_relay.cmd_tx.try_send(SourceTvCommand::SeekTo {
+                                client_id,
+                                target_time_secs,
+                            });
+                        }
+                    }
+                    ClientLobbyMessage::SpectatorJumpLive => {
+                        if let Some(spec) = auth_state.verified_spectators.get_mut(&client_id) {
+                            spec.is_paused = false;
+                            spec.playback_speed = 1.0;
+                            spec.following_live = true;
+                            let _ = tv_relay.cmd_tx.try_send(SourceTvCommand::JumpLive { client_id });
+                        }
+                    }
                     // امنیت سرور آنلاین: دستورات Demo Hero هرگز روی سرور اصلی اجرا نمی‌شوند
                     ClientLobbyMessage::DemoCommand(_) => {}
                     ClientLobbyMessage::SwapCourierSlots { from_slot, to_slot } => {
@@ -926,7 +1390,7 @@ fn server_network_receive_system(
             .server
             .receive_message(client_id, CHANNEL_UNRELIABLE_STATE)
         {
-            if !is_authenticated || match_state.phase != MatchPhase::InGame {
+            if !is_authenticated || is_spectator || match_state.phase != MatchPhase::InGame {
                 continue;
             }
             if let Some(slot_idx) = match_state.slot_for_client(client_id) {
@@ -1057,6 +1521,7 @@ fn server_match_tick_system(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn server_send_snapshot_system(
     time: Res<Time<Fixed>>,
     config: Res<GameConfig>,
@@ -1064,6 +1529,8 @@ fn server_send_snapshot_system(
     mut net: ResMut<ServerNetwork>,
     mut match_state: ResMut<AuthoritativeMatchState>,
     mut world: ResMut<AuthoritativeWorldState>,
+    mut auth_state: ResMut<ServerAuthState>,
+    mut tv_relay: ResMut<SourceTvRelay>,
     mut lobby_timer: ResMut<LobbyBroadcastTimer>,
     mut scratch: ResMut<ServerScratchBuffers>,
 ) {
@@ -1087,6 +1554,20 @@ fn server_send_snapshot_system(
                         scratch.serialize_buf.clone(),
                     );
                 }
+            }
+        }
+        for &spec_cid in auth_state.verified_spectators.keys() {
+            let msg = ServerLobbyPacket::MatchState(ServerMatchMessage {
+                your_slot: usize::MAX,
+                state: snap.clone(),
+            });
+            scratch.serialize_buf.clear();
+            if bincode::serialize_into(&mut scratch.serialize_buf, &msg).is_ok() {
+                net.server.send_message(
+                    spec_cid,
+                    CHANNEL_RELIABLE_LOBBY,
+                    scratch.serialize_buf.clone(),
+                );
             }
         }
         match_state.dirty = false;
@@ -1130,6 +1611,48 @@ fn server_send_snapshot_system(
                             CHANNEL_RELIABLE_FX,
                             scratch.serialize_buf.clone(),
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    if match_state.phase == MatchPhase::InGame {
+        let dt = time.delta_secs();
+        let record_interval = 1.0 / config.spectator.snapshot_record_hz;
+        tv_relay.record_accum += dt;
+        if tv_relay.record_accum >= record_interval {
+            tv_relay.record_accum = 0.0;
+            let base_snapshot = world.build_spectator_snapshot(
+                &config,
+                &items_config,
+                SpectatorFogMode::AllVision,
+            );
+            let dawn_fog_mask = world.pack_team_fog_mask(TeamId::Dawn);
+            let dusk_fog_mask = world.pack_team_fog_mask(TeamId::Dusk);
+            let _ = tv_relay.cmd_tx.try_send(SourceTvCommand::RecordFrame {
+                match_time_secs: world.match_elapsed_secs,
+                base_snapshot,
+                dawn_fog_mask,
+                dusk_fog_mask,
+            });
+        }
+
+        if !auth_state.verified_spectators.is_empty() {
+            tv_relay.step_accum += dt;
+            let step_interval = (1.0 / config.spectator.snapshot_record_hz).min(0.05);
+            if tv_relay.step_accum >= step_interval {
+                let step_dt = tv_relay.step_accum;
+                tv_relay.step_accum = 0.0;
+                let _ = tv_relay.cmd_tx.try_send(SourceTvCommand::StepBroadcast {
+                    dt: step_dt,
+                    now_match_t: world.match_elapsed_secs,
+                });
+            }
+            if let Ok(rx) = tv_relay.out_rx.try_lock() {
+                while let Ok((spec_cid, bytes)) = rx.try_recv() {
+                    if auth_state.verified_spectators.contains_key(&spec_cid) {
+                        net.server.send_message(spec_cid, CHANNEL_UNRELIABLE_STATE, bytes);
                     }
                 }
             }

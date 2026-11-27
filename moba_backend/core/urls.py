@@ -13,6 +13,8 @@ urlpatterns = [
     path("match/abandon/", views.abandon_match_view, name="abandon_match"),
     path("match/report-result/", views.report_match_result_view, name="report_match_result"),
     path("match/history/", views.match_history_view, name="match-history"),
+    path("match/live/", views.live_matches_view, name="live_matches"),
+    path("match/spectate/", views.spectate_match_view, name="spectate_match"),
     # Friends & Social HTTP APIs
     path("friends/", views.friends_list_view, name="friends_list"),
     path("friends/search/", views.friends_search_view, name="friends_search"),

@@ -15,6 +15,8 @@ from django.views.decorators.http import require_GET, require_POST
 
 from .consumers import (
     abandon_active_matches_for_player,
+    issue_spectator_ticket_for_room,
+    list_live_matches_for_watch,
     broadcast_coordinator_state_sync,
     build_coordinator_status_payload,
     build_friends_payload_for_player,
@@ -1007,3 +1009,79 @@ def publish_patch_release_view(request: HttpRequest) -> JsonResponse:
         },
         status=200,
     )
+
+
+@csrf_exempt
+@require_GET
+def live_matches_view(request: HttpRequest) -> JsonResponse:
+    """
+    GET /api/v1/match/live/
+    برگرداندن لیست بازی‌های آنلاین در حال اجرا برای صفحه WATCH LIVE با امکان فیلتر و مرتب‌سازی.
+    """
+    player = _resolve_authenticated_player(request)
+    if not player:
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
+
+    client_ip = request.META.get("REMOTE_ADDR", "")
+    matches = list_live_matches_for_watch(player, client_ip=client_ip)
+
+    q = str(request.GET.get("q", "")).strip().lower()
+    hero_id_str = str(request.GET.get("hero_id", "")).strip()
+    rank_tier = str(request.GET.get("rank_tier", "")).strip().lower()
+    mode = str(request.GET.get("mode", "all")).strip().lower()
+    friends_only = str(request.GET.get("friends_only", "")).strip().lower() in ("1", "true", "yes")
+    sort_by = str(request.GET.get("sort", "mmr")).strip().lower()
+
+    hero_id_filter = int(hero_id_str) if hero_id_str.isdigit() and int(hero_id_str) > 0 else 0
+
+    filtered = []
+    for m in matches:
+        if mode == "ranked" and m["is_custom_lobby"]:
+            continue
+        if mode == "custom" and not m["is_custom_lobby"]:
+            continue
+        if friends_only and not m["has_friend"]:
+            continue
+        if rank_tier and rank_tier != "all" and m["rank_tier"].lower() != rank_tier:
+            continue
+        if hero_id_filter > 0 and not any(p["hero_id"] == hero_id_filter for p in m["players"]):
+            continue
+        if q:
+            in_room = q in m["room_id"].lower()
+            in_players = any(q in p["username"].lower() for p in m["players"])
+            if not (in_room or in_players):
+                continue
+        filtered.append(m)
+
+    if sort_by == "spectators":
+        filtered.sort(key=lambda x: (-x["spectator_count"], -x["avg_mmr"]))
+    elif sort_by == "duration":
+        filtered.sort(key=lambda x: (-x["duration_sec"], -x["avg_mmr"]))
+    else:
+        filtered.sort(key=lambda x: (-x["avg_mmr"], -x["spectator_count"]))
+
+    return JsonResponse({"status": "ok", "matches": filtered}, status=200)
+
+
+@csrf_exempt
+@require_POST
+def spectate_match_view(request: HttpRequest) -> JsonResponse:
+    """
+    POST /api/v1/match/spectate/
+    صدور تیکت امن تماشاگر (Spectator) در Redis برای ورود مهمان به بازی آنلاین.
+    """
+    player = _resolve_authenticated_player(request)
+    if not player:
+        return JsonResponse({"error": "Invalid or expired session token."}, status=401)
+
+    data = _parse_json_body(request)
+    room_id = str(data.get("room_id", "")).strip()
+    if not room_id:
+        return JsonResponse({"error": "room_id is required."}, status=400)
+
+    client_ip = request.META.get("REMOTE_ADDR", "")
+    res = issue_spectator_ticket_for_room(player, room_id, client_ip=client_ip)
+    status_code = int(res.pop("status_code", 200))
+    if "error" in res:
+        return JsonResponse(res, status=status_code)
+    return JsonResponse({"status": "ok", "spectate": res}, status=200)

@@ -262,6 +262,7 @@ fn main() {
         .insert_resource(DirectionalLightShadowMap {
             size: config.lighting.shadow_map_size,
         })
+        .insert_resource(UserCameraCursorSettings::from_config(&config))
         .insert_resource(config)
         .insert_resource(items_config)
         .insert_resource(LocalConfigOverride {
@@ -328,7 +329,6 @@ fn main() {
             ticket_sent: false,
         })
         .insert_resource(ClientSpectatorState::default())
-        .insert_resource(UserCameraCursorSettings::from_config(&config))
         .insert_resource(CameraControlState {
             free_look_target: None,
             camera_unlocked: false,
@@ -371,6 +371,10 @@ fn main() {
                 .after(bevy::app::AnimationSystems)
                 .before(bevy::transform::TransformSystems::Propagate)
                 .run_if(in_state(AppScreenState::InGame)),
+        )
+        .add_systems(
+            PreUpdate,
+            apply_cursor_sensitivity_system.run_if(in_state(AppScreenState::InGame)),
         )
         .add_systems(
             Update,
@@ -4031,7 +4035,7 @@ fn client_sample_input_system(
     let mut has_aim_ray = false;
 
     if let (Ok(window), Ok((camera, camera_tf))) = (window_query.single(), camera_query.single()) {
-        if let Some(cursor_pos) = camera_control.virtual_cursor_pos.or_else(|| window.cursor_position()) {
+        if let Some(cursor_pos) = window.cursor_position() {
             if let Ok(ray) = camera.viewport_to_world(camera_tf, cursor_pos) {
                 aim_ray_origin = ray.origin;
                 aim_ray_dir = *ray.direction;
@@ -5577,19 +5581,66 @@ fn laser_sight_gizmo_system(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn cursor_reticle_system(
-    time: Res<Time>,
-    config: Res<GameConfig>,
+fn apply_cursor_sensitivity_system(
     match_flow: Res<ClientMatchFlow>,
-    render_state: Res<ClientRenderState>,
-    shake: Res<CameraShake>,
-    shop_ui: Res<ShopUiState>,
-    settings_ui: Res<SettingsUiState>,
-    demo_session: Res<demo_client::ActiveDemoSession>,
-    spectator: Res<ClientSpectatorState>,
     cam_settings: Res<UserCameraCursorSettings>,
-    mut mouse_motion: MessageReader<MouseMotion>,
     mut camera_control: ResMut<CameraControlState>,
+    mut mouse_motion: MessageReader<MouseMotion>,
+    mut window_query: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    let Ok(mut window) = window_query.single_mut() else {
+        mouse_motion.clear();
+        return;
+    };
+    let sens = cam_settings.cursor_sensitivity;
+    if !match_flow.is_in_game() || !window.focused || (sens - 1.0).abs() < 0.01 {
+        mouse_motion.clear();
+        camera_control.virtual_cursor_pos = window.cursor_position();
+        return;
+    }
+
+    let mut raw_delta = Vec2::ZERO;
+    for ev in mouse_motion.read() {
+        raw_delta += ev.delta;
+    }
+
+    if raw_delta.length_squared() <= 1e-6 {
+        if let Some(pos) = window.cursor_position() {
+            camera_control.virtual_cursor_pos = Some(pos);
+        }
+        return;
+    }
+
+    let win_w = window.width().max(1.0);
+    let win_h = window.height().max(1.0);
+    let scale = window.scale_factor().max(0.5);
+    let base = camera_control
+        .virtual_cursor_pos
+        .or_else(|| window.cursor_position())
+        .unwrap_or(Vec2::new(win_w * 0.5, win_h * 0.5));
+    let next = Vec2::new(
+        (base.x + (raw_delta.x / scale) * sens).clamp(0.0, (win_w - 1.0).max(0.0)),
+        (base.y + (raw_delta.y / scale) * sens).clamp(0.0, (win_h - 1.0).max(0.0)),
+    );
+    window.set_cursor_position(Some(next));
+    camera_control.virtual_cursor_pos = Some(next);
+}
+
+#[derive(SystemParam)]
+struct CursorReticleRes<'w> {
+    time: Res<'w, Time>,
+    config: Res<'w, GameConfig>,
+    match_flow: Res<'w, ClientMatchFlow>,
+    render_state: Res<'w, ClientRenderState>,
+    shake: Res<'w, CameraShake>,
+    shop_ui: Res<'w, ShopUiState>,
+    settings_ui: Res<'w, SettingsUiState>,
+    demo_session: Res<'w, demo_client::ActiveDemoSession>,
+    spectator: Res<'w, ClientSpectatorState>,
+}
+
+fn cursor_reticle_system(
+    r: CursorReticleRes,
     mut window_query: Query<(&Window, &mut CursorOptions), With<PrimaryWindow>>,
     mut root_query: Query<(&mut ReticleRoot, &mut Node, &mut Visibility)>,
     mut outer_query: Query<
@@ -5633,18 +5684,18 @@ fn cursor_reticle_system(
     let Ok((window, mut cursor_options)) = window_query.single_mut() else {
         return;
     };
-    let in_game = match_flow.is_in_game();
+    let in_game = r.match_flow.is_in_game();
 
     let ui_cursor_needed = !in_game
-        || shop_ui.is_open
-        || settings_ui.is_open
-        || shop_ui.pending_sell_slot.is_some()
-        || shop_ui.is_pointer_over_hud_ui
-        || shop_ui.is_dragging_item
-        || demo_session.is_pointer_over_panel
-        || spectator.is_spectator;
+        || r.shop_ui.is_open
+        || r.settings_ui.is_open
+        || r.shop_ui.pending_sell_slot.is_some()
+        || r.shop_ui.is_pointer_over_hud_ui
+        || r.shop_ui.is_dragging_item
+        || r.demo_session.is_pointer_over_panel
+        || r.spectator.is_spectator;
 
-    if config.cursor_reticle.hide_os_cursor_in_game {
+    if r.config.cursor_reticle.hide_os_cursor_in_game {
         if cursor_options.visible != ui_cursor_needed {
             cursor_options.visible = ui_cursor_needed;
         }
@@ -5655,66 +5706,40 @@ fn cursor_reticle_system(
     };
 
     if ui_cursor_needed {
-        mouse_motion.clear();
-        camera_control.virtual_cursor_pos = window.cursor_position();
         if *root_vis != Visibility::Hidden {
             *root_vis = Visibility::Hidden;
         }
         return;
     }
 
-    let mut raw_delta = Vec2::ZERO;
-    for ev in mouse_motion.read() {
-        raw_delta += ev.delta;
-    }
-    let win_w = window.width().max(1.0);
-    let win_h = window.height().max(1.0);
-    let cursor_pos = if (cam_settings.cursor_sensitivity - 1.0).abs() < 0.01 {
-        let pos = window.cursor_position();
-        camera_control.virtual_cursor_pos = pos;
-        match pos {
-            Some(p) => p,
-            None => {
-                if *root_vis != Visibility::Hidden {
-                    *root_vis = Visibility::Hidden;
-                }
-                return;
-            }
+    let Some(cursor_pos) = window.cursor_position() else {
+        if *root_vis != Visibility::Hidden {
+            *root_vis = Visibility::Hidden;
         }
-    } else {
-        let base = camera_control
-            .virtual_cursor_pos
-            .or_else(|| window.cursor_position())
-            .unwrap_or(Vec2::new(win_w * 0.5, win_h * 0.5));
-        let next = Vec2::new(
-            (base.x + raw_delta.x * cam_settings.cursor_sensitivity).clamp(0.0, win_w),
-            (base.y + raw_delta.y * cam_settings.cursor_sensitivity).clamp(0.0, win_h),
-        );
-        camera_control.virtual_cursor_pos = Some(next);
-        next
+        return;
     };
 
     if *root_vis != Visibility::Visible {
         *root_vis = Visibility::Visible;
     }
-    let rc = &config.cursor_reticle;
+    let rc = &r.config.cursor_reticle;
     let container_size = rc.outer_diameter_px + rc.fire_expand_px + rc.tick_length_px * 2.0 + 16.0;
     root_node.left = px(cursor_pos.x - container_size * 0.5);
     root_node.top = px(cursor_pos.y - container_size * 0.5);
 
-    let dt = time.delta_secs();
-    let target_spread = if render_state.upper_action == UpperBodyAction::FiringRifle {
+    let dt = r.time.delta_secs();
+    let target_spread = if r.render_state.upper_action == UpperBodyAction::FiringRifle {
         rc.fire_expand_px
     } else {
-        (shake.trauma * rc.fire_expand_px * 1.4).clamp(0.0, rc.fire_expand_px)
+        (r.shake.trauma * rc.fire_expand_px * 1.4).clamp(0.0, rc.fire_expand_px)
     };
     reticle.current_spread_px = reticle
         .current_spread_px
         + (target_spread - reticle.current_spread_px) * (rc.expand_recover_speed * dt).clamp(0.0, 1.0);
 
-    let active_rgba = if render_state.upper_action == UpperBodyAction::Reloading {
+    let active_rgba = if r.render_state.upper_action == UpperBodyAction::Reloading {
         rc.reload_color_rgba
-    } else if render_state.aim_locked_on_enemy {
+    } else if r.render_state.aim_locked_on_enemy {
         rc.locked_color_rgba
     } else {
         rc.normal_color_rgba
@@ -6100,7 +6125,7 @@ fn camera_follow_system(
         && !mouse_button.pressed(MouseButton::Middle)
     {
         if let Ok(window) = window_query.single() {
-            if let Some(cursor) = ex.camera_control.virtual_cursor_pos.or_else(|| window.cursor_position()) {
+            if let Some(cursor) = window.cursor_position() {
                 let win_w = window.width().max(1.0);
                 let win_h = window.height().max(1.0);
                 let margin = ex.cam_settings.edge_pan_margin_px;
@@ -6152,7 +6177,7 @@ fn camera_follow_system(
         && ex.pause_state.0.phase == PausePhase::Running
     {
         if let Ok(window) = window_query.single() {
-            if let Some(cursor) = ex.camera_control.virtual_cursor_pos.or_else(|| window.cursor_position()) {
+            if let Some(cursor) = window.cursor_position() {
                 let win_w = window.width().max(1.0);
                 let win_h = window.height().max(1.0);
                 let nx = ((cursor.x / win_w) - 0.5) * 2.0;

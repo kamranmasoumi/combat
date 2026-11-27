@@ -96,6 +96,13 @@ pub struct MatchHistorySummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(crate = "ureq::serde")]
+pub struct MatchHistoryItemSlot {
+    pub slot: usize,
+    pub item_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(crate = "ureq::serde")]
 pub struct MatchHistoryPlayerRow {
     pub user_id: String,
     pub username: String,
@@ -109,6 +116,8 @@ pub struct MatchHistoryPlayerRow {
     pub last_hits: i32,
     pub denies: i32,
     pub gold_coins: i32,
+    #[serde(default)]
+    pub final_items: Vec<MatchHistoryItemSlot>,
     pub status: String,
     #[serde(default)]
     pub party_group_id: String,
@@ -135,6 +144,8 @@ pub struct MatchHistoryEntry {
     pub last_hits: i32,
     pub denies: i32,
     pub gold_coins: i32,
+    #[serde(default)]
+    pub final_items: Vec<MatchHistoryItemSlot>,
     pub mmr_delta: i32,
     pub duration_sec: i32,
     pub played_at: String,

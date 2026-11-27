@@ -816,10 +816,40 @@ def reconnect_active_match_for_player(player: Player) -> int:
     return count
 
 
+def _sanitize_final_items(raw_items):
+    """پاک‌سازی لیست آیتم‌های نهایی اینونتوری ارسال‌شده توسط moba_server."""
+    if not isinstance(raw_items, list):
+        return None
+    cleaned = []
+    seen_slots = set()
+    for idx, entry in enumerate(raw_items[:12]):
+        if isinstance(entry, dict):
+            item_id = str(entry.get("item_id", "")).strip()
+            try:
+                slot = int(entry.get("slot", idx))
+            except (TypeError, ValueError):
+                slot = idx
+        elif isinstance(entry, str):
+            item_id = entry.strip()
+            slot = idx
+        else:
+            continue
+        if not item_id or len(item_id) > 96 or slot < 0 or slot >= 12:
+            continue
+        if slot in seen_slots:
+            continue
+        seen_slots.add(slot)
+        cleaned.append({"slot": slot, "item_id": item_id})
+    cleaned.sort(key=lambda x: x["slot"])
+    return cleaned
+
+
 def update_player_connection_state_from_server(data: dict) -> dict:
     """
-    بروزرسانی آنی وضعیت اتصال بازیکن (`connected` یا `disconnected`) توسط `moba_server`
-    بر اساس رویدادهای واقعی سوکت UDP (اتصال، ریکانکت، دیسکانکت یا بستن مستقیم برنامه بازی).
+    بروزرسانی آنی وضعیت اتصال بازیکن (`connected` یا `disconnected`) و همچنین همگام‌سازی
+    فوری `hero_id` و آمار زنده (level, K/D/A, CS, gold) توسط `moba_server`.
+    ثبت `hero_id` بلافاصله پس از انتخاب هیرو و هنگام دیسکانکت باعث می‌شود حتی اگر
+    بازیکن بازی را Abandon کند و سرور متوقف شود، هیرو و آمار او در تاریخچه ثبت شده باشد.
     """
     room_id = str(data.get("room_id", "")).strip()
     port = int(data.get("port", 0) or 0)
@@ -828,11 +858,31 @@ def update_player_connection_state_from_server(data: dict) -> dict:
     slot_index = data.get("slot_index", None)
     raw_status = str(data.get("status", "")).strip().lower()
 
-    if raw_status not in (
+    if raw_status and raw_status not in (
         MatchParticipant.STATUS_CONNECTED,
         MatchParticipant.STATUS_DISCONNECTED,
     ):
         return {"status": "error", "message": f"Invalid status: {raw_status}"}
+
+    def _opt_nonneg_int(key: str):
+        val = data.get(key, None)
+        if val is None:
+            return None
+        try:
+            return max(0, int(val))
+        except (TypeError, ValueError):
+            return None
+
+    hero_id_val = _opt_nonneg_int("hero_id")
+    level_val = _opt_nonneg_int("level")
+    kills_val = _opt_nonneg_int("kills")
+    deaths_val = _opt_nonneg_int("deaths")
+    assists_val = _opt_nonneg_int("assists")
+    last_hits_val = _opt_nonneg_int("last_hits")
+    denies_val = _opt_nonneg_int("denies")
+    gold_val = _opt_nonneg_int("gold_coins")
+    final_items_raw = data.get("final_items", data.get("items", None))
+    final_items_val = _sanitize_final_items(final_items_raw) if final_items_raw is not None else None
 
     with transaction.atomic():
         room = None
@@ -878,24 +928,55 @@ def update_player_connection_state_from_server(data: dict) -> dict:
         if not part:
             return {"status": "error", "message": "Participant not found in room"}
 
-        # اگر بازیکن قبلاً Abandon یا Completed شده باشد، وضعیت او تغییر نمی‌کند
-        if part.status in (
+        update_fields = []
+        # اگر بازیکن قبلاً Abandon یا Completed شده باشد، وضعیت او تغییر نمی‌کند،
+        # ولی اگر hero_id هنوز ۰ باشد و سرور آن را ارسال کرده باشد ثبت می‌شود.
+        is_terminal = part.status in (
             MatchParticipant.STATUS_ABANDONED,
             MatchParticipant.STATUS_COMPLETED,
+        )
+        if not is_terminal and raw_status and part.status != raw_status:
+            part.status = raw_status
+            update_fields.append("status")
+
+        if hero_id_val is not None and hero_id_val > 0 and part.hero_id != hero_id_val:
+            part.hero_id = hero_id_val
+            update_fields.append("hero_id")
+
+        if level_val is not None and level_val > 0 and part.level != level_val:
+            part.level = level_val
+            update_fields.append("level")
+
+        for field_name, field_val in (
+            ("kills", kills_val),
+            ("deaths", deaths_val),
+            ("assists", assists_val),
+            ("last_hits", last_hits_val),
+            ("denies", denies_val),
+            ("gold_coins", gold_val),
         ):
+            if field_val is not None and getattr(part, field_name) != field_val:
+                setattr(part, field_name, field_val)
+                update_fields.append(field_name)
+
+        if final_items_val is not None and (part.final_items or []) != final_items_val:
+            part.final_items = final_items_val
+            update_fields.append("final_items")
+
+        if update_fields:
+            part.save(update_fields=update_fields)
+            print(
+                f"[UDP STATE SYNC] Room {room.room_id} | Player {part.player.username} (slot {part.slot_index}) | fields={update_fields} | status={part.status.upper()} | hero_id={part.hero_id}",
+                flush=True,
+            )
+
+        if is_terminal and not update_fields:
             return {
                 "status": "ignored",
                 "reason": f"participant_already_{part.status}",
                 "participant_status": part.status,
+                "hero_id": part.hero_id,
             }
-
-        if part.status != raw_status:
-            part.status = raw_status
-            part.save(update_fields=["status"])
-            print(
-                f"[UDP STATE SYNC] Room {room.room_id} | Player {part.player.username} (slot {part.slot_index}) -> {raw_status.upper()}",
-                flush=True,
-            )
 
         return {
             "status": "ok",
@@ -903,6 +984,7 @@ def update_player_connection_state_from_server(data: dict) -> dict:
             "user_id": part.player.user_id,
             "slot_index": part.slot_index,
             "participant_status": part.status,
+            "hero_id": part.hero_id,
         }
 
 
@@ -1136,6 +1218,10 @@ def record_match_result_from_server(data: dict) -> dict:
             part.gold_coins = max(
                 part.gold_coins, int(pstat.get("gold_coins", part.gold_coins) or 0)
             )
+            pstat_items_raw = pstat.get("final_items", pstat.get("items", None))
+            pstat_items = _sanitize_final_items(pstat_items_raw) if pstat_items_raw is not None else None
+            if pstat_items is not None:
+                part.final_items = pstat_items
             part.left_at = part.left_at or now
 
             delete_ticket_from_redis(part.ticket_id)
@@ -1153,6 +1239,7 @@ def record_match_result_from_server(data: dict) -> dict:
                         "last_hits",
                         "denies",
                         "gold_coins",
+                        "final_items",
                         "is_winner",
                         "left_at",
                     ]

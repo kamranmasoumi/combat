@@ -268,6 +268,53 @@ fn post_json_to_django_async(base_http_url: &str, path: &str, json_body: String)
     });
 }
 
+fn escape_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn serialize_final_items_json(inv: &[moba_shared::InventoryItemState]) -> String {
+    let mut out = String::from("[");
+    let mut sorted: Vec<(usize, &str)> = inv
+        .iter()
+        .filter(|it| !it.item_id.trim().is_empty())
+        .map(|it| (it.slot, it.item_id.as_str()))
+        .collect();
+    sorted.sort_by_key(|(slot, _)| *slot);
+    for (i, (slot, item_id)) in sorted.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"slot\":{},\"item_id\":\"{}\"}}",
+            slot,
+            escape_json_str(item_id)
+        ));
+    }
+    out.push(']');
+    out
+}
+
+fn resolve_hero_id_1based(config: &GameConfig, hero_str_id: &str) -> Option<usize> {
+    config
+        .heroes
+        .iter()
+        .position(|h| h.id == hero_str_id)
+        .map(|idx| idx + 1)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn notify_django_player_state(
     config: &GameConfig,
     room_id: &str,
@@ -276,11 +323,39 @@ fn notify_django_player_state(
     ticket_id: &str,
     slot_index: usize,
     status: &str,
+    hero_id_override: Option<usize>,
+    live_player: Option<&moba_shared::PlayerSlotState>,
 ) {
-    let body = format!(
-        "{{\"room_id\":\"{}\",\"port\":{},\"user_id\":\"{}\",\"ticket_id\":\"{}\",\"slot_index\":{},\"status\":\"{}\"}}",
-        room_id, port, user_id, ticket_id, slot_index, status
+    let mut body = format!(
+        "{{\"room_id\":\"{}\",\"port\":{},\"user_id\":\"{}\",\"ticket_id\":\"{}\",\"slot_index\":{},\"status\":\"{}\"",
+        escape_json_str(room_id),
+        port,
+        escape_json_str(user_id),
+        escape_json_str(ticket_id),
+        slot_index,
+        escape_json_str(status)
     );
+
+    if let Some(p) = live_player {
+        let hid = hero_id_override.unwrap_or(p.hero_index + 1);
+        let items_json = serialize_final_items_json(&p.inventory);
+        body.push_str(&format!(
+            ",\"hero_id\":{},\"level\":{},\"kills\":{},\"deaths\":{},\"assists\":{},\"last_hits\":{},\"denies\":{},\"gold_coins\":{},\"final_items\":{}",
+            hid,
+            p.hero_level,
+            p.kills,
+            p.deaths,
+            p.assists,
+            p.last_hits,
+            p.denies,
+            p.hero_gold,
+            items_json
+        ));
+    } else if let Some(hid) = hero_id_override {
+        body.push_str(&format!(",\"hero_id\":{}", hid));
+    }
+
+    body.push('}');
     post_json_to_django_async(
         &config.network.backend_http_url,
         "/api/v1/match/player-state/",
@@ -365,6 +440,16 @@ fn server_network_receive_system(
                 auth_state.pending_auth.remove(&client_id);
                 if let Some(vinfo) = auth_state.verified_clients.remove(&client_id) {
                     if let Some(ref rid) = auth_state.room_id {
+                        let live_player = if match_state.phase == MatchPhase::InGame {
+                            world.players.iter().find(|p| p.slot_index == vinfo.slot_index)
+                        } else {
+                            None
+                        };
+                        let lobby_hero_id = match_state
+                            .players
+                            .get(vinfo.slot_index)
+                            .and_then(|lp| lp.selected_hero_id.as_deref())
+                            .and_then(|hid| resolve_hero_id_1based(&config, hid));
                         notify_django_player_state(
                             &config,
                             rid,
@@ -373,6 +458,8 @@ fn server_network_receive_system(
                             &vinfo.ticket_id,
                             vinfo.slot_index,
                             "disconnected",
+                            lobby_hero_id,
+                            live_player,
                         );
                     }
                 }
@@ -468,6 +555,16 @@ fn server_network_receive_system(
                                         &mut world,
                                         slot_idx,
                                     );
+                                    let live_player = if match_state.phase == MatchPhase::InGame {
+                                        world.players.iter().find(|p| p.slot_index == slot_idx)
+                                    } else {
+                                        None
+                                    };
+                                    let lobby_hero_id = match_state
+                                        .players
+                                        .get(slot_idx)
+                                        .and_then(|lp| lp.selected_hero_id.as_deref())
+                                        .and_then(|hid| resolve_hero_id_1based(&config, hid));
                                     notify_django_player_state(
                                         &config,
                                         expected_room,
@@ -476,6 +573,8 @@ fn server_network_receive_system(
                                         &ticket_id,
                                         slot_idx,
                                         "connected",
+                                        lobby_hero_id,
+                                        live_player,
                                     );
                                     println!(
                                         "[AUTH OK] بازیکن {} ({}) با تیکت معتبر در جایگاه {} متصل شد ({}/{}).",
@@ -509,6 +608,23 @@ fn server_network_receive_system(
                     ClientLobbyMessage::SelectHero { hero_id } => {
                         if match_state.try_select_hero(client_id, &hero_id, &config) {
                             println!("بازیکن {} هیروی '{}' را انتخاب کرد.", client_id, hero_id);
+                            if let (Some(ref rid), Some(vinfo), Some(hid_1based)) = (
+                                &auth_state.room_id,
+                                auth_state.verified_clients.get(&client_id),
+                                resolve_hero_id_1based(&config, &hero_id),
+                            ) {
+                                notify_django_player_state(
+                                    &config,
+                                    rid,
+                                    auth_state.port,
+                                    &vinfo.user_id,
+                                    &vinfo.ticket_id,
+                                    vinfo.slot_index,
+                                    "connected",
+                                    Some(hid_1based),
+                                    None,
+                                );
+                            }
                         }
                     }
                     ClientLobbyMessage::ReportMapLoaded => {
@@ -836,6 +952,23 @@ fn server_match_tick_system(
     if match_state.tick(time.delta_secs(), &config).is_some() {
         let old_ents: Vec<Entity> = existing_soldiers.iter().collect();
         world.init_multiplayer_players(&config, &match_state, &mut commands, &old_ents);
+        if let Some(ref rid) = auth_state.room_id {
+            for vinfo in auth_state.verified_clients.values() {
+                if let Some(live_p) = world.players.iter().find(|p| p.slot_index == vinfo.slot_index) {
+                    notify_django_player_state(
+                        &config,
+                        rid,
+                        auth_state.port,
+                        &vinfo.user_id,
+                        &vinfo.ticket_id,
+                        vinfo.slot_index,
+                        "connected",
+                        Some(live_p.hero_index + 1),
+                        Some(live_p),
+                    );
+                }
+            }
+        }
         println!(
             "همه {} بازیکن وارد زمین بازی شدند (تیم Dawn در غرب و تیم Dusk در شرق)!",
             world.players.len()
@@ -862,9 +995,10 @@ fn server_match_tick_system(
                         .get(p.slot_index)
                         .and_then(|lp| lp.user_id.as_deref())
                         .unwrap_or("");
+                    let items_json = serialize_final_items_json(&p.inventory);
                     players_json.push_str(&format!(
-                        "{{\"user_id\":\"{}\",\"slot_index\":{},\"hero_id\":{},\"level\":{},\"kills\":{},\"deaths\":{},\"assists\":{},\"last_hits\":{},\"denies\":{},\"gold_coins\":{}}}",
-                        uid,
+                        "{{\"user_id\":\"{}\",\"slot_index\":{},\"hero_id\":{},\"level\":{},\"kills\":{},\"deaths\":{},\"assists\":{},\"last_hits\":{},\"denies\":{},\"gold_coins\":{},\"final_items\":{}}}",
+                        escape_json_str(uid),
                         p.slot_index,
                         p.hero_index + 1,
                         p.hero_level,
@@ -873,7 +1007,8 @@ fn server_match_tick_system(
                         p.assists,
                         p.last_hits,
                         p.denies,
-                        p.hero_gold
+                        p.hero_gold,
+                        items_json
                     ));
                 }
                 players_json.push(']');

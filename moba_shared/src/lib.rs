@@ -415,6 +415,19 @@ pub struct MainMenuConfig {
     pub http_timeout_secs: u64,
     pub ws_ping_interval_secs: u64,
     pub ws_poll_sleep_ms: u64,
+    pub hero_icon_anisotropy_clamp: u16,
+    pub hero_icon_generate_mipmaps: bool,
+    pub hero_icon_border_radius_px: f32,
+    pub recent_match_icon_size_px: f32,
+    pub history_log_icon_size_px: f32,
+    pub history_detail_hero_icon_size_px: f32,
+    pub history_player_row_icon_size_px: f32,
+    pub demo_hero_icon_size_px: f32,
+    pub history_log_item_slot_size_px: f32,
+    pub history_detail_item_slot_size_px: f32,
+    pub history_player_item_slot_size_px: f32,
+    pub history_item_slot_border_radius_px: f32,
+    pub history_item_slot_gap_px: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1267,6 +1280,54 @@ impl GameConfig {
         assert!(mm.http_timeout_secs > 0, "main_menu.http_timeout_secs باید بزرگ‌تر از صفر باشد");
         assert!(mm.ws_ping_interval_secs > 0, "main_menu.ws_ping_interval_secs باید بزرگ‌تر از صفر باشد");
         assert!(mm.ws_poll_sleep_ms > 0, "main_menu.ws_poll_sleep_ms باید بزرگ‌تر از صفر باشد");
+        assert!(
+            matches!(mm.hero_icon_anisotropy_clamp, 1 | 2 | 4 | 8 | 16),
+            "main_menu.hero_icon_anisotropy_clamp باید یکی از مقادیر 1، 2، 4، 8 یا 16 باشد"
+        );
+        assert!(
+            mm.hero_icon_border_radius_px.is_finite() && mm.hero_icon_border_radius_px >= 0.0,
+            "main_menu.hero_icon_border_radius_px نامعتبر است"
+        );
+        assert!(
+            mm.recent_match_icon_size_px.is_finite() && mm.recent_match_icon_size_px >= 16.0,
+            "main_menu.recent_match_icon_size_px باید حداقل 16 پیکسل باشد"
+        );
+        assert!(
+            mm.history_log_icon_size_px.is_finite() && mm.history_log_icon_size_px >= 16.0,
+            "main_menu.history_log_icon_size_px باید حداقل 16 پیکسل باشد"
+        );
+        assert!(
+            mm.history_detail_hero_icon_size_px.is_finite() && mm.history_detail_hero_icon_size_px >= 32.0,
+            "main_menu.history_detail_hero_icon_size_px باید حداقل 32 پیکسل باشد"
+        );
+        assert!(
+            mm.history_player_row_icon_size_px.is_finite() && mm.history_player_row_icon_size_px >= 16.0,
+            "main_menu.history_player_row_icon_size_px باید حداقل 16 پیکسل باشد"
+        );
+        assert!(
+            mm.demo_hero_icon_size_px.is_finite() && mm.demo_hero_icon_size_px >= 24.0,
+            "main_menu.demo_hero_icon_size_px باید حداقل 24 پیکسل باشد"
+        );
+        assert!(
+            mm.history_log_item_slot_size_px.is_finite() && mm.history_log_item_slot_size_px >= 16.0,
+            "main_menu.history_log_item_slot_size_px باید حداقل 16 پیکسل باشد"
+        );
+        assert!(
+            mm.history_detail_item_slot_size_px.is_finite() && mm.history_detail_item_slot_size_px >= 24.0,
+            "main_menu.history_detail_item_slot_size_px باید حداقل 24 پیکسل باشد"
+        );
+        assert!(
+            mm.history_player_item_slot_size_px.is_finite() && mm.history_player_item_slot_size_px >= 16.0,
+            "main_menu.history_player_item_slot_size_px باید حداقل 16 پیکسل باشد"
+        );
+        assert!(
+            mm.history_item_slot_border_radius_px.is_finite() && mm.history_item_slot_border_radius_px >= 0.0,
+            "main_menu.history_item_slot_border_radius_px نامعتبر است"
+        );
+        assert!(
+            mm.history_item_slot_gap_px.is_finite() && mm.history_item_slot_gap_px >= 0.0,
+            "main_menu.history_item_slot_gap_px نامعتبر است"
+        );
         for (i, slot) in mm.squad_slots.iter().enumerate() {
             assert!(slot.scale.is_finite() && slot.scale > 0.0, "main_menu.squad_slots[{}].scale نامعتبر است", i);
             assert!(slot.yaw_deg.is_finite(), "main_menu.squad_slots[{}].yaw_deg نامعتبر است", i);

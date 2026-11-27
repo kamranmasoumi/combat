@@ -1,24 +1,28 @@
 use crate::backend_client::{
     clear_persisted_session, load_persisted_session, sanitize_ascii_msg, ActiveMatchInfo,
     BackendAsyncEvent, BackendClient, FriendsSnapshot, LobbyDetail, LobbySummary,
-    LobbyInviteInfo, MatchHistoryResponse, PartyInviteInfo, PartyState, PlayerProfile,
+    LobbyInviteInfo, MatchHistoryItemSlot, MatchHistoryResponse, PartyInviteInfo, PartyState, PlayerProfile,
     PlayerSearchResult,
 };
 use bevy::animation::RepeatAnimation;
 use bevy::app::AppExit;
 use bevy::gltf::Gltf;
+use bevy::image::{
+    ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor,
+};
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input::ButtonState;
 use bevy::light::AmbientLight;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::render::render_resource::{TextureDimension, TextureFormat};
 use bevy::ui::{Pressed, RelativeCursorPosition};
 use bevy::ui_widgets::Button as UiButton;
 use bevy::window::{CursorOptions, PrimaryWindow};
 use crate::demo_client::PendingDemoLaunch;
-use moba_shared::GameConfig;
-use std::collections::HashMap;
+use moba_shared::{parse_recipe_target, GameConfig, HeroDef, ItemsConfig};
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::TAU;
 
 // =============================================================================
@@ -231,6 +235,18 @@ struct MenuShowcaseAssets {
     showcase_visible: bool,
 }
 
+#[derive(Resource, Default)]
+struct MenuHeroPortraitCache {
+    handles: HashMap<String, Handle<Image>>,
+    mipmapped: HashSet<String>,
+}
+
+#[derive(Resource, Default)]
+struct MenuItemIconCache {
+    handles: HashMap<String, Handle<Image>>,
+    mipmapped: HashSet<String>,
+}
+
 #[derive(Component)]
 struct PreGameEntity;
 
@@ -360,11 +376,15 @@ impl Plugin for PreGamePlugin {
         app.init_resource::<PreGameSessionState>()
             .init_resource::<PendingMatchConnection>()
             .init_resource::<MenuShowcaseAssets>()
+            .init_resource::<MenuHeroPortraitCache>()
+            .init_resource::<MenuItemIconCache>()
             .add_systems(OnEnter(AppScreenState::PreGame), on_enter_pregame)
             .add_systems(OnExit(AppScreenState::PreGame), on_exit_pregame)
             .add_systems(
                 Update,
                 (
+                    prepare_hero_portrait_mipmaps_system,
+                    prepare_item_icon_mipmaps_system,
                     poll_backend_events_system,
                     handle_pregame_keyboard_system,
                     handle_pregame_buttons_system,
@@ -456,12 +476,15 @@ fn validate_client_username(u: &str) -> Result<(), &'static str> {
 fn on_enter_pregame(
     mut commands: Commands,
     config: Res<GameConfig>,
+    items_config: Res<ItemsConfig>,
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut backend: ResMut<BackendClient>,
     mut state: ResMut<PreGameSessionState>,
     mut showcase: ResMut<MenuShowcaseAssets>,
+    mut hero_portraits: ResMut<MenuHeroPortraitCache>,
+    mut item_icons: ResMut<MenuItemIconCache>,
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
     mut old_cams_q: Query<(Entity, &mut Camera), (With<Camera3d>, Without<PreGameEntity>)>,
     mut hud_roots: Query<(Entity, &mut Visibility), (With<Node>, Without<ChildOf>, Without<PreGameEntity>)>,
@@ -503,6 +526,74 @@ fn on_enter_pregame(
     showcase.idle_node = None;
     showcase.spawned_squad_count = 0;
     showcase.showcase_visible = false;
+
+    let assets_dir = crate::client_assets_dir();
+    let aniso = mm.hero_icon_anisotropy_clamp;
+    let use_mipmaps = mm.hero_icon_generate_mipmaps;
+    for hero in &config.heroes {
+        let full_path = assets_dir.join(&hero.portrait_path);
+        assert!(
+            full_path.is_file(),
+            "Hero portrait file missing for '{}' ({}): expected '{}'",
+            hero.id,
+            hero.display_name,
+            full_path.display()
+        );
+        if !hero_portraits.handles.contains_key(&hero.portrait_path) {
+            let handle: Handle<Image> = asset_server
+                .load_builder()
+                .with_settings(move |s: &mut ImageLoaderSettings| {
+                    s.is_srgb = true;
+                    s.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                        address_mode_u: ImageAddressMode::ClampToEdge,
+                        address_mode_v: ImageAddressMode::ClampToEdge,
+                        mag_filter: ImageFilterMode::Linear,
+                        min_filter: ImageFilterMode::Linear,
+                        mipmap_filter: if use_mipmaps {
+                            ImageFilterMode::Linear
+                        } else {
+                            ImageFilterMode::Nearest
+                        },
+                        anisotropy_clamp: aniso,
+                        ..default()
+                    });
+                })
+                .load(hero.portrait_path.clone());
+            hero_portraits
+                .handles
+                .insert(hero.portrait_path.clone(), handle);
+        }
+    }
+
+    for item in &items_config.items {
+        let icon_path = item.icon_path.trim();
+        if icon_path.is_empty() || item_icons.handles.contains_key(icon_path) {
+            continue;
+        }
+        let full_path = assets_dir.join(icon_path);
+        if full_path.is_file() {
+            let handle: Handle<Image> = asset_server
+                .load_builder()
+                .with_settings(move |s: &mut ImageLoaderSettings| {
+                    s.is_srgb = true;
+                    s.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                        address_mode_u: ImageAddressMode::ClampToEdge,
+                        address_mode_v: ImageAddressMode::ClampToEdge,
+                        mag_filter: ImageFilterMode::Linear,
+                        min_filter: ImageFilterMode::Linear,
+                        mipmap_filter: if use_mipmaps {
+                            ImageFilterMode::Linear
+                        } else {
+                            ImageFilterMode::Nearest
+                        },
+                        anisotropy_clamp: aniso,
+                        ..default()
+                    });
+                })
+                .load(icon_path.to_string());
+            item_icons.handles.insert(icon_path.to_string(), handle);
+        }
+    }
 
     let cam_pos = Vec3::from_array(mm.camera_position);
     let cam_look = Vec3::from_array(mm.camera_look_at);
@@ -816,6 +907,259 @@ fn attach_menu_soldier_anim_system(
     }
 }
 
+#[inline]
+fn srgb_u8_to_linear(v: u8) -> f32 {
+    let s = (v as f32) / 255.0;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+fn linear_to_srgb_u8(l: f32) -> u8 {
+    let clamped = l.clamp(0.0, 1.0);
+    let s = if clamped <= 0.0031308 {
+        clamped * 12.92
+    } else {
+        1.055 * clamped.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+}
+
+fn generate_rgba8_mip_chain(
+    base_pixels: &[u8],
+    base_w: u32,
+    base_h: u32,
+    is_srgb: bool,
+) -> (Vec<u8>, u32) {
+    let mut all_data = Vec::with_capacity(base_pixels.len() * 4 / 3 + 64);
+    all_data.extend_from_slice(base_pixels);
+    let mut prev = base_pixels.to_vec();
+    let mut w = base_w;
+    let mut h = base_h;
+    let mut mip_count = 1u32;
+
+    while w > 1 || h > 1 {
+        let next_w = (w / 2).max(1);
+        let next_h = (h / 2).max(1);
+        let mut next = vec![0u8; (next_w as usize) * (next_h as usize) * 4];
+
+        for ny in 0..next_h {
+            let sy0 = (ny * 2).min(h - 1);
+            let sy1 = (ny * 2 + 1).min(h - 1);
+            for nx in 0..next_w {
+                let sx0 = (nx * 2).min(w - 1);
+                let sx1 = (nx * 2 + 1).min(w - 1);
+                let coords = [(sx0, sy0), (sx1, sy0), (sx0, sy1), (sx1, sy1)];
+
+                let mut sum_r = 0.0_f32;
+                let mut sum_g = 0.0_f32;
+                let mut sum_b = 0.0_f32;
+                let mut sum_a = 0.0_f32;
+                let mut alpha_weight = 0.0_f32;
+
+                for (sx, sy) in coords {
+                    let idx = ((sy as usize) * (w as usize) + (sx as usize)) * 4;
+                    let a = (prev[idx + 3] as f32) / 255.0;
+                    let (r, g, b) = if is_srgb {
+                        (
+                            srgb_u8_to_linear(prev[idx]),
+                            srgb_u8_to_linear(prev[idx + 1]),
+                            srgb_u8_to_linear(prev[idx + 2]),
+                        )
+                    } else {
+                        (
+                            prev[idx] as f32 / 255.0,
+                            prev[idx + 1] as f32 / 255.0,
+                            prev[idx + 2] as f32 / 255.0,
+                        )
+                    };
+                    sum_r += r * a;
+                    sum_g += g * a;
+                    sum_b += b * a;
+                    sum_a += a;
+                    alpha_weight += a;
+                }
+
+                let dst = ((ny as usize) * (next_w as usize) + (nx as usize)) * 4;
+                let out_a = sum_a * 0.25;
+                if alpha_weight > 1e-5 {
+                    let inv_w = 1.0 / alpha_weight;
+                    let r = sum_r * inv_w;
+                    let g = sum_g * inv_w;
+                    let b = sum_b * inv_w;
+                    if is_srgb {
+                        next[dst] = linear_to_srgb_u8(r);
+                        next[dst + 1] = linear_to_srgb_u8(g);
+                        next[dst + 2] = linear_to_srgb_u8(b);
+                    } else {
+                        next[dst] = (r * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                        next[dst + 1] = (g * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                        next[dst + 2] = (b * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    }
+                }
+                next[dst + 3] = (out_a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
+
+        all_data.extend_from_slice(&next);
+        prev = next;
+        w = next_w;
+        h = next_h;
+        mip_count += 1;
+    }
+
+    (all_data, mip_count)
+}
+
+fn prepare_hero_portrait_mipmaps_system(
+    config: Res<GameConfig>,
+    mut images: ResMut<Assets<Image>>,
+    mut cache: ResMut<MenuHeroPortraitCache>,
+) {
+    if !config.main_menu.hero_icon_generate_mipmaps {
+        return;
+    }
+    if cache.mipmapped.len() >= cache.handles.len() {
+        return;
+    }
+
+    let pending: Vec<(String, Handle<Image>)> = cache
+        .handles
+        .iter()
+        .filter(|(path, _)| !cache.mipmapped.contains(path.as_str()))
+        .map(|(p, h)| (p.clone(), h.clone()))
+        .collect();
+
+    let aniso = config.main_menu.hero_icon_anisotropy_clamp;
+    for (path, handle) in pending {
+        let Some(mut img) = images.get_mut(&handle) else {
+            continue;
+        };
+        let is_srgb = match img.texture_descriptor.format {
+            TextureFormat::Rgba8UnormSrgb => true,
+            TextureFormat::Rgba8Unorm => false,
+            _ => {
+                cache.mipmapped.insert(path);
+                continue;
+            }
+        };
+        if img.texture_descriptor.dimension != TextureDimension::D2
+            || img.texture_descriptor.size.depth_or_array_layers != 1
+            || img.texture_descriptor.mip_level_count > 1
+        {
+            cache.mipmapped.insert(path);
+            continue;
+        }
+        let w = img.texture_descriptor.size.width;
+        let h = img.texture_descriptor.size.height;
+        let expected_bytes = (w as usize) * (h as usize) * 4;
+        if w <= 1 || h <= 1 {
+            cache.mipmapped.insert(path);
+            continue;
+        }
+        let Some(base_data) = img.data.as_ref() else {
+            cache.mipmapped.insert(path);
+            continue;
+        };
+        if base_data.len() != expected_bytes {
+            cache.mipmapped.insert(path);
+            continue;
+        }
+
+        let (mip_bytes, mip_levels) = generate_rgba8_mip_chain(base_data, w, h, is_srgb);
+        img.data = Some(mip_bytes);
+        img.texture_descriptor.mip_level_count = mip_levels;
+        img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::ClampToEdge,
+            address_mode_v: ImageAddressMode::ClampToEdge,
+            mag_filter: ImageFilterMode::Linear,
+            min_filter: ImageFilterMode::Linear,
+            mipmap_filter: ImageFilterMode::Linear,
+            anisotropy_clamp: aniso,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: (mip_levels.saturating_sub(1)) as f32,
+            ..default()
+        });
+        cache.mipmapped.insert(path);
+    }
+}
+
+fn prepare_item_icon_mipmaps_system(
+    config: Res<GameConfig>,
+    mut images: ResMut<Assets<Image>>,
+    mut cache: ResMut<MenuItemIconCache>,
+) {
+    if !config.main_menu.hero_icon_generate_mipmaps {
+        return;
+    }
+    if cache.mipmapped.len() >= cache.handles.len() {
+        return;
+    }
+
+    let pending: Vec<(String, Handle<Image>)> = cache
+        .handles
+        .iter()
+        .filter(|(path, _)| !cache.mipmapped.contains(path.as_str()))
+        .map(|(p, h)| (p.clone(), h.clone()))
+        .collect();
+
+    let aniso = config.main_menu.hero_icon_anisotropy_clamp;
+    for (path, handle) in pending {
+        let Some(mut img) = images.get_mut(&handle) else {
+            continue;
+        };
+        let is_srgb = match img.texture_descriptor.format {
+            TextureFormat::Rgba8UnormSrgb => true,
+            TextureFormat::Rgba8Unorm => false,
+            _ => {
+                cache.mipmapped.insert(path);
+                continue;
+            }
+        };
+        if img.texture_descriptor.dimension != TextureDimension::D2
+            || img.texture_descriptor.size.depth_or_array_layers != 1
+            || img.texture_descriptor.mip_level_count > 1
+        {
+            cache.mipmapped.insert(path);
+            continue;
+        }
+        let w = img.texture_descriptor.size.width;
+        let h = img.texture_descriptor.size.height;
+        let expected_bytes = (w as usize) * (h as usize) * 4;
+        if w <= 1 || h <= 1 {
+            cache.mipmapped.insert(path);
+            continue;
+        }
+        let Some(base_data) = img.data.as_ref() else {
+            cache.mipmapped.insert(path);
+            continue;
+        };
+        if base_data.len() != expected_bytes {
+            cache.mipmapped.insert(path);
+            continue;
+        }
+
+        let (mip_bytes, mip_levels) = generate_rgba8_mip_chain(base_data, w, h, is_srgb);
+        img.data = Some(mip_bytes);
+        img.texture_descriptor.mip_level_count = mip_levels;
+        img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::ClampToEdge,
+            address_mode_v: ImageAddressMode::ClampToEdge,
+            mag_filter: ImageFilterMode::Linear,
+            min_filter: ImageFilterMode::Linear,
+            mipmap_filter: ImageFilterMode::Linear,
+            anisotropy_clamp: aniso,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: (mip_levels.saturating_sub(1)) as f32,
+            ..default()
+        });
+        cache.mipmapped.insert(path);
+    }
+}
+
 // =============================================================================
 // دریافت رویدادهای غیرمسدودکننده بک‌اند و اتصال مجدد خودکار وب‌سوکت دوستان/پارتی
 // =============================================================================
@@ -990,6 +1334,9 @@ fn poll_backend_events_system(
                     p.rank_tier = rank_tier;
                     p.losses = losses;
                     p.abandoned_count = abandoned_count;
+                }
+                if let Some(tok) = state.access_token.clone() {
+                    backend.fetch_match_history(tok);
                 }
                 push_notification(
                     &mut state,
@@ -2598,7 +2945,10 @@ fn animate_pregame_loaders_system(
 fn rebuild_pregame_ui_system(
     mut commands: Commands,
     config: Res<GameConfig>,
+    items_config: Res<ItemsConfig>,
     backend: Res<BackendClient>,
+    hero_portraits: Res<MenuHeroPortraitCache>,
+    item_icons: Res<MenuItemIconCache>,
     mut state: ResMut<PreGameSessionState>,
     root_q: Query<(Entity, Option<&Children>), With<PreGameDynamicRoot>>,
 ) {
@@ -2642,12 +2992,19 @@ fn rebuild_pregame_ui_system(
 
         match state.tab {
             PreGameTab::AuthEmail | PreGameTab::AuthOtp => spawn_auth_screen(parent, &state),
-            PreGameTab::Hub => spawn_hub_screen(parent, &state, &config),
+            PreGameTab::Hub => spawn_hub_screen(parent, &state, &config, &hero_portraits),
             PreGameTab::FindingMatch => spawn_finding_match_screen(parent, &state, &config),
             PreGameTab::LobbyBrowser => spawn_lobby_browser_screen(parent, &state, &config),
             PreGameTab::LobbyRoom => spawn_lobby_room_screen(parent, &state, &config),
-            PreGameTab::MatchHistory => spawn_history_screen(parent, &state, &config),
-            PreGameTab::DemoHero => spawn_demo_hero_screen(parent, &config),
+            PreGameTab::MatchHistory => spawn_history_screen(
+                parent,
+                &state,
+                &config,
+                &items_config,
+                &hero_portraits,
+                &item_icons,
+            ),
+            PreGameTab::DemoHero => spawn_demo_hero_screen(parent, &config, &hero_portraits),
         }
 
         if state.create_lobby_modal_open || state.edit_lobby_settings_open {
@@ -3423,6 +3780,7 @@ fn spawn_hub_screen(
     parent: &mut ChildSpawnerCommands,
     state: &PreGameSessionState,
     config: &GameConfig,
+    hero_portraits: &MenuHeroPortraitCache,
 ) {
     let my_uid = state
         .profile
@@ -3807,21 +4165,21 @@ fn spawn_hub_screen(
                 });
 
             // =================================================================
-            // پایین وسط: کارت RECENT MATCHES
+            // پایین وسط: کارت RECENT MATCHES (با آیکون هیرو)
             // =================================================================
             stage
                 .spawn((
                     Node {
-                        width: Val::Px(256.0),
+                        width: Val::Px(316.0),
                         padding: UiRect::all(Val::Px(12.0)),
                         flex_direction: FlexDirection::Column,
                         row_gap: Val::Px(6.0),
                         border: UiRect::all(Val::Px(1.5)),
-                        border_radius: BorderRadius::all(Val::Px(4.0)),
+                        border_radius: BorderRadius::all(Val::Px(5.0)),
                         ..default()
                     },
-                    BackgroundColor(Color::srgba(0.025, 0.082, 0.098, 0.88)),
-                    BorderColor::all(Color::srgba(0.24, 0.64, 0.62, 0.70)),
+                    BackgroundColor(Color::srgba(0.025, 0.082, 0.098, 0.90)),
+                    BorderColor::all(Color::srgba(0.24, 0.64, 0.62, 0.72)),
                 ))
                 .with_children(|recent| {
                     recent.spawn((
@@ -3849,29 +4207,33 @@ fn spawn_hub_screen(
                             TextColor(Color::srgb(0.56, 0.70, 0.70)),
                         ));
                     } else {
+                        let icon_sz = config.main_menu.recent_match_icon_size_px;
+                        let icon_rad = config.main_menu.hero_icon_border_radius_px;
                         for m in matches_slice.iter().take(3) {
                             let (lbl, row_bg, lbl_col) = match m.outcome.as_str() {
                                 "win" => (
                                     "VICTORY",
-                                    Color::srgba(0.07, 0.28, 0.18, 0.82),
+                                    Color::srgba(0.06, 0.24, 0.16, 0.86),
                                     Color::srgb(0.32, 0.96, 0.56),
                                 ),
                                 "loss" => (
                                     "DEFEAT",
-                                    Color::srgba(0.32, 0.09, 0.10, 0.82),
+                                    Color::srgba(0.28, 0.08, 0.09, 0.86),
                                     Color::srgb(0.98, 0.42, 0.42),
                                 ),
                                 "abandoned" => (
                                     "ABANDON",
-                                    Color::srgba(0.30, 0.20, 0.06, 0.82),
+                                    Color::srgba(0.28, 0.18, 0.05, 0.86),
                                     Color::srgb(0.98, 0.78, 0.34),
                                 ),
                                 _ => (
                                     "LIVE",
-                                    Color::srgba(0.08, 0.24, 0.30, 0.82),
+                                    Color::srgba(0.07, 0.22, 0.28, 0.86),
                                     Color::srgb(0.40, 0.90, 0.98),
                                 ),
                             };
+                            let hero_def = resolve_hero_def(config, m.hero_id);
+                            let hero_name = resolve_hero_display_name(config, m.hero_id);
                             let party_tag = if m.is_party_match { " [P]" } else { "" };
                             recent
                                 .spawn((
@@ -3879,37 +4241,77 @@ fn spawn_hub_screen(
                                     Hovered::default(),
                                     Node {
                                         width: Val::Percent(100.0),
-                                        padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                                        padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
                                         flex_direction: FlexDirection::Row,
                                         justify_content: JustifyContent::SpaceBetween,
                                         align_items: AlignItems::Center,
-                                        border: UiRect::all(Val::Px(1.0)),
-                                        border_radius: BorderRadius::all(Val::Px(3.0)),
+                                        column_gap: Val::Px(8.0),
+                                        border: UiRect {
+                                            left: Val::Px(3.0),
+                                            right: Val::Px(1.0),
+                                            top: Val::Px(1.0),
+                                            bottom: Val::Px(1.0),
+                                        },
+                                        border_radius: BorderRadius::all(Val::Px(4.0)),
                                         ..default()
                                     },
                                     BackgroundColor(row_bg),
-                                    BorderColor::all(Color::srgba(0.28, 0.50, 0.52, 0.35)),
+                                    BorderColor::all(lbl_col.with_alpha(0.55)),
                                     PreGameBtnAction::SwitchTab(PreGameTab::MatchHistory),
                                 ))
                                 .with_children(|r| {
-                                    r.spawn((
-                                        Text::new(format!("{}{}", lbl, party_tag)),
-                                        TextFont {
-                                            font_size: FontSize::Px(12.0),
+                                    r.spawn(Node {
+                                        flex_direction: FlexDirection::Row,
+                                        align_items: AlignItems::Center,
+                                        column_gap: Val::Px(8.0),
+                                        ..default()
+                                    })
+                                    .with_children(|left| {
+                                        spawn_hero_portrait_frame(
+                                            left,
+                                            hero_def,
+                                            hero_portraits,
+                                            icon_sz,
+                                            icon_rad,
+                                            lbl_col.with_alpha(0.85),
+                                            1.5,
+                                            None,
+                                        );
+                                        left.spawn(Node {
+                                            flex_direction: FlexDirection::Column,
+                                            row_gap: Val::Px(1.0),
                                             ..default()
-                                        },
-                                        TextColor(lbl_col),
-                                    ));
+                                        })
+                                        .with_children(|meta| {
+                                            meta.spawn((
+                                                Text::new(hero_name),
+                                                TextFont {
+                                                    font_size: FontSize::Px(11.5),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::WHITE),
+                                            ));
+                                            meta.spawn((
+                                                Text::new(format!("{}{}", lbl, party_tag)),
+                                                TextFont {
+                                                    font_size: FontSize::Px(10.0),
+                                                    ..default()
+                                                },
+                                                TextColor(lbl_col),
+                                            ));
+                                        });
+                                    });
+
                                     r.spawn((
                                         Text::new(format!(
-                                            "{} / {} / {}",
+                                            "{}/{}/{}",
                                             m.kills, m.deaths, m.assists
                                         )),
                                         TextFont {
                                             font_size: FontSize::Px(12.0),
                                             ..default()
                                         },
-                                        TextColor(Color::srgb(0.92, 0.96, 0.96)),
+                                        TextColor(Color::srgb(0.94, 0.98, 0.98)),
                                     ));
                                 });
                         }
@@ -6396,26 +6798,578 @@ fn spawn_team_slots_panel(
         });
 }
 
-fn resolve_hero_display_name(config: &GameConfig, hero_id: i32) -> String {
+fn resolve_hero_def<'a>(config: &'a GameConfig, hero_id: i32) -> Option<&'a HeroDef> {
     if hero_id > 0 {
-        if let Some(h) = config.heroes.get((hero_id - 1) as usize) {
-            return h.display_name.to_uppercase();
-        }
+        config.heroes.get((hero_id - 1) as usize)
+    } else {
+        None
     }
-    if let Some(h) = config.heroes.first() {
-        return h.display_name.to_uppercase();
+}
+
+fn resolve_hero_display_name(config: &GameConfig, hero_id: i32) -> String {
+    match resolve_hero_def(config, hero_id) {
+        Some(h) => h.display_name.to_uppercase(),
+        None => "UNASSIGNED".to_string(),
     }
-    "SOLDIER".to_string()
+}
+
+fn compute_kda_ratio(kills: i32, deaths: i32, assists: i32) -> f32 {
+    let denom = deaths.max(1) as f32;
+    (kills + assists) as f32 / denom
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_hero_portrait_frame(
+    parent: &mut ChildSpawnerCommands,
+    hero: Option<&HeroDef>,
+    portraits: &MenuHeroPortraitCache,
+    size_px: f32,
+    border_radius_px: f32,
+    border_color: Color,
+    border_width_px: f32,
+    level_badge: Option<i32>,
+) {
+    let clamped_radius = border_radius_px.min(size_px * 0.5);
+    let inner_radius = (clamped_radius - border_width_px).max(0.0);
+
+    parent
+        .spawn((
+            Node {
+                width: Val::Px(size_px),
+                height: Val::Px(size_px),
+                flex_shrink: 0.0,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(border_width_px)),
+                border_radius: BorderRadius::all(Val::Px(clamped_radius)),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.02, 0.06, 0.08, 0.96)),
+            BorderColor::all(border_color),
+        ))
+        .with_children(|frame| {
+            if let Some(h) = hero {
+                let handle = portraits
+                    .handles
+                    .get(&h.portrait_path)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Hero portrait handle missing in MenuHeroPortraitCache for '{}' ({})",
+                            h.id, h.portrait_path
+                        )
+                    })
+                    .clone();
+                frame.spawn((
+                    ImageNode::new(handle),
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        border_radius: BorderRadius::all(Val::Px(inner_radius)),
+                        ..default()
+                    },
+                ));
+            } else {
+                frame.spawn((
+                    Text::new("?"),
+                    TextFont {
+                        font_size: FontSize::Px((size_px * 0.44).clamp(11.0, 28.0)),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.56, 0.72, 0.74)),
+                ));
+            }
+
+            if let Some(lvl) = level_badge {
+                if lvl > 0 {
+                    frame
+                        .spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                right: Val::Px(2.0),
+                                bottom: Val::Px(2.0),
+                                padding: UiRect::axes(Val::Px(4.0), Val::Px(1.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                border_radius: BorderRadius::all(Val::Px(3.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.02, 0.05, 0.07, 0.92)),
+                            BorderColor::all(border_color.with_alpha(0.85)),
+                        ))
+                        .with_children(|badge| {
+                            badge.spawn((
+                                Text::new(format!("L{}", lvl)),
+                                TextFont {
+                                    font_size: FontSize::Px(9.0),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.98, 0.88, 0.42)),
+                            ));
+                        });
+                }
+            }
+        });
+}
+
+fn spawn_kda_colored_row(
+    parent: &mut ChildSpawnerCommands,
+    kills: i32,
+    deaths: i32,
+    assists: i32,
+    font_size: f32,
+) {
+    let emerald = Color::srgb(0.32, 0.96, 0.62);
+    let crimson = Color::srgb(0.98, 0.42, 0.42);
+    let teal = Color::srgb(0.42, 0.90, 0.96);
+    let slash = Color::srgb(0.52, 0.66, 0.68);
+
+    parent
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(3.0),
+            ..default()
+        })
+        .with_children(|r| {
+            r.spawn((
+                Text::new(format!("{}", kills)),
+                TextFont { font_size: FontSize::Px(font_size), ..default() },
+                TextColor(emerald),
+            ));
+            r.spawn((
+                Text::new("/"),
+                TextFont { font_size: FontSize::Px(font_size - 1.0), ..default() },
+                TextColor(slash),
+            ));
+            r.spawn((
+                Text::new(format!("{}", deaths)),
+                TextFont { font_size: FontSize::Px(font_size), ..default() },
+                TextColor(crimson),
+            ));
+            r.spawn((
+                Text::new("/"),
+                TextFont { font_size: FontSize::Px(font_size - 1.0), ..default() },
+                TextColor(slash),
+            ));
+            r.spawn((
+                Text::new(format!("{}", assists)),
+                TextFont { font_size: FontSize::Px(font_size), ..default() },
+                TextColor(teal),
+            ));
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_inventory_slots_strip(
+    parent: &mut ChildSpawnerCommands,
+    items_config: &ItemsConfig,
+    item_icons: &MenuItemIconCache,
+    final_items: &[MatchHistoryItemSlot],
+    slot_size_px: f32,
+    border_radius_px: f32,
+    gap_px: f32,
+    show_slot_numbers: bool,
+) {
+    let slot_count = items_config.max_inventory_slots;
+    let clamped_rad = border_radius_px.min(slot_size_px * 0.4);
+    let inner_rad = (clamped_rad - 1.2).max(0.0);
+
+    parent
+        .spawn((
+            Node {
+                padding: UiRect::all(Val::Px(if show_slot_numbers { 5.0 } else { 3.0 })),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(gap_px),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(clamped_rad + 2.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.015, 0.044, 0.058, 0.92)),
+            BorderColor::all(Color::srgba(0.22, 0.46, 0.50, 0.50)),
+        ))
+        .with_children(|tray| {
+            for idx in 0..slot_count {
+                let entry = final_items.iter().find(|it| it.slot == idx);
+                if let Some(slot_entry) = entry {
+                    if parse_recipe_target(&slot_entry.item_id).is_some() {
+                        tray.spawn((
+                            Node {
+                                width: Val::Px(slot_size_px),
+                                height: Val::Px(slot_size_px),
+                                flex_shrink: 0.0,
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(1.3)),
+                                border_radius: BorderRadius::all(Val::Px(clamped_rad)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba(0.24, 0.18, 0.06, 0.95)),
+                            BorderColor::all(Color::srgb(0.95, 0.78, 0.30)),
+                        ))
+                        .with_children(|slot| {
+                            slot.spawn((
+                                Text::new("REC"),
+                                TextFont {
+                                    font_size: FontSize::Px((slot_size_px * 0.28).clamp(7.5, 11.5)),
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(1.0, 0.88, 0.44)),
+                            ));
+                        });
+                        continue;
+                    }
+
+                    if let Some(item) = items_config.get_item(&slot_entry.item_id) {
+                        let c = item.icon_color_rgb;
+                        let bg = Color::srgb(c.0 * 0.24, c.1 * 0.24, c.2 * 0.24);
+                        let bdr = Color::srgb(
+                            (c.0 * 0.85 + 0.15).min(1.0),
+                            (c.1 * 0.85 + 0.15).min(1.0),
+                            (c.2 * 0.85 + 0.15).min(1.0),
+                        );
+                        tray.spawn((
+                            Node {
+                                width: Val::Px(slot_size_px),
+                                height: Val::Px(slot_size_px),
+                                flex_shrink: 0.0,
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border: UiRect::all(Val::Px(1.3)),
+                                border_radius: BorderRadius::all(Val::Px(clamped_rad)),
+                                overflow: Overflow::clip(),
+                                ..default()
+                            },
+                            BackgroundColor(bg),
+                            BorderColor::all(bdr),
+                        ))
+                        .with_children(|slot| {
+                            if let Some(icon_h) = item_icons.handles.get(item.icon_path.trim()) {
+                                slot.spawn((
+                                    ImageNode::new(icon_h.clone()),
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Percent(100.0),
+                                        border_radius: BorderRadius::all(Val::Px(inner_rad)),
+                                        ..default()
+                                    },
+                                ));
+                            } else {
+                                slot.spawn((
+                                    Text::new(&item.short_code),
+                                    TextFont {
+                                        font_size: FontSize::Px(
+                                            (slot_size_px * 0.30).clamp(8.0, 12.0),
+                                        ),
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(
+                                        (c.0 + 0.35).min(1.0),
+                                        (c.1 + 0.35).min(1.0),
+                                        (c.2 + 0.35).min(1.0),
+                                    )),
+                                ));
+                            }
+
+                            if show_slot_numbers {
+                                slot.spawn((
+                                    Node {
+                                        position_type: PositionType::Absolute,
+                                        top: Val::Px(1.0),
+                                        left: Val::Px(2.0),
+                                        padding: UiRect::axes(Val::Px(3.0), Val::Px(0.5)),
+                                        border_radius: BorderRadius::all(Val::Px(2.5)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.02, 0.03, 0.05, 0.86)),
+                                ))
+                                .with_children(|kb| {
+                                    kb.spawn((
+                                        Text::new(format!("{}", idx + 1)),
+                                        TextFont {
+                                            font_size: FontSize::Px(8.0),
+                                            ..default()
+                                        },
+                                        TextColor(Color::srgb(0.95, 0.85, 0.40)),
+                                    ));
+                                });
+                            }
+                        });
+                        continue;
+                    }
+                }
+
+                // اسلات خالی مشابه طراحی اینونتوری داخل بازی
+                tray.spawn((
+                    Node {
+                        width: Val::Px(slot_size_px),
+                        height: Val::Px(slot_size_px),
+                        flex_shrink: 0.0,
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border: UiRect::all(Val::Px(1.0)),
+                        border_radius: BorderRadius::all(Val::Px(clamped_rad)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.055, 0.080, 0.115, 0.82)),
+                    BorderColor::all(Color::srgba(0.24, 0.32, 0.40, 0.48)),
+                ))
+                .with_children(|empty| {
+                    empty.spawn((
+                        Text::new(format!("{}", idx + 1)),
+                        TextFont {
+                            font_size: FontSize::Px((slot_size_px * 0.30).clamp(8.0, 10.5)),
+                            ..default()
+                        },
+                        TextColor(Color::srgba(0.55, 0.68, 0.78, 0.42)),
+                    ));
+                });
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_history_team_block(
+    parent: &mut ChildSpawnerCommands,
+    config: &GameConfig,
+    items_config: &ItemsConfig,
+    hero_portraits: &MenuHeroPortraitCache,
+    item_icons: &MenuItemIconCache,
+    team_name: &str,
+    team_color: Color,
+    is_winner: bool,
+    players: &[&crate::backend_client::MatchHistoryPlayerRow],
+    party_tags: &HashMap<String, usize>,
+) {
+    let gold = Color::srgb(0.98, 0.82, 0.30);
+    let mm = &config.main_menu;
+    let icon_sz = mm.history_player_row_icon_size_px;
+    let icon_rad = mm.hero_icon_border_radius_px;
+
+    let total_kills: i32 = players.iter().map(|p| p.kills).sum();
+    let total_gold: i32 = players.iter().map(|p| p.gold_coins).sum();
+
+    // هدر تیم
+    parent
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                flex_shrink: 0.0,
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                border: UiRect {
+                    left: Val::Px(3.5),
+                    bottom: Val::Px(1.0),
+                    ..default()
+                },
+                border_radius: BorderRadius::all(Val::Px(3.0)),
+                ..default()
+            },
+            BackgroundColor(team_color.with_alpha(0.14)),
+            BorderColor::all(team_color.with_alpha(0.75)),
+        ))
+        .with_children(|hdr| {
+            hdr.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                ..default()
+            })
+            .with_children(|left| {
+                left.spawn((
+                    Text::new(team_name),
+                    TextFont { font_size: FontSize::Px(11.5), ..default() },
+                    TextColor(team_color),
+                ));
+                if is_winner {
+                    left.spawn((
+                        Node {
+                            padding: UiRect::axes(Val::Px(6.0), Val::Px(1.5)),
+                            border: UiRect::all(Val::Px(1.0)),
+                            border_radius: BorderRadius::all(Val::Px(3.0)),
+                            ..default()
+                        },
+                        BackgroundColor(gold.with_alpha(0.20)),
+                        BorderColor::all(gold.with_alpha(0.85)),
+                    ))
+                    .with_children(|w| {
+                        w.spawn((
+                            Text::new("WINNER"),
+                            TextFont { font_size: FontSize::Px(9.0), ..default() },
+                            TextColor(gold),
+                        ));
+                    });
+                }
+            });
+
+            hdr.spawn((
+                Text::new(format!("{} KILLS  |  {}G", total_kills, total_gold)),
+                TextFont { font_size: FontSize::Px(10.5), ..default() },
+                TextColor(Color::srgb(0.84, 0.92, 0.92)),
+            ));
+        });
+
+    if players.is_empty() {
+        parent.spawn((
+            Text::new("No players recorded for this team."),
+            TextFont { font_size: FontSize::Px(10.5), ..default() },
+            TextColor(Color::srgb(0.56, 0.70, 0.72)),
+        ));
+        return;
+    }
+
+    for p in players {
+        let hero_def = resolve_hero_def(config, p.hero_id);
+        let hero_lbl = resolve_hero_display_name(config, p.hero_id);
+        let p_tag = if !p.party_group_id.is_empty() {
+            format!(" [P{}]", party_tags.get(&p.party_group_id).copied().unwrap_or(1))
+        } else {
+            String::new()
+        };
+        let you_tag = if p.is_me { " [YOU]" } else { "" };
+        let frame_border = if p.is_me {
+            gold
+        } else {
+            team_color.with_alpha(0.80)
+        };
+
+        parent
+            .spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    flex_shrink: 0.0,
+                    padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(5.0),
+                    border: UiRect::all(Val::Px(if p.is_me { 1.2 } else { 1.0 })),
+                    border_radius: BorderRadius::all(Val::Px(5.0)),
+                    ..default()
+                },
+                BackgroundColor(if p.is_me {
+                    Color::srgba(0.11, 0.25, 0.25, 0.94)
+                } else {
+                    Color::srgba(0.032, 0.095, 0.115, 0.84)
+                }),
+                BorderColor::all(if p.is_me {
+                    gold.with_alpha(0.78)
+                } else {
+                    Color::srgba(0.22, 0.48, 0.50, 0.35)
+                }),
+            ))
+            .with_children(|prow| {
+                // ردیف بالا: آیکون هیرو + نام بازیکن/هیرو | آمار K/D/A + CS + Gold
+                prow.spawn(Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                })
+                .with_children(|top_row| {
+                    top_row
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(8.0),
+                            ..default()
+                        })
+                        .with_children(|left| {
+                            spawn_hero_portrait_frame(
+                                left,
+                                hero_def,
+                                hero_portraits,
+                                icon_sz,
+                                icon_rad,
+                                frame_border,
+                                1.5,
+                                None,
+                            );
+                            left.spawn(Node {
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(1.0),
+                                ..default()
+                            })
+                            .with_children(|info| {
+                                info.spawn((
+                                    Text::new(format!("{}{}{}", p.username, you_tag, p_tag)),
+                                    TextFont { font_size: FontSize::Px(11.5), ..default() },
+                                    TextColor(if p.is_me { gold } else { Color::WHITE }),
+                                ));
+                                info.spawn((
+                                    Text::new(format!("{}  |  LVL {}", hero_lbl, p.level)),
+                                    TextFont { font_size: FontSize::Px(9.5), ..default() },
+                                    TextColor(team_color.with_alpha(0.88)),
+                                ));
+                            });
+                        });
+
+                    top_row
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(10.0),
+                            ..default()
+                        })
+                        .with_children(|stats| {
+                            spawn_kda_colored_row(stats, p.kills, p.deaths, p.assists, 11.5);
+                            stats.spawn((
+                                Text::new(format!("{}/{} CS", p.last_hits, p.denies)),
+                                TextFont { font_size: FontSize::Px(10.0), ..default() },
+                                TextColor(Color::srgb(0.76, 0.88, 0.88)),
+                            ));
+                            stats.spawn((
+                                Text::new(format!("{}G", p.gold_coins)),
+                                TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                TextColor(gold),
+                            ));
+                        });
+                });
+
+                // ردیف پایین: نوار اینونتوری نهایی بازیکن (مشابه اسلات‌های HUD داخل بازی)
+                prow.spawn(Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|inv_row| {
+                    inv_row.spawn((
+                        Text::new("BUILD"),
+                        TextFont { font_size: FontSize::Px(8.5), ..default() },
+                        TextColor(Color::srgb(0.52, 0.72, 0.74)),
+                    ));
+                    spawn_inventory_slots_strip(
+                        inv_row,
+                        items_config,
+                        item_icons,
+                        &p.final_items,
+                        mm.history_player_item_slot_size_px,
+                        mm.history_item_slot_border_radius_px,
+                        mm.history_item_slot_gap_px,
+                        false,
+                    );
+                });
+            });
+    }
 }
 
 fn spawn_history_screen(
     parent: &mut ChildSpawnerCommands,
     state: &PreGameSessionState,
     config: &GameConfig,
+    items_config: &ItemsConfig,
+    hero_portraits: &MenuHeroPortraitCache,
+    item_icons: &MenuItemIconCache,
 ) {
     let gold = Color::srgb(0.98, 0.82, 0.30);
     let emerald = Color::srgb(0.28, 0.96, 0.60);
     let crimson = Color::srgb(0.96, 0.38, 0.38);
+    let amber = Color::srgb(0.98, 0.64, 0.28);
+    let cyan = Color::srgb(0.36, 0.88, 0.98);
 
     let Some(ref hist) = state.history else {
         parent
@@ -6451,10 +7405,13 @@ fn spawn_history_screen(
     };
     let selected_match = filtered_matches.get(sel_idx).copied();
 
+    let mm = &config.main_menu;
+
     parent
         .spawn(Node {
             width: Val::Percent(100.0),
             flex_grow: 1.0,
+            min_height: Val::Px(0.0),
             padding: UiRect::axes(Val::Px(22.0), Val::Px(14.0)),
             flex_direction: FlexDirection::Column,
             row_gap: Val::Px(12.0),
@@ -6462,7 +7419,7 @@ fn spawn_history_screen(
         })
         .with_children(|wrap| {
             // =================================================================
-            // ۱. نوار بالای CAREER SUMMARY (مشابه تصویر مرجع)
+            // ۱. نوار بالای CAREER SUMMARY
             // =================================================================
             wrap.spawn((
                 Node {
@@ -6472,29 +7429,43 @@ fn spawn_history_screen(
                     justify_content: JustifyContent::SpaceBetween,
                     align_items: AlignItems::Center,
                     border: UiRect::all(Val::Px(1.5)),
-                    border_radius: BorderRadius::all(Val::Px(5.0)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.025, 0.088, 0.102, 0.92)),
-                BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.65)),
+                BackgroundColor(Color::srgba(0.025, 0.088, 0.102, 0.94)),
+                BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.68)),
             ))
             .with_children(|hdr| {
-                hdr.spawn((
-                    Text::new("CAREER SUMMARY"),
-                    TextFont { font_size: FontSize::Px(20.0), ..default() },
-                    TextColor(Color::WHITE),
-                ));
+                hdr.spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(2.0),
+                    ..default()
+                })
+                .with_children(|title_col| {
+                    title_col.spawn((
+                        Text::new("CAREER SUMMARY"),
+                        TextFont { font_size: FontSize::Px(19.0), ..default() },
+                        TextColor(Color::WHITE),
+                    ));
+                    title_col.spawn((
+                        Text::new(format!(
+                            "{}W  -  {}L  -  {}A",
+                            s.wins, s.losses, s.abandoned_count
+                        )),
+                        TextFont { font_size: FontSize::Px(10.5), ..default() },
+                        TextColor(Color::srgb(0.64, 0.84, 0.82)),
+                    ));
+                });
 
-                // شاخص‌های کلیدی
                 hdr.spawn(Node {
                     flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(28.0),
+                    column_gap: Val::Px(26.0),
                     align_items: AlignItems::Center,
                     ..default()
                 })
                 .with_children(|metrics| {
                     let avg_kda_str = format!(
-                        "{:.1} KDA ({}/{}/{})",
+                        "{:.2} KDA ({}/{}/{})",
                         s.avg_kda, s.total_kills, s.total_deaths, s.total_assists
                     );
                     for (lbl, val, col) in [
@@ -6506,12 +7477,13 @@ fn spawn_history_screen(
                         metrics
                             .spawn(Node {
                                 flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(1.0),
                                 ..default()
                             })
                             .with_children(|mcol| {
                                 mcol.spawn((
                                     Text::new(lbl),
-                                    TextFont { font_size: FontSize::Px(10.0), ..default() },
+                                    TextFont { font_size: FontSize::Px(9.5), ..default() },
                                     TextColor(Color::srgb(0.60, 0.78, 0.76)),
                                 ));
                                 mcol.spawn((
@@ -6523,7 +7495,6 @@ fn spawn_history_screen(
                     }
                 });
 
-                // فیلتر نوع بازی‌ها
                 hdr.spawn(Node {
                     flex_direction: FlexDirection::Row,
                     column_gap: Val::Px(6.0),
@@ -6559,20 +7530,21 @@ fn spawn_history_screen(
             });
 
             // =================================================================
-            // ۲. بخش دو ستونه: چپ MATCH LOG | راست MATCH DETAILS + BACK TO MENU
+            // ۲. بخش دو ستونه: چپ MATCH LOG (53%) | راست MATCH DETAILS (47%)
             // =================================================================
             wrap.spawn(Node {
                 width: Val::Percent(100.0),
                 flex_grow: 1.0,
+                min_height: Val::Px(0.0),
                 flex_direction: FlexDirection::Row,
                 column_gap: Val::Px(14.0),
                 ..default()
             })
             .with_children(|cols| {
-                // ستون چپ: جدول MATCH LOG
+                // ستون چپ: فهرست مسابقات با آیکون هیرو + نوار آیتم‌ها
                 cols.spawn((
                     Node {
-                        width: Val::Percent(62.0),
+                        width: Val::Percent(53.0),
                         height: Val::Percent(100.0),
                         padding: UiRect::all(Val::Px(10.0)),
                         flex_direction: FlexDirection::Column,
@@ -6582,15 +7554,15 @@ fn spawn_history_screen(
                         overflow: Overflow::clip(),
                         ..default()
                     },
-                    BackgroundColor(Color::srgba(0.02, 0.070, 0.084, 0.88)),
-                    BorderColor::all(Color::srgba(0.24, 0.62, 0.60, 0.55)),
+                    BackgroundColor(Color::srgba(0.02, 0.070, 0.084, 0.90)),
+                    BorderColor::all(Color::srgba(0.24, 0.62, 0.60, 0.58)),
                 ))
                 .with_children(|log| {
                     // هدر ستون‌ها
                     log.spawn((
                         Node {
                             width: Val::Percent(100.0),
-                            padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                            padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
                             flex_direction: FlexDirection::Row,
                             align_items: AlignItems::Center,
                             border: UiRect::bottom(Val::Px(1.0)),
@@ -6600,17 +7572,16 @@ fn spawn_history_screen(
                     ))
                     .with_children(|th| {
                         for (lbl, pct) in [
-                            ("MATCH LOG", 18.0),
-                            ("HERO & MODE", 34.0),
+                            ("HERO & RESULT", 40.0),
+                            ("FINAL ITEMS", 28.0),
                             ("K / D / A", 16.0),
-                            ("DURATION", 14.0),
-                            ("PLAYED AT", 18.0),
+                            ("TIME", 16.0),
                         ] {
                             th.spawn(Node { width: Val::Percent(pct), ..default() })
                                 .with_children(|c| {
                                     c.spawn((
                                         Text::new(lbl),
-                                        TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                        TextFont { font_size: FontSize::Px(10.5), ..default() },
                                         TextColor(Color::srgb(0.62, 0.82, 0.80)),
                                     ));
                                 });
@@ -6648,120 +7619,234 @@ fn spawn_history_screen(
                             PreGameScrollableList,
                         ))
                         .with_children(|hist_scroll| {
-                        for (idx, m) in filtered_matches.iter().enumerate() {
-                            let is_sel = idx == sel_idx;
-                            let (outcome_lbl, accent) = match m.outcome.as_str() {
-                                "win" => ("VICTORY", emerald),
-                                "loss" => ("DEFEAT", crimson),
-                                "abandoned" => ("ABANDON", Color::srgb(0.98, 0.74, 0.24)),
-                                "running" => ("LIVE", Color::srgb(0.36, 0.88, 0.98)),
-                                _ => ("CANCELED", Color::srgb(0.60, 0.66, 0.68)),
-                            };
-                            let hero_name = resolve_hero_display_name(config, m.hero_id);
-                            let mode_sub = if m.is_custom_lobby {
-                                "CUSTOM LOBBY".to_string()
-                            } else if m.is_party_match {
-                                format!("PARTY RANKED ({:+} MMR)", m.mmr_delta)
-                            } else {
-                                format!("SOLO RANKED ({:+} MMR)", m.mmr_delta)
-                            };
-                            let dur_str = format!("{:02}:{:02}", m.duration_sec / 60, m.duration_sec % 60);
-
-                            hist_scroll.spawn((
-                                UiButton,
-                                Hovered::default(),
-                                Node {
-                                    width: Val::Percent(100.0),
-                                    flex_shrink: 0.0,
-                                    height: Val::Px(54.0),
-                                    padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
-                                    flex_direction: FlexDirection::Row,
-                                    align_items: AlignItems::Center,
-                                    border: UiRect {
-                                        left: Val::Px(4.5),
-                                        right: Val::Px(if is_sel { 1.5 } else { 1.0 }),
-                                        top: Val::Px(if is_sel { 1.5 } else { 1.0 }),
-                                        bottom: Val::Px(if is_sel { 1.5 } else { 1.0 }),
-                                    },
-                                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                                    ..default()
-                                },
-                                BackgroundColor(if is_sel {
-                                    Color::srgba(0.16, 0.14, 0.05, 0.92)
+                            let row_icon_sz = mm.history_log_icon_size_px;
+                            let row_height = (row_icon_sz + 20.0).max(64.0);
+                            for (idx, m) in filtered_matches.iter().enumerate() {
+                                let is_sel = idx == sel_idx;
+                                let (outcome_lbl, accent) = match m.outcome.as_str() {
+                                    "win" => ("VICTORY", emerald),
+                                    "loss" => ("DEFEAT", crimson),
+                                    "abandoned" => ("ABANDON", Color::srgb(0.98, 0.74, 0.24)),
+                                    "running" => ("LIVE", cyan),
+                                    _ => ("CANCELED", Color::srgb(0.60, 0.66, 0.68)),
+                                };
+                                let hero_def = resolve_hero_def(config, m.hero_id);
+                                let hero_name = resolve_hero_display_name(config, m.hero_id);
+                                let mode_sub = if m.is_custom_lobby {
+                                    "CUSTOM LOBBY".to_string()
+                                } else if m.is_party_match {
+                                    format!("PARTY ({:+} MMR)", m.mmr_delta)
                                 } else {
-                                    Color::srgba(0.035, 0.11, 0.13, 0.88)
-                                }),
-                                BorderColor::all(if is_sel { gold } else { accent.with_alpha(0.70) }),
-                                PreGameBtnAction::SelectHistoryMatch(idx),
-                            ))
-                            .with_children(|row| {
-                                // OUTCOME
-                                row.spawn(Node { width: Val::Percent(18.0), ..default() })
-                                    .with_children(|c| {
-                                        c.spawn((
-                                            Text::new(outcome_lbl),
-                                            TextFont { font_size: FontSize::Px(13.5), ..default() },
-                                            TextColor(accent),
-                                        ));
+                                    format!("RANKED ({:+} MMR)", m.mmr_delta)
+                                };
+                                let dur_str = format!(
+                                    "{:02}:{:02}",
+                                    m.duration_sec / 60,
+                                    m.duration_sec % 60
+                                );
+                                let kda_ratio = compute_kda_ratio(m.kills, m.deaths, m.assists);
+
+                                hist_scroll
+                                    .spawn((
+                                        UiButton,
+                                        Hovered::default(),
+                                        Node {
+                                            width: Val::Percent(100.0),
+                                            flex_shrink: 0.0,
+                                            height: Val::Px(row_height),
+                                            padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                                            flex_direction: FlexDirection::Row,
+                                            align_items: AlignItems::Center,
+                                            border: UiRect {
+                                                left: Val::Px(4.5),
+                                                right: Val::Px(if is_sel { 1.5 } else { 1.0 }),
+                                                top: Val::Px(if is_sel { 1.5 } else { 1.0 }),
+                                                bottom: Val::Px(if is_sel { 1.5 } else { 1.0 }),
+                                            },
+                                            border_radius: BorderRadius::all(Val::Px(5.0)),
+                                            ..default()
+                                        },
+                                        BackgroundColor(if is_sel {
+                                            Color::srgba(0.15, 0.14, 0.05, 0.94)
+                                        } else {
+                                            Color::srgba(0.032, 0.102, 0.122, 0.88)
+                                        }),
+                                        BorderColor::all(if is_sel {
+                                            gold
+                                        } else {
+                                            accent.with_alpha(0.68)
+                                        }),
+                                        PreGameBtnAction::SelectHistoryMatch(idx),
+                                    ))
+                                    .with_children(|row| {
+                                        // ستون ۱: آیکون هیرو + نام هیرو + نتیجه و مود
+                                        row.spawn(Node {
+                                            width: Val::Percent(40.0),
+                                            flex_direction: FlexDirection::Row,
+                                            align_items: AlignItems::Center,
+                                            column_gap: Val::Px(8.0),
+                                            ..default()
+                                        })
+                                        .with_children(|hero_cell| {
+                                            spawn_hero_portrait_frame(
+                                                hero_cell,
+                                                hero_def,
+                                                hero_portraits,
+                                                row_icon_sz,
+                                                mm.hero_icon_border_radius_px,
+                                                if is_sel { gold } else { accent },
+                                                1.8,
+                                                Some(m.level),
+                                            );
+                                            hero_cell
+                                                .spawn(Node {
+                                                    flex_direction: FlexDirection::Column,
+                                                    row_gap: Val::Px(3.0),
+                                                    ..default()
+                                                })
+                                                .with_children(|meta| {
+                                                    meta.spawn(Node {
+                                                        flex_direction: FlexDirection::Row,
+                                                        align_items: AlignItems::Center,
+                                                        column_gap: Val::Px(5.0),
+                                                        ..default()
+                                                    })
+                                                    .with_children(|top_line| {
+                                                        top_line.spawn((
+                                                            Text::new(hero_name),
+                                                            TextFont {
+                                                                font_size: FontSize::Px(12.5),
+                                                                ..default()
+                                                            },
+                                                            TextColor(Color::WHITE),
+                                                        ));
+                                                        top_line
+                                                            .spawn((
+                                                                Node {
+                                                                    padding: UiRect::axes(
+                                                                        Val::Px(4.5),
+                                                                        Val::Px(1.0),
+                                                                    ),
+                                                                    border: UiRect::all(Val::Px(1.0)),
+                                                                    border_radius: BorderRadius::all(
+                                                                        Val::Px(3.0),
+                                                                    ),
+                                                                    ..default()
+                                                                },
+                                                                BackgroundColor(
+                                                                    accent.with_alpha(0.16),
+                                                                ),
+                                                                BorderColor::all(
+                                                                    accent.with_alpha(0.80),
+                                                                ),
+                                                            ))
+                                                            .with_children(|pill| {
+                                                                pill.spawn((
+                                                                    Text::new(outcome_lbl),
+                                                                    TextFont {
+                                                                        font_size: FontSize::Px(8.5),
+                                                                        ..default()
+                                                                    },
+                                                                    TextColor(accent),
+                                                                ));
+                                                            });
+                                                    });
+                                                    meta.spawn((
+                                                        Text::new(mode_sub),
+                                                        TextFont {
+                                                            font_size: FontSize::Px(9.5),
+                                                            ..default()
+                                                        },
+                                                        TextColor(Color::srgb(0.68, 0.82, 0.80)),
+                                                    ));
+                                                });
+                                        });
+
+                                        // ستون ۲: نوار آیتم‌های نهایی (مشابه اینونتوری)
+                                        row.spawn(Node {
+                                            width: Val::Percent(28.0),
+                                            align_items: AlignItems::Center,
+                                            ..default()
+                                        })
+                                        .with_children(|items_cell| {
+                                            spawn_inventory_slots_strip(
+                                                items_cell,
+                                                items_config,
+                                                item_icons,
+                                                &m.final_items,
+                                                mm.history_log_item_slot_size_px,
+                                                mm.history_item_slot_border_radius_px,
+                                                mm.history_item_slot_gap_px,
+                                                false,
+                                            );
+                                        });
+
+                                        // ستون ۳: K/D/A رنگی + نسبت KDA
+                                        row.spawn(Node {
+                                            width: Val::Percent(16.0),
+                                            flex_direction: FlexDirection::Column,
+                                            row_gap: Val::Px(2.0),
+                                            ..default()
+                                        })
+                                        .with_children(|c| {
+                                            spawn_kda_colored_row(
+                                                c, m.kills, m.deaths, m.assists, 12.5,
+                                            );
+                                            c.spawn((
+                                                Text::new(format!(
+                                                    "{:.2} KDA | {}G",
+                                                    kda_ratio, m.gold_coins
+                                                )),
+                                                TextFont {
+                                                    font_size: FontSize::Px(9.0),
+                                                    ..default()
+                                                },
+                                                TextColor(gold),
+                                            ));
+                                        });
+
+                                        // ستون ۴: مدت زمان و تاریخ
+                                        row.spawn(Node {
+                                            width: Val::Percent(16.0),
+                                            flex_direction: FlexDirection::Column,
+                                            row_gap: Val::Px(2.0),
+                                            ..default()
+                                        })
+                                        .with_children(|c| {
+                                            c.spawn((
+                                                Text::new(dur_str),
+                                                TextFont {
+                                                    font_size: FontSize::Px(11.5),
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(0.88, 0.95, 0.95)),
+                                            ));
+                                            c.spawn((
+                                                Text::new(m.played_at.clone()),
+                                                TextFont {
+                                                    font_size: FontSize::Px(9.5),
+                                                    ..default()
+                                                },
+                                                TextColor(if is_sel {
+                                                    gold
+                                                } else {
+                                                    Color::srgb(0.68, 0.80, 0.80)
+                                                }),
+                                            ));
+                                        });
                                     });
-                                // HERO & MODE
-                                row.spawn(Node {
-                                    width: Val::Percent(34.0),
-                                    flex_direction: FlexDirection::Column,
-                                    ..default()
-                                })
-                                .with_children(|c| {
-                                    c.spawn((
-                                        Text::new(hero_name),
-                                        TextFont { font_size: FontSize::Px(14.0), ..default() },
-                                        TextColor(Color::WHITE),
-                                    ));
-                                    c.spawn((
-                                        Text::new(mode_sub),
-                                        TextFont { font_size: FontSize::Px(10.0), ..default() },
-                                        TextColor(Color::srgb(0.68, 0.82, 0.80)),
-                                    ));
-                                });
-                                // K/D/A
-                                row.spawn(Node { width: Val::Percent(16.0), ..default() })
-                                    .with_children(|c| {
-                                        c.spawn((
-                                            Text::new(format!("{} / {} / {}", m.kills, m.deaths, m.assists)),
-                                            TextFont { font_size: FontSize::Px(13.5), ..default() },
-                                            TextColor(Color::srgb(0.95, 0.98, 0.97)),
-                                        ));
-                                    });
-                                // DURATION
-                                row.spawn(Node { width: Val::Percent(14.0), ..default() })
-                                    .with_children(|c| {
-                                        c.spawn((
-                                            Text::new(dur_str),
-                                            TextFont { font_size: FontSize::Px(13.0), ..default() },
-                                            TextColor(Color::srgb(0.84, 0.92, 0.92)),
-                                        ));
-                                    });
-                                // PLAYED AT
-                                row.spawn(Node { width: Val::Percent(18.0), ..default() })
-                                    .with_children(|c| {
-                                        c.spawn((
-                                            Text::new(m.played_at.clone()),
-                                            TextFont { font_size: FontSize::Px(11.5), ..default() },
-                                            TextColor(if is_sel { gold } else { Color::srgb(0.72, 0.82, 0.82) }),
-                                        ));
-                                    });
-                            });
-                        }
+                            }
                         });
                     }
                 });
 
-                // ستون راست: MATCH DETAILS + BACK TO MENU
+                // ستون راست: MATCH DETAILS با بنر هیرو + اینونتوری کامل + جدول دو تیم
                 cols.spawn(Node {
-                    width: Val::Percent(38.0),
+                    width: Val::Percent(47.0),
                     height: Val::Percent(100.0),
                     flex_direction: FlexDirection::Column,
                     justify_content: JustifyContent::SpaceBetween,
-                    row_gap: Val::Px(12.0),
+                    row_gap: Val::Px(10.0),
                     ..default()
                 })
                 .with_children(|right_col| {
@@ -6770,46 +7855,234 @@ fn spawn_history_screen(
                             Node {
                                 width: Val::Percent(100.0),
                                 flex_grow: 1.0,
-                                padding: UiRect::all(Val::Px(16.0)),
+                                min_height: Val::Px(0.0),
+                                padding: UiRect::all(Val::Px(14.0)),
                                 flex_direction: FlexDirection::Column,
-                                row_gap: Val::Px(12.0),
+                                row_gap: Val::Px(10.0),
                                 border: UiRect::all(Val::Px(1.5)),
                                 border_radius: BorderRadius::all(Val::Px(6.0)),
                                 overflow: Overflow::clip(),
                                 ..default()
                             },
-                            BackgroundColor(Color::srgba(0.025, 0.082, 0.098, 0.92)),
-                            BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.65)),
+                            BackgroundColor(Color::srgba(0.025, 0.082, 0.098, 0.94)),
+                            BorderColor::all(Color::srgba(0.26, 0.72, 0.70, 0.68)),
                         ))
                         .with_children(|det| {
-                            det.spawn((
-                                Text::new("MATCH DETAILS"),
-                                TextFont { font_size: FontSize::Px(17.0), ..default() },
-                                TextColor(Color::WHITE),
-                            ));
-
                             if let Some(m) = selected_match {
                                 let (o_lbl, o_col) = match m.outcome.as_str() {
                                     "win" => ("VICTORY", emerald),
                                     "loss" => ("DEFEAT", crimson),
                                     "abandoned" => ("ABANDONED", Color::srgb(0.98, 0.74, 0.24)),
-                                    _ => ("MATCH", Color::srgb(0.38, 0.88, 0.98)),
+                                    "running" => ("LIVE MATCH", cyan),
+                                    _ => ("CANCELED", Color::srgb(0.64, 0.72, 0.74)),
                                 };
-                                let dur_str = format!("{:02}:{:02}", m.duration_sec / 60, m.duration_sec % 60);
-                                let tag = if m.is_custom_lobby {
-                                    "CUSTOM"
+                                let dur_str = format!(
+                                    "{:02}:{:02}",
+                                    m.duration_sec / 60,
+                                    m.duration_sec % 60
+                                );
+                                let mode_lbl = if m.is_custom_lobby {
+                                    "CUSTOM LOBBY"
                                 } else if m.is_party_match {
-                                    "PARTY"
+                                    "PARTY RANKED"
                                 } else {
-                                    "SOLO"
+                                    "SOLO RANKED"
                                 };
-                                det.spawn((
-                                    Text::new(format!("{}  |  {}  |  {}  [{}]", o_lbl, config.main_menu.default_map_name, dur_str, tag)),
-                                    TextFont { font_size: FontSize::Px(11.5), ..default() },
-                                    TextColor(o_col),
-                                ));
+                                let hero_def = resolve_hero_def(config, m.hero_id);
+                                let hero_name = resolve_hero_display_name(config, m.hero_id);
+                                let kda_ratio = compute_kda_ratio(m.kills, m.deaths, m.assists);
 
-                                // شبکه ۲×۲ آمار کلیدی نبرد انتخاب‌شده
+                                // بنر ویژه هیرو انتخاب‌شده
+                                det.spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        flex_shrink: 0.0,
+                                        padding: UiRect::all(Val::Px(11.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        justify_content: JustifyContent::SpaceBetween,
+                                        align_items: AlignItems::Center,
+                                        column_gap: Val::Px(12.0),
+                                        border: UiRect {
+                                            left: Val::Px(4.0),
+                                            right: Val::Px(1.0),
+                                            top: Val::Px(1.0),
+                                            bottom: Val::Px(1.0),
+                                        },
+                                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(o_col.with_alpha(0.11)),
+                                    BorderColor::all(o_col.with_alpha(0.65)),
+                                ))
+                                .with_children(|banner| {
+                                    banner
+                                        .spawn(Node {
+                                            flex_direction: FlexDirection::Row,
+                                            align_items: AlignItems::Center,
+                                            column_gap: Val::Px(12.0),
+                                            ..default()
+                                        })
+                                        .with_children(|left| {
+                                            spawn_hero_portrait_frame(
+                                                left,
+                                                hero_def,
+                                                hero_portraits,
+                                                mm.history_detail_hero_icon_size_px,
+                                                mm.hero_icon_border_radius_px,
+                                                o_col,
+                                                2.2,
+                                                Some(m.level),
+                                            );
+                                            left.spawn(Node {
+                                                flex_direction: FlexDirection::Column,
+                                                row_gap: Val::Px(3.0),
+                                                ..default()
+                                            })
+                                            .with_children(|txt| {
+                                                txt.spawn((
+                                                    Text::new(format!("{}  //  {}", o_lbl, mode_lbl)),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(10.5),
+                                                        ..default()
+                                                    },
+                                                    TextColor(o_col),
+                                                ));
+                                                txt.spawn((
+                                                    Text::new(hero_name),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(18.0),
+                                                        ..default()
+                                                    },
+                                                    TextColor(Color::WHITE),
+                                                ));
+                                                txt.spawn((
+                                                    Text::new(format!(
+                                                        "{}  |  {}  |  {}",
+                                                        mm.default_map_name, dur_str, m.played_at
+                                                    )),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(9.5),
+                                                        ..default()
+                                                    },
+                                                    TextColor(Color::srgb(0.70, 0.84, 0.84)),
+                                                ));
+                                            });
+                                        });
+
+                                    banner
+                                        .spawn(Node {
+                                            flex_direction: FlexDirection::Column,
+                                            align_items: AlignItems::FlexEnd,
+                                            row_gap: Val::Px(2.0),
+                                            ..default()
+                                        })
+                                        .with_children(|kda_box| {
+                                            spawn_kda_colored_row(
+                                                kda_box, m.kills, m.deaths, m.assists, 17.5,
+                                            );
+                                            kda_box.spawn((
+                                                Text::new(format!("{:.2} KDA", kda_ratio)),
+                                                TextFont {
+                                                    font_size: FontSize::Px(10.5),
+                                                    ..default()
+                                                },
+                                                TextColor(gold),
+                                            ));
+                                        });
+                                });
+
+                                // پنل FINAL INVENTORY مشابه طراحی اینونتوری داخل بازی
+                                let equipped_names: Vec<String> = m
+                                    .final_items
+                                    .iter()
+                                    .filter_map(|it| {
+                                        if let Some(target) = parse_recipe_target(&it.item_id) {
+                                            Some(format!("RECIPE: {}", target.to_uppercase()))
+                                        } else {
+                                            items_config
+                                                .get_item(&it.item_id)
+                                                .map(|d| d.name.to_uppercase())
+                                        }
+                                    })
+                                    .collect();
+                                let items_summary = if equipped_names.is_empty() {
+                                    "No items equipped in final inventory.".to_string()
+                                } else {
+                                    equipped_names.join("  |  ")
+                                };
+
+                                det.spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        flex_shrink: 0.0,
+                                        padding: UiRect::axes(Val::Px(10.0), Val::Px(8.0)),
+                                        flex_direction: FlexDirection::Column,
+                                        row_gap: Val::Px(6.0),
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        border_radius: BorderRadius::all(Val::Px(5.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.022, 0.068, 0.086, 0.94)),
+                                    BorderColor::all(Color::srgba(0.24, 0.58, 0.60, 0.52)),
+                                ))
+                                .with_children(|inv_panel| {
+                                    inv_panel
+                                        .spawn(Node {
+                                            width: Val::Percent(100.0),
+                                            flex_direction: FlexDirection::Row,
+                                            justify_content: JustifyContent::SpaceBetween,
+                                            align_items: AlignItems::Center,
+                                            ..default()
+                                        })
+                                        .with_children(|row| {
+                                            row.spawn(Node {
+                                                flex_direction: FlexDirection::Column,
+                                                row_gap: Val::Px(2.0),
+                                                ..default()
+                                            })
+                                            .with_children(|lbl_col| {
+                                                lbl_col.spawn((
+                                                    Text::new("FINAL INVENTORY"),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(10.5),
+                                                        ..default()
+                                                    },
+                                                    TextColor(gold),
+                                                ));
+                                                lbl_col.spawn((
+                                                    Text::new(format!(
+                                                        "{} / {} SLOTS",
+                                                        equipped_names.len(),
+                                                        items_config.max_inventory_slots
+                                                    )),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(9.0),
+                                                        ..default()
+                                                    },
+                                                    TextColor(Color::srgb(0.62, 0.80, 0.80)),
+                                                ));
+                                            });
+
+                                            spawn_inventory_slots_strip(
+                                                row,
+                                                items_config,
+                                                item_icons,
+                                                &m.final_items,
+                                                mm.history_detail_item_slot_size_px,
+                                                mm.history_item_slot_border_radius_px,
+                                                mm.history_item_slot_gap_px,
+                                                true,
+                                            );
+                                        });
+
+                                    inv_panel.spawn((
+                                        Text::new(items_summary),
+                                        TextFont { font_size: FontSize::Px(9.0), ..default() },
+                                        TextColor(Color::srgb(0.72, 0.86, 0.86)),
+                                    ));
+                                });
+
+                                // ردیف ۴ کارت آمار کلیدی نبرد
                                 let mmr_str = if m.is_custom_lobby {
                                     "0 (CUSTOM)".to_string()
                                 } else {
@@ -6824,130 +8097,130 @@ fn spawn_history_screen(
                                 };
                                 det.spawn(Node {
                                     width: Val::Percent(100.0),
+                                    flex_shrink: 0.0,
                                     flex_direction: FlexDirection::Row,
-                                    flex_wrap: FlexWrap::Wrap,
-                                    row_gap: Val::Px(8.0),
                                     column_gap: Val::Px(8.0),
                                     ..default()
                                 })
-                                .with_children(|grid| {
+                                .with_children(|strip| {
                                     for (k, v, c) in [
-                                        ("GOLD EARNED", format!("{}", m.gold_coins), gold),
-                                        ("LAST HITS / DENIES", format!("{} / {}", m.last_hits, m.denies), Color::WHITE),
-                                        ("HERO LEVEL", format!("LVL {}", m.level), Color::srgb(0.40, 0.90, 0.98)),
+                                        ("GOLD EARNED", format!("{}G", m.gold_coins), gold),
+                                        (
+                                            "CS / DENIES",
+                                            format!("{} / {}", m.last_hits, m.denies),
+                                            Color::WHITE,
+                                        ),
+                                        ("HERO LEVEL", format!("LVL {}", m.level), cyan),
                                         ("MMR CHANGE", mmr_str, mmr_col),
                                     ] {
-                                        grid.spawn((
-                                            Node {
-                                                width: Val::Percent(47.5),
-                                                padding: UiRect::axes(Val::Px(10.0), Val::Px(7.0)),
-                                                flex_direction: FlexDirection::Column,
-                                                border: UiRect::all(Val::Px(1.0)),
-                                                border_radius: BorderRadius::all(Val::Px(4.0)),
-                                                ..default()
-                                            },
-                                            BackgroundColor(Color::srgba(0.04, 0.13, 0.15, 0.90)),
-                                            BorderColor::all(Color::srgba(0.24, 0.56, 0.56, 0.45)),
-                                        ))
-                                        .with_children(|cell| {
-                                            cell.spawn((
-                                                Text::new(k),
-                                                TextFont { font_size: FontSize::Px(9.5), ..default() },
-                                                TextColor(Color::srgb(0.62, 0.80, 0.78)),
-                                            ));
-                                            cell.spawn((
-                                                Text::new(v),
-                                                TextFont { font_size: FontSize::Px(16.0), ..default() },
-                                                TextColor(c),
-                                            ));
-                                        });
+                                        strip
+                                            .spawn((
+                                                Node {
+                                                    flex_grow: 1.0,
+                                                    flex_basis: Val::Px(0.0),
+                                                    padding: UiRect::axes(
+                                                        Val::Px(8.0),
+                                                        Val::Px(6.0),
+                                                    ),
+                                                    flex_direction: FlexDirection::Column,
+                                                    row_gap: Val::Px(2.0),
+                                                    border: UiRect::all(Val::Px(1.0)),
+                                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                                    ..default()
+                                                },
+                                                BackgroundColor(Color::srgba(
+                                                    0.038, 0.122, 0.145, 0.92,
+                                                )),
+                                                BorderColor::all(Color::srgba(
+                                                    0.24, 0.56, 0.56, 0.48,
+                                                )),
+                                            ))
+                                            .with_children(|cell| {
+                                                cell.spawn((
+                                                    Text::new(k),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(9.0),
+                                                        ..default()
+                                                    },
+                                                    TextColor(Color::srgb(0.62, 0.80, 0.78)),
+                                                ));
+                                                cell.spawn((
+                                                    Text::new(v),
+                                                    TextFont {
+                                                        font_size: FontSize::Px(13.0),
+                                                        ..default()
+                                                    },
+                                                    TextColor(c),
+                                                ));
+                                            });
                                     }
                                 });
 
-                                // خلاصه دو تیم (TEAM ALPHA vs TEAM OMEGA) و بازیکنان همراه با بج پارتی
-                                let t1_kills: i32 = m.players.iter().filter(|p| p.team_id == 1).map(|p| p.kills).sum();
-                                let t2_kills: i32 = m.players.iter().filter(|p| p.team_id == 2).map(|p| p.kills).sum();
-                                det.spawn((
-                                    Node {
-                                        width: Val::Percent(100.0),
-                                        padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-                                        flex_direction: FlexDirection::Row,
-                                        justify_content: JustifyContent::SpaceBetween,
-                                        border: UiRect::bottom(Val::Px(1.0)),
-                                        ..default()
-                                    },
-                                    BorderColor::all(Color::srgba(0.28, 0.68, 0.66, 0.45)),
-                                ))
-                                .with_children(|vs| {
-                                    vs.spawn((
-                                        Text::new(format!("TEAM ALPHA ({})", t1_kills)),
-                                        TextFont { font_size: FontSize::Px(12.0), ..default() },
-                                        TextColor(emerald),
-                                    ));
-                                    vs.spawn((
-                                        Text::new("VS"),
-                                        TextFont { font_size: FontSize::Px(11.0), ..default() },
-                                        TextColor(gold),
-                                    ));
-                                    vs.spawn((
-                                        Text::new(format!("TEAM OMEGA ({})", t2_kills)),
-                                        TextFont { font_size: FontSize::Px(12.0), ..default() },
-                                        TextColor(Color::srgb(0.98, 0.64, 0.28)),
-                                    ));
-                                });
-
-                                // لیست بازیکنان حاضر در مسابقه و نمایش هم‌پارتی‌ها
-                                let mut party_tags: std::collections::HashMap<String, usize> =
-                                    std::collections::HashMap::new();
+                                // جدول بازیکنان تفکیک‌شده بر اساس تیم (قابل اسکرول)
+                                let mut party_tags: HashMap<String, usize> = HashMap::new();
                                 for p in &m.players {
-                                    if !p.party_group_id.is_empty() && !party_tags.contains_key(&p.party_group_id) {
+                                    if !p.party_group_id.is_empty()
+                                        && !party_tags.contains_key(&p.party_group_id)
+                                    {
                                         let next_id = party_tags.len() + 1;
                                         party_tags.insert(p.party_group_id.clone(), next_id);
                                     }
                                 }
 
-                                for p in m.players.iter().take(10) {
-                                    let t_col = if p.team_id == 1 {
-                                        emerald
-                                    } else {
-                                        Color::srgb(0.98, 0.64, 0.28)
-                                    };
-                                    let p_tag = if !p.party_group_id.is_empty() {
-                                        format!(" [P{}]", party_tags.get(&p.party_group_id).copied().unwrap_or(1))
-                                    } else {
-                                        String::new()
-                                    };
-                                    let h_lbl = resolve_hero_display_name(config, p.hero_id);
-                                    det.spawn((
-                                        Node {
-                                            width: Val::Percent(100.0),
-                                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
-                                            flex_direction: FlexDirection::Row,
-                                            justify_content: JustifyContent::SpaceBetween,
-                                            align_items: AlignItems::Center,
-                                            border_radius: BorderRadius::all(Val::Px(3.0)),
-                                            ..default()
-                                        },
-                                        BackgroundColor(if p.is_me {
-                                            Color::srgba(0.08, 0.24, 0.24, 0.92)
-                                        } else {
-                                            Color::srgba(0.035, 0.10, 0.12, 0.80)
-                                        }),
-                                    ))
-                                    .with_children(|prow| {
-                                        prow.spawn((
-                                            Text::new(format!("{}{} ({})", p.username, p_tag, h_lbl)),
-                                            TextFont { font_size: FontSize::Px(11.0), ..default() },
-                                            TextColor(if p.is_me { gold } else { t_col }),
-                                        ));
-                                        prow.spawn((
-                                            Text::new(format!("{}/{}/{}  |  {}G", p.kills, p.deaths, p.assists, p.gold_coins)),
-                                            TextFont { font_size: FontSize::Px(11.0), ..default() },
-                                            TextColor(Color::srgb(0.88, 0.94, 0.94)),
-                                        ));
-                                    });
-                                }
+                                let mut alpha_players: Vec<&crate::backend_client::MatchHistoryPlayerRow> =
+                                    m.players.iter().filter(|p| p.team_id == 1).collect();
+                                alpha_players.sort_by_key(|p| p.slot_index);
+
+                                let mut omega_players: Vec<&crate::backend_client::MatchHistoryPlayerRow> =
+                                    m.players.iter().filter(|p| p.team_id != 1).collect();
+                                omega_players.sort_by_key(|p| p.slot_index);
+
+                                det.spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        flex_grow: 1.0,
+                                        min_height: Val::Px(0.0),
+                                        flex_direction: FlexDirection::Column,
+                                        row_gap: Val::Px(6.0),
+                                        overflow: Overflow::scroll_y(),
+                                        ..default()
+                                    },
+                                    ScrollPosition::default(),
+                                    RelativeCursorPosition::default(),
+                                    PreGameScrollableList,
+                                ))
+                                .with_children(|roster| {
+                                    spawn_history_team_block(
+                                        roster,
+                                        config,
+                                        items_config,
+                                        hero_portraits,
+                                        item_icons,
+                                        "TEAM ALPHA",
+                                        emerald,
+                                        m.winner_team == 1,
+                                        &alpha_players,
+                                        &party_tags,
+                                    );
+                                    spawn_history_team_block(
+                                        roster,
+                                        config,
+                                        items_config,
+                                        hero_portraits,
+                                        item_icons,
+                                        "TEAM OMEGA",
+                                        amber,
+                                        m.winner_team == 2,
+                                        &omega_players,
+                                        &party_tags,
+                                    );
+                                });
                             } else {
+                                det.spawn((
+                                    Text::new("MATCH DETAILS"),
+                                    TextFont { font_size: FontSize::Px(17.0), ..default() },
+                                    TextColor(Color::WHITE),
+                                ));
                                 det.spawn((
                                     Text::new("Select a match from the log to inspect details."),
                                     TextFont { font_size: FontSize::Px(13.0), ..default() },
@@ -6960,6 +8233,7 @@ fn spawn_history_screen(
                     right_col
                         .spawn(Node {
                             width: Val::Percent(100.0),
+                            flex_shrink: 0.0,
                             flex_direction: FlexDirection::Row,
                             justify_content: JustifyContent::FlexEnd,
                             ..default()
@@ -6972,7 +8246,7 @@ fn spawn_history_screen(
                                 Color::srgba(0.05, 0.16, 0.18, 0.94),
                                 Color::srgb(0.30, 0.86, 0.78),
                                 210.0,
-                                52.0,
+                                48.0,
                             );
                         });
                 });
@@ -7035,14 +8309,20 @@ fn safe_despawn(commands: &mut Commands, entity: Entity) {
 // صفحه انتخاب هیرو برای ورود به محیط Demo Hero (در دسترس همه بازیکنان از منوی اصلی)
 // =============================================================================
 
-fn spawn_demo_hero_screen(parent: &mut ChildSpawnerCommands, config: &GameConfig) {
+fn spawn_demo_hero_screen(
+    parent: &mut ChildSpawnerCommands,
+    config: &GameConfig,
+    hero_portraits: &MenuHeroPortraitCache,
+) {
     let gold = Color::srgb(0.98, 0.84, 0.34);
     let teal = Color::srgb(0.28, 0.94, 0.82);
+    let mm = &config.main_menu;
 
     parent
         .spawn(Node {
             width: Val::Percent(100.0),
             flex_grow: 1.0,
+            min_height: Val::Px(0.0),
             padding: UiRect::axes(Val::Px(26.0), Val::Px(18.0)),
             flex_direction: FlexDirection::Column,
             justify_content: JustifyContent::SpaceBetween,
@@ -7115,11 +8395,11 @@ fn spawn_demo_hero_screen(parent: &mut ChildSpawnerCommands, config: &GameConfig
                 for hero in &config.heroes {
                     grid.spawn((
                         Node {
-                            width: Val::Px(276.0),
+                            width: Val::Px(312.0),
                             padding: UiRect::all(Val::Px(14.0)),
                             flex_direction: FlexDirection::Column,
                             justify_content: JustifyContent::SpaceBetween,
-                            row_gap: Val::Px(10.0),
+                            row_gap: Val::Px(12.0),
                             border: UiRect::all(Val::Px(1.5)),
                             border_radius: BorderRadius::all(Val::Px(6.0)),
                             ..default()
@@ -7129,29 +8409,48 @@ fn spawn_demo_hero_screen(parent: &mut ChildSpawnerCommands, config: &GameConfig
                     ))
                     .with_children(|card| {
                         card.spawn(Node {
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(4.0),
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(12.0),
                             ..default()
                         })
-                        .with_children(|info| {
-                            info.spawn((
-                                Text::new(hero.display_name.to_uppercase()),
-                                TextFont { font_size: FontSize::Px(16.0), ..default() },
-                                TextColor(Color::WHITE),
-                            ));
-                            info.spawn((
-                                Text::new(format!("WEAPON: {:?}", hero.weapon.weapon_kind)),
-                                TextFont { font_size: FontSize::Px(11.5), ..default() },
-                                TextColor(teal),
-                            ));
-                            info.spawn((
-                                Text::new(format!(
-                                    "HP: {:.0}   |   ARMOR: {:.1}   |   DMG: {:.0}",
-                                    hero.max_hp, hero.armor, hero.weapon.damage
-                                )),
-                                TextFont { font_size: FontSize::Px(11.5), ..default() },
-                                TextColor(Color::srgb(0.82, 0.92, 0.92)),
-                            ));
+                        .with_children(|header| {
+                            spawn_hero_portrait_frame(
+                                header,
+                                Some(hero),
+                                hero_portraits,
+                                mm.demo_hero_icon_size_px,
+                                mm.hero_icon_border_radius_px,
+                                teal.with_alpha(0.85),
+                                1.8,
+                                None,
+                            );
+                            header
+                                .spawn(Node {
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: Val::Px(4.0),
+                                    ..default()
+                                })
+                                .with_children(|info| {
+                                    info.spawn((
+                                        Text::new(hero.display_name.to_uppercase()),
+                                        TextFont { font_size: FontSize::Px(15.5), ..default() },
+                                        TextColor(Color::WHITE),
+                                    ));
+                                    info.spawn((
+                                        Text::new(format!("WEAPON: {:?}", hero.weapon.weapon_kind)),
+                                        TextFont { font_size: FontSize::Px(11.0), ..default() },
+                                        TextColor(teal),
+                                    ));
+                                    info.spawn((
+                                        Text::new(format!(
+                                            "HP {:.0}  |  ARMOR {:.1}  |  DMG {:.0}",
+                                            hero.max_hp, hero.armor, hero.weapon.damage
+                                        )),
+                                        TextFont { font_size: FontSize::Px(10.5), ..default() },
+                                        TextColor(Color::srgb(0.82, 0.92, 0.92)),
+                                    ));
+                                });
                         });
 
                         spawn_sized_button(
@@ -7160,7 +8459,7 @@ fn spawn_demo_hero_screen(parent: &mut ChildSpawnerCommands, config: &GameConfig
                             PreGameBtnAction::LaunchDemoHero(hero.id.clone()),
                             Color::srgba(0.64, 0.46, 0.10, 0.95),
                             gold,
-                            246.0,
+                            282.0,
                             38.0,
                         );
                     });

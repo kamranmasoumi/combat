@@ -282,6 +282,11 @@ class MatchParticipant(models.Model):
     last_hits = models.IntegerField("ضربه آخر (Last Hits)", default=0)
     denies = models.IntegerField("دینای (Denies)", default=0)
     gold_coins = models.IntegerField("طلای نهایی (Gold)", default=0)
+    final_items = models.JSONField(
+        "آیتم‌های نهایی اینونتوری (Final Inventory Items)",
+        default=list,
+        blank=True,
+    )
     is_winner = models.BooleanField("برنده مسابقه", default=False)
     mmr_delta = models.IntegerField("تغییر امتیاز MMR", default=0)
     party_group_id = models.CharField("شناسه گروه پارتی", max_length=64, blank=True, default="", db_index=True)
